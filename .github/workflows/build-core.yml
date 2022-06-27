@@ -37,7 +37,7 @@ jobs:
             python3 -m pip install -r etc/pip/compile-requirements.txt
 
             # Builds the MongoDB binary
-            python3 buildscripts/scons.py install-core --disable-warnings-as-errors
+            python3 buildscripts/scons.py MONGO_VERSION=6.0.0-experimental install-core --disable-warnings-as-errors
 
       - name: Upload Binaries
         uses: actions/upload-artifact@v3
