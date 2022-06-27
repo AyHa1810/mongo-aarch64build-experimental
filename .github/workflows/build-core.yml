@@ -16,7 +16,7 @@ on:
 # A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
   # This workflow contains a single job called "build"
-  build-core:
+  builds:
     # The type of runner that the job will run on
     runs-on: ubuntu-latest
 
@@ -25,24 +25,19 @@ jobs:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - uses: actions/checkout@v3
 
-      # Install dependencies required for the build
-      - name: Install dependencies
+      - name: Build core aarch64
         uses: uraimo/run-on-arch-action@v2.2.0
         with:
           arch: aarch64
           distro: ubuntu_latest
           run: |
+            # Install dependencies required for the build
             DEBIAN_FRONTEND=noninteractive apt update # && apt upgrade -y
-            DEBIAN_FRONTEND=noninteractive apt install -y build-essential libcurl4-nss-dev liblzma-dev python3 python3-pip python-dev-is-python3 libssl-dev
+            DEBIAN_FRONTEND=noninteractive apt install --no-install-recommends -y build-essential libcurl4-nss-dev liblzma-dev python3 python3-pip python-dev-is-python3 libssl-dev
             python3 -m pip install -r etc/pip/compile-requirements.txt
 
-      # Builds the MongoDB binary
-      - name: Build MongoDB
-        uses: uraimo/run-on-arch-action@v2.2.0
-        with:
-          arch: aarch64
-          distro: ubuntu_latest
-          run: python3 buildscripts/scons.py install-core --disable-warnings-as-errors
+            # Builds the MongoDB binary
+            python3 buildscripts/scons.py install-core --disable-warnings-as-errors
 
       - name: Upload Binaries
         uses: actions/upload-artifact@v3
