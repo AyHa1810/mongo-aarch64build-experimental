@@ -32,8 +32,8 @@ jobs:
           arch: aarch64
           distro: ubuntu_latest
           run: |
-            apt update && apt upgrade
-            apt install build-essential libcurl4-nss-dev liblzma-dev python3 python-dev-is-python3 libssl-dev
+            DEBIAN_FRONTEND=noninteractive apt update && apt upgrade
+            DEBIAN_FRONTEND=noninteractive apt install build-essential libcurl4-nss-dev liblzma-dev python3 python-dev-is-python3 libssl-dev
             python3 -m pip install -r etc/pip/compile-requirements.txt
 
       # Builds the MongoDB binary
