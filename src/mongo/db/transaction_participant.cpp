@@ -573,7 +573,7 @@ TransactionParticipant::getOldestActiveTimestamp(Timestamp stableTimestamp) {
 
         ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(
             opCtx->lockState());
-        Lock::DBLock dbLock(opCtx.get(), nss.db(), MODE_IS, deadline);
+        Lock::DBLock dbLock(opCtx.get(), nss.dbName(), MODE_IS, deadline);
         Lock::CollectionLock collLock(opCtx.get(), nss, MODE_IS, deadline);
 
         auto databaseHolder = DatabaseHolder::get(opCtx.get());
@@ -910,7 +910,6 @@ void TransactionParticipant::Participant::_beginMultiDocumentTransaction(
         invariant(p().transactionOperations.empty());
     }
 
-    // TODO: (SERVER-62375): Remove upgrade/downgrade code for internal transactions
     if (_isInternalSession() && opCtx->writesAreReplicated()) {
         // Don't check the FCV and feature flag when starting an internal transaction on secondaries
         // since they must apply transaction oplog entries replicated from the primary whether or
