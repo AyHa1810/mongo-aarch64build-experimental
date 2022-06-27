@@ -43,7 +43,7 @@ jobs:
           distro: ubuntu_latest
         run: python3 buildscripts/scons.py install-core --disable-warnings-as-errors
 
-      - Upload Binaries
+      - name: Upload Binaries
         uses: actions/upload-artifact@v3
         with:
           name: mongodb-build-aarch64
