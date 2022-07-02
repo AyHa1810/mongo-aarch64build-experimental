@@ -2170,6 +2170,7 @@ env.Library(
         'service_context_test_fixture.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/client/clientdriver_network',
         '$BUILD_DIR/mongo/unittest/unittest',
         'service_context',
     ],
@@ -2358,7 +2359,6 @@ env.Library(
         # NOTE: If you need to add a static or mongo initializer to mongod startup,
         # please add that library here, as a private library dependency.
         '$BUILD_DIR/mongo/executor/network_interface_factory',
-        '$BUILD_DIR/mongo/logv2/logv2_options',
         '$BUILD_DIR/mongo/rpc/rpc',
         '$BUILD_DIR/mongo/s/commands/sharded_cluster_sharding_commands',
         '$BUILD_DIR/mongo/scripting/scripting_server',
@@ -2684,6 +2684,7 @@ if wiredtiger:
             'logical_session_cache_test.cpp',
             'logical_session_id_test.cpp',
             'logical_time_test.cpp',
+            'metric_tree_test.cpp',
             'mirroring_sampler_test.cpp',
             'multi_key_path_tracker_test.cpp',
             'namespace_string_test.cpp',

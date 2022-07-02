@@ -875,6 +875,7 @@ buildvariants:
     external_auth_jobs_max: 1
   tasks:
   - name: cqf
+  - name: cqf_passthrough
   - name: cqf_parallel
   - name: compile_and_archive_dist_test_then_package_TG
     distros:
@@ -1362,6 +1363,14 @@ buildvariants:
     - rhel80-xlarge
   - name: generate_buildid_to_debug_symbols_mapping
 
+- <<: *enterprise-rhel-80-64-bit-dynamic-required-template
+  name: enterprise-rhel-80-64-bit-dynamic-debug-mode
+  display_name: "Shared Library Enterprise RHEL 8.0 Debug Mode"
+  cron: "0 4 */3 * *" # Run once every three days
+  expansions:
+    <<: *enterprise-rhel-80-64-bit-dynamic-required-expansions
+    compile_flags: --ssl MONGO_DISTMOD=rhel80 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars --link-model=dynamic --use-glibcxx-debug --dbg=on --allocator=system
+
 - name: enterprise-rhel-80-64-bit-dynamic-required-ninja
   display_name: "Ninja Build: Enterprise RHEL 8.0"
   cron: "0 4 * * *" # From the ${project_nightly_cron} parameter.
@@ -1411,6 +1420,7 @@ buildvariants:
       --excludeWithAnyTags=incompatible_with_shard_merge
   tasks: &enterprise-rhel-80-64-bit-dynamic-all-feature-flags-tasks
   - name: cqf
+  - name: cqf_passthrough
   - name: cqf_parallel
   - name: compile_test_and_package_parallel_core_stream_TG
     distros:
@@ -1435,6 +1445,10 @@ buildvariants:
   - name: .causally_consistent !.sharding
   - name: .change_streams
   - name: .change_stream_fuzzer
+  - name: change_streams_multitenant_passthrough
+  - name: change_streams_multitenant_sharded_collections_passthrough
+    distros:
+    - rhel80-medium # TODO SERVER-65950 remove the distro.
   - name: .misc_js
   - name: .clustered_collections
   - name: .concurrency !.large !.ubsan !.no_txns !.debug_only
@@ -2073,48 +2087,37 @@ buildvariants:
     - rhel72-zseries-build
   - name: generate_buildid_to_debug_symbols_mapping
 
-
-- name: enterprise-rhel80-dynamic-clang-tidy-required
-  display_name: "! Enterprise Clang Tidy"
-  cron: "0 */4 * * *" # From the ${project_required_suggested_cron} parameter
+- &enterprise-rhel-80-64-dynamic-clang-tidy-condensed
+  name: enterprise-rhel80-dynamic-clang-tidy-condensed
+  display_name: "Enterprise Clang Tidy With Extra Checks"
+  cron: "0 4 * * *"
   modules:
   - enterprise
   run_on:
-  - rhel80-xlarge
+  - rhel80-xxlarge
   expansions:
-    additional_package_targets: archive-mongocryptd archive-mongocryptd-debug
     lang_environment: LANG=C
-    compile_flags: --link-model=dynamic -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars
-    # Unlike static builds, dynamic builds have no need to
-    # constrain the number of link jobs. Unfortunately, --jlink=1
-    # means one link job, not 100%. So this is a bit gross but set
-    # it to .99.
-    num_scons_link_jobs_available: 0.99
+    compile_flags: --link-model=dynamic -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_${clang_tidy_toolchain}_clang.vars
     scons_cache_scope: shared
     scons_cache_mode: all
     show_scons_timings: false
     clang_tidy_toolchain: v3
+    clang_tidy_file: .clang-tidy-extra-checks
+  tasks:
+  - name: clang_tidy_condensed_TG
+
+- <<: *enterprise-rhel-80-64-dynamic-clang-tidy-condensed
+  name: enterprise-rhel80-dynamic-clang-tidy-required
+  display_name: "! Enterprise Clang Tidy"
+  cron: "0 */4 * * *" # From the ${project_required_suggested_cron} parameter
   tasks:
   - name: clang_tidy_TG
 
-- name: enterprise-rhel80-dynamic-clang-tidy-v4
+- <<: *enterprise-rhel-80-64-dynamic-clang-tidy-condensed
+  name: enterprise-rhel80-dynamic-clang-tidy-v4
   display_name: "Enterprise Clang Tidy v4 Toolchain"
   cron: "0 */4 * * *" # From the ${project_required_suggested_cron} parameter
-  modules:
-  - enterprise
-  run_on:
-  - rhel80-xlarge
   expansions:
-    lang_environment: LANG=C
-    compile_flags: --link-model=dynamic -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v4_clang.vars
-    # Unlike static builds, dynamic builds have no need to
-    # constrain the number of link jobs. Unfortunately, --jlink=1
-    # means one link job, not 100%. So this is a bit gross but set
-    # it to .99.
-    num_scons_link_jobs_available: 0.99
-    scons_cache_scope: shared
-    scons_cache_mode: all
-    show_scons_timings: false
     clang_tidy_toolchain: v4
   tasks:
   - name: clang_tidy_TG
@@ -2213,6 +2216,7 @@ buildvariants:
     separate_debug: off
   tasks:
   - name: cqf
+  - name: cqf_passthrough
   - name: cqf_parallel
   - name: compile_and_archive_dist_test_then_package_TG
   - name: .aggregation
@@ -2220,6 +2224,8 @@ buildvariants:
   - name: audit
   - name: .causally_consistent !.wo_snapshot
   - name: .change_streams
+  - name: change_streams_multitenant_passthrough
+  - name: change_streams_multitenant_sharded_collections_passthrough
   - name: .misc_js
   #  - name: .concurrency !.ubsan !.no_txns !.kill_terminate
   #  - name: .encrypt
@@ -2368,6 +2374,7 @@ buildvariants:
     large_distro_name: rhel80-build
   tasks:
   - name: cqf
+  - name: cqf_passthrough
   - name: cqf_parallel
   - name: compile_and_archive_dist_test_then_package_TG
   - name: .aggregation
@@ -2375,6 +2382,8 @@ buildvariants:
   - name: audit
   - name: .causally_consistent !.wo_snapshot
   - name: .change_streams
+  - name: change_streams_multitenant_passthrough
+  - name: change_streams_multitenant_sharded_collections_passthrough
   - name: .misc_js
   - name: .concurrency !.no_txns !.repl !.kill_terminate
   - name: disk_wiredtiger

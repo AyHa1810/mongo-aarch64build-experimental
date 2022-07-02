@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2018-present MongoDB, Inc.
+ *    Copyright (C) 2022-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -27,38 +27,52 @@
  *    it in the license file.
  */
 
-#pragma once
+#include "mongo/util/scoped_unlock.h"
 
-#include <map>
-#include <string>
-
-#include "mongo/db/jsobj.h"
+#include "mongo/platform/mutex.h"
+#include "mongo/unittest/death_test.h"
+#include "mongo/unittest/unittest.h"
 
 namespace mongo {
+namespace {
+TEST(ScopedUnlockTest, Relocked) {
+    Mutex mutex;
+    stdx::unique_lock lk(mutex);
 
-class ServerStatusMetric;
+    { ScopedUnlock scopedUnlock(lk); }
 
-class MetricTree {
-public:
-    void add(ServerStatusMetric* metric);
+    ASSERT(lk.owns_lock()) << "ScopedUnlock should relock on destruction";
+}
 
-    /**
-     * Append the metrics tree to the given BSON builder.
-     */
-    void appendTo(BSONObjBuilder& b) const;
+TEST(ScopedUnlockTest, Unlocked) {
+    Mutex mutex;
+    stdx::unique_lock<Mutex> lk(mutex);
 
-    /**
-     * Implementation of appendTo which allows tree of exclude paths. The alternative overload is
-     * preferred to avoid overhead when no excludes are present.
-     */
-    void appendTo(const BSONObj& excludePaths, BSONObjBuilder& b) const;
+    ScopedUnlock scopedUnlock(lk);
 
-    static MetricTree* theMetricTree;
+    ASSERT_FALSE(lk.owns_lock()) << "ScopedUnlock should unlock on construction";
+}
 
-private:
-    void _add(const std::string& path, ServerStatusMetric* metric);
+TEST(ScopedUnlockTest, Dismissed) {
+    Mutex mutex;
+    stdx::unique_lock<Mutex> lk(mutex);
 
-    std::map<std::string, MetricTree*> _subtrees;
-    std::map<std::string, ServerStatusMetric*> _metrics;
-};
+    {
+        ScopedUnlock scopedUnlock(lk);
+        scopedUnlock.dismiss();
+    }
+
+    ASSERT_FALSE(lk.owns_lock()) << "ScopedUnlock should not relock on destruction if dismissed";
+}
+
+DEATH_TEST(ScopedUnlockTest,
+           InitUnlocked,
+           "Locks in ScopedUnlock must be locked on initialization.") {
+    Mutex mutex;
+    stdx::unique_lock<Mutex> lk(mutex);
+    lk.unlock();
+
+    ScopedUnlock scopedUnlock(lk);
+}
+}  // namespace
 }  // namespace mongo

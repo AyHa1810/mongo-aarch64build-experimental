@@ -74,6 +74,7 @@
 #include "mongo/db/s/resharding/resharding_coordinator_service.h"
 #include "mongo/db/s/resharding/resharding_donor_recipient_common.h"
 #include "mongo/db/s/sharding_ddl_coordinator_service.h"
+#include "mongo/db/s/sharding_util.h"
 #include "mongo/db/s/transaction_coordinator_service.h"
 #include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/db/server_options.h"
@@ -530,6 +531,11 @@ private:
             createChangeStreamPreImagesCollection(opCtx);
         }
 
+        // TODO SERVER-67392: Remove once FCV 7.0 becomes last-lts.
+        if (feature_flags::gGlobalIndexesShardingCatalog.isEnabledOnVersion(requestedVersion)) {
+            uassertStatusOK(sharding_util::createGlobalIndexesIndexes(opCtx));
+        }
+
         hangWhileUpgrading.pauseWhileSet(opCtx);
     }
 
@@ -596,6 +602,48 @@ private:
                         // FCV 6.0 becomes last-lts.
                         return preImagesFeatureFlagDisabledOnDowngradeVersion &&
                             collection->isChangeStreamPreAndPostImagesEnabled();
+                    });
+
+                catalog::forEachCollectionFromDb(
+                    opCtx,
+                    dbName,
+                    MODE_S,
+                    [&](const CollectionPtr& collection) {
+                        invariant(collection->getTimeseriesOptions());
+
+                        auto indexCatalog = collection->getIndexCatalog();
+                        auto indexIt = indexCatalog->getIndexIterator(
+                            opCtx,
+                            IndexCatalog::InclusionPolicy::kReady |
+                                IndexCatalog::InclusionPolicy::kUnfinished);
+
+                        while (indexIt->more()) {
+                            auto indexEntry = indexIt->next();
+                            // Fail to downgrade if the time-series collection has a partial, TTL
+                            // index.
+                            if (indexEntry->descriptor()->isPartial()) {
+                                // TODO (SERVER-67659): Remove partial, TTL index check once FCV 7.0
+                                // becomes last-lts.
+                                uassert(
+                                    ErrorCodes::CannotDowngrade,
+                                    str::stream()
+                                        << "Cannot downgrade the cluster when there are secondary "
+                                           "TTL indexes with partial filters on time-series "
+                                           "collections. Drop all partial, TTL indexes on "
+                                           "time-series collections before downgrading. First "
+                                           "detected incompatible index name: '"
+                                        << indexEntry->descriptor()->indexName()
+                                        << "' on collection: '"
+                                        << collection->ns().getTimeseriesViewNamespace() << "'",
+                                    !indexEntry->descriptor()->infoObj().hasField(
+                                        IndexDescriptor::kExpireAfterSecondsFieldName));
+                            }
+                        }
+
+                        return true;
+                    },
+                    [&](const CollectionPtr& collection) {
+                        return collection->getTimeseriesOptions() != boost::none;
                     });
             }
 
@@ -668,6 +716,28 @@ private:
             ShardingDDLCoordinatorService::getService(opCtx)
                 ->waitForCoordinatorsOfGivenTypeToComplete(
                     opCtx, DDLCoordinatorTypeEnum::kReshardCollection);
+        }
+
+        // TODO SERVER-67392: Remove when 7.0 branches-out.
+        if (requestedVersion == GenericFCV::kLastLTS) {
+            NamespaceString indexCatalogNss;
+            if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+                indexCatalogNss = NamespaceString::kConfigsvrIndexCatalogNamespace;
+            } else {
+                indexCatalogNss = NamespaceString::kShardsIndexCatalogNamespace;
+            }
+            LOGV2(6280502, "Droping global indexes collection", "nss"_attr = indexCatalogNss);
+            DropReply dropReply;
+            const auto deletionStatus =
+                dropCollection(opCtx,
+                               indexCatalogNss,
+                               &dropReply,
+                               DropCollectionSystemCollectionMode::kAllowSystemCollectionDrops);
+            uassert(deletionStatus.code(),
+                    str::stream() << "Failed to drop " << indexCatalogNss
+                                  << causedBy(deletionStatus.reason()),
+                    deletionStatus.isOK() ||
+                        deletionStatus.code() == ErrorCodes::NamespaceNotFound);
         }
 
         uassert(ErrorCodes::Error(549181),

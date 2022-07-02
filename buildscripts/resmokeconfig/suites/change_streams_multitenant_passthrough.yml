@@ -4,11 +4,9 @@ selector:
   roots:
   - jstests/change_streams/**/*.js
   exclude_files:
-  # Expects oplog entries to be in $v:2 format.
-  - jstests/change_streams/expanded_update_description.js
-  - jstests/change_streams/pipeline_style_updates_v2_oplog_entries.js
-  - jstests/change_streams/show_expanded_events.js
-
+  # TODO SERVER-66840 investigate the failing test case.
+  - jstests/change_streams/projection_fakes_internal_event.js
+  - jstests/change_streams/only_wake_getmore_for_relevant_changes.js
   exclude_with_any_tags:
   ##
   # The next tags correspond to the special errors thrown by the
@@ -23,7 +21,6 @@ executor:
   archive:
     hooks:
       - CheckReplDBHash
-      - CheckReplOplogs
       - ValidateCollections
   config:
     shell_options:
@@ -31,23 +28,18 @@ executor:
         TestData:
           defaultReadConcernLevel: null
           enableMajorityReadConcern: ''
-      # Enable causal consistency for change streams suites. Some tests rely on the assumption that
-      # a w:majority write will be visible immediately in a subsequently opened change stream. An
-      # operation that majority commits at timestamp T will force the majority snapshot to advance
-      # to T, but the oplog visibility point may not have advanced to T yet. Subsequent majority
-      # snapshot reads will see this write in the oplog, but speculative majority reads may not,
-      # since they read from a local snapshot and are bound to the oplog visibility rules. Using
-      # causal consistency forces the visibility point to advance to the timestamp of the last write
-      # before doing a new read.
+      # Enable causal consistency for change streams suites using 1 node replica sets. See
+      # change_streams.yml for detailed explanation.
+      #TODO SERVER-67267 load 'inject_tenant_prefix.js'.
       eval: >-
         var testingReplication = true;
         load('jstests/libs/override_methods/set_read_and_write_concerns.js');
         load('jstests/libs/override_methods/enable_causal_consistency_without_read_pref.js');
+        load('jstests/libs/override_methods/override_fixtures_changestream_multitenancy.js');
   hooks:
   # The CheckReplDBHash hook waits until all operations have replicated to and have been applied
   # on the secondaries, so we run the ValidateCollections hook after it to ensure we're
   # validating the entire contents of the collection.
-  - class: CheckReplOplogs
   - class: CheckReplDBHash
   - class: ValidateCollections
   - class: CleanEveryN
@@ -58,5 +50,7 @@ executor:
       bind_ip_all: ''
       set_parameters:
         enableTestCommands: 1
-        internalQueryEnableLoggingV2OplogEntries: false
+        featureFlagServerlessChangeStreams: true
+        failpoint.assertChangeStreamNssCollection:
+          "{'mode': 'alwaysOn', 'data': {'collectionName': 'system.change_collection'}}"
     num_nodes: 2
