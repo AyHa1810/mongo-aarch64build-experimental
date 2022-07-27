@@ -40,7 +40,9 @@
 #include "mongo/crypto/encryption_fields_gen.h"
 #include "mongo/crypto/fle_crypto.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_time_tracker.h"
 #include "mongo/db/ops/write_ops_gen.h"
 #include "mongo/db/ops/write_ops_parsers.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
@@ -114,7 +116,8 @@ void replyToResponse(OperationContext* opCtx,
     // committed. The Transaction API propagates the OpTime from the commit transaction onto the
     // current thread so grab it from TLS and change the OpTime on the reply.
     //
-    response->setLastOp(repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp());
+    response->setLastOp({OperationTimeTracker::get(opCtx)->getMaxOperationTime().asTimestamp(),
+                         repl::OpTime::kUninitializedTerm});
 }
 
 void responseToReply(const BatchedCommandResponse& response,
@@ -303,7 +306,7 @@ write_ops::DeleteCommandReply processDelete(OperationContext* opCtx,
 
     auto ownedRequest = deleteRequest.serialize({});
     auto ownedDeleteRequest =
-        write_ops::DeleteCommandRequest::parse(IDLParserErrorContext("delete"), ownedRequest);
+        write_ops::DeleteCommandRequest::parse(IDLParserContext("delete"), ownedRequest);
     auto ownedDeleteOpEntry = ownedDeleteRequest.getDeletes()[0];
 
     auto expCtx = makeExpCtx(opCtx, ownedDeleteRequest, ownedDeleteOpEntry);
@@ -391,7 +394,7 @@ write_ops::UpdateCommandReply processUpdate(OperationContext* opCtx,
 
     auto ownedRequest = updateRequest.serialize({});
     auto ownedUpdateRequest =
-        write_ops::UpdateCommandRequest::parse(IDLParserErrorContext("update"), ownedRequest);
+        write_ops::UpdateCommandRequest::parse(IDLParserContext("update"), ownedRequest);
     auto ownedUpdateOpEntry = ownedUpdateRequest.getUpdates()[0];
 
     auto expCtx = makeExpCtx(opCtx, ownedUpdateRequest, ownedUpdateOpEntry);
@@ -671,7 +674,7 @@ StatusWith<std::pair<ReplyType, OpMsgRequest>> processFindAndModifyRequest(
 
     auto ownedRequest = findAndModifyRequest.serialize({});
     auto ownedFindAndModifyRequest = write_ops::FindAndModifyCommandRequest::parse(
-        IDLParserErrorContext("findAndModify"), ownedRequest);
+        IDLParserContext("findAndModify"), ownedRequest);
 
     auto expCtx = makeExpCtx(opCtx, ownedFindAndModifyRequest, ownedFindAndModifyRequest);
     auto findAndModifyBlock = std::make_tuple(ownedFindAndModifyRequest, expCtx);
@@ -927,11 +930,6 @@ FLEBatchResult processFLEBatch(OperationContext* opCtx,
     if (request.getWriteCommandRequestBase().getEncryptionInformation()->getCrudProcessed()) {
         return FLEBatchResult::kNotProcessed;
     }
-
-    // TODO (SERVER-65077): Remove FCV check once 6.0 is released
-    uassert(6371209,
-            "Queryable Encryption is only supported when FCV supports 6.0",
-            gFeatureFlagFLE2.isEnabled(serverGlobalParams.featureCompatibility));
 
     if (request.getBatchType() == BatchedCommandRequest::BatchType_Insert) {
         auto insertRequest = request.getInsertRequest();
@@ -1210,16 +1208,11 @@ FLEBatchResult processFLEFindAndModify(OperationContext* opCtx,
                                        BSONObjBuilder& result) {
     // There is no findAndModify parsing in mongos so we need to first parse to decide if it is for
     // FLE2
-    auto request = write_ops::FindAndModifyCommandRequest::parse(
-        IDLParserErrorContext("findAndModify"), cmdObj);
+    auto request =
+        write_ops::FindAndModifyCommandRequest::parse(IDLParserContext("findAndModify"), cmdObj);
 
     if (!request.getEncryptionInformation().has_value()) {
         return FLEBatchResult::kNotProcessed;
-    }
-
-    // TODO (SERVER-65077): Remove FCV check once 6.0 is released
-    if (!gFeatureFlagFLE2.isEnabled(serverGlobalParams.featureCompatibility)) {
-        uasserted(6371405, "Queryable Encryption is only supported when FCV supports 6.0");
     }
 
     // FLE2 Mongos CRUD operations loopback through MongoS with EncryptionInformation as
@@ -1282,12 +1275,10 @@ uint64_t FLEQueryInterfaceImpl::countDocuments(const NamespaceString& nss) {
     CountCommandRequest ccr(nss);
     auto opMsgRequest = ccr.serialize(BSONObj());
 
-    auto requestMessage = opMsgRequest.serialize();
+    DBDirectClient directClient(opCtx.get());
+    auto uniqueReply = directClient.runCommand(opMsgRequest);
 
-    auto serviceEntryPoint = opCtx->getServiceContext()->getServiceEntryPoint();
-    DbResponse dbResponse = serviceEntryPoint->handleRequest(opCtx.get(), requestMessage).get();
-
-    auto reply = rpc::makeReply(&dbResponse.response)->getCommandReply().getOwned();
+    auto reply = uniqueReply->getCommandReply();
 
     auto status = getStatusFromWriteCommandReply(reply);
     uassertStatusOK(status);
@@ -1368,7 +1359,7 @@ std::pair<write_ops::DeleteCommandReply, BSONObj> FLEQueryInterfaceImpl::deleteW
         deleteReply.getWriteCommandReplyBase().setWriteErrors(singleStatusToWriteErrors(status));
     } else {
         auto reply =
-            write_ops::FindAndModifyCommandReply::parse(IDLParserErrorContext("reply"), response);
+            write_ops::FindAndModifyCommandReply::parse(IDLParserContext("reply"), response);
 
         if (reply.getLastErrorObject().getNumDocs() > 0) {
             deleteReply.getWriteCommandReplyBase().setN(1);
@@ -1412,8 +1403,7 @@ std::pair<write_ops::UpdateCommandReply, BSONObj> FLEQueryInterfaceImpl::updateW
     auto status = getStatusFromWriteCommandReply(response);
     uassertStatusOK(status);
 
-    auto reply =
-        write_ops::FindAndModifyCommandReply::parse(IDLParserErrorContext("reply"), response);
+    auto reply = write_ops::FindAndModifyCommandReply::parse(IDLParserContext("reply"), response);
 
     write_ops::UpdateCommandReply updateReply;
 
@@ -1483,7 +1473,7 @@ write_ops::FindAndModifyCommandReply FLEQueryInterfaceImpl::findAndModify(
     auto status = getStatusFromWriteCommandReply(response);
     uassertStatusOK(status);
 
-    return write_ops::FindAndModifyCommandReply::parse(IDLParserErrorContext("reply"), response);
+    return write_ops::FindAndModifyCommandReply::parse(IDLParserContext("reply"), response);
 }
 
 std::vector<BSONObj> FLEQueryInterfaceImpl::findDocuments(const NamespaceString& nss,

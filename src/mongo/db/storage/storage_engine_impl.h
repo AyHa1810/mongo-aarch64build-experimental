@@ -101,8 +101,6 @@ public:
     virtual StatusWith<std::deque<std::string>> extendBackupCursor(
         OperationContext* opCtx) override;
 
-    virtual bool isDurable() const override;
-
     virtual bool isEphemeral() const override;
 
     virtual Status repairRecordStore(OperationContext* opCtx,
@@ -285,7 +283,8 @@ public:
         void _startup();
 
         KVEngine* _engine;
-        bool _running;
+        bool _running = false;
+        bool _shuttingDown = false;
 
         // Periodic runner that the timestamp monitor schedules its job on.
         PeriodicRunner* _periodicRunner;

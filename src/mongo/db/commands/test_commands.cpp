@@ -43,7 +43,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/service_context.h"
@@ -99,7 +99,7 @@ public:
         // TODO SERVER-66561 Use DatabaseName obj passed in
         DatabaseName dbName(boost::none, dbname);
         Lock::DBLock lk(opCtx, dbName, MODE_X);
-        OldClientContext ctx(opCtx, nss.ns());
+        OldClientContext ctx(opCtx, nss);
         Database* db = ctx.db();
 
         WriteUnitOfWork wunit(opCtx);
@@ -262,7 +262,7 @@ public:
         const Timestamp requestedPinTs = cmdObj.firstElement().timestamp();
         const bool round = cmdObj["round"].booleanSafe();
 
-        AutoGetDb autoDb(opCtx, kDurableHistoryTestNss.db(), MODE_IX);
+        AutoGetDb autoDb(opCtx, kDurableHistoryTestNss.dbName(), MODE_IX);
         Lock::CollectionLock collLock(opCtx, kDurableHistoryTestNss, MODE_IX);
         if (!CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
                 opCtx,

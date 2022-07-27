@@ -197,7 +197,7 @@ private:
     void processProjectedPaths(const projection_executor::InclusionNode& node) {
         // For each preserved path, mark that each path element along the field path should be
         // included.
-        std::set<std::string> preservedPaths;
+        OrderedPathSet preservedPaths;
         node.reportProjectedPaths(&preservedPaths);
 
         for (const std::string& preservedPathStr : preservedPaths) {
@@ -217,7 +217,7 @@ private:
     void processComputedPaths(const projection_executor::InclusionNode& node,
                               const std::string& rootProjection,
                               const bool isAddingFields) {
-        std::set<std::string> computedPaths;
+        OrderedPathSet computedPaths;
         StringMap<std::string> renamedPaths;
         node.reportComputedPaths(&computedPaths, &renamedPaths);
 
@@ -227,9 +227,11 @@ private:
                 FieldPath(renamedPathEntry.second),
                 make<PathIdentity>(),
                 [](const std::string& fieldName, const bool isLastElement, ABT input) {
-                    return make<PathGet>(fieldName,
-                                         isLastElement ? std::move(input)
-                                                       : make<PathTraverse>(std::move(input)));
+                    return make<PathGet>(
+                        fieldName,
+                        isLastElement
+                            ? std::move(input)
+                            : make<PathTraverse>(std::move(input), PathTraverse::kUnlimited));
                 });
 
             auto entry = _ctx.getNode();
@@ -295,7 +297,7 @@ private:
     void visitExclusionNode(const projection_executor::ExclusionNode& node) {
         // Handle simple exclusion projections: for each excluded path, mark that the last field
         // path element should be dropped.
-        std::set<std::string> excludedPaths;
+        OrderedPathSet excludedPaths;
         node.reportProjectedPaths(&excludedPaths);
         for (const std::string& excludedPathStr : excludedPaths) {
             assertSupportedPath(excludedPathStr);
@@ -563,9 +565,10 @@ public:
             *localPath,
             make<PathIdentity>(),
             [](const std::string& fieldName, const bool isLastElement, ABT input) {
-                return make<PathGet>(fieldName,
-                                     isLastElement ? std::move(input)
-                                                   : make<PathTraverse>(std::move(input)));
+                return make<PathGet>(
+                    fieldName,
+                    isLastElement ? std::move(input)
+                                  : make<PathTraverse>(std::move(input), PathTraverse::kUnlimited));
             });
 
         auto localPathProjName = _ctx.getNextId("localPath");
@@ -591,7 +594,8 @@ public:
             *foreignPath,
             make<PathCompare>(Operations::EqMember, make<Variable>(localProjName)),
             [](const std::string& fieldName, const bool /*isLastElement*/, ABT input) {
-                return make<PathGet>(fieldName, make<PathTraverse>(std::move(input)));
+                return make<PathGet>(
+                    fieldName, make<PathTraverse>(std::move(input), PathTraverse::kSingleLevel));
             });
 
         // Retain only the top-level get into foreignSimplePath.
@@ -629,7 +633,7 @@ public:
             make<PathConstant>(make<Variable>(foreignFoldedProjName)),
             [](const std::string& fieldName, const bool isLastElement, ABT input) {
                 if (!isLastElement) {
-                    input = make<PathTraverse>(std::move(input));
+                    input = make<PathTraverse>(std::move(input), PathTraverse::kUnlimited);
                 }
                 return make<PathField>(fieldName, std::move(input));
             });
@@ -832,9 +836,10 @@ public:
             unwindFieldPath,
             std::move(embedPath),
             [](const std::string& fieldName, const bool isLastElement, ABT input) {
-                return make<PathField>(fieldName,
-                                       isLastElement ? std::move(input)
-                                                     : make<PathTraverse>(std::move(input)));
+                return make<PathField>(
+                    fieldName,
+                    isLastElement ? std::move(input)
+                                  : make<PathTraverse>(std::move(input), PathTraverse::kUnlimited));
             });
 
         ABT unwoundPath = translateFieldPath(

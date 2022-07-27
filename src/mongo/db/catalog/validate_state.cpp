@@ -82,12 +82,25 @@ ValidateState::ValidateState(OperationContext* opCtx,
         _collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, _nss);
 
     if (!_collection) {
-        if (CollectionCatalog::get(opCtx)->lookupView(opCtx, _nss)) {
-            uasserted(ErrorCodes::CommandNotSupportedOnView, "Cannot validate a view");
+        auto view = CollectionCatalog::get(opCtx)->lookupView(opCtx, _nss);
+        if (!view) {
+            uasserted(ErrorCodes::NamespaceNotFound,
+                      str::stream() << "Collection '" << _nss << "' does not exist to validate.");
+        } else {
+            // Uses the bucket collection in place of the time-series collection view.
+            if (!view->timeseries() ||
+                !feature_flags::gExtendValidateCommand.isEnabled(
+                    serverGlobalParams.featureCompatibility)) {
+                uasserted(ErrorCodes::CommandNotSupportedOnView, "Cannot validate a view");
+            }
+            _nss = _nss.makeTimeseriesBucketsNamespace();
+            if (isBackground()) {
+                _collectionLock.emplace(opCtx, _nss, MODE_IS);
+            } else {
+                _collectionLock.emplace(opCtx, _nss, MODE_X);
+            }
+            _collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, _nss);
         }
-
-        uasserted(ErrorCodes::NamespaceNotFound,
-                  str::stream() << "Collection '" << _nss << "' does not exist to validate.");
     }
 
     // RepairMode is incompatible with the ValidateModes kBackground and
@@ -265,8 +278,8 @@ void ValidateState::initializeCursors(OperationContext* opCtx) {
     // use cursor->next() to get subsequent Records. However, if the Record Store is empty,
     // there is no first record. In this case, we set the first Record Id to an invalid RecordId
     // (RecordId()), which will halt iteration at the initialization step.
-    const boost::optional<Record> record = _traverseRecordStoreCursor->next(opCtx);
-    _firstRecordId = record ? record->id : RecordId();
+    auto record = _traverseRecordStoreCursor->next(opCtx);
+    _firstRecordId = record ? std::move(record->id) : RecordId();
 }
 
 void ValidateState::_relockDatabaseAndCollection(OperationContext* opCtx) {

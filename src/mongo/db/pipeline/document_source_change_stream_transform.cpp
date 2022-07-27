@@ -63,8 +63,8 @@ DocumentSourceChangeStreamTransform::createFromBson(
     uassert(5467601,
             "the '$_internalChangeStreamTransform' object spec must be an object",
             rawSpec.type() == BSONType::Object);
-    auto spec = DocumentSourceChangeStreamSpec::parse(IDLParserErrorContext("$changeStream"),
-                                                      rawSpec.Obj());
+    auto spec =
+        DocumentSourceChangeStreamSpec::parse(IDLParserContext("$changeStream"), rawSpec.Obj());
     return new DocumentSourceChangeStreamTransform(expCtx, std::move(spec));
 }
 
@@ -120,7 +120,7 @@ DepsTracker::State DocumentSourceChangeStreamTransform::getDependencies(DepsTrac
 
 DocumentSource::GetModPathsReturn DocumentSourceChangeStreamTransform::getModifiedPaths() const {
     // All paths are modified.
-    return {DocumentSource::GetModPathsReturn::Type::kAllPaths, std::set<std::string>{}, {}};
+    return {DocumentSource::GetModPathsReturn::Type::kAllPaths, OrderedPathSet{}, {}};
 }
 
 DocumentSource::GetNextResult DocumentSourceChangeStreamTransform::doGetNext() {

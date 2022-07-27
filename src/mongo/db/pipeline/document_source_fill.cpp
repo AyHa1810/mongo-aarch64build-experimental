@@ -37,7 +37,7 @@
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/stdx/variant.h"
 #include "mongo/util/assert_util.h"
-#include "mongo/util/visit_helper.h"
+#include "mongo/util/overloaded_visitor.h"
 #include <string>
 
 namespace mongo {
@@ -47,8 +47,8 @@ REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(fill,
                                        document_source_fill::createFromBson,
                                        AllowedWithApiStrict::kNeverInVersion1,
                                        AllowedWithClientType::kAny,
-                                       feature_flags::gFeatureFlagFill.getVersion(),
-                                       feature_flags::gFeatureFlagFill.isEnabledAndIgnoreFCV());
+                                       boost::none,
+                                       true);
 namespace document_source_fill {
 
 std::list<boost::intrusive_ptr<DocumentSource>> createFromBson(
@@ -59,7 +59,7 @@ std::list<boost::intrusive_ptr<DocumentSource>> createFromBson(
                           << typeName(elem.type()),
             elem.type() == BSONType::Object);
 
-    auto spec = FillSpec::parse(IDLParserErrorContext(kStageName), elem.embeddedObject());
+    auto spec = FillSpec::parse(IDLParserContext(kStageName), elem.embeddedObject());
     std::list<boost::intrusive_ptr<DocumentSource>> outputPipeline;
     BSONObjBuilder setWindowFieldsSpec;
 
@@ -81,7 +81,7 @@ std::list<boost::intrusive_ptr<DocumentSource>> createFromBson(
                 "Each fill output specification must be an object with exactly one field",
                 fieldSpec.type() == BSONType::Object);
         auto parsedSpec =
-            FillOutputSpec::parse(IDLParserErrorContext(kStageName), fieldSpec.embeddedObject());
+            FillOutputSpec::parse(IDLParserContext(kStageName), fieldSpec.embeddedObject());
         if (auto&& method = parsedSpec.getMethod()) {
             uassert(6050201,
                     "Each fill output specification must have exactly one of 'method' or 'value' "

@@ -67,7 +67,7 @@ BSONObj getMinValidDocument(OperationContext* opCtx, const NamespaceString& minV
         Lock::DBLock dblk(opCtx, minValidNss.dbName(), MODE_IS);
         Lock::CollectionLock lk(opCtx, minValidNss, MODE_IS);
         BSONObj mv;
-        if (Helpers::getSingleton(opCtx, minValidNss.ns().c_str(), mv)) {
+        if (Helpers::getSingleton(opCtx, minValidNss, mv)) {
             return mv;
         }
         return mv;
@@ -255,8 +255,8 @@ TEST_F(ReplicationConsistencyMarkersTest, InitialSyncId) {
     consistencyMarkers.setInitialSyncIdIfNotSet(opCtx);
     auto firstInitialSyncIdBson = consistencyMarkers.getInitialSyncId(opCtx);
     ASSERT_FALSE(firstInitialSyncIdBson.isEmpty());
-    InitialSyncIdDocument firstInitialSyncIdDoc = InitialSyncIdDocument::parse(
-        IDLParserErrorContext("initialSyncId"), firstInitialSyncIdBson);
+    InitialSyncIdDocument firstInitialSyncIdDoc =
+        InitialSyncIdDocument::parse(IDLParserContext("initialSyncId"), firstInitialSyncIdBson);
 
     // Setting it twice should change nothing.
     consistencyMarkers.setInitialSyncIdIfNotSet(opCtx);
@@ -271,8 +271,8 @@ TEST_F(ReplicationConsistencyMarkersTest, InitialSyncId) {
     consistencyMarkers.setInitialSyncIdIfNotSet(opCtx);
     auto secondInitialSyncIdBson = consistencyMarkers.getInitialSyncId(opCtx);
     ASSERT_FALSE(secondInitialSyncIdBson.isEmpty());
-    InitialSyncIdDocument secondInitialSyncIdDoc = InitialSyncIdDocument::parse(
-        IDLParserErrorContext("initialSyncId"), secondInitialSyncIdBson);
+    InitialSyncIdDocument secondInitialSyncIdDoc =
+        InitialSyncIdDocument::parse(IDLParserContext("initialSyncId"), secondInitialSyncIdBson);
     ASSERT_NE(firstInitialSyncIdDoc.get_id(), secondInitialSyncIdDoc.get_id());
 }
 

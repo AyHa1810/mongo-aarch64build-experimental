@@ -524,14 +524,14 @@ void RollbackImpl::_restoreTxnsTableEntryFromRetryableWrites(OperationContext* o
         }
         const auto nss = NamespaceString::kSessionTransactionsTableNamespace;
         writeConflictRetry(opCtx, "updateSessionTransactionsTableInRollback", nss.ns(), [&] {
+            opCtx->recoveryUnit()->allowUntimestampedWrite();
             AutoGetCollection collection(opCtx, nss, MODE_IX);
             auto filter = BSON(SessionTxnRecord::kSessionIdFieldName << sessionId.toBSON());
             UnreplicatedWritesBlock uwb(opCtx);
             // Perform an untimestamped write so that it will not be rolled back on recovering
             // to the 'stableTimestamp' if we were to crash. This is safe because this update is
             // meant to be consistent with the 'stableTimestamp' and not the common point.
-            Helpers::upsert(
-                opCtx, nss.ns(), filter, sessionTxnRecord.toBSON(), /*fromMigrate=*/false);
+            Helpers::upsert(opCtx, nss, filter, sessionTxnRecord.toBSON(), /*fromMigrate=*/false);
         });
     }
     // Take a stable checkpoint so that writes to the 'config.transactions' table are
@@ -967,7 +967,7 @@ Status RollbackImpl::_processRollbackOp(OperationContext* opCtx, const OplogEntr
             _newCounts.erase(oplogEntry.getUuid().get());
         } else if (oplogEntry.getCommandType() == OplogEntry::CommandType::kImportCollection) {
             auto importEntry = mongo::ImportCollectionOplogEntry::parse(
-                IDLParserErrorContext("importCollectionOplogEntry"), oplogEntry.getObject());
+                IDLParserContext("importCollectionOplogEntry"), oplogEntry.getObject());
             // Nothing to roll back if this is a dryRun.
             if (!importEntry.getDryRun()) {
                 const auto& catalogEntry = importEntry.getCatalogEntry();

@@ -318,6 +318,12 @@ public:
     static NamespaceString makeChangeCollectionNSS(const boost::optional<TenantId>& tenantId);
 
     /**
+     * Constructs the pre-images collection namespace for a tenant if the 'tenantId' is specified,
+     * otherwise creates a default pre-images collection namespace.
+     */
+    static NamespaceString makePreImageCollectionNSS(const boost::optional<TenantId>& tenantId);
+
+    /**
      * Constructs a NamespaceString representing a listCollections namespace. The format for this
      * namespace is "<dbName>.$cmd.listCollections".
      */
@@ -588,7 +594,7 @@ public:
     std::string getSisterNS(StringData local) const;
 
     NamespaceString getCommandNS() const {
-        return {db(), "$cmd"};
+        return {dbName(), "$cmd"};
     }
 
     void serializeCollectionName(BSONObjBuilder* builder, StringData fieldName) const;
@@ -701,6 +707,7 @@ private:
  */
 class NamespaceStringOrUUID {
 public:
+    NamespaceStringOrUUID() = delete;
     NamespaceStringOrUUID(NamespaceString nss) : _nss(std::move(nss)) {}
     NamespaceStringOrUUID(DatabaseName dbname, UUID uuid)
         : _uuid(std::move(uuid)), _dbname(std::move(dbname)) {}

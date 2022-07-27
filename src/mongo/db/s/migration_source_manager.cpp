@@ -34,7 +34,7 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/logical_session_cache.h"
 #include "mongo/db/logical_session_id_helpers.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/read_concern.h"
 #include "mongo/db/repl/replication_coordinator.h"
@@ -59,7 +59,6 @@
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog_cache_loader.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/pm2423_feature_flags_gen.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/elapsed_tracker.h"
@@ -83,28 +82,6 @@ const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
                                                 WriteConcernOptions::kWriteConcernTimeoutMigration);
 
 std::string kEmptyErrMsgForMoveTimingHelper;
-
-/**
- * Best-effort attempt to ensure the recipient shard has refreshed its routing table to
- * 'newCollVersion'. Fires and forgets an asychronous remote setShardVersion command.
- */
-void refreshRecipientRoutingTable(OperationContext* opCtx,
-                                  const NamespaceString& nss,
-                                  const HostAndPort& toShardHost,
-                                  const ChunkVersion& newCollVersion) {
-    const executor::RemoteCommandRequest request(
-        toShardHost,
-        NamespaceString::kAdminDb.toString(),
-        BSON("_flushRoutingTableCacheUpdates" << nss.ns()),
-        ReadPreferenceSetting{ReadPreference::PrimaryOnly}.toContainingBSON(),
-        opCtx,
-        executor::RemoteCommandRequest::kNoTimeout);
-
-    auto executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
-    auto noOp = [](const executor::TaskExecutor::RemoteCommandCallbackArgs&) {};
-    executor->scheduleRemoteCommand(request, noOp).getStatus().ignore();
-}
-
 
 /*
  * Taking into account the provided max chunk size, returns:
@@ -134,7 +111,6 @@ MONGO_FAIL_POINT_DEFINE(moveChunkHangAtStep4);
 MONGO_FAIL_POINT_DEFINE(moveChunkHangAtStep5);
 MONGO_FAIL_POINT_DEFINE(moveChunkHangAtStep6);
 
-MONGO_FAIL_POINT_DEFINE(doNotRefreshRecipientAfterCommit);
 MONGO_FAIL_POINT_DEFINE(failMigrationCommit);
 MONGO_FAIL_POINT_DEFINE(hangBeforeLeavingCriticalSection);
 MONGO_FAIL_POINT_DEFINE(migrationCommitNetworkError);
@@ -170,8 +146,6 @@ MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
                           << "moveChunk"
                           << "fromShard" << _args.getFromShard() << "toShard"
                           << _args.getToShard())),
-      _acquireCSOnRecipient(feature_flags::gFeatureFlagMigrationRecipientCriticalSection.isEnabled(
-          serverGlobalParams.featureCompatibility)),
       _moveTimingHelper(_opCtx,
                         "from",
                         _args.getCommandParameter().ns(),
@@ -524,7 +498,7 @@ void MigrationSourceManager::commitChunkOnRecipient() {
     });
 
     // Tell the recipient shard to fetch the latest changes.
-    auto commitCloneStatus = _cloneDriver->commitClone(_opCtx, _acquireCSOnRecipient);
+    auto commitCloneStatus = _cloneDriver->commitClone(_opCtx);
 
     if (MONGO_unlikely(failMigrationCommit.shouldFail()) && commitCloneStatus.isOK()) {
         commitCloneStatus = {ErrorCodes::InternalError,
@@ -608,10 +582,8 @@ void MigrationSourceManager::commitChunkMetadataOnConfig() {
         uassertStatusOK(migrationCommitStatus);
     }
 
-    if (_acquireCSOnRecipient) {
-        // Asynchronously tell the recipient to release its critical section
-        _coordinator->launchReleaseRecipientCriticalSection(_opCtx);
-    }
+    // Asynchronously tell the recipient to release its critical section
+    _coordinator->launchReleaseRecipientCriticalSection(_opCtx);
 
     hangBeforePostMigrationCommitRefresh.pauseWhileSet();
 
@@ -680,7 +652,7 @@ void MigrationSourceManager::commitChunkMetadataOnConfig() {
 
     _stats.totalCriticalSectionCommitTimeMillis.addAndFetch(t.millis());
 
-    LOGV2(4817403,
+    LOGV2(6107801,
           "Exiting commit critical section",
           "migrationId"_attr = _coordinator->getMigrationId(),
           "durationMillis"_attr = t.millis());
@@ -698,13 +670,6 @@ void MigrationSourceManager::commitChunkMetadataOnConfig() {
         ShardingCatalogClient::kMajorityWriteConcern);
 
     const ChunkRange range(*_args.getMin(), *_args.getMax());
-
-    if (!_acquireCSOnRecipient && !MONGO_unlikely(doNotRefreshRecipientAfterCommit.shouldFail())) {
-        // Best-effort make the recipient refresh its routing table to the new collection
-        // version.
-        refreshRecipientRoutingTable(
-            _opCtx, nss(), _recipientHost, refreshedMetadata.getCollVersion());
-    }
 
     std::string orphanedRangeCleanUpErrMsg = str::stream()
         << "Moved chunks successfully but failed to clean up " << nss() << " range "
@@ -801,6 +766,12 @@ void MigrationSourceManager::_cleanup(bool completeMigration) noexcept {
     }();
 
     if (_state == kCriticalSection || _state == kCloneCompleted || _state == kCommittingOnConfig) {
+        LOGV2_DEBUG_OPTIONS(4817403,
+                            2,
+                            {logv2::LogComponent::kShardMigrationPerf},
+                            "Finished critical section",
+                            "migrationId"_attr = _coordinator->getMigrationId());
+
         LOGV2(6107802,
               "Finished critical section",
               "migrationId"_attr = _coordinator->getMigrationId(),
@@ -855,8 +826,7 @@ void MigrationSourceManager::_cleanup(bool completeMigration) noexcept {
                 // This can be called on an exception path after the OperationContext has been
                 // interrupted, so use a new OperationContext. Note, it's valid to call
                 // getServiceContext on an interrupted OperationContext.
-                _cleanupCompleteFuture =
-                    _coordinator->completeMigration(newOpCtx, _acquireCSOnRecipient);
+                _cleanupCompleteFuture = _coordinator->completeMigration(newOpCtx);
             }
         }
 

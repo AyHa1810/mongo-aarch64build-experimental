@@ -33,7 +33,7 @@
 #include "mongo/db/catalog/collection_uuid_mismatch.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/s/reshard_collection_coordinator.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
@@ -108,12 +108,11 @@ ReshardCollectionCoordinator::ReshardCollectionCoordinator(ShardingDDLCoordinato
                                                            const BSONObj& initialState,
                                                            bool persistCoordinatorDocument)
     : RecoverableShardingDDLCoordinator(service, "ReshardCollectionCoordinator", initialState),
-      _request(_doc.getReshardCollectionRequest()),
-      _persistCoordinatorDocument(persistCoordinatorDocument) {}
+      _request(_doc.getReshardCollectionRequest()) {}
 
 void ReshardCollectionCoordinator::checkIfOptionsConflict(const BSONObj& doc) const {
     const auto otherDoc = ReshardCollectionCoordinatorDocument::parse(
-        IDLParserErrorContext("ReshardCollectionCoordinatorDocument"), doc);
+        IDLParserContext("ReshardCollectionCoordinatorDocument"), doc);
 
     uassert(ErrorCodes::ConflictingOperationInProgress,
             "Another reshard collection with different arguments is already running for the same "
@@ -124,13 +123,6 @@ void ReshardCollectionCoordinator::checkIfOptionsConflict(const BSONObj& doc) co
 
 void ReshardCollectionCoordinator::appendCommandInfo(BSONObjBuilder* cmdInfoBuilder) const {
     cmdInfoBuilder->appendElements(_request.toBSON());
-}
-
-void ReshardCollectionCoordinator::_enterPhase(Phase newPhase) {
-    if (!_persistCoordinatorDocument) {
-        return;
-    }
-    RecoverableShardingDDLCoordinator::_enterPhase(newPhase);
 }
 
 ExecutorFuture<void> ReshardCollectionCoordinator::_runImpl(
@@ -154,15 +146,10 @@ ExecutorFuture<void> ReshardCollectionCoordinator::_runImpl(
                     Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(
                         opCtx, nss()));
 
-                if (_persistCoordinatorDocument) {
-                    StateDoc newDoc(_doc);
-                    newDoc.setOldShardKey(cmOld.getShardKeyPattern().getKeyPattern().toBSON());
-                    newDoc.setOldCollectionUUID(cmOld.getUUID());
-                    _updateStateDocument(opCtx, std::move(newDoc));
-                } else {
-                    _doc.setOldShardKey(cmOld.getShardKeyPattern().getKeyPattern().toBSON());
-                    _doc.setOldCollectionUUID(cmOld.getUUID());
-                }
+                StateDoc newDoc(_doc);
+                newDoc.setOldShardKey(cmOld.getShardKeyPattern().getKeyPattern().toBSON());
+                newDoc.setOldCollectionUUID(cmOld.getUUID());
+                _updateStateDocument(opCtx, std::move(newDoc));
 
                 ConfigsvrReshardCollection configsvrReshardCollection(nss(), _doc.getKey());
                 configsvrReshardCollection.setDbName(nss().db());
@@ -203,9 +190,5 @@ ExecutorFuture<void> ReshardCollectionCoordinator::_runImpl(
             return status;
         });
 }
-
-ReshardCollectionCoordinator_NORESILIENT::ReshardCollectionCoordinator_NORESILIENT(
-    ShardingDDLCoordinatorService* service, const BSONObj& initialState)
-    : ReshardCollectionCoordinator(service, initialState, false /* persistCoordinatorDocument */) {}
 
 }  // namespace mongo

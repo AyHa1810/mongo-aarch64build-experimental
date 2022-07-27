@@ -340,7 +340,6 @@ TenantMigrationConcurrentWriteUtil.testCases = {
     appendOplogNote: {skip: isNotRunOnUserDatabase},
     applyOps: {skip: isNotSupportedInServerless},
     authenticate: {skip: isAuthCommand},
-    availableQueryOptions: {skip: isNotWriteCommand},
     buildInfo: {skip: isNotWriteCommand},
     captrunc: {
         skip: isNotWriteCommand,           // TODO (SERVER-49834)
@@ -804,8 +803,6 @@ TenantMigrationConcurrentWriteUtil.testCases = {
     usersInfo: {skip: isNotRunOnUserDatabase},
     validate: {skip: isNotWriteCommand},
     voteCommitIndexBuild: {skip: isNotRunOnUserDatabase},
-    // TODO (SERVER-64296): Remove voteCommitMigrationProgress in 6.1.
-    voteCommitMigrationProgress: {skip: isNotRunOnUserDatabase},
     waitForFailPoint: {skip: isNotRunOnUserDatabase},
     waitForOngoingChunkSplits: {skip: isNotRunOnUserDatabase},
     whatsmysni: {skip: isNotRunOnUserDatabase},

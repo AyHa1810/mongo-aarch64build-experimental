@@ -347,6 +347,10 @@ public:
         unsupportedExpression(expr);
     }
 
+    void visit(const EncryptedBetweenMatchExpression* expr) override {
+        unsupportedExpression(expr);
+    }
+
 private:
     void unsupportedExpression(const MatchExpression* expr) {
         _eligible = false;
@@ -392,7 +396,7 @@ private:
 
     template <typename T>
     void checkUnsupportedInclusionExclusion(const T* transformer) {
-        std::set<std::string> computedPaths;
+        OrderedPathSet computedPaths;
         StringMap<std::string> renamedPaths;
         transformer->getRoot()->reportComputedPaths(&computedPaths, &renamedPaths);
 
@@ -402,7 +406,7 @@ private:
             return;
         }
 
-        std::set<std::string> preservedPaths;
+        OrderedPathSet preservedPaths;
         transformer->getRoot()->reportProjectedPaths(&preservedPaths);
 
         for (const std::string& path : preservedPaths) {
@@ -630,7 +634,8 @@ bool isEligibleCommon(const RequestType& request,
 
 boost::optional<bool> shouldForceBonsai() {
     // Without the feature flag set, nothing else matters.
-    if (!feature_flags::gFeatureFlagCommonQueryFramework.isEnabled(
+    if (!serverGlobalParams.featureCompatibility.isVersionInitialized() ||
+        !feature_flags::gFeatureFlagCommonQueryFramework.isEnabled(
             serverGlobalParams.featureCompatibility)) {
         return false;
     }

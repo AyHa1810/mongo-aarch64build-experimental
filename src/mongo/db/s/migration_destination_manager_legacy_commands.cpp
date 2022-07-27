@@ -120,7 +120,11 @@ public:
         // Ensure this shard is not currently receiving or donating any chunks.
         auto scopedReceiveChunk(
             uassertStatusOK(ActiveMigrationsRegistry::get(opCtx).registerReceiveChunk(
-                opCtx, nss, chunkRange, cloneRequest.getFromShardId(), false)));
+                opCtx,
+                nss,
+                chunkRange,
+                cloneRequest.getFromShardId(),
+                false /* waitForCompletionOfConflictingOps*/)));
 
         // We force a refresh immediately after registering this migration to guarantee that this
         // shard will not receive a chunk after refreshing.
@@ -240,10 +244,7 @@ public:
         auto const sessionId = uassertStatusOK(MigrationSessionId::extractFromBSON(cmdObj));
         auto const mdm = MigrationDestinationManager::get(opCtx);
 
-        const auto elem = cmdObj.getField("acquireCSOnRecipient");
-        const auto acquireCSOnRecipient = elem ? elem.boolean() : false;
-
-        Status const status = mdm->startCommit(sessionId, acquireCSOnRecipient);
+        Status const status = mdm->startCommit(sessionId);
         mdm->report(result, opCtx, false);
         if (!status.isOK()) {
             LOGV2(22014,

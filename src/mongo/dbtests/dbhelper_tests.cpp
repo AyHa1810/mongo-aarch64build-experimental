@@ -37,8 +37,9 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/global_settings.h"
-#include "mongo/db/op_observer_impl.h"
-#include "mongo/db/op_observer_registry.h"
+#include "mongo/db/op_observer/op_observer_impl.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
+#include "mongo/db/op_observer/oplog_writer_impl.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/range_arithmetic.h"
 #include "mongo/db/repl/replication_coordinator.h"
@@ -120,7 +121,8 @@ public:
         auto opCtx2 = client2->makeOperationContext();
 
         auto registry = std::make_unique<OpObserverRegistry>();
-        registry->addObserver(std::make_unique<OpObserverImpl>());
+        registry->addObserver(
+            std::make_unique<OpObserverImpl>(std::make_unique<OplogWriterImpl>()));
         opCtx1.get()->getServiceContext()->setOpObserver(std::move(registry));
         repl::createOplog(opCtx1.get());
 
@@ -169,7 +171,7 @@ public:
 
         // Assert that findByIdAndNoopUpdate did not generate an oplog entry.
         BSONObj oplogEntry;
-        Helpers::getLast(opCtx1.get(), NamespaceString::kRsOplogNamespace.ns().c_str(), oplogEntry);
+        Helpers::getLast(opCtx1.get(), NamespaceString::kRsOplogNamespace, oplogEntry);
         ASSERT_BSONOBJ_NE(oplogEntry, BSONObj());
         ASSERT_TRUE(oplogEntry.getStringField("op") == "i"_sd);
 
@@ -223,7 +225,7 @@ private:
 
         // Assert that findByIdAndNoopUpdate did not generate an oplog entry.
         BSONObj oplogEntry;
-        Helpers::getLast(opCtx2, NamespaceString::kRsOplogNamespace.ns().c_str(), oplogEntry);
+        Helpers::getLast(opCtx2, NamespaceString::kRsOplogNamespace, oplogEntry);
         ASSERT_BSONOBJ_NE(oplogEntry, BSONObj());
         ASSERT_TRUE(oplogEntry.getStringField("op") == "i"_sd);
     }

@@ -259,13 +259,12 @@ struct CommandHelpers {
     static BSONObj runCommandDirectly(OperationContext* opCtx, const OpMsgRequest& request);
 
     /**
-     * Decides the command execution model (i.e., synchronous or asynchronous) based on the provided
-     * threading model.
+     * Runs the command synchronously in presence of a dedicated thread.
+     * Otherwise, runs the command asynchronously.
      */
-    static Future<void> runCommandInvocation(
-        std::shared_ptr<RequestExecutionContext> rec,
-        std::shared_ptr<CommandInvocation> invocation,
-        transport::ServiceExecutor::ThreadingModel threadingModel);
+    static Future<void> runCommandInvocation(std::shared_ptr<RequestExecutionContext> rec,
+                                             std::shared_ptr<CommandInvocation> invocation,
+                                             bool useDedicatedThread);
 
     /**
      * Runs a previously parsed CommandInvocation and propagates the result to the
@@ -856,7 +855,7 @@ public:
      * Runs the given command. Returns true upon success.
      */
     virtual bool runWithReplyBuilder(OperationContext* opCtx,
-                                     const std::string& db,
+                                     const DatabaseName& dbName,
                                      const BSONObj& cmdObj,
                                      rpc::ReplyBuilderInterface* replyBuilder) = 0;
 
@@ -864,9 +863,10 @@ public:
      * Provides a future that may run the command asynchronously. By default, it falls back to
      * runWithReplyBuilder.
      */
-    virtual Future<void> runAsync(std::shared_ptr<RequestExecutionContext> rec, std::string db) {
+    virtual Future<void> runAsync(std::shared_ptr<RequestExecutionContext> rec,
+                                  const DatabaseName& dbName) {
         if (!runWithReplyBuilder(
-                rec->getOpCtx(), db, rec->getRequest().body, rec->getReplyBuilder()))
+                rec->getOpCtx(), dbName, rec->getRequest().body, rec->getReplyBuilder()))
             return Status(ErrorCodes::FailedToRunWithReplyBuilder,
                           fmt::format("Failed to run command: {}", rec->getCommand()->getName()));
         return Status::OK();
@@ -1002,11 +1002,12 @@ public:
                      BSONObjBuilder& result) = 0;
 
     bool runWithReplyBuilder(OperationContext* opCtx,
-                             const std::string& db,
+                             const DatabaseName& dbName,
                              const BSONObj& cmdObj,
                              rpc::ReplyBuilderInterface* replyBuilder) override {
         auto result = replyBuilder->getBodyBuilder();
-        return run(opCtx, db, cmdObj, result);
+        // TODO SERVER-67459 change BasicCommand::run to take in DatabaseName
+        return run(opCtx, dbName.toStringWithTenantId(), cmdObj, result);
     }
 };
 
@@ -1043,7 +1044,7 @@ constexpr StringData command_alias_v = CommandAlias<T>::kAlias;
  *
  *      - a static member factory function 'parse', callable as:
  *
- *         const IDLParserErrorContext& idlCtx = ...;
+ *         const IDLParserContext& idlCtx = ...;
  *         const OpMsgRequest& opMsgRequest = ...;
  *         Request r = Request::parse(idlCtx, opMsgRequest);
  *
@@ -1066,15 +1067,15 @@ protected:
     BasicCommandWithRequestParser(StringData name) : BasicCommandWithReplyBuilderInterface(name) {}
 
     bool runWithReplyBuilder(OperationContext* opCtx,
-                             const std::string& db,
+                             const DatabaseName& dbName,
                              const BSONObj& cmdObj,
                              rpc::ReplyBuilderInterface* replyBuilder) final {
         auto result = replyBuilder->getBodyBuilder();
 
         // To enforce API versioning
-        auto requestParser = RequestParser(opCtx, cmdObj);
+        auto requestParser = RequestParser(opCtx, dbName, cmdObj);
 
-        auto cmdDone = runWithRequestParser(opCtx, db, cmdObj, requestParser, result);
+        auto cmdDone = runWithRequestParser(opCtx, dbName, cmdObj, requestParser, result);
 
         // Only validate results in test mode so that we don't expose users to errors if we
         // construct an invalid reply.
@@ -1091,7 +1092,7 @@ protected:
      * Runs the given command. Returns true upon success.
      */
     virtual bool runWithRequestParser(OperationContext* opCtx,
-                                      const std::string& db,
+                                      const DatabaseName& dbName,
                                       const BSONObj& cmdObj,
                                       const RequestParser& requestParser,
                                       BSONObjBuilder& result) = 0;
@@ -1105,7 +1106,7 @@ protected:
      * Calls to this function should be done only in test mode so that we don't expose users to
      * errors if we construct an invalid error reply.
      */
-    static bool checkIsErrorStatus(const BSONObj& resultObj, const IDLParserErrorContext& ctx) {
+    static bool checkIsErrorStatus(const BSONObj& resultObj, const IDLParserContext& ctx) {
         auto wcStatus = getWriteConcernStatusFromCommandResult(resultObj);
         if (!wcStatus.isOK()) {
             if (wcStatus.code() == ErrorCodes::TypeMismatch) {
@@ -1118,7 +1119,7 @@ protected:
             auto status = getStatusFromCommandResult(resultObj);
             if (!status.isOK()) {
                 // Will throw if the result doesn't match the ErrorReply.
-                ErrorReply::parse(IDLParserErrorContext("ErrorType", &ctx), resultObj);
+                ErrorReply::parse(IDLParserContext("ErrorType", &ctx), resultObj);
                 return true;
             }
         }
@@ -1132,18 +1133,21 @@ class BasicCommandWithRequestParser<Derived>::RequestParser {
 public:
     using RequestType = typename Derived::Request;
 
-    RequestParser(OperationContext* opCtx, const BSONObj& cmdObj)
-        : _request{_parseRequest(opCtx, cmdObj)} {}
+    RequestParser(OperationContext* opCtx, const DatabaseName& dbName, const BSONObj& cmdObj)
+        : _request{_parseRequest(opCtx, dbName, cmdObj)} {}
 
     const RequestType& request() const {
         return _request;
     }
 
 private:
-    static RequestType _parseRequest(OperationContext* opCtx, const BSONObj& cmdObj) {
+    static RequestType _parseRequest(OperationContext* opCtx,
+                                     const DatabaseName& dbName,
+                                     const BSONObj& cmdObj) {
+        // TODO SERVER-67155 pass tenantId to the BSONObj parse function
         return RequestType::parse(
-            IDLParserErrorContext(RequestType::kCommandName,
-                                  APIParameters::get(opCtx).getAPIStrict().value_or(false)),
+            IDLParserContext(RequestType::kCommandName,
+                             APIParameters::get(opCtx).getAPIStrict().value_or(false)),
             cmdObj);
     }
 
@@ -1180,7 +1184,7 @@ class ErrmsgCommandDeprecated : public BasicCommand {
  *
  *      - a static member factory function 'parse', callable as:
  *
- *         const IDLParserErrorContext& idlCtx = ...;
+ *         const IDLParserContext& idlCtx = ...;
  *         const OpMsgRequest& opMsgRequest = ...;
  *         Request r = Request::parse(idlCtx, opMsgRequest);
  *
@@ -1253,8 +1257,7 @@ private:
                                     << command->getName() << "' instead");
         }
 
-        return RequestType::parse(IDLParserErrorContext(command->getName(), apiStrict),
-                                  opMsgRequest);
+        return RequestType::parse(IDLParserContext(command->getName(), apiStrict), opMsgRequest);
     }
 
     RequestType _request;

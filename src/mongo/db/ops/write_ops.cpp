@@ -35,8 +35,8 @@
 #include "mongo/db/update/update_oplog_entry_version.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/overloaded_visitor.h"
 #include "mongo/util/str.h"
-#include "mongo/util/visit_helper.h"
 
 namespace mongo {
 
@@ -229,7 +229,7 @@ UpdateModification UpdateModification::parseFromBSON(BSONElement elem) {
 
 int UpdateModification::objsize() const {
     return stdx::visit(
-        visit_helper::Overloaded{
+        OverloadedVisitor{
             [](const ReplacementUpdate& replacement) -> int { return replacement.bson.objsize(); },
             [](const ModifierUpdate& modifier) -> int { return modifier.bson.objsize(); },
             [](const PipelineUpdate& pipeline) -> int {
@@ -247,12 +247,11 @@ int UpdateModification::objsize() const {
 
 UpdateModification::Type UpdateModification::type() const {
     return stdx::visit(
-        visit_helper::Overloaded{
-            [](const ReplacementUpdate& replacement) { return Type::kReplacement; },
-            [](const ModifierUpdate& modifier) { return Type::kModifier; },
-            [](const PipelineUpdate& pipelineUpdate) { return Type::kPipeline; },
-            [](const DeltaUpdate& delta) { return Type::kDelta; },
-            [](const TransformUpdate& transform) { return Type::kTransform; }},
+        OverloadedVisitor{[](const ReplacementUpdate& replacement) { return Type::kReplacement; },
+                          [](const ModifierUpdate& modifier) { return Type::kModifier; },
+                          [](const PipelineUpdate& pipelineUpdate) { return Type::kPipeline; },
+                          [](const DeltaUpdate& delta) { return Type::kDelta; },
+                          [](const TransformUpdate& transform) { return Type::kTransform; }},
         _update);
 }
 
@@ -262,24 +261,24 @@ UpdateModification::Type UpdateModification::type() const {
  */
 void UpdateModification::serializeToBSON(StringData fieldName, BSONObjBuilder* bob) const {
 
-    stdx::visit(
-        visit_helper::Overloaded{
-            [fieldName, bob](const ReplacementUpdate& replacement) {
-                *bob << fieldName << replacement.bson;
-            },
-            [fieldName, bob](const ModifierUpdate& modifier) {
-                *bob << fieldName << modifier.bson;
-            },
-            [fieldName, bob](const PipelineUpdate& pipeline) {
-                BSONArrayBuilder arrayBuilder(bob->subarrayStart(fieldName));
-                for (auto&& stage : pipeline) {
-                    arrayBuilder << stage;
-                }
-                arrayBuilder.doneFast();
-            },
-            [fieldName, bob](const DeltaUpdate& delta) { *bob << fieldName << delta.diff; },
-            [](const TransformUpdate& transform) {}},
-        _update);
+    stdx::visit(OverloadedVisitor{[fieldName, bob](const ReplacementUpdate& replacement) {
+                                      *bob << fieldName << replacement.bson;
+                                  },
+                                  [fieldName, bob](const ModifierUpdate& modifier) {
+                                      *bob << fieldName << modifier.bson;
+                                  },
+                                  [fieldName, bob](const PipelineUpdate& pipeline) {
+                                      BSONArrayBuilder arrayBuilder(bob->subarrayStart(fieldName));
+                                      for (auto&& stage : pipeline) {
+                                          arrayBuilder << stage;
+                                      }
+                                      arrayBuilder.doneFast();
+                                  },
+                                  [fieldName, bob](const DeltaUpdate& delta) {
+                                      *bob << fieldName << delta.diff;
+                                  },
+                                  [](const TransformUpdate& transform) {}},
+                _update);
 }
 
 WriteError::WriteError(int32_t index, Status status) : _index(index), _status(std::move(status)) {}
@@ -312,7 +311,7 @@ BSONObj WriteError::serialize() const {
 }  // namespace write_ops
 
 InsertCommandRequest InsertOp::parse(const OpMsgRequest& request) {
-    auto insertOp = InsertCommandRequest::parse(IDLParserErrorContext("insert"), request);
+    auto insertOp = InsertCommandRequest::parse(IDLParserContext("insert"), request);
 
     validate(insertOp);
     return insertOp;
@@ -347,7 +346,7 @@ InsertCommandRequest InsertOp::parseLegacy(const Message& msgRaw) {
 
 InsertCommandReply InsertOp::parseResponse(const BSONObj& obj) {
     uassertStatusOK(getStatusFromCommandResult(obj));
-    return InsertCommandReply::parse(IDLParserErrorContext("insertReply"), obj);
+    return InsertCommandReply::parse(IDLParserContext("insertReply"), obj);
 }
 
 void InsertOp::validate(const InsertCommandRequest& insertOp) {
@@ -356,7 +355,7 @@ void InsertOp::validate(const InsertCommandRequest& insertOp) {
 }
 
 UpdateCommandRequest UpdateOp::parse(const OpMsgRequest& request) {
-    auto updateOp = UpdateCommandRequest::parse(IDLParserErrorContext("update"), request);
+    auto updateOp = UpdateCommandRequest::parse(IDLParserContext("update"), request);
 
     checkOpCountForCommand(updateOp, updateOp.getUpdates().size());
     return updateOp;
@@ -365,7 +364,7 @@ UpdateCommandRequest UpdateOp::parse(const OpMsgRequest& request) {
 UpdateCommandReply UpdateOp::parseResponse(const BSONObj& obj) {
     uassertStatusOK(getStatusFromCommandResult(obj));
 
-    return UpdateCommandReply::parse(IDLParserErrorContext("updateReply"), obj);
+    return UpdateCommandReply::parse(IDLParserContext("updateReply"), obj);
 }
 
 void UpdateOp::validate(const UpdateCommandRequest& updateOp) {
@@ -375,11 +374,11 @@ void UpdateOp::validate(const UpdateCommandRequest& updateOp) {
 FindAndModifyCommandReply FindAndModifyOp::parseResponse(const BSONObj& obj) {
     uassertStatusOK(getStatusFromCommandResult(obj));
 
-    return FindAndModifyCommandReply::parse(IDLParserErrorContext("findAndModifyReply"), obj);
+    return FindAndModifyCommandReply::parse(IDLParserContext("findAndModifyReply"), obj);
 }
 
 DeleteCommandRequest DeleteOp::parse(const OpMsgRequest& request) {
-    auto deleteOp = DeleteCommandRequest::parse(IDLParserErrorContext("delete"), request);
+    auto deleteOp = DeleteCommandRequest::parse(IDLParserContext("delete"), request);
 
     checkOpCountForCommand(deleteOp, deleteOp.getDeletes().size());
     return deleteOp;
@@ -387,7 +386,7 @@ DeleteCommandRequest DeleteOp::parse(const OpMsgRequest& request) {
 
 DeleteCommandReply DeleteOp::parseResponse(const BSONObj& obj) {
     uassertStatusOK(getStatusFromCommandResult(obj));
-    return DeleteCommandReply::parse(IDLParserErrorContext("deleteReply"), obj);
+    return DeleteCommandReply::parse(IDLParserContext("deleteReply"), obj);
 }
 
 void DeleteOp::validate(const DeleteCommandRequest& deleteOp) {

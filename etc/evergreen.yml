@@ -94,7 +94,7 @@ variables:
     distros:
     - windows-vsCurrent-large
   - name: burn_in_tests_gen
-  - name: .aggfuzzer .common
+  - name: .aggfuzzer .common !.feature_flag_guarded
   - name: audit
   - name: auth_audit_gen
   - name: buildscripts_test
@@ -142,13 +142,13 @@ variables:
     repo_edition: enterprise
     scons_cache_scope: shared
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
     distros:
     - rhel70
   - name: compile_build_tools_next_TG
     distros:
     - rhel70
-  - name: .aggfuzzer
+  - name: .aggfuzzer !.feature_flag_guarded
   - name: audit
   - name: auth_audit_gen
   - name: auth_gen
@@ -288,46 +288,6 @@ buildvariants:
     num_scons_link_jobs_available: 0.99
     test_flags: --excludeWithAnyTags=requires_http_client
 
-- name: linux-64-duroff
-  display_name: Linux (No Journal)
-  cron: "0 4 * * *" # From the ${project_nightly_cron} parameter.
-  run_on:
-  - rhel80-small
-  expansions: &linux-64-required-duroff-expansions
-    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars --enable-free-mon=off --enable-http-client=off --link-model=dynamic
-    multiversion_platform: rhel80
-    multiversion_edition: targeted
-    # Running WiredTiger with --nojournal in a replica set is no longer supported, so this variant
-    # does not include replica set tests. Since transactions are only supported on replica sets, we
-    # exclude those tests as well.
-    test_flags: --nojournal --excludeWithAnyTags=requires_journaling,requires_replication,requires_sharding,uses_transactions,requires_http_client
-    scons_cache_mode: all
-    scons_cache_scope: shared
-    num_scons_link_jobs_available: 0.99
-    large_distro_name: rhel80-medium
-  tasks:
-  - name: compile_test_and_package_parallel_core_stream_TG
-    distros:
-    - rhel80-xlarge
-  - name: compile_test_and_package_parallel_unittest_stream_TG
-    distros:
-    - rhel80-xlarge
-  - name: compile_test_and_package_parallel_dbtest_stream_TG
-    distros:
-    - rhel80-xlarge
-  - name: .aggfuzzer .common
-  - name: aggregation !.feature_flag_guarded
-  - name: aggregation_auth !.feature_flag_guarded
-  - name: auth_gen
-  - name: .misc_js !.sharded
-  - name: concurrency_gen
-  - name: concurrency_simultaneous_gen
-  - name: disk_wiredtiger
-  - name: failpoints_auth
-  - name: .jscore .common !.sharding !.decimal !.txns
-  - name: .jstestfuzz .common !.sharding !.repl
-  - name: generate_buildid_to_debug_symbols_mapping
-
 - name: tla-plus
   display_name: TLA+
   run_on:
@@ -338,26 +298,6 @@ buildvariants:
     timeout_secs: 345600 # 4 days
   tasks:
   - name: tla_plus
-
-- name: enterprise-rhel80-ninja
-  display_name: "Ninja Build: RHEL 8.0"
-  cron: "0 4 * * *" # From the ${project_nightly_cron} parameter.
-  modules:
-  - enterprise
-  run_on:
-  - rhel80-small
-  stepback: false
-  expansions:
-    compile_flags: --ssl --ocsp-stapling=off MONGO_DISTMOD=rhel80 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars --link-model=dynamic
-    repo_edition: enterprise
-    has_packages: false
-  tasks:
-  - name: compile_ninja_next_TG
-    distros:
-    - rhel80-build
-  - name: compile_ninja_TG
-    distros:
-    - rhel80-build
 
 - &enterprise-rhel80-dynamic-v4gcc-debug-experimental-template
   name: enterprise-rhel80-dynamic-v4gcc-debug-experimental
@@ -386,7 +326,7 @@ buildvariants:
     distros:
     - rhel80-xlarge
   - name: test_api_version_compatibility
-  - name: .aggfuzzer !.multiversion
+  - name: .aggfuzzer !.multiversion !.feature_flag_guarded
   - name: .aggregation !.multiversion !.feature_flag_guarded
   - name: audit
   - name: .auth !.multiversion
@@ -505,7 +445,7 @@ buildvariants:
   # to reduce the overall size of the generated configuration, most of the
   # tasks we would normally include have been disabled. See revert of
   # SERVER-60832
-  #- name: .aggfuzzer
+  #- name: .aggfuzzer !.feature_flag_guarded
   #- name: .aggregation !.unwind !.feature_flag_guarded
   #- name: audit
   #- name: .auth
@@ -531,7 +471,7 @@ buildvariants:
   #- name: .query_fuzzer
   #- name: .random_multiversion_ds
   #- name: .read_write_concern
-  - name: .replica_sets !.ignore_non_generated_replica_sets_jscore_passthrough
+  - name: .replica_sets !.ignore_non_generated_replica_sets_jscore_passthrough !.ignore_on_code_coverage
   - name: replica_sets_jscore_passthrough_gen
   #- name: .read_only
   #- name: .rollbackfuzzer
@@ -662,6 +602,72 @@ buildvariants:
   expansions:
     <<: *enterprise-rhel80-dynamic-v4gcc-debug-experimental-expansions
     compile_flags: --opt=on -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_testing_gcc.vars --cxx-std=20 --experimental-optimization=* --experimental-runtime-hardening=* --disable-warnings-as-errors
+  tasks: &enterprise-rhel80-dynamic-v4gcc-debug-experimental-tasks-no-unittests
+    - name: compile_test_and_package_parallel_core_stream_TG
+      distros:
+      - rhel80-xlarge
+    - name: compile_test_and_package_parallel_dbtest_stream_TG
+      distros:
+      - rhel80-xlarge
+    - name: test_api_version_compatibility
+    - name: .aggfuzzer !.multiversion !.feature_flag_guarded
+    - name: .aggregation !.multiversion !.feature_flag_guarded
+    - name: audit
+    - name: .auth !.multiversion
+    - name: .causally_consistent !.sharding
+    - name: .change_streams !.multiversion
+    - name: .misc_js !.multiversion
+    - name: .concurrency !.large !.ubsan !.no_txns !.debug_only !.multiversion
+    - name: .concurrency .large !.ubsan !.no_txns !.debug_only !.multiversion
+      distros:
+      - rhel80-xlarge
+    - name: disk_wiredtiger
+    - name: .encrypt !.multiversion
+    - name: idl_tests
+    - name: .integration !.multiversion
+      distros:
+      - rhel80-xlarge
+    - name: jsCore
+      distros:
+      - rhel80-xlarge
+    - name: .jscore .common !jsCore !.multiversion
+    - name: jsCore_minimum_batch_size
+    - name: jsCore_txns_large_txns_format
+    - name: json_schema
+    - name: libunwind_tests
+    - name: mqlrun
+    - name: .multi_shard !.multiversion
+    - name: multi_stmt_txn_jscore_passthrough_with_migration_gen
+    - name: .read_write_concern .large !.multiversion
+      distros:
+      - rhel80-xlarge
+    - name: .read_write_concern !.large !.multiversion
+    - name: .replica_sets !.encrypt !.auth !.multiversion
+      distros:
+      - rhel80-xlarge
+    - name: replica_sets_api_version_jscore_passthrough_gen
+    - name: replica_sets_reconfig_jscore_passthrough_gen
+    - name: retryable_writes_jscore_passthrough_gen
+    - name: .read_only !.multiversion
+    - name: sasl
+    - name: search
+    - name: search_auth
+    - name: search_ssl
+    - name: session_jscore_passthrough
+    - name: .sharding .jscore !.wo_snapshot !.multi_stmt !.multiversion
+    - name: sharding_api_version_jscore_passthrough_gen
+    - name: .sharding .txns !.multiversion
+    - name: .sharding .common !.multiversion
+    - name: .stitch
+    - name: secondary_reads_passthrough_gen
+    - name: server_discovery_and_monitoring_json_test_TG
+    - name: .serverless !.multiversion
+      distros:
+      - rhel80-xlarge
+    - name: server_selection_json_test_TG
+      distros:
+      - rhel80-xlarge
+
 
 - <<: *enterprise-rhel80-dynamic-v4gcc-debug-experimental-template
   name: enterprise-rhel80-v4clang-cxx20-pm-1328-experimental
@@ -670,6 +676,7 @@ buildvariants:
   expansions:
     <<: *enterprise-rhel80-dynamic-v4gcc-debug-experimental-expansions
     compile_flags: --opt=on -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_testing_clang.vars --cxx-std=20 --experimental-optimization=* --experimental-runtime-hardening=*
+  tasks: *enterprise-rhel80-dynamic-v4gcc-debug-experimental-tasks-no-unittests
 
 - name: stm-daily-cron
   modules:
@@ -875,6 +882,7 @@ buildvariants:
     external_auth_jobs_max: 1
   tasks:
   - name: cqf
+  - name: cqf_disabled_pipeline_opt
   - name: cqf_passthrough
   - name: cqf_parallel
   - name: compile_and_archive_dist_test_then_package_TG
@@ -967,7 +975,7 @@ buildvariants:
   - name: compile_test_and_package_serial_TG
     distros:
     - windows-vsCurrent-large
-  - name: .aggfuzzer
+  - name: .aggfuzzer !.feature_flag_guarded
   - name: .aggregation !.auth !.encrypt !.unwind !.feature_flag_guarded
   - name: auth_gen
   - name: causally_consistent_jscore_txns_passthrough
@@ -986,7 +994,7 @@ buildvariants:
   - name: .query_fuzzer
   - name: .read_write_concern
   - name: replica_sets_gen
-  - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_gen
   - name: .sharding .jscore !.wo_snapshot !.multi_stmt !.multiversion
   - name: .sharding .txns !.multiversion
   - name: .sharding .common !.csrs !.multiversion
@@ -1243,7 +1251,7 @@ buildvariants:
     idle_timeout_factor: 1.5
     exec_timeout_factor: 1.5
     large_distro_name: rhel80-medium
-    burn_in_tag_buildvariants: enterprise-rhel-80-64-bit-inmem linux-64-duroff enterprise-rhel-80-64-bit-multiversion
+    burn_in_tag_buildvariants: enterprise-rhel-80-64-bit-inmem enterprise-rhel-80-64-bit-multiversion
     num_scons_link_jobs_available: 0.99
   tasks:
   - name: compile_test_and_package_parallel_core_stream_TG
@@ -1264,7 +1272,7 @@ buildvariants:
   - name: burn_in_tests_gen
   - name: check_feature_flag_tags
   - name: check_for_todos
-  - name: .aggfuzzer
+  - name: .aggfuzzer !.feature_flag_guarded
   - name: .aggregation !.feature_flag_guarded
   - name: audit
   - name: .auth
@@ -1378,8 +1386,10 @@ buildvariants:
   - enterprise
   run_on:
   - rhel80-small
+  stepback: false
   expansions:
-    compile_flags: --ssl MONGO_DISTMOD=rhel80 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars --link-model=dynamic
+    compile_flags: --ssl --ocsp-stapling=off MONGO_DISTMOD=rhel80 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars --link-model=dynamic
+    repo_edition: enterprise
     has_packages: false
   tasks:
   - name: compile_ninja_next_TG
@@ -1420,6 +1430,7 @@ buildvariants:
       --excludeWithAnyTags=incompatible_with_shard_merge
   tasks: &enterprise-rhel-80-64-bit-dynamic-all-feature-flags-tasks
   - name: cqf
+  - name: cqf_disabled_pipeline_opt
   - name: cqf_passthrough
   - name: cqf_parallel
   - name: compile_test_and_package_parallel_core_stream_TG
@@ -1547,12 +1558,12 @@ buildvariants:
     target_resmoke_time: 10
     max_sub_suites: 5
     large_distro_name: rhel80-medium
-    burn_in_tag_buildvariants: enterprise-rhel-80-64-bit-inmem linux-64-duroff enterprise-rhel-80-64-bit-multiversion
+    burn_in_tag_buildvariants: enterprise-rhel-80-64-bit-inmem enterprise-rhel-80-64-bit-multiversion
     num_scons_link_jobs_available: 0.99
     test_flags: >-
       --mongodSetParameters="{internalQueryForceClassicEngine: true}"
   tasks:
-  - name: .aggfuzzer
+  - name: .aggfuzzer !.sbe_only
   - name: .aggregation !.sbe_only
   - name: .auth
   - name: .causally_consistent !.sharding
@@ -1882,10 +1893,10 @@ buildvariants:
     scons_cache_scope: shared
     large_distro_name: rhel80-large
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
     distros:
     - rhel80-xlarge
-  - name: .aggfuzzer
+  - name: .aggfuzzer !.feature_flag_guarded
   - name: audit
   - name: auth_audit_gen
   - name: auth_gen
@@ -1975,7 +1986,7 @@ buildvariants:
   - name: compile_test_and_package_parallel_dbtest_stream_TG
     distros:
     - rhel70
-  - name: .aggfuzzer
+  - name: .aggfuzzer !.feature_flag_guarded
   - name: audit
   - name: auth_audit_gen
   - name: auth_gen
@@ -2011,7 +2022,7 @@ buildvariants:
     num_scons_link_jobs_available: 0.99
     large_distro_name: ubuntu1804-large
     test_flags: >-
-      --mongodSetParameters="{maintainValidCursorsAcrossSBEYieldandReadCommands: true, featureFlagSbeFull: true}"
+      --mongodSetParameters="{maintainValidCursorsAcrossSBEReadCommands: true, maintainValidCursorsAcrossSBEYield: true, featureFlagSbeFull: true}"
   tasks:
   - name: compile_test_and_package_parallel_core_stream_TG
     distros:
@@ -2216,6 +2227,7 @@ buildvariants:
     separate_debug: off
   tasks:
   - name: cqf
+  - name: cqf_disabled_pipeline_opt
   - name: cqf_passthrough
   - name: cqf_parallel
   - name: compile_and_archive_dist_test_then_package_TG
@@ -2374,6 +2386,7 @@ buildvariants:
     large_distro_name: rhel80-build
   tasks:
   - name: cqf
+  - name: cqf_disabled_pipeline_opt
   - name: cqf_passthrough
   - name: cqf_parallel
   - name: compile_and_archive_dist_test_then_package_TG
@@ -2674,8 +2687,8 @@ buildvariants:
     multiversion_platform: rhel80
     multiversion_edition: enterprise
     test_flags: >-
-      --mongosSetParameters="{initialServiceExecutorThreadingModel: borrowed}"
-      --mongodSetParameters="{initialServiceExecutorThreadingModel: borrowed}"
+      --mongosSetParameters="{initialServiceExecutorUseDedicatedThread: false}"
+      --mongodSetParameters="{initialServiceExecutorUseDedicatedThread: false}"
     large_distro_name: rhel80-build
   tasks:
   - name: compile_test_and_package_parallel_core_stream_TG

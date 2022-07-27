@@ -2,6 +2,7 @@ test_kind: js_test
 
 selector:
   roots:
+  - jstests/aggregation/**/*.js
   - jstests/core/**/*.js
   exclude_files:
   # TODO SERVER-67427 Fix conjunctions over an array field.
@@ -38,8 +39,6 @@ selector:
   # TODO SERVER-62407 translate to ABT directly from find.
   - jstests/core/currentop_cursors.js
   - jstests/core/profile_getmore.js
-  # TODO SERVER-67503
-  - jstests/core/elemmatch_object.js
   # TODO SERVER-67517
   - jstests/core/field_name_empty.js
   - jstests/core/field_name_validation.js
@@ -49,6 +48,7 @@ selector:
   # TODO SERVER-67639
   - jstests/core/index_stats.js
   # TODO SERVER-67640
+  - jstests/aggregation/sources/collStats/query_exec_stats.js
   - jstests/core/operation_latency_histogram.js
   - jstests/core/top.js
   # TODO SERVER-64007 Enable yielding for plans generated from bonsai.

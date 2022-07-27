@@ -101,7 +101,7 @@ Status createIndex(OperationContext* opCtx, StringData ns, const BSONObj& keys, 
 
 Status createIndexFromSpec(OperationContext* opCtx, StringData ns, const BSONObj& spec) {
     NamespaceString nss(ns);
-    AutoGetDb autoDb(opCtx, nsToDatabaseSubstring(ns), MODE_IX);
+    AutoGetDb autoDb(opCtx, nss.dbName(), MODE_IX);
     {
         Lock::CollectionLock collLock(opCtx, nss, MODE_X);
         WriteUnitOfWork wunit(opCtx);
@@ -182,7 +182,7 @@ WriteContextForTests::WriteContextForTests(OperationContext* opCtx, StringData n
 
     const bool doShardVersionCheck = false;
 
-    _clientContext.emplace(opCtx, _nss.ns(), doShardVersionCheck);
+    _clientContext.emplace(opCtx, _nss, doShardVersionCheck);
     auto db = _autoDb->ensureDbExists(opCtx);
     invariant(db, _nss.ns());
     invariant(db == _clientContext->db());

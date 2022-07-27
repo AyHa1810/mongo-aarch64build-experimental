@@ -388,7 +388,7 @@ std::vector<AsyncRequestsSender::Response> scatterGatherUnversionedTargetAllShar
     const ReadPreferenceSetting& readPref,
     Shard::RetryPolicy retryPolicy) {
     std::vector<AsyncRequestsSender::Request> requests;
-    for (auto shardId : Grid::get(opCtx)->shardRegistry()->getAllShardIdsNoReload())
+    for (auto&& shardId : Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx))
         requests.emplace_back(std::move(shardId), cmdObj);
 
     return gatherResponses(opCtx, dbName, readPref, retryPolicy, requests);
@@ -587,7 +587,7 @@ RawResponsesResult appendRawResponses(
     if (firstError.code() == ErrorCodes::CollectionUUIDMismatch &&
         !firstError.extraInfo<CollectionUUIDMismatchInfo>()->actualCollection()) {
         // The first error is a CollectionUUIDMismatchInfo but it doesn't contain an actual
-        // namespace. It's possible that the acutal namespace is unsharded, in which case only the
+        // namespace. It's possible that the actual namespace is unsharded, in which case only the
         // error from the primary shard will contain this information. Iterate through the errors to
         // see if this is the case.
         for (const auto& error : genericErrorsReceived) {

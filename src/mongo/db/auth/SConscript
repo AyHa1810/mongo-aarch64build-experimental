@@ -84,8 +84,8 @@ env.Library(
         '$BUILD_DIR/mongo/db/audit',
         '$BUILD_DIR/mongo/db/catalog/collection_options',
         '$BUILD_DIR/mongo/db/index/index_descriptor',
-        '$BUILD_DIR/mongo/db/op_observer',
-        '$BUILD_DIR/mongo/db/op_observer_util',
+        '$BUILD_DIR/mongo/db/op_observer/op_observer',
+        '$BUILD_DIR/mongo/db/op_observer/op_observer_util',
         '$BUILD_DIR/mongo/db/repl/oplog_entry',
         'auth',
     ],
@@ -172,6 +172,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/idl/server_parameter',
+        'oidc_authentication_config',
     ],
 )
 
@@ -426,6 +427,7 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/base/secure_allocator',
+        '$BUILD_DIR/mongo/crypto/rsa_public_key',
         '$BUILD_DIR/mongo/crypto/sha_block_${MONGO_CRYPTO}',
         '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
         '$BUILD_DIR/mongo/util/icu',
@@ -519,6 +521,20 @@ env.Library(
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/base',
         'auth',
+    ],
+)
+
+env.Library(
+    target="oidc_authentication_config",
+    source=[
+        "oidc_authentication.idl",
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/idl/feature_flag',
+        '$BUILD_DIR/mongo/idl/idl_parser',
     ],
 )
 

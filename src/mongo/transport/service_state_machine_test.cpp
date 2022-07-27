@@ -65,80 +65,152 @@ namespace mongo {
 namespace transport {
 namespace {
 
-// TODO(cr) Does this go into its own header?
+/** Scope guard to set and restore an object value. */
+template <typename T>
+class ScopedValueOverride {
+public:
+    ScopedValueOverride(T& target, T v)
+        : _target{target}, _saved{std::exchange(_target, std::move(v))} {}
+    ~ScopedValueOverride() {
+        _target = std::move(_saved);
+    }
+
+private:
+    T& _target;
+    T _saved;
+};
+
+/**
+ * This class stores and synchronizes the shared state result between the test
+ * fixture and its various wrappers.
+ */
+struct StateResult {
+    Mutex mutex = MONGO_MAKE_LATCH("StateResult::_mutex");
+    stdx::condition_variable cv;
+
+    AtomicWord<bool> isConnected{true};
+
+    boost::optional<Status> pollResult;
+    boost::optional<StatusWith<Message>> sourceResult;
+    boost::optional<StatusWith<DbResponse>> processResult;
+    boost::optional<Status> sinkResult;
+};
+
+const Status kClosedSessionError{ErrorCodes::SocketException, "Session is closed"};
+const Status kNetworkError{ErrorCodes::HostUnreachable, "Someone is unreachable"};
+const Status kShutdownError{ErrorCodes::ShutdownInProgress, "Something is shutting down"};
+const Status kArbitraryError{ErrorCodes::InternalError, "Something happened"};
+
+/**
+ * FailureCondition represents a set of the ways any state in the ServiceStateMachine can fail.
+ */
+enum class FailureCondition {
+    kNone,
+    kTerminate,   // External termination via the ServiceEntryPoint.
+    kDisconnect,  // Socket disconnection by peer.
+    kNetwork,     // Unspecified network failure (ala host unreachable).
+    kShutdown,    // System shutdown.
+    kArbitrary,   // An arbitrary error that does not fall under the other conditions.
+};
+
+constexpr StringData toString(FailureCondition fail) {
+    switch (fail) {
+        case FailureCondition::kNone:
+            return "None"_sd;
+        case FailureCondition::kTerminate:
+            return "Terminate"_sd;
+        case FailureCondition::kDisconnect:
+            return "Disconnect"_sd;
+        case FailureCondition::kNetwork:
+            return "Network"_sd;
+        case FailureCondition::kShutdown:
+            return "Shutdown"_sd;
+        case FailureCondition::kArbitrary:
+            return "Arbitrary"_sd;
+    };
+
+    return "Unknown"_sd;
+}
+
+std::ostream& operator<<(std::ostream& os, FailureCondition fail) {
+    return os << toString(fail);
+}
+
+/**
+ * SessionState represents the externally observable state of the ServiceStateMachine. These
+ * states map relatively closely to the internals of the ServiceStateMachine::Impl. That said,
+ * this enum represents the ServiceStateMachineTest's external understanding of the internal
+ * state.
+ */
+enum class SessionState {
+    kStart,
+    kPoll,
+    kSource,
+    kProcess,
+    kSink,
+    kEnd,
+};
+
+constexpr StringData toString(SessionState state) {
+    switch (state) {
+        case SessionState::kStart:
+            return "Start"_sd;
+        case SessionState::kPoll:
+            return "Poll"_sd;
+        case SessionState::kSource:
+            return "Source"_sd;
+        case SessionState::kProcess:
+            return "Process"_sd;
+        case SessionState::kSink:
+            return "Sink"_sd;
+        case SessionState::kEnd:
+            return "End"_sd;
+    };
+
+    return "Unknown"_sd;
+}
+
+std::ostream& operator<<(std::ostream& os, SessionState state) {
+    return os << toString(state);
+}
+
+/**
+ * RequestKind represents the type of operation of the ServiceStateMachine. Depending on various
+ * message flags and conditions, the ServiceStateMachine will transition between states
+ * differently.
+ */
+enum class RequestKind {
+    kDefault,
+    kExhaust,
+    kMoreToCome,
+};
+
+constexpr StringData toString(RequestKind kind) {
+    switch (kind) {
+        case RequestKind::kDefault:
+            return "Default"_sd;
+        case RequestKind::kExhaust:
+            return "Exhaust"_sd;
+        case RequestKind::kMoreToCome:
+            return "MoreToCome"_sd;
+    };
+
+    return "Unknown"_sd;
+}
+
+std::ostream& operator<<(std::ostream& os, RequestKind kind) {
+    return os << toString(kind);
+}
+
 /**
  * The ServiceStateMachineTest is a fixture that mocks the external inputs into the
  * ServiceStateMachine so as to provide a deterministic way to evaluate the state machine
  * implemenation.
  */
 class ServiceStateMachineTest : public LockerNoopServiceContextTest {
-    /**
-     * This class stores and synchronizes the shared data between the test fixture and its various
-     * wrappers.
-     */
-    struct Data {
-        Mutex mutex = MONGO_MAKE_LATCH("ServiceStateMachineTest::Data::_mutex");
-        stdx::condition_variable cv;
-
-        AtomicWord<bool> isConnected{true};
-
-        boost::optional<Status> pollResult;
-        boost::optional<StatusWith<Message>> sourceResult;
-        boost::optional<StatusWith<DbResponse>> processResult;
-        boost::optional<Status> sinkResult;
-    };
-
 public:
     class ServiceEntryPoint;
     class Session;
-    class StepRunner;
-
-    static inline const auto kClosedSessionError =
-        Status{ErrorCodes::SocketException, "Session is closed"};
-    static inline const auto kNetworkError =
-        Status{ErrorCodes::HostUnreachable, "Someone is unreachable"};
-    static inline const auto kShutdownError =
-        Status{ErrorCodes::ShutdownInProgress, "Something is shutting down"};
-    static inline const auto kArbitraryError =
-        Status{ErrorCodes::InternalError, "Something happened"};
-
-    /**
-     * FailureCondition represents a set of the ways any state in the ServiceStateMachine can fail.
-     */
-    enum class FailureCondition {
-        kNone,
-        kTerminate,   // External termination via the ServiceEntryPoint.
-        kDisconnect,  // Socket disconnection by peer.
-        kNetwork,     // Unspecified network failure (ala host unreachable).
-        kShutdown,    // System shutdown.
-        kArbitrary,   // An arbitrary error that does not fall under the other conditions.
-    };
-
-    /**
-     * IngressState represents the externally observable state of the ServiceStateMachine. These
-     * states map relatively closely to the internals of the ServiceStateMachine::Impl. That said,
-     * this enum represents the ServiceStateMachineTest's external understanding of the internal
-     * state.
-     */
-    enum class IngressState {
-        kStart,
-        kPoll,
-        kSource,
-        kProcess,
-        kSink,
-        kEnd,
-    };
-
-    /**
-     * IngressMode represents the mode of operation of the ServiceStateMachine. Depending on various
-     * message flags and conditions, the ServiceStateMachine will transition between states
-     * differently.
-     */
-    enum class IngressMode {
-        kDefault,
-        kExhaust,
-        kMoreToCome,
-    };
 
     /**
      * Make a generic thread pool to deliver external inputs out of line (mocking the network or
@@ -151,16 +223,13 @@ public:
         return std::make_shared<ThreadPool>(std::move(options));
     }
 
-    ServiceStateMachineTest(boost::optional<ServiceExecutor::ThreadingModel> threadingModel = {})
-        : _threadingModel(std::move(threadingModel)) {}
-
     void setUp() override;
     void tearDown() override;
 
     /**
      * This function blocks until the ServiceStateMachineTest observes a state change.
      */
-    IngressState popIngressState() {
+    SessionState popSessionState() {
         return _stateQueue.pop();
     }
 
@@ -170,7 +239,7 @@ public:
      * Note that this function does not guarantee that it will not observe a state change in the
      * future.
      */
-    void assertNoIngressState() {
+    void assertNoSessionState() {
         if (auto maybeState = _stateQueue.tryPop()) {
             FAIL("The queue is not empty, state: ") << *maybeState;
         }
@@ -180,48 +249,48 @@ public:
      * This function stores an external response to be delivered out of line to the
      * ServiceStateMachine.
      */
-    template <IngressState kMode, typename ResultT>
+    template <SessionState kState, typename ResultT>
     void setResult(ResultT result) {
-        auto lk = stdx::lock_guard(_data->mutex);
-        if constexpr (kMode == IngressState::kPoll) {
-            _data->pollResult = std::move(result);
-        } else if constexpr (kMode == IngressState::kSource) {
-            _data->sourceResult = std::move(result);
-        } else if constexpr (kMode == IngressState::kProcess) {
-            _data->processResult = std::move(result);
-        } else if constexpr (kMode == IngressState::kSink) {
-            _data->sinkResult = std::move(result);
+        auto lk = stdx::lock_guard(_stateResult->mutex);
+        if constexpr (kState == SessionState::kPoll) {
+            _stateResult->pollResult = std::move(result);
+        } else if constexpr (kState == SessionState::kSource) {
+            _stateResult->sourceResult = std::move(result);
+        } else if constexpr (kState == SessionState::kProcess) {
+            _stateResult->processResult = std::move(result);
+        } else if constexpr (kState == SessionState::kSink) {
+            _stateResult->sinkResult = std::move(result);
         } else {
             FAIL("Cannot set a result for this state");
         }
-        _data->cv.notify_one();
+        _stateResult->cv.notify_one();
     }
 
     /**
      * This function makes a generic result appropriate for a successful state change given
-     * IngressState and IngressMode.
+     * SessionState and RequestKind.
      */
-    template <IngressState kState, IngressMode kMode>
+    template <SessionState kState, RequestKind kKind>
     auto makeGenericResult() {
-        if constexpr (kState == IngressState::kPoll || kState == IngressState::kSink) {
+        if constexpr (kState == SessionState::kPoll || kState == SessionState::kSink) {
             return Status::OK();
-        } else if constexpr (kState == IngressState::kSource) {
+        } else if constexpr (kState == SessionState::kSource) {
             Message result = _makeIndexedBson();
-            if constexpr (kMode == IngressMode::kExhaust) {
+            if constexpr (kKind == RequestKind::kExhaust) {
                 OpMsg::setFlag(&result, OpMsg::kExhaustSupported);
             } else {
-                static_assert(kMode == IngressMode::kDefault || kMode == IngressMode::kMoreToCome);
+                static_assert(kKind == RequestKind::kDefault || kKind == RequestKind::kMoreToCome);
             }
             return result;
-        } else if constexpr (kState == IngressState::kProcess) {
+        } else if constexpr (kState == SessionState::kProcess) {
             DbResponse response;
-            if constexpr (kMode == IngressMode::kDefault) {
+            if constexpr (kKind == RequestKind::kDefault) {
                 response.response = _makeIndexedBson();
-            } else if constexpr (kMode == IngressMode::kExhaust) {
+            } else if constexpr (kKind == RequestKind::kExhaust) {
                 response.response = _makeIndexedBson();
                 response.shouldRunAgainForExhaust = true;
             } else {
-                static_assert(kMode == IngressMode::kMoreToCome);
+                static_assert(kKind == RequestKind::kMoreToCome);
             }
             return response;
         } else {
@@ -248,84 +317,38 @@ public:
      * Mark the session as no longer connected.
      */
     void endSession() {
-        auto lk = stdx::lock_guard(_data->mutex);
-        if (_data->isConnected.swap(false)) {
+        auto lk = stdx::lock_guard(_stateResult->mutex);
+        if (_stateResult->isConnected.swap(false)) {
             LOGV2(5014101, "Ending session");
-            _data->cv.notify_one();
+            _stateResult->cv.notify_one();
         }
+    }
+
+    /**
+     * Start a brand new session, run the given function, and then join the session.
+     */
+    template <typename F>
+    void runWithNewSession(F&& func) {
+        initNewSession();
+        startSession();
+
+        auto firstState = popSessionState();
+        ASSERT(firstState == SessionState::kSource || firstState == SessionState::kPoll)
+            << "State was instead: " << toString(firstState);
+
+        std::forward<F>(func)();
+
+        joinSession();
     }
 
     void terminateViaServiceEntryPoint();
 
     bool isConnected() const {
-        return _data->isConnected.load();
+        return _stateResult->isConnected.load();
     }
 
     int onClientDisconnectCalledTimes() const {
         return _onClientDisconnectCalled;
-    }
-
-    friend constexpr StringData toString(FailureCondition fail) {
-        switch (fail) {
-            case FailureCondition::kNone:
-                return "None"_sd;
-            case FailureCondition::kTerminate:
-                return "Terminate"_sd;
-            case FailureCondition::kDisconnect:
-                return "Disconnect"_sd;
-            case FailureCondition::kNetwork:
-                return "Network"_sd;
-            case FailureCondition::kShutdown:
-                return "Shutdown"_sd;
-            case FailureCondition::kArbitrary:
-                return "Arbitrary"_sd;
-        };
-
-        return "Unknown"_sd;
-    }
-
-    friend std::ostream& operator<<(std::ostream& os, FailureCondition fail) {
-        return os << toString(fail);
-    }
-
-    friend constexpr StringData toString(IngressState state) {
-        switch (state) {
-            case IngressState::kStart:
-                return "Start"_sd;
-            case IngressState::kPoll:
-                return "Poll"_sd;
-            case IngressState::kSource:
-                return "Source"_sd;
-            case IngressState::kProcess:
-                return "Process"_sd;
-            case IngressState::kSink:
-                return "Sink"_sd;
-            case IngressState::kEnd:
-                return "End"_sd;
-        };
-
-        return "Unknown"_sd;
-    }
-
-    friend std::ostream& operator<<(std::ostream& os, IngressState state) {
-        return os << toString(state);
-    }
-
-    friend constexpr StringData toString(IngressMode mode) {
-        switch (mode) {
-            case IngressMode::kDefault:
-                return "Default"_sd;
-            case IngressMode::kExhaust:
-                return "Exhaust"_sd;
-            case IngressMode::kMoreToCome:
-                return "MoreToCome"_sd;
-        };
-
-        return "Unknown"_sd;
-    }
-
-    friend std::ostream& operator<<(std::ostream& os, IngressMode mode) {
-        return os << toString(mode);
     }
 
 private:
@@ -343,38 +366,22 @@ private:
     }
 
     /**
-     * Start a brand new session, run the given function, and then join the session.
-     */
-    template <typename F>
-    void _runWithNewSession(F&& func) {
-        initNewSession();
-        startSession();
-
-        auto firstState = popIngressState();
-        ASSERT(firstState == IngressState::kSource || firstState == IngressState::kPoll)
-            << "State was instead: " << toString(firstState);
-
-        std::forward<F>(func)();
-
-        joinSession();
-    }
-
-    /**
      * Use an external result to mock handling a request.
      */
     StatusWith<DbResponse> _handleRequest(OperationContext* opCtx, const Message&) noexcept {
-        _stateQueue.push(IngressState::kProcess);
+        _stateQueue.push(SessionState::kProcess);
 
         auto result = [&]() -> StatusWith<DbResponse> {
-            auto lk = stdx::unique_lock(_data->mutex);
-            _data->cv.wait(lk, [this] { return _data->processResult || !isConnected(); });
+            auto lk = stdx::unique_lock(_stateResult->mutex);
+            _stateResult->cv.wait(lk,
+                                  [this] { return _stateResult->processResult || !isConnected(); });
 
             if (!isConnected()) {
                 return kClosedSessionError;
             }
 
-            invariant(_data->processResult);
-            return *std::exchange(_data->processResult, {});
+            invariant(_stateResult->processResult);
+            return *std::exchange(_stateResult->processResult, {});
         }();
 
         LOGV2(5014100, "Handled request", "error"_attr = result.getStatus());
@@ -386,17 +393,18 @@ private:
      * Use an external result to mock polling for data and observe the state.
      */
     Status _waitForData() {
-        _stateQueue.push(IngressState::kPoll);
+        _stateQueue.push(SessionState::kPoll);
 
         auto result = [&]() -> Status {
-            auto lk = stdx::unique_lock(_data->mutex);
-            _data->cv.wait(lk, [this] { return _data->pollResult || !isConnected(); });
+            auto lk = stdx::unique_lock(_stateResult->mutex);
+            _stateResult->cv.wait(lk,
+                                  [this] { return _stateResult->pollResult || !isConnected(); });
 
             if (!isConnected()) {
                 return kClosedSessionError;
             }
 
-            return *std::exchange(_data->pollResult, {});
+            return *std::exchange(_stateResult->pollResult, {});
         }();
 
         LOGV2(5014102, "Finished waiting for data", "error"_attr = result);
@@ -407,18 +415,19 @@ private:
      * Use an external result to mock reading data and observe the state.
      */
     StatusWith<Message> _sourceMessage() {
-        _stateQueue.push(IngressState::kSource);
+        _stateQueue.push(SessionState::kSource);
 
         auto result = [&]() -> StatusWith<Message> {
-            auto lk = stdx::unique_lock(_data->mutex);
-            _data->cv.wait(lk, [this] { return _data->sourceResult || !isConnected(); });
+            auto lk = stdx::unique_lock(_stateResult->mutex);
+            _stateResult->cv.wait(lk,
+                                  [this] { return _stateResult->sourceResult || !isConnected(); });
 
             if (!isConnected()) {
                 return kClosedSessionError;
             }
 
-            invariant(_data->sourceResult);
-            return *std::exchange(_data->sourceResult, {});
+            invariant(_stateResult->sourceResult);
+            return *std::exchange(_stateResult->sourceResult, {});
         }();
 
         LOGV2(5014103, "Sourced message", "error"_attr = result.getStatus());
@@ -430,18 +439,19 @@ private:
      * Use an external result to mock writing data and observe the state.
      */
     Status _sinkMessage(Message message) {
-        _stateQueue.push(IngressState::kSink);
+        _stateQueue.push(SessionState::kSink);
 
         auto result = [&]() -> Status {
-            auto lk = stdx::unique_lock(_data->mutex);
-            _data->cv.wait(lk, [this] { return _data->sinkResult || !isConnected(); });
+            auto lk = stdx::unique_lock(_stateResult->mutex);
+            _stateResult->cv.wait(lk,
+                                  [this] { return _stateResult->sinkResult || !isConnected(); });
 
             if (!isConnected()) {
                 return kClosedSessionError;
             }
 
-            invariant(_data->sinkResult);
-            return *std::exchange(_data->sinkResult, {});
+            invariant(_stateResult->sinkResult);
+            return *std::exchange(_stateResult->sinkResult, {});
         }();
 
         LOGV2(5014104, "Sunk message", "error"_attr = result);
@@ -456,24 +466,21 @@ private:
             session == _session,
             "This fixture and the ServiceStateMachine should have handles to the same Session");
 
-        _stateQueue.push(IngressState::kEnd);
+        _stateQueue.push(SessionState::kEnd);
     }
 
     void _onClientDisconnect() {
         ++_onClientDisconnectCalled;
     }
 
-    const boost::optional<ServiceExecutor::ThreadingModel> _threadingModel;
-    boost::optional<ServiceExecutor::ThreadingModel> _originalThreadingModel;
-
     ServiceStateMachineTest::ServiceEntryPoint* _sep;
 
     const std::shared_ptr<ThreadPool> _threadPool = makeThreadPool();
 
-    std::unique_ptr<Data> _data;
+    std::unique_ptr<StateResult> _stateResult;
 
     std::shared_ptr<ServiceStateMachineTest::Session> _session;
-    SingleProducerSingleConsumerQueue<IngressState> _stateQueue;
+    SingleProducerSingleConsumerQueue<SessionState> _stateQueue;
 
     int _onClientDisconnectCalled{0};
 };
@@ -577,15 +584,15 @@ private:
 /**
  * This class iterates over the potential methods of failure for a set of steps.
  */
-class ServiceStateMachineTest::StepRunner {
+class StepRunner {
     /**
      * This is a simple data structure describing the external response for one state in the service
      * state machine.
      */
     struct Step {
-        ServiceStateMachineTest::IngressState state;
-        ServiceStateMachineTest::IngressMode mode;
-        unique_function<IngressState(FailureCondition)> func;
+        SessionState state;
+        RequestKind kind;
+        unique_function<SessionState(FailureCondition)> func;
     };
     using StepList = std::vector<Step>;
 
@@ -597,13 +604,13 @@ public:
 
     /**
      * Given a FailureCondition, cause an external result to be delivered that is appropriate for
-     * the given state and mode.
+     * the given state and request kind.
      */
-    template <IngressState kState, IngressMode kMode>
-    IngressState doGenericStep(FailureCondition fail) {
+    template <SessionState kState, RequestKind kKind>
+    SessionState doGenericStep(FailureCondition fail) {
         switch (fail) {
             case FailureCondition::kNone: {
-                _fixture->setResult<kState>(_fixture->makeGenericResult<kState, kMode>());
+                _fixture->setResult<kState>(_fixture->makeGenericResult<kState, kKind>());
             } break;
             case FailureCondition::kTerminate: {
                 _fixture->terminateViaServiceEntryPoint();
@@ -626,25 +633,25 @@ public:
             } break;
         };
 
-        return _fixture->popIngressState();
+        return _fixture->popSessionState();
     }
 
     /**
      * Mark an additional expected state in the service state machine.
      */
-    template <IngressState kState, IngressMode kMode>
+    template <SessionState kState, RequestKind kKind>
     void expectNextState() {
         auto step = Step{};
         step.state = kState;
-        step.mode = kMode;
-        step.func = [this](FailureCondition fail) { return doGenericStep<kState, kMode>(fail); };
+        step.kind = kKind;
+        step.func = [this](FailureCondition fail) { return doGenericStep<kState, kKind>(fail); };
         _steps.emplace_back(std::move(step));
     }
 
     /**
      * Mark the final expected state in the service state machine.
      */
-    template <IngressState kState>
+    template <SessionState kState>
     void expectFinalState() {
         _finalState = kState;
     }
@@ -675,13 +682,13 @@ public:
 
         // Do one entirely clean run.
         LOGV2(5014106, "Running success case");
-        _fixture->_runWithNewSession([&] {
+        _fixture->runWithNewSession([&] {
             for (auto iter = _steps.begin(); iter != _steps.end(); ++iter) {
                 ASSERT_EQ(iter->func(FailureCondition::kNone), getExpectedPostState(iter));
             }
 
             _fixture->endSession();
-            ASSERT_EQ(_fixture->popIngressState(), IngressState::kEnd);
+            ASSERT_EQ(_fixture->popSessionState(), SessionState::kEnd);
         });
 
         const auto failList = std::vector<FailureCondition>{FailureCondition::kTerminate,
@@ -696,20 +703,20 @@ public:
                 LOGV2(5014105,
                       "Running failure case",
                       "failureCase"_attr = fail,
-                      "ingressState"_attr = failIter->state,
-                      "ingressMode"_attr = failIter->mode);
+                      "sessionState"_attr = failIter->state,
+                      "requestKind"_attr = failIter->kind);
 
-                _fixture->_runWithNewSession([&] {
+                _fixture->runWithNewSession([&] {
                     auto iter = _steps.begin();
                     for (; iter != failIter; ++iter) {
                         // Run through each step until our point of failure with
                         // FailureCondition::kNone.
                         ASSERT_EQ(iter->func(FailureCondition::kNone), getExpectedPostState(iter))
-                            << "Current state: (" << iter->state << ", " << iter->mode << ")";
+                            << "Current state: (" << iter->state << ", " << iter->kind << ")";
                     }
 
                     // Finally fail on a given step.
-                    ASSERT_EQ(iter->func(fail), IngressState::kEnd);
+                    ASSERT_EQ(iter->func(fail), SessionState::kEnd);
                 });
             }
         }
@@ -720,7 +727,7 @@ public:
 private:
     ServiceStateMachineTest* const _fixture;
 
-    boost::optional<ServiceStateMachineTest::IngressState> _finalState;
+    boost::optional<SessionState> _finalState;
     StepList _steps;
 
     // This variable is currently used as a post-condition to make sure that the StepRunner has been
@@ -731,16 +738,16 @@ private:
 };
 
 void ServiceStateMachineTest::initNewSession() {
-    assertNoIngressState();
+    assertNoSessionState();
 
     _session = std::make_shared<Session>(this);
-    _data->isConnected.store(true);
+    _stateResult->isConnected.store(true);
 }
 
 void ServiceStateMachineTest::joinSession() {
     ASSERT(_sep->waitForNoSessions(Seconds{1}));
 
-    assertNoIngressState();
+    assertNoSessionState();
 }
 
 void ServiceStateMachineTest::startSession() {
@@ -754,11 +761,6 @@ void ServiceStateMachineTest::terminateViaServiceEntryPoint() {
 void ServiceStateMachineTest::setUp() {
     ServiceContextTest::setUp();
 
-    if (_threadingModel) {
-        _originalThreadingModel = ServiceExecutor::getInitialThreadingModel();
-        ServiceExecutor::setInitialThreadingModel(*_threadingModel);
-    }
-
     auto sep = std::make_unique<ServiceStateMachineTest::ServiceEntryPoint>(this);
     _sep = sep.get();
     getServiceContext()->setServiceEntryPoint(std::move(sep));
@@ -766,7 +768,7 @@ void ServiceStateMachineTest::setUp() {
 
     _threadPool->startup();
 
-    _data = std::make_unique<Data>();
+    _stateResult = std::make_unique<StateResult>();
 }
 
 void ServiceStateMachineTest::tearDown() {
@@ -779,29 +781,21 @@ void ServiceStateMachineTest::tearDown() {
 
     _threadPool->shutdown();
     _threadPool->join();
-
-    if (_originalThreadingModel) {
-        ServiceExecutor::setInitialThreadingModel(*_originalThreadingModel);
-    }
 }
 
-class ServiceStateMachineWithDedicatedThreadsTest : public ServiceStateMachineTest {
-public:
-    ServiceStateMachineWithDedicatedThreadsTest()
-        : ServiceStateMachineTest(ServiceExecutor::ThreadingModel::kDedicated) {}
+template <bool useDedicatedThread>
+class DedicatedThreadOverrideTest : public ServiceStateMachineTest {
+    ScopedValueOverride<bool> _svo{gInitialUseDedicatedThread, useDedicatedThread};
 };
 
-class ServiceStateMachineWithBorrowedThreadsTest : public ServiceStateMachineTest {
-public:
-    ServiceStateMachineWithBorrowedThreadsTest()
-        : ServiceStateMachineTest(ServiceExecutor::ThreadingModel::kBorrowed) {}
-};
+using ServiceStateMachineWithBorrowedThreadsTest = DedicatedThreadOverrideTest<false>;
+using ServiceStateMachineWithDedicatedThreadsTest = DedicatedThreadOverrideTest<true>;
 
 TEST_F(ServiceStateMachineTest, StartThenEndSession) {
     initNewSession();
     startSession();
 
-    ASSERT_EQ(popIngressState(), IngressState::kSource);
+    ASSERT_EQ(popSessionState(), SessionState::kSource);
 
     endSession();
 }
@@ -815,10 +809,10 @@ TEST_F(ServiceStateMachineTest, EndBeforeStartSession) {
 TEST_F(ServiceStateMachineTest, OnClientDisconnectCalledOnCleanup) {
     initNewSession();
     startSession();
-    ASSERT_EQ(popIngressState(), IngressState::kSource);
+    ASSERT_EQ(popSessionState(), SessionState::kSource);
     ASSERT_EQ(onClientDisconnectCalledTimes(), 0);
     endSession();
-    ASSERT_EQ(popIngressState(), IngressState::kEnd);
+    ASSERT_EQ(popSessionState(), SessionState::kEnd);
     joinSession();
     ASSERT_EQ(onClientDisconnectCalledTimes(), 1);
 }
@@ -826,10 +820,10 @@ TEST_F(ServiceStateMachineTest, OnClientDisconnectCalledOnCleanup) {
 TEST_F(ServiceStateMachineWithDedicatedThreadsTest, DefaultLoop) {
     auto runner = StepRunner(this);
 
-    runner.expectNextState<IngressState::kSource, IngressMode::kDefault>();
-    runner.expectNextState<IngressState::kProcess, IngressMode::kDefault>();
-    runner.expectNextState<IngressState::kSink, IngressMode::kDefault>();
-    runner.expectFinalState<IngressState::kSource>();
+    runner.expectNextState<SessionState::kSource, RequestKind::kDefault>();
+    runner.expectNextState<SessionState::kProcess, RequestKind::kDefault>();
+    runner.expectNextState<SessionState::kSink, RequestKind::kDefault>();
+    runner.expectFinalState<SessionState::kSource>();
 
     runner.run();
 }
@@ -837,12 +831,12 @@ TEST_F(ServiceStateMachineWithDedicatedThreadsTest, DefaultLoop) {
 TEST_F(ServiceStateMachineWithDedicatedThreadsTest, ExhaustLoop) {
     auto runner = StepRunner(this);
 
-    runner.expectNextState<IngressState::kSource, IngressMode::kExhaust>();
-    runner.expectNextState<IngressState::kProcess, IngressMode::kExhaust>();
-    runner.expectNextState<IngressState::kSink, IngressMode::kExhaust>();
-    runner.expectNextState<IngressState::kProcess, IngressMode::kDefault>();
-    runner.expectNextState<IngressState::kSink, IngressMode::kDefault>();
-    runner.expectFinalState<IngressState::kSource>();
+    runner.expectNextState<SessionState::kSource, RequestKind::kExhaust>();
+    runner.expectNextState<SessionState::kProcess, RequestKind::kExhaust>();
+    runner.expectNextState<SessionState::kSink, RequestKind::kExhaust>();
+    runner.expectNextState<SessionState::kProcess, RequestKind::kDefault>();
+    runner.expectNextState<SessionState::kSink, RequestKind::kDefault>();
+    runner.expectFinalState<SessionState::kSource>();
 
     runner.run();
 }
@@ -850,12 +844,12 @@ TEST_F(ServiceStateMachineWithDedicatedThreadsTest, ExhaustLoop) {
 TEST_F(ServiceStateMachineWithDedicatedThreadsTest, MoreToComeLoop) {
     auto runner = StepRunner(this);
 
-    runner.expectNextState<IngressState::kSource, IngressMode::kMoreToCome>();
-    runner.expectNextState<IngressState::kProcess, IngressMode::kMoreToCome>();
-    runner.expectNextState<IngressState::kSource, IngressMode::kDefault>();
-    runner.expectNextState<IngressState::kProcess, IngressMode::kDefault>();
-    runner.expectNextState<IngressState::kSink, IngressMode::kDefault>();
-    runner.expectFinalState<IngressState::kSource>();
+    runner.expectNextState<SessionState::kSource, RequestKind::kMoreToCome>();
+    runner.expectNextState<SessionState::kProcess, RequestKind::kMoreToCome>();
+    runner.expectNextState<SessionState::kSource, RequestKind::kDefault>();
+    runner.expectNextState<SessionState::kProcess, RequestKind::kDefault>();
+    runner.expectNextState<SessionState::kSink, RequestKind::kDefault>();
+    runner.expectFinalState<SessionState::kSource>();
 
     runner.run();
 }
@@ -863,11 +857,11 @@ TEST_F(ServiceStateMachineWithDedicatedThreadsTest, MoreToComeLoop) {
 TEST_F(ServiceStateMachineWithBorrowedThreadsTest, DefaultLoop) {
     auto runner = StepRunner(this);
 
-    runner.expectNextState<IngressState::kPoll, IngressMode::kDefault>();
-    runner.expectNextState<IngressState::kSource, IngressMode::kDefault>();
-    runner.expectNextState<IngressState::kProcess, IngressMode::kDefault>();
-    runner.expectNextState<IngressState::kSink, IngressMode::kDefault>();
-    runner.expectFinalState<IngressState::kPoll>();
+    runner.expectNextState<SessionState::kPoll, RequestKind::kDefault>();
+    runner.expectNextState<SessionState::kSource, RequestKind::kDefault>();
+    runner.expectNextState<SessionState::kProcess, RequestKind::kDefault>();
+    runner.expectNextState<SessionState::kSink, RequestKind::kDefault>();
+    runner.expectFinalState<SessionState::kPoll>();
 
     runner.run();
 }
@@ -875,13 +869,13 @@ TEST_F(ServiceStateMachineWithBorrowedThreadsTest, DefaultLoop) {
 TEST_F(ServiceStateMachineWithBorrowedThreadsTest, ExhaustLoop) {
     auto runner = StepRunner(this);
 
-    runner.expectNextState<IngressState::kPoll, IngressMode::kExhaust>();
-    runner.expectNextState<IngressState::kSource, IngressMode::kExhaust>();
-    runner.expectNextState<IngressState::kProcess, IngressMode::kExhaust>();
-    runner.expectNextState<IngressState::kSink, IngressMode::kExhaust>();
-    runner.expectNextState<IngressState::kProcess, IngressMode::kDefault>();
-    runner.expectNextState<IngressState::kSink, IngressMode::kDefault>();
-    runner.expectFinalState<IngressState::kPoll>();
+    runner.expectNextState<SessionState::kPoll, RequestKind::kExhaust>();
+    runner.expectNextState<SessionState::kSource, RequestKind::kExhaust>();
+    runner.expectNextState<SessionState::kProcess, RequestKind::kExhaust>();
+    runner.expectNextState<SessionState::kSink, RequestKind::kExhaust>();
+    runner.expectNextState<SessionState::kProcess, RequestKind::kDefault>();
+    runner.expectNextState<SessionState::kSink, RequestKind::kDefault>();
+    runner.expectFinalState<SessionState::kPoll>();
 
     runner.run();
 }
@@ -889,14 +883,14 @@ TEST_F(ServiceStateMachineWithBorrowedThreadsTest, ExhaustLoop) {
 TEST_F(ServiceStateMachineWithBorrowedThreadsTest, MoreToComeLoop) {
     auto runner = StepRunner(this);
 
-    runner.expectNextState<IngressState::kPoll, IngressMode::kMoreToCome>();
-    runner.expectNextState<IngressState::kSource, IngressMode::kMoreToCome>();
-    runner.expectNextState<IngressState::kProcess, IngressMode::kMoreToCome>();
-    runner.expectNextState<IngressState::kPoll, IngressMode::kDefault>();
-    runner.expectNextState<IngressState::kSource, IngressMode::kDefault>();
-    runner.expectNextState<IngressState::kProcess, IngressMode::kDefault>();
-    runner.expectNextState<IngressState::kSink, IngressMode::kDefault>();
-    runner.expectFinalState<IngressState::kPoll>();
+    runner.expectNextState<SessionState::kPoll, RequestKind::kMoreToCome>();
+    runner.expectNextState<SessionState::kSource, RequestKind::kMoreToCome>();
+    runner.expectNextState<SessionState::kProcess, RequestKind::kMoreToCome>();
+    runner.expectNextState<SessionState::kPoll, RequestKind::kDefault>();
+    runner.expectNextState<SessionState::kSource, RequestKind::kDefault>();
+    runner.expectNextState<SessionState::kProcess, RequestKind::kDefault>();
+    runner.expectNextState<SessionState::kSink, RequestKind::kDefault>();
+    runner.expectFinalState<SessionState::kPoll>();
 
     runner.run();
 }

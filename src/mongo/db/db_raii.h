@@ -503,7 +503,7 @@ private:
 class AutoGetDbForReadLockFree {
 public:
     AutoGetDbForReadLockFree(OperationContext* opCtx,
-                             StringData dbName,
+                             const DatabaseName& dbName,
                              Date_t deadline = Date_t::max());
 
 private:
@@ -524,7 +524,7 @@ private:
 class AutoGetDbForReadMaybeLockFree {
 public:
     AutoGetDbForReadMaybeLockFree(OperationContext* opCtx,
-                                  StringData dbName,
+                                  const DatabaseName& dbName,
                                   Date_t deadline = Date_t::max());
 
 private:
@@ -541,7 +541,7 @@ class OldClientContext {
     OldClientContext& operator=(const OldClientContext&) = delete;
 
 public:
-    OldClientContext(OperationContext* opCtx, const std::string& ns, bool doVersion = true);
+    OldClientContext(OperationContext* opCtx, const NamespaceString& nss, bool doVersion = true);
     ~OldClientContext();
 
     Database* db() const {

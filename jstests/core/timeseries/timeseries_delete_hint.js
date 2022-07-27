@@ -11,16 +11,18 @@
  *   # Fail points in this test do not exist on mongos.
  *   assumes_against_mongod_not_mongos,
  *   uses_parallel_shell,
+ *   # This test is multiversion incompatible with binaries < 6.0.
+ *   requires_fcv_60
  * ]
  */
 (function() {
 "use strict";
 
-load("jstests/core/timeseries/libs/timeseries.js");
 load("jstests/libs/curop_helpers.js");
+load("jstests/libs/feature_flag_util.js");
 load('jstests/libs/parallel_shell_helpers.js');
 
-if (!TimeseriesTest.timeseriesUpdatesAndDeletesEnabled(db.getMongo())) {
+if (!FeatureFlagUtil.isEnabled(db, "TimeseriesUpdatesAndDeletes")) {
     jsTestLog("Skipping test because the time-series updates and deletes feature flag is disabled");
     return;
 }

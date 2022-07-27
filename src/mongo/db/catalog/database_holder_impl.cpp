@@ -38,7 +38,7 @@
 #include "mongo/db/catalog/database_impl.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/index_builds_coordinator.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/top.h"
@@ -56,7 +56,7 @@ Database* DatabaseHolderImpl::getDb(OperationContext* opCtx, const DatabaseName&
         "invalid db name: " + dbName.db(),
         NamespaceString::validDBName(dbName.db(), NamespaceString::DollarInDbNameBehavior::Allow));
 
-    invariant(opCtx->lockState()->isDbLockedForMode(dbName.toString(), MODE_IS) ||
+    invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_IS) ||
               (dbName.db().compare("local") == 0 && opCtx->lockState()->isLocked()));
 
     stdx::lock_guard<SimpleMutex> lk(_m);
@@ -112,7 +112,7 @@ Database* DatabaseHolderImpl::openDb(OperationContext* opCtx,
         6198701,
         "invalid db name: " + dbName.db(),
         NamespaceString::validDBName(dbName.db(), NamespaceString::DollarInDbNameBehavior::Allow));
-    invariant(opCtx->lockState()->isDbLockedForMode(dbName.db(), MODE_IX));
+    invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_IX));
 
     if (justCreated)
         *justCreated = false;  // Until proven otherwise.
@@ -216,7 +216,7 @@ void DatabaseHolderImpl::dropDb(OperationContext* opCtx, Database* db) {
 
     LOGV2_DEBUG(20310, 1, "dropDatabase {name}", "name"_attr = name);
 
-    invariant(opCtx->lockState()->isDbLockedForMode(name.db(), MODE_X));
+    invariant(opCtx->lockState()->isDbLockedForMode(name, MODE_X));
 
     auto catalog = CollectionCatalog::get(opCtx);
     for (auto collIt = catalog->begin(opCtx, name); collIt != catalog->end(opCtx); ++collIt) {
@@ -274,7 +274,7 @@ void DatabaseHolderImpl::close(OperationContext* opCtx, const DatabaseName& dbNa
         6198700,
         "invalid db name: " + dbName.db(),
         NamespaceString::validDBName(dbName.db(), NamespaceString::DollarInDbNameBehavior::Allow));
-    invariant(opCtx->lockState()->isDbLockedForMode(dbName.db(), MODE_X));
+    invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_X));
 
     stdx::lock_guard<SimpleMutex> lk(_m);
 
@@ -321,6 +321,90 @@ void DatabaseHolderImpl::closeAll(OperationContext* opCtx) {
             close(opCtx, name);
         }
     }
+}
+
+void DatabaseHolderImpl::setDbInfo(OperationContext* opCtx,
+                                   const DatabaseName& dbName,
+                                   const DatabaseType& dbInfo) {
+    uassert(
+        6420900,
+        "Invalid database name: " + dbName.db(),
+        NamespaceString::validDBName(dbName.db(), NamespaceString::DollarInDbNameBehavior::Allow));
+    invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_X));
+
+    stdx::lock_guard<SimpleMutex> lk(_m);
+
+    const auto it = _dbs.find(dbName);
+    if (it == _dbs.end() || !it->second) {
+        return;
+    }
+
+    LOGV2(6420901,
+          "Setting this node's cached database info",
+          "db"_attr = dbName.db(),
+          "version"_attr = dbInfo.getVersion());
+
+    auto db = static_cast<DatabaseImpl*>(it->second);
+    db->_info.emplace(dbInfo);
+}
+
+void DatabaseHolderImpl::clearDbInfo(OperationContext* opCtx, const DatabaseName& dbName) {
+    uassert(
+        6420902,
+        "Invalid database name: " + dbName.db(),
+        NamespaceString::validDBName(dbName.db(), NamespaceString::DollarInDbNameBehavior::Allow));
+    invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_IX));
+
+    stdx::lock_guard<SimpleMutex> lk(_m);
+
+    const auto it = _dbs.find(dbName);
+    if (it == _dbs.end() || !it->second) {
+        return;
+    }
+
+    LOGV2(6420903, "Clearing this node's cached database info", "db"_attr = dbName.db());
+
+    auto db = static_cast<DatabaseImpl*>(it->second);
+    db->_info = boost::none;
+}
+
+boost::optional<DatabaseVersion> DatabaseHolderImpl::getDbVersion(
+    OperationContext* opCtx, const DatabaseName& dbName) const {
+    uassert(
+        6420904,
+        "Invalid database name: " + dbName.db(),
+        NamespaceString::validDBName(dbName.db(), NamespaceString::DollarInDbNameBehavior::Allow));
+    // The database should be required to be locked in IS mode, however this function is also called
+    // by the `AutoGet*ForReadLockFree` constructor, which only holds the global lock in IS mode.
+
+    stdx::lock_guard<SimpleMutex> lk(_m);
+
+    const auto it = _dbs.find(dbName);
+    if (it == _dbs.end() || !it->second) {
+        return boost::none;
+    }
+
+    auto db = static_cast<DatabaseImpl*>(it->second);
+    return db->_info ? boost::optional<DatabaseVersion>(db->_info->getVersion()) : boost::none;
+}
+
+boost::optional<ShardId> DatabaseHolderImpl::getDbPrimary(OperationContext* opCtx,
+                                                          const DatabaseName& dbName) const {
+    uassert(
+        6420905,
+        "Invalid database name: " + dbName.db(),
+        NamespaceString::validDBName(dbName.db(), NamespaceString::DollarInDbNameBehavior::Allow));
+    invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_IS));
+
+    stdx::lock_guard<SimpleMutex> lk(_m);
+
+    const auto it = _dbs.find(dbName);
+    if (it == _dbs.end() || !it->second) {
+        return boost::none;
+    }
+
+    auto db = static_cast<DatabaseImpl*>(it->second);
+    return db->_info ? boost::optional<ShardId>(db->_info->getPrimary()) : boost::none;
 }
 
 }  // namespace mongo

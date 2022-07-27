@@ -1505,6 +1505,8 @@ functions:
       - "./src/evergreen/powercycle_exit.sh"
 
   "run packager.py":
+  - *get_version_expansions
+  - *apply_version_expansions
   - *f_expansions_write
   - command: subprocess.exec
     params:
@@ -2224,6 +2226,14 @@ tasks:
         archive-dist-test
       task_compile_flags: >-
         PREFIX=dist-test
+  - command: subprocess.exec
+    params:
+      binary: bash
+      add_expansions_to_env: true
+      args:
+      - "src/evergreen/run_python_script.sh"
+      - "evergreen/macos_notary.py"
+      - "mongodb-binaries.${ext|tgz}"
 
   - command: s3.put
     params:
@@ -3472,6 +3482,21 @@ tasks:
       num_files: 5
       num_tasks: 5
       jstestfuzz_vars: --diffTestingMode wildcard
+      npm_command: agg-fuzzer
+      suite: generational_fuzzer
+      resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+
+## Standalone fuzzer for checking columnstore index correctness ##
+- <<: *jstestfuzz_template
+  name: aggregation_columnstore_fuzzer_gen
+  tags: ["aggfuzzer", "common", "columnstore", "require_npm", "random_name", "sbe_only", "feature_flag_guarded"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      <<: *jstestfuzz_config_vars
+      num_files: 5
+      num_tasks: 5
+      jstestfuzz_vars: --diffTestingMode columnstore
       npm_command: agg-fuzzer
       suite: generational_fuzzer
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
@@ -5039,7 +5064,7 @@ tasks:
 
 - <<: *task_template
   name: replica_sets_kill_secondaries_jscore_passthrough
-  tags: ["replica_sets", "san", "large", "non_live_record"]
+  tags: ["replica_sets", "san", "large", "non_live_record", "ignore_on_code_coverage"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -5678,12 +5703,13 @@ tasks:
     vars:
       use_large_distro: "true"
 
-- <<: *task_template
-  name: write_concern_majority_passthrough
+- <<: *gen_task_template
+  name: write_concern_majority_passthrough_gen
   tags: ["read_write_concern", "large", "write"]
   commands:
-  - func: "do setup"
-  - func: "run tests"
+  - func: "generate resmoke tasks"
+    vars:
+      use_large_distro: "true"
 
 - <<: *task_template
   name: cwrwc_passthrough
@@ -6687,6 +6713,8 @@ tasks:
   commands:
   - command: manifest.load
   - func: "git get project and add git tag"
+  - func: "get version expansions"
+  - func: "apply version expansions"
   - func: "f_expansions_write"
   - func: "kill processes"
   - func: "cleanup environment"
@@ -7171,6 +7199,9 @@ tasks:
   - func: "upload pip requirements"
   - func: "get buildnumber"
   - func: "f_expansions_write"
+  - func: "get version expansions"
+  - func: "apply version expansions"
+  - func: "f_expansions_write"
   - func: "generate compile expansions"
   - func: "apply compile expansions"
   - func: "f_expansions_write"
@@ -7292,6 +7323,13 @@ tasks:
 
 - <<: *task_template
   name: cqf
+  tags: []
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+
+- <<: *task_template
+  name: cqf_disabled_pipeline_opt
   tags: []
   commands:
   - func: "do setup"
@@ -7547,6 +7585,19 @@ task_groups:
   - compile_all
   - package
 
+# The *no_unittests_TG taskgroups remove compile/run unittests to work around
+# limitations in the size of debug info. See SERVER-68024.
+- <<: *compile_task_group_template
+  name: compile_test_and_package_serial_no_unittests_TG
+  tasks:
+  - compile_dist_test
+  - archive_dist_test
+  - archive_dist_test_debug
+  - compile_dbtest
+  - run_dbtest
+  - archive_dbtest
+  - package
+
 - <<: *compile_task_group_template
   name: compile_test_benchmark_and_package_serial_TG
   tasks:
@@ -7559,7 +7610,18 @@ task_groups:
   - run_dbtest
   - archive_dbtest
   - compile_upload_benchmarks
-  - compile_all
+  - package
+
+- <<: *compile_task_group_template
+  name: compile_test_benchmark_and_package_serial_no_unittests_TG
+  tasks:
+  - compile_dist_test
+  - archive_dist_test
+  - archive_dist_test_debug
+  - compile_dbtest
+  - run_dbtest
+  - archive_dbtest
+  - compile_upload_benchmarks
   - package
 
 - <<: *compile_task_group_template

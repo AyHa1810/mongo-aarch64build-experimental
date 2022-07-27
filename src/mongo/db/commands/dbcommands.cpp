@@ -70,7 +70,7 @@
 #include "mongo/db/json.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/pipeline/document_source_internal_unpack_bucket.h"
 #include "mongo/db/pipeline/storage_stats_spec_gen.h"
@@ -499,7 +499,7 @@ public:
         }
 
         result.append("ns", nss.ns());
-        auto spec = StorageStatsSpec::parse(IDLParserErrorContext("collStats"), jsobj);
+        auto spec = StorageStatsSpec::parse(IDLParserContext("collStats"), jsobj);
         Status status = appendCollectionStorageStats(opCtx, nss, spec, &result);
         if (!status.isOK() && status.code() != ErrorCodes::NamespaceNotFound) {
             errmsg = status.reason();
@@ -548,27 +548,29 @@ public:
     }
 
     bool runWithRequestParser(OperationContext* opCtx,
-                              const std::string& db,
+                              const DatabaseName& dbName,
                               const BSONObj& cmdObj,
                               const RequestParser& requestParser,
                               BSONObjBuilder& result) final {
         const auto* cmd = &requestParser.request();
+
+        // Targeting the underlying buckets collection directly would make the time-series
+        // Collection out of sync with the time-series view document. Additionally, we want to
+        // ultimately obscure/hide the underlying buckets collection from the user, so we're
+        // disallowing targetting it.
+        uassert(
+            ErrorCodes::InvalidNamespace,
+            "collMod on a time-series collection's underlying buckets collection is not supported.",
+            !cmd->getNamespace().isTimeseriesBucketsCollection());
+
         const auto isChangeStreamPreAndPostImagesEnabled =
             (cmd->getChangeStreamPreAndPostImages() &&
              cmd->getChangeStreamPreAndPostImages()->getEnabled());
-
-        if (feature_flags::gFeatureFlagChangeStreamPreAndPostImages.isEnabled(
-                serverGlobalParams.featureCompatibility)) {
-            const auto isRecordPreImagesEnabled = cmd->getRecordPreImages().get_value_or(false);
-            uassert(ErrorCodes::InvalidOptions,
-                    "'recordPreImages' and 'changeStreamPreAndPostImages.enabled' can not be set "
-                    "to true simultaneously",
-                    !(isChangeStreamPreAndPostImagesEnabled && isRecordPreImagesEnabled));
-        } else {
-            uassert(ErrorCodes::InvalidOptions,
-                    "BSON field 'changeStreamPreAndPostImages' is an unknown field.",
-                    !cmd->getChangeStreamPreAndPostImages().has_value());
-        }
+        const auto isRecordPreImagesEnabled = cmd->getRecordPreImages().get_value_or(false);
+        uassert(ErrorCodes::InvalidOptions,
+                "'recordPreImages' and 'changeStreamPreAndPostImages.enabled' can not be set "
+                "to true simultaneously",
+                !(isChangeStreamPreAndPostImagesEnabled && isRecordPreImagesEnabled));
 
         // Updating granularity on sharded time-series collections is not allowed.
         if (Grid::get(opCtx)->catalogClient() && cmd->getTimeseries() &&
@@ -593,7 +595,7 @@ public:
     }
 
     void validateResult(const BSONObj& resultObj) final {
-        auto reply = Reply::parse(IDLParserErrorContext("CollModReply"), resultObj);
+        auto reply = Reply::parse(IDLParserContext("CollModReply"), resultObj);
         coll_mod_reply_validation::validateReply(reply);
     }
 
@@ -659,7 +661,8 @@ public:
             CurOp::get(opCtx)->setNS_inlock(dbname);
         }
 
-        AutoGetDb autoDb(opCtx, ns, MODE_IS);
+        // TODO SERVER-67519 Pass ns.dbName() directly once parseNs returns NamespaceString obj
+        AutoGetDb autoDb(opCtx, DatabaseName(boost::none, ns), MODE_IS);
 
         result.append("db", ns);
 
@@ -696,7 +699,7 @@ public:
         } else {
             {
                 stdx::lock_guard<Client> lk(*opCtx->getClient());
-                // TODO SERVER-66561: For getDatabaseProfileLevel, takes the passed in "const
+                // TODO SERVER-67459: For getDatabaseProfileLevel, takes the passed in "const
                 // DatabaseName& dbname" directly.
                 // TODO: OldClientContext legacy, needs to be removed
                 CurOp::get(opCtx)->enter_inlock(
@@ -777,7 +780,7 @@ public:
         return true;
     }
 
-    Future<void> runAsync(std::shared_ptr<RequestExecutionContext> rec, std::string) final {
+    Future<void> runAsync(std::shared_ptr<RequestExecutionContext> rec, const DatabaseName&) final {
         auto opCtx = rec->getOpCtx();
         return BuildInfoExecutor::get(opCtx->getServiceContext())->schedule(std::move(rec));
     }

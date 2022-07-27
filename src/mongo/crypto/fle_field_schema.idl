@@ -27,6 +27,8 @@
 
 global:
     cpp_namespace: "mongo"
+    cpp_includes:
+      - "mongo/crypto/fle_fields_util.h"
 
 imports:
     - "mongo/idl/basic_types.idl"
@@ -77,6 +79,7 @@ enums:
         values:
             kUnindexed: 1
             kEquality: 2
+            kRange: 3
 
     Fle2PlaceholderType:
         description: "The type of payload to generate from a placeholder"
@@ -115,6 +118,7 @@ structs:
         description: "Implements Encryption BinData (subtype 6) sub-subtype 0, the intent-to-encrypt
             mapping. Contains a value to encrypt and a description of how it should be encrypted."
         strict: true
+        cpp_validator_func: "validateIDLFLE2EncryptionPlaceholder"
         fields:
           t:
             description: "The type number, determines what payload to replace the placeholder with"

@@ -73,7 +73,7 @@ Status upsert(OperationContext* opCtx, const IndexBuildEntry& indexBuildEntry) {
 
                                   WriteUnitOfWork wuow(opCtx);
                                   Helpers::upsert(opCtx,
-                                                  NamespaceString::kIndexBuildEntryNamespace.ns(),
+                                                  NamespaceString::kIndexBuildEntryNamespace,
                                                   indexBuildEntry.toBSON(),
                                                   /*fromMigrate=*/false);
                                   wuow.commit();
@@ -128,7 +128,7 @@ Status upsert(OperationContext* opCtx, const BSONObj& filter, const BSONObj& upd
 
                                   WriteUnitOfWork wuow(opCtx);
                                   Helpers::upsert(opCtx,
-                                                  NamespaceString::kIndexBuildEntryNamespace.ns(),
+                                                  NamespaceString::kIndexBuildEntryNamespace,
                                                   filter,
                                                   updateMod,
                                                   /*fromMigrate=*/false);
@@ -153,7 +153,7 @@ Status update(OperationContext* opCtx, const BSONObj& filter, const BSONObj& upd
 
                                   WriteUnitOfWork wuow(opCtx);
                                   Helpers::update(opCtx,
-                                                  NamespaceString::kIndexBuildEntryNamespace.ns(),
+                                                  NamespaceString::kIndexBuildEntryNamespace,
                                                   filter,
                                                   updateMod,
                                                   /*fromMigrate=*/false);
@@ -172,7 +172,7 @@ void ensureIndexBuildEntriesNamespaceExists(OperationContext* opCtx) {
         "createIndexBuildCollection",
         NamespaceString::kIndexBuildEntryNamespace.ns(),
         [&]() -> void {
-            AutoGetDb autoDb(opCtx, NamespaceString::kIndexBuildEntryNamespace.db(), MODE_IX);
+            AutoGetDb autoDb(opCtx, NamespaceString::kIndexBuildEntryNamespace.dbName(), MODE_IX);
             auto db = autoDb.ensureDbExists(opCtx);
 
             // Ensure the database exists.
@@ -311,7 +311,7 @@ StatusWith<IndexBuildEntry> getIndexBuildEntry(OperationContext* opCtx, UUID ind
     }
 
     try {
-        IDLParserErrorContext ctx("IndexBuildsEntry Parser");
+        IDLParserContext ctx("IndexBuildsEntry Parser");
         IndexBuildEntry indexBuildEntry = IndexBuildEntry::parse(ctx, obj);
         return indexBuildEntry;
     } catch (DBException& ex) {

@@ -90,7 +90,7 @@ boost::optional<MinValidDocument> ReplicationConsistencyMarkersImpl::_getMinVali
     }
 
     auto minValid =
-        MinValidDocument::parse(IDLParserErrorContext("MinValidDocument"), result.getValue());
+        MinValidDocument::parse(IDLParserContext("MinValidDocument"), result.getValue());
     return minValid;
 }
 
@@ -170,7 +170,7 @@ void ReplicationConsistencyMarkersImpl::clearInitialSyncFlag(OperationContext* o
               "Clearing the truncate point while primary is unsafe: it is asynchronously updated.");
     setOplogTruncateAfterPoint(opCtx, Timestamp());
 
-    if (getGlobalServiceContext()->getStorageEngine()->isDurable()) {
+    if (!getGlobalServiceContext()->getStorageEngine()->isEphemeral()) {
         JournalFlusher::get(opCtx)->waitForJournalFlush();
         replCoord->setMyLastDurableOpTimeAndWallTime(opTimeAndWallTime);
     }
@@ -355,7 +355,7 @@ ReplicationConsistencyMarkersImpl::_getOplogTruncateAfterPointDocument(
     }
 
     auto oplogTruncateAfterPoint = OplogTruncateAfterPointDocument::parse(
-        IDLParserErrorContext("OplogTruncateAfterPointDocument"), doc.getValue());
+        IDLParserContext("OplogTruncateAfterPointDocument"), doc.getValue());
     return oplogTruncateAfterPoint;
 }
 

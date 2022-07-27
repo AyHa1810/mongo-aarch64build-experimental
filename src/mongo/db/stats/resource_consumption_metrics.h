@@ -301,7 +301,7 @@ public:
         bool endScopedCollecting();
 
         bool isCollecting() const {
-            return _collecting == ScopedCollectionState::kInScopeCollecting;
+            return !_paused && _collecting == ScopedCollectionState::kInScopeCollecting;
         }
 
         bool isInScope() const {
@@ -344,13 +344,13 @@ public:
          * This should be called once per document read with the number of bytes read for that
          * document.  This is a no-op when metrics collection is disabled on this operation.
          */
-        void incrementOneDocRead(std::string uri, size_t docBytesRead);
+        void incrementOneDocRead(StringData uri, size_t docBytesRead);
 
         /**
          * This should be called once per index entry read with the number of bytes read for that
          * entry. This is a no-op when metrics collection is disabled on this operation.
          */
-        void incrementOneIdxEntryRead(std::string uri, size_t idxEntryBytesRead);
+        void incrementOneIdxEntryRead(StringData uri, size_t idxEntryBytesRead);
 
         /**
          * Increments the number of keys sorted for a query operation. This is a no-op when metrics
@@ -367,7 +367,7 @@ public:
         /**
          * Increments the number of document units returned in the command response.
          */
-        void incrementDocUnitsReturned(std::string ns, DocumentUnitCounter docUnitsReturned);
+        void incrementDocUnitsReturned(StringData ns, DocumentUnitCounter docUnitsReturned);
 
         /**
          * This should be called once per document written with the number of bytes written for that
@@ -375,13 +375,13 @@ public:
          * function should not be called when the operation is a write to the oplog. The metrics are
          * only for operations that are not oplog writes.
          */
-        void incrementOneDocWritten(std::string uri, size_t docBytesWritten);
+        void incrementOneDocWritten(StringData uri, size_t docBytesWritten);
 
         /**
          * This should be called once per index entry written with the number of bytes written for
          * that entry. This is a no-op when metrics collection is disabled on this operation.
          */
-        void incrementOneIdxEntryWritten(std::string uri, size_t idxEntryBytesWritten);
+        void incrementOneIdxEntryWritten(StringData uri, size_t idxEntryBytesWritten);
 
         /**
          * This should be called once every time the storage engine successfully does a cursor seek.
@@ -389,7 +389,31 @@ public:
          * only be called once. If the seek does not find anything, this function should not be
          * called.
          */
-        void incrementOneCursorSeek(std::string uri);
+        void incrementOneCursorSeek(StringData uri);
+
+        /**
+         * Pause metrics collection, overriding kInScopeCollecting status. The scope status may be
+         * changed during a pause, but will not come into effect until resume() is called.
+         */
+        void pause() {
+            invariant(!_paused);
+            _paused = true;
+        }
+
+        /**
+         * Resume metrics collection. Trying to resume a non-paused object will invariant.
+         */
+        void resume() {
+            invariant(_paused);
+            _paused = false;
+        }
+
+        /**
+         * Returns if the current object is in paused state.
+         */
+        bool isPaused() {
+            return _paused;
+        }
 
     private:
         // Privatize copy constructors to prevent callers from accidentally copying when this is
@@ -418,6 +442,7 @@ public:
         bool _hasCollectedMetrics = false;
         std::string _dbName;
         OperationMetrics _metrics;
+        bool _paused = false;
     };
 
     /**
@@ -437,6 +462,37 @@ public:
     private:
         bool _topLevel;
         OperationContext* _opCtx;
+    };
+
+    /**
+     * RAII-style class to temporarily pause the MetricsCollector in the OperationContext. This
+     * applies even if the MetricsCollector is started explicitly in lower levels.
+     *
+     * Exception: CPU metrics are not paused.
+     */
+    class PauseMetricsCollectorBlock {
+        PauseMetricsCollectorBlock(const PauseMetricsCollectorBlock&) = delete;
+        PauseMetricsCollectorBlock& operator=(const PauseMetricsCollectorBlock&) = delete;
+
+    public:
+        explicit PauseMetricsCollectorBlock(OperationContext* opCtx) : _opCtx(opCtx) {
+            auto& metrics = MetricsCollector::get(_opCtx);
+            _wasPaused = metrics.isPaused();
+            if (!_wasPaused) {
+                metrics.pause();
+            }
+        }
+
+        ~PauseMetricsCollectorBlock() {
+            if (!_wasPaused) {
+                auto& metrics = MetricsCollector::get(_opCtx);
+                metrics.resume();
+            }
+        }
+
+    private:
+        OperationContext* _opCtx;
+        bool _wasPaused;
     };
 
     /**

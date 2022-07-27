@@ -46,7 +46,7 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/matcher/matcher.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/collation/collation_spec.h"
 #include "mongo/db/repl/replication_coordinator.h"
@@ -131,7 +131,7 @@ Status _applyOps(OperationContext* opCtx,
 
             // Reject malformed or over-specified operations in an atomic applyOps.
             try {
-                ReplOperation::parse(IDLParserErrorContext("applyOps"), opObj);
+                ReplOperation::parse(IDLParserContext("applyOps"), opObj);
             } catch (...) {
                 uasserted(ErrorCodes::AtomicityFailure,
                           str::stream() << "cannot apply a malformed or over-specified operation "
@@ -152,7 +152,7 @@ Status _applyOps(OperationContext* opCtx,
             // Malformed operations should have already been caught and retried in non-atomic mode.
             invariant(entry.isOK());
 
-            OldClientContext ctx(opCtx, nss.ns());
+            OldClientContext ctx(opCtx, nss);
 
             const auto& op = entry.getValue();
             const bool isDataConsistent = true;
@@ -226,7 +226,7 @@ Status _applyOps(OperationContext* opCtx,
                                           << nss.ns() << ": " << mongo::redact(opObj));
                         }
 
-                        OldClientContext ctx(opCtx, nss.ns());
+                        OldClientContext ctx(opCtx, nss);
 
                         // We return the status rather than merely aborting so failure of CRUD
                         // ops doesn't stop the applyOps from trying to process the rest of the

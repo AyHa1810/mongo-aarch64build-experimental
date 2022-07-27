@@ -34,8 +34,8 @@
 #include <utility>
 
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/op_observer_noop.h"
-#include "mongo/db/op_observer_registry.h"
+#include "mongo/db/op_observer/op_observer_noop.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/persistent_task_store.h"
@@ -51,6 +51,7 @@
 #include "mongo/db/s/resharding/resharding_donor_service.h"
 #include "mongo/db/s/resharding/resharding_service_test_helpers.h"
 #include "mongo/db/s/resharding/resharding_util.h"
+#include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/unittest/death_test.h"
@@ -104,14 +105,18 @@ public:
 class ReshardingDonorServiceForTest : public ReshardingDonorService {
 public:
     explicit ReshardingDonorServiceForTest(ServiceContext* serviceContext)
-        : ReshardingDonorService(serviceContext) {}
+        : ReshardingDonorService(serviceContext), _serviceContext(serviceContext) {}
 
     std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(BSONObj initialState) override {
         return std::make_shared<DonorStateMachine>(
             this,
             ReshardingDonorDocument::parse({"ReshardingDonorServiceForTest"}, initialState),
-            std::make_unique<ExternalStateForTest>());
+            std::make_unique<ExternalStateForTest>(),
+            _serviceContext);
     }
+
+private:
+    ServiceContext* _serviceContext;
 };
 
 class ReshardingDonorServiceTest : public repl::PrimaryOnlyServiceMongoDTest {
@@ -284,7 +289,7 @@ TEST_F(ReshardingDonorServiceTest, WritesNoOpOplogEntryOnReshardingBegin) {
 
     ReshardBeginChangeEventO2Field expectedChangeEvent{sourceNss, doc.getReshardingUUID()};
     auto receivedChangeEvent = ReshardBeginChangeEventO2Field::parse(
-        IDLParserErrorContext("ReshardBeginChangeEventO2Field"), *op.getObject2());
+        IDLParserContext("ReshardBeginChangeEventO2Field"), *op.getObject2());
 
     ASSERT_EQ(OpType_serializer(op.getOpType()), OpType_serializer(repl::OpTypeEnum::kNoop))
         << op.getEntry();

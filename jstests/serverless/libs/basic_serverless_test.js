@@ -44,14 +44,14 @@ const runCommitSplitThreadWrapper = function(rstArgs,
 const runShardSplitCommand = function(
     replicaSet, cmdObj, retryOnRetryableErrors, enableDonorStartMigrationFsync) {
     let res;
+    if (enableDonorStartMigrationFsync) {
+        replicaSet.awaitLastOpCommitted();
+        assert.commandWorked(replicaSet.getPrimary().adminCommand({fsync: 1}));
+    }
+
     assert.soon(() => {
         try {
             const primary = replicaSet.getPrimary();
-            if (enableDonorStartMigrationFsync) {
-                replicaSet.awaitLastOpCommitted();
-                assert.commandWorked(primary.adminCommand({fsync: 1}));
-            }
-
             // Note: assert.commandWorked() considers command responses with embedded
             // writeErrors and WriteConcernErrors as a failure even if the command returned
             // "ok: 1". And, admin commands(like, donorStartMigration)
@@ -592,6 +592,15 @@ function assertMigrationState(primary, migrationId, state) {
 
     if (migrationDoc.state === 'aborted') {
         print(tojson(migrationDoc));
+    }
+
+    // If transitioning to "blocking", prove that we wrote that fact at the blockTimestamp.
+    if (state === "blocking") {
+        const oplogEntry =
+            primary.getDB("local").oplog.rs.find({ts: migrationDoc.blockTimestamp}).next();
+        assert.neq(null, oplogEntry.o, oplogEntry);
+        assert.neq(null, oplogEntry.o.state, oplogEntry);
+        assert.eq(oplogEntry.o.state, state, oplogEntry);
     }
 
     assert.eq(migrationDoc.state, state);

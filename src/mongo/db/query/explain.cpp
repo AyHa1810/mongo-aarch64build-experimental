@@ -61,9 +61,9 @@
 #include "mongo/db/server_options.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/net/socket_utils.h"
+#include "mongo/util/overloaded_visitor.h"
 #include "mongo/util/str.h"
 #include "mongo/util/version.h"
-#include "mongo/util/visit_helper.h"
 
 namespace mongo {
 namespace {
@@ -97,11 +97,8 @@ void generatePlannerInfo(PlanExecutor* exec,
         const QuerySettings* querySettings =
             QuerySettingsDecoration::get(mainCollection->getSharedDecorations());
         if (exec->getCanonicalQuery()->isSbeCompatible() &&
-            feature_flags::gFeatureFlagSbePlanCache.isEnabledAndIgnoreFCV() &&
-            !exec->getCanonicalQuery()->getForceClassicEngine() &&
-            // TODO SERVER-61507: remove canUseSbePlanCache check when $group pushdown is
-            // integrated with SBE plan cache.
-            canonical_query_encoder::canUseSbePlanCache(*exec->getCanonicalQuery())) {
+            feature_flags::gFeatureFlagSbeFull.isEnabledAndIgnoreFCV() &&
+            !exec->getCanonicalQuery()->getForceClassicEngine()) {
             const auto planCacheKeyInfo =
                 plan_cache_key_factory::make(*exec->getCanonicalQuery(), collections);
             planCacheKeyHash = planCacheKeyInfo.planCacheKeyHash();
@@ -113,7 +110,7 @@ void generatePlannerInfo(PlanExecutor* exec,
             queryHash = planCacheKeyInfo.queryHash();
         }
         if (auto allowedIndicesFilter = querySettings->getAllowedIndicesFilter(
-                exec->getCanonicalQuery()->encodeKeyForIndexFilters())) {
+                exec->getCanonicalQuery()->encodeKeyForPlanCacheCommand())) {
             // Found an index filter set on the query shape.
             indexFilterSet = true;
         }
@@ -436,15 +433,14 @@ void Explain::planCacheEntryToBSON(const PlanCacheEntry& entry, BSONObjBuilder* 
             }
         }
 
-        auto explainer =
-            stdx::visit(visit_helper::Overloaded{[](const plan_ranker::StatsDetails&) {
-                                                     return plan_explainer_factory::make(nullptr);
-                                                 },
-                                                 [](const plan_ranker::SBEStatsDetails&) {
-                                                     return plan_explainer_factory::make(
-                                                         nullptr, nullptr, nullptr);
-                                                 }},
-                        debugInfo.decision->stats);
+        auto explainer = stdx::visit(
+            OverloadedVisitor{[](const plan_ranker::StatsDetails&) {
+                                  return plan_explainer_factory::make(nullptr);
+                              },
+                              [](const plan_ranker::SBEStatsDetails&) {
+                                  return plan_explainer_factory::make(nullptr, nullptr, nullptr);
+                              }},
+            debugInfo.decision->stats);
         auto plannerStats =
             explainer->getCachedPlanStats(debugInfo, ExplainOptions::Verbosity::kQueryPlanner);
         auto execStats =

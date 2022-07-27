@@ -221,7 +221,9 @@ public:
             // later commitTransaction or abortTransaction oplog entry.
             shouldNotConflictBlock.emplace(opCtx->lockState());
         }
-        AutoGetDb autoDb(opCtx, ns, lockMode);
+
+        // TODO SERVER-67459 Pass dbName obj directly
+        AutoGetDb autoDb(opCtx, DatabaseName(boost::none, ns), lockMode);
         Database* db = autoDb.getDb();
 
         result.append("host", prettyHostName());
@@ -344,7 +346,7 @@ private:
                                   << minSnapshot->toString(),
                     !minSnapshot || *mySnapshot >= *minSnapshot);
         } else {
-            invariant(opCtx->lockState()->isDbLockedForMode(db->name().db(), MODE_S));
+            invariant(opCtx->lockState()->isDbLockedForMode(db->name(), MODE_S));
         }
 
         auto desc = collection->getIndexCatalog()->findIdIndex(opCtx);

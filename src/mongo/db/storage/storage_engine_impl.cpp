@@ -499,7 +499,7 @@ bool StorageEngineImpl::_handleInternalIdent(OperationContext* opCtx,
                           "failToParseResumeIndexInfo fail point is enabled");
             }
 
-            resumeInfo = ResumeIndexInfo::parse(IDLParserErrorContext("ResumeIndexInfo"), doc);
+            resumeInfo = ResumeIndexInfo::parse(IDLParserContext("ResumeIndexInfo"), doc);
         } catch (const DBException& e) {
             LOGV2(4916300, "Failed to parse resumable index info", "error"_attr = e.toStatus());
 
@@ -945,10 +945,6 @@ StatusWith<std::deque<std::string>> StorageEngineImpl::extendBackupCursor(Operat
     return _engine->extendBackupCursor(opCtx);
 }
 
-bool StorageEngineImpl::isDurable() const {
-    return _engine->isDurable();
-}
-
 bool StorageEngineImpl::isEphemeral() const {
     return _engine->isEphemeral();
 }
@@ -1174,7 +1170,7 @@ void StorageEngineImpl::_onMinOfCheckpointAndOldestTimestampChanged(const Timest
 }
 
 StorageEngineImpl::TimestampMonitor::TimestampMonitor(KVEngine* engine, PeriodicRunner* runner)
-    : _engine(engine), _running(false), _periodicRunner(runner) {
+    : _engine(engine), _periodicRunner(runner) {
     _startup();
 }
 
@@ -1259,12 +1255,16 @@ void StorageEngineImpl::TimestampMonitor::_startup() {
                     LOGV2(6183600, "Timestamp monitor got interrupted, retrying");
                     return;
                 }
-                if (!ErrorCodes::isCancellationError(ex))
+                if (ex.code() == ErrorCodes::InterruptedAtShutdown) {
+                    if (_shuttingDown) {
+                        return;
+                    }
+                    _shuttingDown = true;
+                    LOGV2(22263, "Timestamp monitor is stopping", "error"_attr = ex);
+                }
+                if (!ErrorCodes::isCancellationError(ex)) {
                     throw;
-                // If we're interrupted at shutdown or after PeriodicRunner's client has been
-                // killed, it's fine to give up on future notifications.
-                LOGV2(22263, "Timestamp monitor is stopping", "error"_attr = ex);
-                return;
+                }
             } catch (const DBException& ex) {
                 // Logs and rethrows the exceptions of other types.
                 LOGV2_ERROR(5802500, "Timestamp monitor throws an exception", "error"_attr = ex);

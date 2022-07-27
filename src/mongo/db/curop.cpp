@@ -218,9 +218,7 @@ void CurOp::reportCurrentOpForClient(OperationContext* opCtx,
     }
 
     if (const auto seCtx = transport::ServiceExecutorContext::get(client)) {
-        bool isDedicated = (seCtx->getThreadingModel() ==
-                            transport::ServiceExecutorContext::ThreadingModel::kDedicated);
-        infoBuilder->append("threaded"_sd, isDedicated);
+        infoBuilder->append("threaded"_sd, seCtx->useDedicatedThread());
     }
 
     if (clientOpCtx) {
@@ -808,6 +806,22 @@ void OpDebug::report(OperationContext* opCtx,
 
     if (prepareConflictDurationMillis > Milliseconds::zero()) {
         pAttrs->add("prepareConflictDuration", prepareConflictDurationMillis);
+    }
+
+    if (catalogCacheDatabaseLookupMillis > Milliseconds::zero()) {
+        pAttrs->add("catalogCacheDatabaseLookupDuration", catalogCacheDatabaseLookupMillis);
+    }
+
+    if (catalogCacheCollectionLookupMillis > Milliseconds::zero()) {
+        pAttrs->add("catalogCacheCollectionLookupDuration", catalogCacheCollectionLookupMillis);
+    }
+
+    if (databaseVersionRefreshMillis > Milliseconds::zero()) {
+        pAttrs->add("databaseVersionRefreshDuration", databaseVersionRefreshMillis);
+    }
+
+    if (shardVersionRefreshMillis > Milliseconds::zero()) {
+        pAttrs->add("shardVersionRefreshDuration", shardVersionRefreshMillis);
     }
 
     if (dataThroughputLastSecond) {

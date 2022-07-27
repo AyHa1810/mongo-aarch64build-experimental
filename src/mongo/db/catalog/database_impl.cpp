@@ -27,9 +27,6 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/catalog/database_impl.h"
 
 #include <algorithm>
@@ -57,7 +54,7 @@
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/introspect.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
@@ -120,15 +117,9 @@ Status validateDBNameForWindows(StringData dbname) {
     return Status::OK();
 }
 
-// Random number generator used to create unique collection namespaces suitable for temporary
-// collections.
-PseudoRandom uniqueCollectionNamespacePseudoRandom(Date_t::now().asInt64());
-
-Mutex uniqueCollectionNamespaceMutex = MONGO_MAKE_LATCH("DatabaseUniqueCollectionNamespaceMutex");
-
 void assertMovePrimaryInProgress(OperationContext* opCtx, NamespaceString const& nss) {
-    invariant(opCtx->lockState()->isDbLockedForMode(nss.db(), MODE_IS));
-    auto dss = DatabaseShardingState::get(opCtx, nss.db().toString());
+    invariant(opCtx->lockState()->isDbLockedForMode(nss.dbName(), MODE_IS));
+    auto dss = DatabaseShardingState::get(opCtx, nss.dbName().toStringWithTenantId());
     if (!dss) {
         return;
     }
@@ -173,8 +164,7 @@ Status DatabaseImpl::validateDBName(StringData dbname) {
 }
 
 DatabaseImpl::DatabaseImpl(const DatabaseName& dbName)
-    : _name(dbName),
-      _viewsName(_name.toString() + "." + DurableViewCatalog::viewsCollectionName().toString()) {}
+    : _name(dbName), _viewsName(_name, DurableViewCatalog::viewsCollectionName().toString()) {}
 
 Status DatabaseImpl::init(OperationContext* const opCtx) {
     Status status = validateDBName(_name.db());
@@ -213,7 +203,7 @@ Status DatabaseImpl::init(OperationContext* const opCtx) {
         try {
             Lock::CollectionLock systemViewsLock(
                 opCtx,
-                NamespaceString(_name.db(), NamespaceString::kSystemDotViewsCollectionName),
+                NamespaceString(_name, NamespaceString::kSystemDotViewsCollectionName),
                 MODE_IS);
             ViewsForDatabase viewsForDb{std::make_unique<DurableViewCatalogImpl>(this)};
             Status reloadStatus = viewsForDb.reload(opCtx);
@@ -314,7 +304,7 @@ Status DatabaseImpl::init(OperationContext* const opCtx) {
 }
 
 void DatabaseImpl::clearTmpCollections(OperationContext* opCtx) const {
-    invariant(opCtx->lockState()->isDbLockedForMode(name().db(), MODE_IX));
+    invariant(opCtx->lockState()->isDbLockedForMode(name(), MODE_IX));
 
     CollectionCatalog::CollectionInfoFn callback = [&](const CollectionPtr& collection) {
         try {
@@ -348,12 +338,12 @@ void DatabaseImpl::clearTmpCollections(OperationContext* opCtx) const {
 
 void DatabaseImpl::setDropPending(OperationContext* opCtx, bool dropPending) {
     auto mode = dropPending ? MODE_X : MODE_IX;
-    invariant(opCtx->lockState()->isDbLockedForMode(name().db(), mode));
+    invariant(opCtx->lockState()->isDbLockedForMode(name(), mode));
     _dropPending.store(dropPending);
 }
 
 bool DatabaseImpl::isDropPending(OperationContext* opCtx) const {
-    invariant(opCtx->lockState()->isDbLockedForMode(name().db(), MODE_IS));
+    invariant(opCtx->lockState()->isDbLockedForMode(name(), MODE_IS));
     return _dropPending.load();
 }
 
@@ -372,7 +362,7 @@ void DatabaseImpl::getStats(OperationContext* opCtx,
     long long indexSize = 0;
     long long indexFreeStorageSize = 0;
 
-    invariant(opCtx->lockState()->isDbLockedForMode(name().db(), MODE_IS));
+    invariant(opCtx->lockState()->isDbLockedForMode(name(), MODE_IS));
 
     catalog::forEachCollectionFromDb(
         opCtx, name(), MODE_IS, [&](const CollectionPtr& collection) -> bool {
@@ -444,7 +434,7 @@ void DatabaseImpl::getStats(OperationContext* opCtx,
 }
 
 Status DatabaseImpl::dropView(OperationContext* opCtx, NamespaceString viewName) const {
-    dassert(opCtx->lockState()->isDbLockedForMode(name().db(), MODE_IX));
+    dassert(opCtx->lockState()->isDbLockedForMode(name(), MODE_IX));
     dassert(opCtx->lockState()->isCollectionLockedForMode(viewName, MODE_IX));
     dassert(opCtx->lockState()->isCollectionLockedForMode(NamespaceString(_viewsName), MODE_X));
 
@@ -466,7 +456,7 @@ Status DatabaseImpl::dropCollection(OperationContext* opCtx,
         return Status::OK();
     }
 
-    invariant(nss.db() == _name.db());
+    invariant(nss.dbName() == _name);
 
     // Returns true if the supplied namespace 'nss' is a system collection that can be dropped,
     // false otherwise.
@@ -653,7 +643,7 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
 void DatabaseImpl::_dropCollectionIndexes(OperationContext* opCtx,
                                           const NamespaceString& nss,
                                           Collection* collection) const {
-    invariant(_name.db() == nss.db());
+    invariant(_name == nss.dbName());
     LOGV2_DEBUG(
         20316, 1, "dropCollection: {namespace} - dropAllIndexes start", "namespace"_attr = nss);
     collection->getIndexCatalog()->dropAllIndexes(opCtx, collection, true, {});
@@ -703,8 +693,8 @@ Status DatabaseImpl::renameCollection(OperationContext* opCtx,
     invariant(opCtx->lockState()->isCollectionLockedForMode(fromNss, MODE_X));
     invariant(opCtx->lockState()->isCollectionLockedForMode(toNss, MODE_X));
 
-    invariant(fromNss.db() == _name.db());
-    invariant(toNss.db() == _name.db());
+    invariant(fromNss.dbName() == _name);
+    invariant(toNss.dbName() == _name);
     if (CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, toNss)) {
         return Status(ErrorCodes::NamespaceExists,
                       str::stream() << "Cannot rename '" << fromNss << "' to '" << toNss
@@ -792,7 +782,7 @@ void DatabaseImpl::_checkCanCreateCollection(OperationContext* opCtx,
 Status DatabaseImpl::createView(OperationContext* opCtx,
                                 const NamespaceString& viewName,
                                 const CollectionOptions& options) const {
-    dassert(opCtx->lockState()->isDbLockedForMode(name().db(), MODE_IX));
+    dassert(opCtx->lockState()->isDbLockedForMode(name(), MODE_IX));
     dassert(opCtx->lockState()->isCollectionLockedForMode(viewName, MODE_IX));
     dassert(opCtx->lockState()->isCollectionLockedForMode(NamespaceString(_viewsName), MODE_X));
 
@@ -892,7 +882,7 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
     std::pair<RecordId, std::unique_ptr<RecordStore>> catalogIdRecordStorePair =
         uassertStatusOK(storageEngine->getCatalog()->createCollection(
             opCtx, nss, optionsWithUUID, true /*allocateDefaultSpace*/));
-    auto catalogId = catalogIdRecordStorePair.first;
+    auto& catalogId = catalogIdRecordStorePair.first;
     std::shared_ptr<Collection> ownedCollection = Collection::Factory::get(opCtx)->make(
         opCtx, nss, catalogId, optionsWithUUID, std::move(catalogIdRecordStorePair.second));
     auto collection = ownedCollection.get();
@@ -950,57 +940,6 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
     }
 
     return collection;
-}
-
-StatusWith<NamespaceString> DatabaseImpl::makeUniqueCollectionNamespace(
-    OperationContext* opCtx, StringData collectionNameModel) const {
-    invariant(opCtx->lockState()->isDbLockedForMode(name().db(), MODE_IX));
-
-    // There must be at least one percent sign in the collection name model.
-    auto numPercentSign = std::count(collectionNameModel.begin(), collectionNameModel.end(), '%');
-    if (numPercentSign == 0) {
-        return Status(ErrorCodes::FailedToParse,
-                      str::stream()
-                          << "Cannot generate collection name for temporary collection: "
-                             "model for collection name "
-                          << collectionNameModel << " must contain at least one percent sign.");
-    }
-
-    const auto charsToChooseFrom =
-        "0123456789"
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        "abcdefghijklmnopqrstuvwxyz"_sd;
-    invariant((10U + 26U * 2) == charsToChooseFrom.size());
-
-    stdx::lock_guard<Latch> lk(uniqueCollectionNamespaceMutex);
-
-    auto replacePercentSign = [&](char c) {
-        if (c != '%') {
-            return c;
-        }
-        auto i = uniqueCollectionNamespacePseudoRandom.nextInt32(charsToChooseFrom.size());
-        return charsToChooseFrom[i];
-    };
-
-    auto numGenerationAttempts = numPercentSign * charsToChooseFrom.size() * 100U;
-    for (decltype(numGenerationAttempts) i = 0; i < numGenerationAttempts; ++i) {
-        auto collectionName = collectionNameModel.toString();
-        std::transform(collectionName.begin(),
-                       collectionName.end(),
-                       collectionName.begin(),
-                       replacePercentSign);
-
-        NamespaceString nss(_name.db(), collectionName);
-        if (!CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss)) {
-            return nss;
-        }
-    }
-
-    return Status(
-        ErrorCodes::NamespaceExists,
-        str::stream() << "Cannot generate collection name for temporary collection with model "
-                      << collectionNameModel << " after " << numGenerationAttempts
-                      << " attempts due to namespace conflicts with existing collections.");
 }
 
 void DatabaseImpl::checkForIdIndexesAndDropPendingCollections(OperationContext* opCtx) const {

@@ -27,13 +27,9 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/repl/rs_rollback.h"
 
 #include <algorithm>
-#include <memory>
 
 #include "mongo/bson/bsonelement_comparator.h"
 #include "mongo/bson/util/bson_extract.h"
@@ -44,6 +40,7 @@
 #include "mongo/db/catalog/index_build_oplog_entry.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/rename_collection.h"
+#include "mongo/db/catalog/unique_collection_name.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
@@ -83,7 +80,6 @@
 #include "mongo/util/scopeguard.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationRollback
-
 
 namespace mongo {
 
@@ -1091,11 +1087,11 @@ void renameOutOfTheWay(OperationContext* opCtx, RenameCollectionInfo info, Datab
 
     // The generated unique collection name is only guaranteed to exist if the database is
     // exclusively locked.
-    invariant(opCtx->lockState()->isDbLockedForMode(db->name().db(), LockMode::MODE_X));
+    invariant(opCtx->lockState()->isDbLockedForMode(db->name(), LockMode::MODE_X));
     // Creates the oplog entry to temporarily rename the collection that is
     // preventing the renameCollection command from rolling back to a unique
     // namespace.
-    auto tmpNameResult = db->makeUniqueCollectionNamespace(opCtx, "rollback.tmp%%%%%");
+    auto tmpNameResult = makeUniqueCollectionName(opCtx, db->name(), "rollback.tmp%%%%%");
     if (!tmpNameResult.isOK()) {
         LOGV2_FATAL_CONTINUE(
             21743,
@@ -1507,7 +1503,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                   "Dropping collection",
                   "namespace"_attr = *nss,
                   "uuid"_attr = uuid);
-            AutoGetDb dbLock(opCtx, nss->db(), MODE_X);
+            AutoGetDb dbLock(opCtx, nss->dbName(), MODE_X);
 
             Database* db = dbLock.getDb();
             if (db) {
@@ -1737,7 +1733,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                 // TODO: Lots of overhead in context. This can be faster.
                 const NamespaceString docNss(doc.ns);
                 Lock::DBLock docDbLock(opCtx, docNss.dbName(), MODE_X);
-                OldClientContext ctx(opCtx, doc.ns.toString());
+                OldClientContext ctx(opCtx, docNss);
                 CollectionWriter collection(opCtx, uuid);
 
                 // Adds the doc to our rollback file if the collection was not dropped while
@@ -1957,7 +1953,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         const NamespaceString oplogNss(NamespaceString::kRsOplogNamespace);
         Lock::DBLock oplogDbLock(opCtx, oplogNss.dbName(), MODE_IX);
         Lock::CollectionLock oplogCollectionLoc(opCtx, oplogNss, MODE_X);
-        OldClientContext ctx(opCtx, oplogNss.ns());
+        OldClientContext ctx(opCtx, oplogNss);
         auto oplogCollection =
             CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, oplogNss);
         if (!oplogCollection) {

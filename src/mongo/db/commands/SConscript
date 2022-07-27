@@ -324,6 +324,7 @@ env.Library(
 env.Library(
     target="standalone",
     source=[
+        "analyze_cmd.cpp",
         "count_cmd.cpp",
         "cqf/cqf_aggregate.cpp",
         "cqf/cqf_command_utils.cpp",
@@ -560,6 +561,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/catalog/index_key_validate',
         '$BUILD_DIR/mongo/db/change_stream_change_collection_manager',
         '$BUILD_DIR/mongo/db/change_stream_options_manager',
+        '$BUILD_DIR/mongo/db/change_stream_pre_images_collection_manager',
         '$BUILD_DIR/mongo/db/cluster_transaction_api',
         '$BUILD_DIR/mongo/db/commands',
         '$BUILD_DIR/mongo/db/curop_failpoint_helpers',
@@ -585,7 +587,6 @@ env.Library(
         '$BUILD_DIR/mongo/db/s/sharding_runtime_d',
         '$BUILD_DIR/mongo/db/s/transaction_coordinator',
         '$BUILD_DIR/mongo/db/s/user_writes_recoverable_critical_section',
-        '$BUILD_DIR/mongo/db/server_feature_flags',
         '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/db/serverless/shard_split_donor_service',
         '$BUILD_DIR/mongo/db/tenant_id',
@@ -820,7 +821,7 @@ env.CppUnitTest(
         "$BUILD_DIR/mongo/db/fle_crud",
         "$BUILD_DIR/mongo/db/fle_mocks",
         "$BUILD_DIR/mongo/db/multitenancy",
-        "$BUILD_DIR/mongo/db/op_observer",
+        "$BUILD_DIR/mongo/db/op_observer/op_observer",
         "$BUILD_DIR/mongo/db/query/query_planner",
         "$BUILD_DIR/mongo/db/query/query_test_service_context",
         "$BUILD_DIR/mongo/db/query_exec",

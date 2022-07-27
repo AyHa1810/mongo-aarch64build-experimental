@@ -45,7 +45,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
@@ -728,7 +728,7 @@ bool replHasDatabases(OperationContext* opCtx) {
 
         // we have a local database.  return true if oplog isn't empty
         BSONObj o;
-        if (Helpers::getSingleton(opCtx, NamespaceString::kRsOplogNamespace.ns().c_str(), o)) {
+        if (Helpers::getSingleton(opCtx, NamespaceString::kRsOplogNamespace, o)) {
             return true;
         }
     }

@@ -24,11 +24,11 @@ buildvariants:
     virtualenv: /opt/mongodbtoolchain/v3/bin/virtualenv
     large_distro_name: amazon1-2018-build
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
     distros:
     - amazon1-2018-build
-  - name: .aggfuzzer .common
-  - name: aggregation
+  - name: .aggfuzzer .common !.feature_flag_guarded
+  - name: aggregation !.feature_flag_guarded
   - name: .auth !.audit !.multiversion
   - name: causally_consistent_jscore_txns_passthrough
   - name: .misc_js
@@ -79,11 +79,11 @@ buildvariants:
     scons_cache_scope: shared
     virtualenv: /opt/mongodbtoolchain/v3/bin/virtualenv
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
     distros:
     - amazon1-2018-build
-  - name: .aggfuzzer .common
-  - name: aggregation
+  - name: .aggfuzzer .common !.feature_flag_guarded
+  - name: aggregation !.feature_flag_guarded
   - name: .auth !.multiversion
   - name: audit
   - name: causally_consistent_jscore_txns_passthrough
@@ -132,11 +132,11 @@ buildvariants:
     scons_cache_scope: shared
     large_distro_name: amazon2-large
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
     distros:
     - amazon2-build
-  - name: .aggfuzzer .common
-  - name: aggregation
+  - name: .aggfuzzer .common !.feature_flag_guarded
+  - name: aggregation !.feature_flag_guarded
   - name: .auth !.audit !.multiversion
   - name: causally_consistent_jscore_txns_passthrough
   - name: .misc_js
@@ -191,11 +191,11 @@ buildvariants:
     repo_edition: enterprise
     scons_cache_scope: shared
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
     distros:
     - amazon2-build
-  - name: .aggfuzzer .common
-  - name: aggregation
+  - name: .aggfuzzer .common !.feature_flag_guarded
+  - name: aggregation !.feature_flag_guarded
   - name: audit
   - name: .auth !.multiversion
   - name: causally_consistent_jscore_txns_passthrough
@@ -244,10 +244,10 @@ buildvariants:
     scons_cache_scope: shared
     large_distro_name: amazon2-arm64-large
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
     distros:
     - amazon2-arm64-large
-  - name: aggregation
+  - name: aggregation !.feature_flag_guarded
   - name: .auth !.audit !.multiversion
   - name: causally_consistent_jscore_txns_passthrough
   - name: .misc_js
@@ -303,12 +303,12 @@ buildvariants:
     repo_edition: enterprise
     scons_cache_scope: shared
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
     distros:
     - amazon2-arm64-large
   - name: test_api_version_compatibility
-  - name: .aggfuzzer
-  - name: .aggregation
+  - name: .aggfuzzer !.feature_flag_guarded
+  - name: .aggregation !.feature_flag_guarded
   - name: audit
   - name: .auth
   - name: .causally_consistent !.sharding
@@ -421,11 +421,11 @@ buildvariants:
     scons_cache_scope: shared
     large_distro_name: debian10-build
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
     distros:
     - debian10-build
-  - name: .aggfuzzer .common
-  - name: aggregation
+  - name: .aggfuzzer .common !.feature_flag_guarded
+  - name: aggregation !.feature_flag_guarded
   - name: aggregation_auth
   - name: .auth !.audit !.multiversion
   - name: causally_consistent_jscore_txns_passthrough
@@ -479,10 +479,10 @@ buildvariants:
     scons_cache_scope: shared
     large_distro_name: debian10-build
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
     distros:
     - debian10-build
-  - name: .aggfuzzer .common
+  - name: .aggfuzzer .common !.feature_flag_guarded
   - name: audit
   - name: causally_consistent_jscore_txns_passthrough
   - name: .encrypt !.replica_sets !.aggregation !.sharding !.jscore
@@ -531,11 +531,11 @@ buildvariants:
     scons_cache_scope: shared
     large_distro_name: debian11-large
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
     distros:
     - debian11-large
-  - name: .aggfuzzer .common
-  - name: aggregation
+  - name: .aggfuzzer .common !.feature_flag_guarded
+  - name: aggregation !.feature_flag_guarded
   - name: aggregation_auth
   - name: .auth !.audit !.multiversion
   - name: causally_consistent_jscore_txns_passthrough
@@ -589,10 +589,10 @@ buildvariants:
     scons_cache_scope: shared
     large_distro_name: debian11-large
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
     distros:
     - debian11-large
-  - name: .aggfuzzer .common
+  - name: .aggfuzzer .common !.feature_flag_guarded
   - name: audit
   - name: causally_consistent_jscore_txns_passthrough
   - name: .encrypt !.replica_sets !.aggregation !.sharding !.jscore
@@ -639,10 +639,10 @@ buildvariants:
     scons_cache_scope: shared
     large_distro_name: rhel70
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
     distros:
     - rhel70
-  - name: aggregation
+  - name: aggregation !.feature_flag_guarded
   - name: .auth !.audit !.multiversion
   - name: causally_consistent_jscore_txns_passthrough
   - name: .misc_js
@@ -729,10 +729,10 @@ buildvariants:
     scons_cache_scope: shared
     large_distro_name: rhel80-build
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
     distros:
     - rhel80-build
-  - name: aggregation
+  - name: aggregation !.feature_flag_guarded
   - name: .auth !.audit !.multiversion
   - name: causally_consistent_jscore_txns_passthrough
   - name: .misc_js
@@ -789,11 +789,11 @@ buildvariants:
     max_sub_suites: 3
     large_distro_name: rhel80-medium
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
     distros:
     - rhel80-large
-  - name: .aggfuzzer
-  - name: .aggregation
+  - name: .aggfuzzer !.feature_flag_guarded
+  - name: .aggregation !.feature_flag_guarded
   - name: audit
   - name: .auth
   - name: unittest_shell_hang_analyzer_gen
@@ -895,10 +895,10 @@ buildvariants:
     scons_cache_scope: shared
     large_distro_name: rhel82-arm64-large
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
     distros:
     - rhel82-arm64-large
-  - name: aggregation
+  - name: aggregation !.feature_flag_guarded
   - name: .auth !.audit !.multiversion
   - name: causally_consistent_jscore_txns_passthrough
   - name: .misc_js
@@ -947,10 +947,10 @@ buildvariants:
     repo_edition: enterprise
     scons_cache_scope: shared
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
     distros:
     - rhel82-arm64-large
-  - name: .aggfuzzer !.multiversion
+  - name: .aggfuzzer !.multiversion !.feature_flag_guarded
   - name: audit
   - name: auth_audit_gen
   - name: auth_gen
@@ -1006,11 +1006,11 @@ buildvariants:
     scons_cache_scope: shared
     large_distro_name: suse12-sp5-large
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
     distros:
     - suse12-sp5-large
-  - name: .aggfuzzer .common
-  - name: aggregation
+  - name: .aggfuzzer .common !.feature_flag_guarded
+  - name: aggregation !.feature_flag_guarded
   - name: .auth !.audit !.multiversion
   - name: causally_consistent_jscore_txns_passthrough
   - name: .misc_js
@@ -1060,10 +1060,10 @@ buildvariants:
     repo_edition: enterprise
     scons_cache_scope: shared
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
     distros:
     - suse12-sp5-large
-  - name: .aggfuzzer .common
+  - name: .aggfuzzer .common !.feature_flag_guarded
   - name: audit
   - name: causally_consistent_jscore_txns_passthrough
   - name: .encrypt !.replica_sets !.aggregation !.sharding !.jscore
@@ -1108,10 +1108,10 @@ buildvariants:
     repo_edition: enterprise
     scons_cache_scope: shared
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
     distros:
     - suse15-build
-  - name: .aggfuzzer .common !.multiversion
+  - name: .aggfuzzer .common !.multiversion !.feature_flag_guarded
   - name: audit
   - name: causally_consistent_jscore_txns_passthrough
   - name: .encrypt !.replica_sets !.aggregation !.sharding !.jscore
@@ -1154,11 +1154,11 @@ buildvariants:
     scons_cache_scope: shared
     large_distro_name: suse15-build
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
     distros:
     - suse15-build
-  - name: .aggfuzzer .common !.multiversion
-  - name: aggregation
+  - name: .aggfuzzer .common !.multiversion !.feature_flag_guarded
+  - name: aggregation !.feature_flag_guarded
   - name: .auth !.audit !.multiversion
   - name: causally_consistent_jscore_txns_passthrough
   - name: .misc_js
@@ -1204,11 +1204,11 @@ buildvariants:
     scons_cache_scope: shared
     large_distro_name: ubuntu1804-build
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
     distros:
     - ubuntu1804-build
-  - name: .aggfuzzer .common
-  - name: aggregation
+  - name: .aggfuzzer .common !.feature_flag_guarded
+  - name: aggregation !.feature_flag_guarded
   - name: .auth !.audit !.multiversion
   - name: .misc_js
   - name: .concurrency .common
@@ -1269,7 +1269,7 @@ buildvariants:
     # TODO SERVER-64479 remove external_auth_jobs_max once resolved
     external_auth_jobs_max: 1
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
     distros:
     - ubuntu1804-build
   - name: compile_build_tools_next_TG
@@ -1280,7 +1280,7 @@ buildvariants:
     - ubuntu1804-build
   - name: .crypt
   - name: .publish_crypt
-  - name: .aggfuzzer .common
+  - name: .aggfuzzer .common !.feature_flag_guarded
   - name: audit
   - name: causally_consistent_jscore_txns_passthrough
   - name: .encrypt !.aggregation !.replica_sets !.sharding !.jscore
@@ -1340,8 +1340,8 @@ buildvariants:
     multiversion_edition: enterprise
     scons_cache_scope: shared
   tasks:
-  - name: compile_test_and_package_serial_TG
-  - name: aggregation
+  - name: compile_test_and_package_serial_no_unittests_TG
+  - name: aggregation !.feature_flag_guarded
   - name: aggregation_wildcard_fuzzer_gen
   - name: .auth !.audit !.multiversion !.jscore
   - name: causally_consistent_jscore_txns_passthrough
@@ -1395,7 +1395,7 @@ buildvariants:
     multiversion_edition: targeted
     scons_cache_scope: shared
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
   - name: free_monitoring
   - name: jsCore
   - name: replica_sets_jscore_passthrough
@@ -1428,11 +1428,11 @@ buildvariants:
     scons_cache_scope: shared
     large_distro_name: ubuntu2004-large
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
     distros:
     - ubuntu2004-large
-  - name: .aggfuzzer .common !.multiversion
-  - name: aggregation
+  - name: .aggfuzzer .common !.multiversion !.feature_flag_guarded
+  - name: aggregation !.feature_flag_guarded
   - name: .auth !.audit !.multiversion
   - name: .misc_js
   - name: .concurrency .common
@@ -1487,12 +1487,12 @@ buildvariants:
     # TODO SERVER-64479 remove external_auth_jobs_max once resolved
     external_auth_jobs_max: 1
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
     distros:
     - ubuntu2004-large
   - name: .crypt
   - name: .publish_crypt
-  - name: .aggfuzzer .common !.multiversion
+  - name: .aggfuzzer .common !.multiversion !.feature_flag_guarded
   - name: audit
   - name: causally_consistent_jscore_txns_passthrough
   - name: .encrypt !.aggregation !.replica_sets !.sharding !.jscore
@@ -1544,8 +1544,8 @@ buildvariants:
     multiversion_edition: enterprise
     scons_cache_scope: shared
   tasks:
-  - name: compile_test_and_package_serial_TG
-  - name: aggregation
+  - name: compile_test_and_package_serial_no_unittests_TG
+  - name: aggregation !.feature_flag_guarded
   - name: aggregation_wildcard_fuzzer_gen
   - name: .auth !.audit !.multiversion !.jscore
   - name: causally_consistent_jscore_txns_passthrough
@@ -1596,7 +1596,7 @@ buildvariants:
     multiversion_edition: targeted
     scons_cache_scope: shared
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
   - name: free_monitoring
   - name: jsCore
   - name: replica_sets_jscore_passthrough
@@ -1633,11 +1633,11 @@ buildvariants:
     large_distro_name: windows-vsCurrent-large
     test_flags: &windows_common_test_excludes --excludeWithAnyTags=incompatible_with_windows_tls
   tasks:
-  - name: compile_test_and_package_serial_TG
+  - name: compile_test_and_package_serial_no_unittests_TG
     distros:
     - windows-vsCurrent-large
-  - name: .aggfuzzer
-  - name: .aggregation !.auth !.encrypt !.unwind
+  - name: .aggfuzzer !.feature_flag_guarded
+  - name: .aggregation !.auth !.encrypt !.unwind !.feature_flag_guarded
   - name: auth_gen
   - name: causally_consistent_jscore_txns_passthrough
   - name: .misc_js
@@ -1700,8 +1700,8 @@ buildvariants:
   - name: compile_test_and_package_serial_TG
     distros:
     - windows-vsCurrent-large
-  - name: .aggfuzzer
-  - name: .aggregation !.auth !.encrypt !.unwind
+  - name: .aggfuzzer !.feature_flag_guarded
+  - name: .aggregation !.auth !.encrypt !.unwind !.feature_flag_guarded
   - name: auth_gen
   - name: causally_consistent_jscore_txns_passthrough
   - name: .misc_js
@@ -1758,7 +1758,7 @@ buildvariants:
   tasks:
   - name: compile_test_and_package_serial_TG
   - name: compile_build_tools_next_TG
-  - name: .aggregation !.auth !.encrypt !.unwind
+  - name: .aggregation !.auth !.encrypt !.unwind !.feature_flag_guarded
   - name: auth_gen
   - name: .causally_consistent !.sharding
   - name: .change_streams !.secondary_reads
@@ -1809,7 +1809,7 @@ buildvariants:
   tasks:
   - name: compile_test_and_package_serial_TG
   - name: compile_build_tools_next_TG
-  - name: .aggregation !.auth !.encrypt !.unwind
+  - name: .aggregation !.auth !.encrypt !.unwind !.feature_flag_guarded
   - name: auth_gen
   - name: .causally_consistent !.sharding
   - name: .change_streams !.secondary_reads

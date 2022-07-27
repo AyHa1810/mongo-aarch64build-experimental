@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/s/sharding_data_transform_cumulative_metrics_field_name_provider.h"
 #include "mongo/db/s/sharding_data_transform_metrics_observer_interface.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/atomic_word.h"
@@ -79,16 +80,50 @@ public:
         kNumStates
     };
 
+    using NameProvider = ShardingDataTransformCumulativeMetricsFieldNameProvider;
     using Role = ShardingDataTransformMetrics::Role;
     using InstanceObserver = ShardingDataTransformMetricsObserverInterface;
     using DeregistrationFunction = unique_function<void()>;
 
+    struct MetricsComparer {
+        inline bool operator()(const InstanceObserver* a, const InstanceObserver* b) const {
+            auto aTime = a->getStartTimestamp();
+            auto bTime = b->getStartTimestamp();
+            if (aTime == bTime) {
+                return a->getUuid() < b->getUuid();
+            }
+            return aTime < bTime;
+        }
+    };
+    using MetricsSet = std::set<const InstanceObserver*, MetricsComparer>;
+
+    /**
+     * RAII type that takes care of deregistering the observer once it goes out of scope.
+     */
+    class ScopedObserver {
+    public:
+        ScopedObserver(ShardingDataTransformCumulativeMetrics* metrics,
+                       Role role,
+                       MetricsSet::iterator observerIterator);
+        ScopedObserver(const ScopedObserver&) = delete;
+        ScopedObserver& operator=(const ScopedObserver&) = delete;
+
+        ~ScopedObserver();
+
+    private:
+        ShardingDataTransformCumulativeMetrics* const _metrics;
+        const Role _role;
+        const MetricsSet::iterator _observerIterator;
+    };
+
+    using UniqueScopedObserver = std::unique_ptr<ScopedObserver>;
+    friend ScopedObserver;
 
     static ShardingDataTransformCumulativeMetrics* getForResharding(ServiceContext* context);
     static ShardingDataTransformCumulativeMetrics* getForGlobalIndexes(ServiceContext* context);
 
     ShardingDataTransformCumulativeMetrics(const std::string& rootSectionName);
-    [[nodiscard]] DeregistrationFunction registerInstanceMetrics(const InstanceObserver* metrics);
+    [[nodiscard]] UniqueScopedObserver registerInstanceMetrics(const InstanceObserver* metrics);
     int64_t getOldestOperationHighEstimateRemainingTimeMillis(Role role) const;
     int64_t getOldestOperationLowEstimateRemainingTimeMillis(Role role) const;
     size_t getObservedMetricsCount() const;
@@ -130,17 +165,6 @@ public:
     void onBatchRetrievedDuringOplogApplying(const Milliseconds& elapsedTime);
 
 private:
-    struct MetricsComparer {
-        inline bool operator()(const InstanceObserver* a, const InstanceObserver* b) const {
-            auto aTime = a->getStartTimestamp();
-            auto bTime = b->getStartTimestamp();
-            if (aTime == bTime) {
-                return a->getUuid() < b->getUuid();
-            }
-            return aTime < bTime;
-        }
-    };
-    using MetricsSet = std::set<const InstanceObserver*, MetricsComparer>;
     using CoordinatorStateArray =
         std::array<AtomicWord<int64_t>, static_cast<size_t>(CoordinatorStateEnum::kNumStates)>;
     using DonorStateArray =
@@ -170,9 +194,11 @@ private:
     const RecipientStateArray* getStateArrayFor(RecipientStateEnum state) const;
 
     MetricsSet::iterator insertMetrics(const InstanceObserver* metrics, MetricsSet& set);
+    void deregisterMetrics(const Role& role, const MetricsSet::iterator& metrics);
 
     mutable Mutex _mutex;
     const std::string _rootSectionName;
+    std::unique_ptr<NameProvider> _fieldNames;
     std::vector<MetricsSet> _instanceMetricsForAllRoles;
     AtomicWord<bool> _operationWasAttempted;
 
@@ -191,8 +217,8 @@ private:
     AtomicWord<int64_t> _totalBatchRetrievedDuringCloneMillis{0};
     AtomicWord<int64_t> _oplogBatchApplied{0};
     AtomicWord<int64_t> _oplogBatchAppliedMillis{0};
-    AtomicWord<int64_t> _documentsCopied{0};
-    AtomicWord<int64_t> _bytesCopied{0};
+    AtomicWord<int64_t> _documentsProcessed{0};
+    AtomicWord<int64_t> _bytesWritten{0};
 
     AtomicWord<int64_t> _lastOpEndingChunkImbalance{0};
     AtomicWord<int64_t> _readsDuringCriticalSection{0};

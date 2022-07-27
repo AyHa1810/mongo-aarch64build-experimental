@@ -235,7 +235,7 @@ void assertCanWrite_inlock(OperationContext* opCtx, const NamespaceString& ns) {
 
 void makeCollection(OperationContext* opCtx, const NamespaceString& ns) {
     writeConflictRetry(opCtx, "implicit collection creation", ns.ns(), [&opCtx, &ns] {
-        AutoGetDb autoDb(opCtx, ns.db(), MODE_IX);
+        AutoGetDb autoDb(opCtx, ns.dbName(), MODE_IX);
         Lock::CollectionLock collLock(opCtx, ns, MODE_IX);
 
         assertCanWrite_inlock(opCtx, ns);
@@ -373,7 +373,11 @@ void insertDocuments(OperationContext* opCtx,
     hangAndFailAfterDocumentInsertsReserveOpTimes.executeIf(
         [&](const BSONObj& data) {
             hangAndFailAfterDocumentInsertsReserveOpTimes.pauseWhileSet(opCtx);
-            uasserted(51269, "hangAndFailAfterDocumentInsertsReserveOpTimes fail point enabled");
+            const auto skipFail = data["skipFail"];
+            if (!skipFail || !skipFail.boolean()) {
+                uasserted(51269,
+                          "hangAndFailAfterDocumentInsertsReserveOpTimes fail point enabled");
+            }
         },
         [&](const BSONObj& data) {
             // Check if the failpoint specifies no collection or matches the existing one.

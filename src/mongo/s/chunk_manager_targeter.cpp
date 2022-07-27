@@ -308,8 +308,8 @@ BSONObj ChunkManagerTargeter::extractBucketsShardKeyFromTimeseriesDoc(
             str::stream() << "'" << timeField
                           << "' must be present and contain a valid BSON UTC datetime value",
             !timeElement.eoo() && timeElement.type() == BSONType::Date);
-    auto roundedTimeValue = timeseries::roundTimestampToGranularity(
-        timeElement.date(), timeseriesOptions.getGranularity());
+    auto roundedTimeValue =
+        timeseries::roundTimestampToGranularity(timeElement.date(), timeseriesOptions);
     {
         BSONObjBuilder controlBuilder{builder.subobjStart(timeseries::kBucketControlFieldName)};
         {
@@ -616,7 +616,7 @@ std::vector<ShardEndpoint> ChunkManagerTargeter::targetAllShards(OperationContex
     // implies the collection is sharded, so we should always have a chunk manager.
     invariant(_cm.isSharded());
 
-    auto shardIds = Grid::get(opCtx)->shardRegistry()->getAllShardIdsNoReload();
+    auto shardIds = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
 
     std::vector<ShardEndpoint> endpoints;
     for (auto&& shardId : shardIds) {

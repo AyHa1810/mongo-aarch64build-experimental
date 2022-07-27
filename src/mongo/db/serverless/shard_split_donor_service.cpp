@@ -38,6 +38,7 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/tenant_migration_access_blocker_util.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
+#include "mongo/db/s/resharding/resharding_util.h"
 #include "mongo/db/serverless/shard_split_statistics.h"
 #include "mongo/db/serverless/shard_split_utils.h"
 #include "mongo/executor/cancelable_executor.h"
@@ -176,8 +177,7 @@ void ShardSplitDonorService::checkIfConflictsWithOtherInstances(
     OperationContext* opCtx,
     BSONObj initialState,
     const std::vector<const repl::PrimaryOnlyService::Instance*>& existingInstances) {
-    auto stateDoc =
-        ShardSplitDonorDocument::parse(IDLParserErrorContext("donorStateDoc"), initialState);
+    auto stateDoc = ShardSplitDonorDocument::parse(IDLParserContext("donorStateDoc"), initialState);
 
     for (auto& instance : existingInstances) {
         auto existingTypedInstance =
@@ -199,7 +199,7 @@ std::shared_ptr<repl::PrimaryOnlyService::Instance> ShardSplitDonorService::cons
     return std::make_shared<DonorStateMachine>(
         _serviceContext,
         this,
-        ShardSplitDonorDocument::parse(IDLParserErrorContext("donorStateDoc"), initialState));
+        ShardSplitDonorDocument::parse(IDLParserContext("donorStateDoc"), initialState));
 }
 
 void ShardSplitDonorService::abortAllSplits(OperationContext* opCtx) {
@@ -288,8 +288,7 @@ void ShardSplitDonorService::DonorStateMachine::tryForget() {
 
 void ShardSplitDonorService::DonorStateMachine::checkIfOptionsConflict(
     const BSONObj& stateDocBson) const {
-    auto stateDoc =
-        ShardSplitDonorDocument::parse(IDLParserErrorContext("donorStateDoc"), stateDocBson);
+    auto stateDoc = ShardSplitDonorDocument::parse(IDLParserContext("donorStateDoc"), stateDocBson);
 
     stdx::lock_guard<Latch> lg(_mutex);
     invariant(stateDoc.getId() == _stateDoc.getId());
@@ -329,13 +328,13 @@ SemiFuture<void> ShardSplitDonorService::DonorStateMachine::run(
     auto criticalSectionTimer = std::make_shared<Timer>();
     auto criticalSectionWithoutCatchupTimer = std::make_shared<Timer>();
 
-    _decisionPromise.setWith([&] {
-        const bool shouldRemoveStateDocumentOnRecipient = [&]() {
-            stdx::lock_guard<Latch> lg(_mutex);
-            auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
-            return serverless::shouldRemoveStateDocumentOnRecipient(opCtx.get(), _stateDoc);
-        }();
+    const bool shouldRemoveStateDocumentOnRecipient = [&]() {
+        auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
+        stdx::lock_guard<Latch> lg(_mutex);
+        return serverless::shouldRemoveStateDocumentOnRecipient(opCtx.get(), _stateDoc);
+    }();
 
+    _decisionPromise.setWith([&] {
         if (shouldRemoveStateDocumentOnRecipient) {
             pauseShardSplitBeforeRecipientCleanup.pauseWhileSet();
 
@@ -353,6 +352,11 @@ SemiFuture<void> ShardSplitDonorService::DonorStateMachine::run(
                 .unsafeToInlineFuture();
         }
 
+        LOGV2(6086506,
+              "Starting shard split.",
+              "id"_attr = _migrationId,
+              "timeout"_attr = repl::shardSplitTimeoutMS.load());
+
         auto isConfigValidWithStatus = [&]() {
             stdx::lock_guard<Latch> lg(_mutex);
             auto replCoord = repl::ReplicationCoordinator::get(cc().getServiceContext());
@@ -362,20 +366,15 @@ SemiFuture<void> ShardSplitDonorService::DonorStateMachine::run(
         }();
 
         if (!isConfigValidWithStatus.isOK()) {
+            stdx::lock_guard<Latch> lg(_mutex);
+
             LOGV2_ERROR(6395900,
                         "Failed to validate recipient nodes for shard split.",
                         "id"_attr = _migrationId,
                         "status"_attr = isConfigValidWithStatus);
-            return ExecutorFuture(
-                       **executor,
-                       DurableState{ShardSplitDonorStateEnum::kAborted, isConfigValidWithStatus})
-                .unsafeToInlineFuture();
-        }
 
-        LOGV2(6086506,
-              "Starting shard split.",
-              "id"_attr = _migrationId,
-              "timeout"_attr = repl::shardSplitTimeoutMS.load());
+            _abortReason = isConfigValidWithStatus;
+        }
 
         _initiateTimeout(executor, abortToken);
         return ExecutorFuture(**executor)
@@ -424,7 +423,8 @@ SemiFuture<void> ShardSplitDonorService::DonorStateMachine::run(
                 LOGV2(6236700,
                       "Shard split decision reached",
                       "id"_attr = _migrationId,
-                      "state"_attr = _stateDoc.getState());
+                      "state"_attr = ShardSplitDonorState_serializer(_stateDoc.getState()),
+                      "status"_attr = status);
 
                 {
                     stdx::lock_guard<Latch> lg(_mutex);
@@ -451,10 +451,33 @@ SemiFuture<void> ShardSplitDonorService::DonorStateMachine::run(
     });
 
     _completionPromise.setWith([&] {
+        if (shouldRemoveStateDocumentOnRecipient) {
+            return ExecutorFuture(**executor)
+                .then([&] { return _decisionPromise.getFuture().semi().ignoreValue(); })
+                .onCompletion(
+                    [this, executor, anchor = shared_from_this(), primaryToken](Status status) {
+                        if (!status.isOK()) {
+                            LOGV2_ERROR(6753100,
+                                        "Failed to cleanup the state document on recipient nodes",
+                                        "id"_attr = _migrationId,
+                                        "abortReason"_attr = _abortReason,
+                                        "status"_attr = status);
+                        } else {
+                            LOGV2(6753101,
+                                  "Successfully cleaned up the state document on recipient nodes.",
+                                  "id"_attr = _migrationId,
+                                  "abortReason"_attr = _abortReason,
+                                  "status"_attr = status);
+                        }
+                    })
+                .unsafeToInlineFuture();
+        }
+
         return ExecutorFuture(**executor)
             .then([&] { return _decisionPromise.getFuture().semi().ignoreValue(); })
             .onCompletion([this, executor, primaryToken](Status status) {
-                // Always remove the split config, whether the operation was aborted or committed.
+                // Always remove the split config, whether the operation was aborted or
+                // committed.
                 auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
                 pauseShardSplitBeforeSplitConfigRemoval.pauseWhileSetAndNotCanceled(opCtx.get(),
                                                                                     primaryToken);
@@ -589,15 +612,19 @@ ShardSplitDonorService::DonorStateMachine::_enterAbortIndexBuildsOrAbortedState(
     ShardSplitDonorStateEnum nextState;
     {
         stdx::lock_guard<Latch> lg(_mutex);
-        if (_stateDoc.getState() == ShardSplitDonorStateEnum::kAborted) {
+        if (_stateDoc.getState() == ShardSplitDonorStateEnum::kAborted || _abortReason) {
             if (isAbortedDocumentPersistent(lg, _stateDoc)) {
                 // Node has step up and created an instance using a document in abort state. No
                 // need to write the document as it already exists.
+                _abortReason = mongo::resharding::getStatusFromAbortReason(_stateDoc);
+
                 return ExecutorFuture(**executor);
             }
 
-            _abortReason =
-                Status(ErrorCodes::TenantMigrationAborted, "Aborted due to 'abortShardSplit'.");
+            if (!_abortReason) {
+                _abortReason =
+                    Status(ErrorCodes::TenantMigrationAborted, "Aborted due to 'abortShardSplit'.");
+            }
             BSONObjBuilder bob;
             _abortReason->serializeErrorToBSON(&bob);
             _stateDoc.setAbortReason(bob.obj());
@@ -893,16 +920,18 @@ ExecutorFuture<repl::OpTime> ShardSplitDonorService::DonorStateMachine::_updateS
     const ScopedTaskExecutorPtr& executor,
     const CancellationToken& token,
     ShardSplitDonorStateEnum nextState) {
-    auto [tenantIds, isInsert] = [&]() {
+    auto [tenantIds, isInsert, originalStateDocBson] = [&]() {
         stdx::lock_guard<Latch> lg(_mutex);
-        auto isInsert = _stateDoc.getState() == ShardSplitDonorStateEnum::kUninitialized ||
-            _stateDoc.getState() == ShardSplitDonorStateEnum::kAborted;
-        return std::make_pair(_stateDoc.getTenantIds(), isInsert);
+        auto currentState = _stateDoc.getState();
+        auto isInsert = currentState == ShardSplitDonorStateEnum::kUninitialized ||
+            currentState == ShardSplitDonorStateEnum::kAborted;
+        return std::make_tuple(_stateDoc.getTenantIds(), isInsert, _stateDoc.toBSON());
     }();
 
     return AsyncTry([this,
                      tenantIds = std::move(tenantIds),
                      isInsert = isInsert,
+                     originalStateDocBson = originalStateDocBson,
                      uuid = _migrationId,
                      nextState] {
                auto opCtxHolder = _cancelableOpCtxFactory->makeOperationContext(&cc());
@@ -937,7 +966,7 @@ ExecutorFuture<repl::OpTime> ShardSplitDonorService::DonorStateMachine::_updateS
 
                        // Reserve an opTime for the write.
                        auto oplogSlot = LocalOplogInfo::get(opCtx)->getNextOpTimes(opCtx, 1U)[0];
-                       {
+                       auto updatedStateDocBson = [&]() {
                            stdx::lock_guard<Latch> lg(_mutex);
                            _stateDoc.setState(nextState);
                            switch (nextState) {
@@ -962,27 +991,58 @@ ExecutorFuture<repl::OpTime> ShardSplitDonorService::DonorStateMachine::_updateS
                                default:
                                    MONGO_UNREACHABLE;
                            }
-                       }
+                           if (isInsert) {
+                               return BSON("$setOnInsert" << _stateDoc.toBSON());
+                           }
 
-                       const auto filter = BSON(ShardSplitDonorDocument::kIdFieldName << uuid);
-                       const auto updatedStateDocBson = [&]() {
-                           stdx::lock_guard<Latch> lg(_mutex);
-                           return BSON("$set" << _stateDoc.toBSON());
+                           return _stateDoc.toBSON();
                        }();
-                       auto updateResult = Helpers::upsert(opCtx,
-                                                           _stateDocumentsNS.ns(),
-                                                           filter,
-                                                           updatedStateDocBson,
-                                                           /*fromMigrate=*/false);
 
-                       if (isInsert) {
-                           invariant(!updateResult.existing);
-                           invariant(!updateResult.upsertedId.isEmpty());
-                       } else {
-                           invariant(updateResult.numDocsModified == 1);
-                       }
+                       auto updateOpTime = [&]() {
+                           if (isInsert) {
+                               const auto filter =
+                                   BSON(ShardSplitDonorDocument::kIdFieldName << uuid);
+                               auto updateResult = Helpers::upsert(opCtx,
+                                                                   _stateDocumentsNS,
+                                                                   filter,
+                                                                   updatedStateDocBson,
+                                                                   /*fromMigrate=*/false);
+
+                               // '$setOnInsert' update operator can never modify an existing
+                               // on-disk state doc.
+                               invariant(!updateResult.existing);
+                               invariant(!updateResult.numDocsModified);
+
+                               return repl::ReplClientInfo::forClient(opCtx->getClient())
+                                   .getLastOp();
+                           }
+
+                           const auto originalRecordId =
+                               Helpers::findOne(opCtx,
+                                                collection.getCollection(),
+                                                BSON("_id" << originalStateDocBson["_id"]));
+                           const auto originalSnapshot = Snapshotted<BSONObj>(
+                               opCtx->recoveryUnit()->getSnapshotId(), originalStateDocBson);
+                           invariant(!originalRecordId.isNull());
+
+                           CollectionUpdateArgs args;
+                           args.criteria = BSON("_id" << uuid);
+                           args.oplogSlots = {oplogSlot};
+                           args.update = updatedStateDocBson;
+
+                           collection->updateDocument(opCtx,
+                                                      originalRecordId,
+                                                      originalSnapshot,
+                                                      updatedStateDocBson,
+                                                      false,
+                                                      nullptr /* OpDebug* */,
+                                                      &args);
+
+                           return oplogSlot;
+                       }();
 
                        wuow.commit();
+                       return updateOpTime;
                    });
 
                return repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();

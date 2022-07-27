@@ -106,11 +106,8 @@ std::string EncryptedDBClientBase::getServerAddress() const {
     return _conn->getServerAddress();
 }
 
-bool EncryptedDBClientBase::call(Message& toSend,
-                                 Message& response,
-                                 bool assertOk,
-                                 std::string* actualServer) {
-    return _conn->call(toSend, response, assertOk, actualServer);
+void EncryptedDBClientBase::_call(Message& toSend, Message& response, std::string* actualServer) {
+    _conn->call(toSend, response, actualServer);
 }
 
 void EncryptedDBClientBase::say(Message& toSend, bool isRetry, std::string* actualServer) {
@@ -530,7 +527,7 @@ boost::optional<EncryptedFieldConfig> EncryptedDBClientBase::getEncryptedFieldCo
     if (efc.eoo() || !efc.isABSONObj()) {
         return boost::none;
     }
-    return EncryptedFieldConfig::parse(IDLParserErrorContext("encryptedFields"), efc.Obj());
+    return EncryptedFieldConfig::parse(IDLParserContext("encryptedFields"), efc.Obj());
 }
 
 void EncryptedDBClientBase::compact(JSContext* cx, JS::CallArgs args) {
@@ -677,7 +674,7 @@ SecureVector<uint8_t> EncryptedDBClientBase::getKeyMaterialFromDisk(const UUID& 
         uasserted(ErrorCodes::BadValue, "Invalid keyID.");
     }
 
-    auto keyStoreRecord = KeyStoreRecord::parse(IDLParserErrorContext("root"), dataKeyObj);
+    auto keyStoreRecord = KeyStoreRecord::parse(IDLParserContext("root"), dataKeyObj);
     if (dataKeyObj.hasField("version"_sd)) {
         uassert(ErrorCodes::BadValue,
                 "Invalid version, must be either 0 or undefined",
@@ -816,7 +813,7 @@ std::unique_ptr<DBClientBase> createEncryptedDBClientBase(std::unique_ptr<DBClie
                 arg.isObject());
 
         const BSONObj obj = mozjs::ValueWriter(cx, arg).toBSON();
-        encryptionOptions = encryptionOptions.parse(IDLParserErrorContext("root"), obj);
+        encryptionOptions = encryptionOptions.parse(IDLParserContext("root"), obj);
 
         // IDL does not perform a deep copy of BSONObjs when parsing, so we must get an
         // owned copy of the schemaMap.

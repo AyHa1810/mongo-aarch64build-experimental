@@ -56,8 +56,9 @@
 #include "mongo/db/index_build_entry_helpers.h"
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/multi_key_path_tracker.h"
-#include "mongo/db/op_observer_impl.h"
-#include "mongo/db/op_observer_registry.h"
+#include "mongo/db/op_observer/op_observer_impl.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
+#include "mongo/db/op_observer/oplog_writer_impl.h"
 #include "mongo/db/query/wildcard_multikey_paths.h"
 #include "mongo/db/repl/apply_ops.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
@@ -114,7 +115,7 @@ Status createIndexFromSpec(OperationContext* opCtx,
     // on this namespace would have a dangling Collection pointer after this function has run.
     invariant(!opCtx->lockState()->isCollectionLockedForMode(nss, MODE_IX));
 
-    AutoGetDb autoDb(opCtx, nsToDatabaseSubstring(ns), MODE_X);
+    AutoGetDb autoDb(opCtx, nss.dbName(), MODE_X);
     {
         WriteUnitOfWork wunit(opCtx);
         auto coll =
@@ -136,7 +137,8 @@ Status createIndexFromSpec(OperationContext* opCtx,
                               collection,
                               spec,
                               [opCtx, clock](const std::vector<BSONObj>& specs) -> Status {
-                                  if (opCtx->recoveryUnit()->getCommitTimestamp().isNull()) {
+                                  if (opCtx->writesAreReplicated() &&
+                                      opCtx->recoveryUnit()->getCommitTimestamp().isNull()) {
                                       return opCtx->recoveryUnit()->setTimestamp(
                                           clock->tickClusterTime(1).asTimestamp());
                                   }
@@ -166,8 +168,10 @@ Status createIndexFromSpec(OperationContext* opCtx,
                              collection.getWritableCollection(opCtx),
                              MultiIndexBlock::kNoopOnCreateEachFn,
                              MultiIndexBlock::kNoopOnCommitFn));
-    LogicalTime indexTs = clock->tickClusterTime(1);
-    ASSERT_OK(opCtx->recoveryUnit()->setTimestamp(indexTs.asTimestamp()));
+    if (opCtx->writesAreReplicated()) {
+        LogicalTime indexTs = clock->tickClusterTime(1);
+        ASSERT_OK(opCtx->recoveryUnit()->setTimestamp(indexTs.asTimestamp()));
+    }
     wunit.commit();
     abortOnExit.dismiss();
     return Status::OK();
@@ -300,7 +304,8 @@ public:
         repl::ReplClientInfo::forClient(_opCtx->getClient()).clearLastOp();
 
         auto registry = std::make_unique<OpObserverRegistry>();
-        registry->addObserver(std::make_unique<OpObserverImpl>());
+        registry->addObserver(
+            std::make_unique<OpObserverImpl>(std::make_unique<OplogWriterImpl>()));
         _opCtx->getServiceContext()->setOpObserver(std::move(registry));
 
         repl::createOplog(_opCtx);
@@ -354,7 +359,8 @@ public:
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
             auto db = autoColl.ensureDbExists(_opCtx);
             WriteUnitOfWork wunit(_opCtx);
-            if (_opCtx->recoveryUnit()->getCommitTimestamp().isNull()) {
+            if (_opCtx->writesAreReplicated() &&
+                _opCtx->recoveryUnit()->getCommitTimestamp().isNull()) {
                 ASSERT_OK(_opCtx->recoveryUnit()->setTimestamp(Timestamp(1, 1)));
             }
             invariant(db->createCollection(_opCtx, nss));
@@ -485,7 +491,7 @@ public:
     Timestamp getTopOfOplog() {
         OneOffRead oor(_opCtx, Timestamp::min());
         BSONObj ret;
-        ASSERT_TRUE(Helpers::getLast(_opCtx, NamespaceString::kRsOplogNamespace.ns().c_str(), ret));
+        ASSERT_TRUE(Helpers::getLast(_opCtx, NamespaceString::kRsOplogNamespace, ret));
         return ret["ts"].timestamp();
     }
 
@@ -498,7 +504,7 @@ public:
         OneOffRead oor(_opCtx, ts);
 
         auto doc =
-            repl::MinValidDocument::parse(IDLParserErrorContext("MinValidDocument"), findOne(coll));
+            repl::MinValidDocument::parse(IDLParserContext("MinValidDocument"), findOne(coll));
         ASSERT_EQ(expectedDoc.getMinValidTimestamp(), doc.getMinValidTimestamp())
             << "minValid timestamps weren't equal at " << ts.toString()
             << ". Expected: " << expectedDoc.toBSON() << ". Found: " << doc.toBSON();
@@ -856,7 +862,7 @@ TEST_F(StorageTimestampTest, SecondaryInsertTimes) {
         OneOffRead oor(_opCtx, firstInsertTime.addTicks(idx).asTimestamp());
 
         BSONObj result;
-        ASSERT(Helpers::getLast(_opCtx, nss.ns().c_str(), result)) << " idx is " << idx;
+        ASSERT(Helpers::getLast(_opCtx, nss, result)) << " idx is " << idx;
         ASSERT_EQ(0, SimpleBSONObjComparator::kInstance.compare(result, BSON("_id" << idx)))
             << "Doc: " << result.toString() << " Expected: " << BSON("_id" << idx);
     }
@@ -914,7 +920,7 @@ TEST_F(StorageTimestampTest, SecondaryArrayInsertTimes) {
         OneOffRead oor(_opCtx, firstInsertTime.addTicks(idx).asTimestamp());
 
         BSONObj result;
-        ASSERT(Helpers::getLast(_opCtx, nss.ns().c_str(), result)) << " idx is " << idx;
+        ASSERT(Helpers::getLast(_opCtx, nss, result)) << " idx is " << idx;
         ASSERT_EQ(0, SimpleBSONObjComparator::kInstance.compare(result, BSON("_id" << idx)))
             << "Doc: " << result.toString() << " Expected: " << BSON("_id" << idx);
     }
@@ -1357,7 +1363,7 @@ TEST_F(StorageTimestampTest, PrimaryCreateCollectionInApplyOps) {
     { ASSERT(AutoGetCollectionForReadCommand(_opCtx, nss).getCollection()); }
 
     BSONObj result;
-    ASSERT(Helpers::getLast(_opCtx, NamespaceString::kRsOplogNamespace.toString().c_str(), result));
+    ASSERT(Helpers::getLast(_opCtx, NamespaceString::kRsOplogNamespace, result));
     repl::OplogEntry op(result);
     ASSERT(op.getOpType() == repl::OpTypeEnum::kCommand) << op.toBSONForLogging();
     // The next logOp() call will get 'futureTs', which will be the timestamp at which we do
@@ -1664,6 +1670,7 @@ TEST_F(StorageTimestampTest, PrimarySetIndexMultikeyOnInsert) {
 
 TEST_F(StorageTimestampTest, PrimarySetIndexMultikeyOnInsertUnreplicated) {
     // Use an unreplicated collection.
+    repl::UnreplicatedWritesBlock noRep(_opCtx);
     NamespaceString nss("unittests.system.profile");
     create(nss);
 
@@ -2779,7 +2786,7 @@ TEST_F(StorageTimestampTest, IndexBuildsResolveErrorsDuringStateChangeToPrimary)
 
     // Update one documents to be valid, and delete the other. These modifications are written
     // to the side writes table and must be drained.
-    Helpers::upsert(_opCtx, collection->ns().ns(), BSON("_id" << 0 << "a" << 1 << "b" << 1));
+    Helpers::upsert(_opCtx, collection->ns(), BSON("_id" << 0 << "a" << 1 << "b" << 1));
     {
         RecordId badRecord = Helpers::findOne(_opCtx, collection.get(), BSON("_id" << 1));
         WriteUnitOfWork wuow(_opCtx);

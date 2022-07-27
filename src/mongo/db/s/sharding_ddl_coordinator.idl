@@ -50,9 +50,10 @@ enums:
             kCreateCollection: "createCollection_V2"
             kRefineCollectionShardKey: "refineCollectionShardKey"
             kSetAllowMigrations: "setAllowMigrations"
-            kCollMod: "collMod_V2"
+            kCollMod: "collMod_V3"
+            # TODO SERVER-68008: Remove once 7.0 becomes last LTS
+            kCollModPre61Compatible: "collMod_V2" 
             kReshardCollection: "reshardCollection"
-            kReshardCollectionNoResilient: "reshardCollectionNoResilient"
             kCompactStructuredEncryptionData: "compactStructuredEncryptionData"
 
 types:
@@ -111,4 +112,8 @@ structs:
                 optional: true
             session:
                 type: ShardingDDLSession
+                optional: true
+            bucketNss:
+                description: "In case of sharded timeseries this variable will hold the underlying bucket namespace"
+                type: namespacestring
                 optional: true

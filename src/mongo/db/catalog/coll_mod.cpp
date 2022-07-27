@@ -48,7 +48,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_builds_coordinator.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/database_sharding_state.h"
@@ -62,8 +62,8 @@
 #include "mongo/idl/command_generic_argument.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/overloaded_visitor.h"
 #include "mongo/util/version/releases.h"
-#include "mongo/util/visit_helper.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
@@ -159,13 +159,7 @@ StatusWith<std::pair<ParsedCollModRequest, BSONObj>> parseCollModRequest(Operati
     }
 
     if (cmr.getCappedSize() || cmr.getCappedMax()) {
-        // TODO (SERVER-64042): Remove FCV check once 6.1 is released.
-        if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-            serverGlobalParams.featureCompatibility.isLessThan(
-                multiversion::FeatureCompatibilityVersion::kVersion_6_0)) {
-            return {ErrorCodes::InvalidOptions,
-                    "Cannot change the size limits of a capped collection."};
-        } else if (!coll->isCapped()) {
+        if (!coll->isCapped()) {
             return {ErrorCodes::InvalidOptions, "Collection must be capped."};
         } else if (coll->ns().isOplog()) {
             return {ErrorCodes::InvalidOptions,
@@ -522,7 +516,7 @@ StatusWith<std::pair<ParsedCollModRequest, BSONObj>> parseCollModRequest(Operati
         }
 
         auto status = stdx::visit(
-            visit_helper::Overloaded{
+            OverloadedVisitor{
                 [&oplogEntryBuilder](const std::string& value) -> Status {
                     if (value != "off") {
                         return {ErrorCodes::InvalidOptions,
@@ -548,7 +542,7 @@ StatusWith<std::pair<ParsedCollModRequest, BSONObj>> parseCollModRequest(Operati
     if (auto& timeseries = cmr.getTimeseries()) {
         parsed.numModifications++;
         if (!isTimeseries) {
-            return getOnlySupportedOnTimeseriesError(CollMod::kIsTimeseriesNamespaceFieldName);
+            return getOnlySupportedOnTimeseriesError(CollMod::kTimeseriesFieldName);
         }
 
         BSONObjBuilder subObjBuilder(oplogEntryBuilder.subobjStart(CollMod::kTimeseriesFieldName));
@@ -579,7 +573,7 @@ void _setClusteredExpireAfterSeconds(
     boost::optional<int64_t> oldExpireAfterSeconds = oldCollOptions.expireAfterSeconds;
 
     stdx::visit(
-        visit_helper::Overloaded{
+        OverloadedVisitor{
             [&](const std::string& newExpireAfterSeconds) {
                 invariant(newExpireAfterSeconds == "off");
                 if (!oldExpireAfterSeconds) {
@@ -770,7 +764,7 @@ Status _collModInternal(OperationContext* opCtx,
 
     // This is necessary to set up CurOp, update the Top stats, and check shard version if the
     // operation is not on a view.
-    OldClientContext ctx(opCtx, nss.ns(), !view);
+    OldClientContext ctx(opCtx, nss, !view);
 
     bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
         !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss);
@@ -838,30 +832,17 @@ Status _collModInternal(OperationContext* opCtx,
 
         const CollectionOptions& oldCollOptions = coll->getCollectionOptions();
 
-        // TODO SERVER-58584: remove the feature flag.
-        if (feature_flags::gFeatureFlagChangeStreamPreAndPostImages.isEnabled(
-                serverGlobalParams.featureCompatibility)) {
-            // If 'changeStreamPreAndPostImagesOptions' are enabled, 'recordPreImages' must be set
-            // to false. If 'recordPreImages' is set to true, 'changeStreamPreAndPostImagesOptions'
-            // must be disabled.
-            if (cmrNew.changeStreamPreAndPostImagesOptions &&
-                cmrNew.changeStreamPreAndPostImagesOptions->getEnabled()) {
-                cmrNew.recordPreImages = false;
-            }
-
-            if (cmrNew.recordPreImages) {
-                cmrNew.changeStreamPreAndPostImagesOptions =
-                    ChangeStreamPreAndPostImagesOptions(false);
-            }
-        } else {
-            // If the FCV has changed while executing the command to the version, where the feature
-            // flag is disabled, specifying changeStreamPreAndPostImagesOptions is not allowed.
-            if (cmrNew.changeStreamPreAndPostImagesOptions) {
-                return Status(ErrorCodes::InvalidOptions,
-                              "The 'changeStreamPreAndPostImages' is an unknown field.");
-            }
+        // If 'changeStreamPreAndPostImagesOptions' are enabled, 'recordPreImages' must be set
+        // to false. If 'recordPreImages' is set to true, 'changeStreamPreAndPostImagesOptions'
+        // must be disabled.
+        if (cmrNew.changeStreamPreAndPostImagesOptions &&
+            cmrNew.changeStreamPreAndPostImagesOptions->getEnabled()) {
+            cmrNew.recordPreImages = false;
         }
 
+        if (cmrNew.recordPreImages) {
+            cmrNew.changeStreamPreAndPostImagesOptions = ChangeStreamPreAndPostImagesOptions(false);
+        }
         if (cmrNew.cappedSize || cmrNew.cappedMax) {
             // If the current capped collection size exceeds the newly set limits, future document
             // inserts will prompt document deletion.

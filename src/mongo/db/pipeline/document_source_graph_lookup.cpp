@@ -44,8 +44,8 @@
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
+#include "mongo/db/pipeline/sort_reorder_helpers.h"
 #include "mongo/db/query/query_knobs_gen.h"
-#include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/logv2/log.h"
 
@@ -211,9 +211,7 @@ void DocumentSourceGraphLookUp::doDispose() {
 }
 
 bool DocumentSourceGraphLookUp::foreignShardedGraphLookupAllowed() const {
-    return feature_flags::gFeatureFlagShardedLookup.isEnabled(
-               serverGlobalParams.featureCompatibility) &&
-        !pExpCtx->opCtx->inMultiDocumentTransaction();
+    return !pExpCtx->opCtx->inMultiDocumentTransaction();
 }
 
 boost::optional<DocumentSource::DistributedPlanLogic>
@@ -498,11 +496,6 @@ void DocumentSourceGraphLookUp::performSearch() {
             staleInfo->getVersionWanted() != ChunkVersion::UNSHARDED()) {
             uassert(3904801,
                     "Cannot run $graphLookup with a sharded foreign collection in a transaction",
-                    !feature_flags::gFeatureFlagShardedLookup.isEnabled(
-                        serverGlobalParams.featureCompatibility) ||
-                        !pExpCtx->opCtx->inMultiDocumentTransaction());
-            uassert(31428,
-                    "Cannot run $graphLookup with sharded foreign collection",
                     foreignShardedGraphLookupAllowed());
         }
         throw;
@@ -510,7 +503,7 @@ void DocumentSourceGraphLookUp::performSearch() {
 }
 
 DocumentSource::GetModPathsReturn DocumentSourceGraphLookUp::getModifiedPaths() const {
-    std::set<std::string> modifiedPaths{_as.fullPath()};
+    OrderedPathSet modifiedPaths{_as.fullPath()};
     if (_unwind) {
         auto pathsModifiedByUnwind = _unwind.get()->getModifiedPaths();
         invariant(pathsModifiedByUnwind.type == GetModPathsReturn::Type::kFiniteSet);
@@ -518,6 +511,31 @@ DocumentSource::GetModPathsReturn DocumentSourceGraphLookUp::getModifiedPaths() 
                              pathsModifiedByUnwind.paths.end());
     }
     return {GetModPathsReturn::Type::kFiniteSet, std::move(modifiedPaths), {}};
+}
+
+StageConstraints DocumentSourceGraphLookUp::constraints(Pipeline::SplitState pipeState) const {
+    // If we are in a mongos, graphLookup on sharded foreign collections is allowed, and the foreign
+    // collection is sharded, then the host type requirement is mongos or a shard. Otherwise, it's
+    // the primary shard.
+    HostTypeRequirement hostRequirement =
+        (pExpCtx->inMongos && pExpCtx->mongoProcessInterface->isSharded(pExpCtx->opCtx, _from) &&
+         foreignShardedGraphLookupAllowed())
+        ? HostTypeRequirement::kNone
+        : HostTypeRequirement::kPrimaryShard;
+
+    StageConstraints constraints(StreamType::kStreaming,
+                                 PositionRequirement::kNone,
+                                 hostRequirement,
+                                 DiskUseRequirement::kNoDiskUse,
+                                 FacetRequirement::kAllowed,
+                                 TransactionRequirement::kAllowed,
+                                 LookupRequirement::kAllowed,
+                                 UnionRequirement::kAllowed);
+
+    constraints.canSwapWithMatch = true;
+    constraints.canSwapWithSkippingOrLimitingStage = !_unwind;
+
+    return constraints;
 }
 
 Pipeline::SourceContainer::iterator DocumentSourceGraphLookUp::doOptimizeAt(
@@ -536,6 +554,16 @@ Pipeline::SourceContainer::iterator DocumentSourceGraphLookUp::doOptimizeAt(
         container->erase(std::next(itr));
         return itr;
     }
+
+    // If the following stage is $sort and there is no internal $unwind, consider pushing it ahead
+    // of $graphLookup.
+    if (!_unwind) {
+        itr = tryReorderingWithSort(itr, container);
+        if (*itr != this) {
+            return itr;
+        }
+    }
+
     return std::next(itr);
 }
 

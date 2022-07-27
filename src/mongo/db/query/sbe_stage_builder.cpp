@@ -694,6 +694,7 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
 
     return {std::move(stage), std::move(outputs)};
 }
+
 namespace {
 std::unique_ptr<sbe::EExpression> abtToExpr(optimizer::ABT& abt, optimizer::SlotVarMap& slotMap) {
     auto env = optimizer::VariableEnvironment::build(abt);
@@ -729,8 +730,8 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
 
     PlanStageSlots outputs;
 
-    auto recordSlot = _slotIdGenerator.generate();
-    outputs.set(kResult, recordSlot);
+    auto reconstructedRecordSlot = _slotIdGenerator.generate();
+    outputs.set(kResult, reconstructedRecordSlot);
 
     boost::optional<sbe::value::SlotId> ridSlot;
 
@@ -742,14 +743,17 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
     auto fieldSlotIds = _slotIdGenerator.generateMultiple(csn->allFields.size());
     auto rowStoreSlot = _slotIdGenerator.generate();
     auto emptyExpr = sbe::makeE<sbe::EFunction>("newObj", sbe::EExpression::Vector{});
-    std::vector<std::unique_ptr<sbe::EExpression>> pathExprs;
-    for (size_t remaining = csn->allFields.size(); remaining > 0; remaining--) {
-        pathExprs.emplace_back(emptyExpr->clone());
-    }
 
     std::string rootStr = "rowStoreRoot";
     optimizer::FieldMapBuilder builder(rootStr, true);
-    for (const std::string& field : csn->allFields) {
+
+    // When building its output document (in 'recordSlot'), the 'ColumnStoreStage' should not try to
+    // separately project both a document and its sub-fields (e.g., both 'a' and 'a.b'). Compute the
+    // subset of 'csn->allFields' that only includes a field if no other field in 'csn->allFields'
+    // is its prefix.
+    auto fieldsToProject =
+        DepsTracker::simplifyDependencies(csn->allFields, DepsTracker::TruncateToRootLevel::no);
+    for (const std::string& field : fieldsToProject) {
         builder.integrateFieldPath(FieldPath(field),
                                    [](const bool isLastElement, optimizer::FieldMapEntry& entry) {
                                        entry._hasLeadingObj = true;
@@ -757,41 +761,38 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
                                    });
     }
 
-    // Generate expression that reconstructs the whole object (runs against the row store bson for
-    // now).
+    // Generate the expression that is applied to the row store record (in the case when the result
+    // cannot be reconstructed from the index).
     optimizer::SlotVarMap slotMap{};
     slotMap[rootStr] = rowStoreSlot;
     auto abt = builder.generateABT();
-    auto exprOut = abt ? abtToExpr(*abt, slotMap) : emptyExpr->clone();
+    auto rowStoreExpr = abt ? abtToExpr(*abt, slotMap) : emptyExpr->clone();
+
     std::unique_ptr<sbe::PlanStage> stage = std::make_unique<sbe::ColumnScanStage>(
         getCurrentCollection(reqs)->uuid(),
         csn->indexEntry.catalogName,
-        fieldSlotIds,
         std::vector<std::string>{csn->allFields.begin(), csn->allFields.end()},
-        recordSlot,
         ridSlot,
-        std::move(exprOut),
-        std::move(pathExprs),
+        reconstructedRecordSlot,
         rowStoreSlot,
+        std::move(rowStoreExpr),
         _yieldPolicy,
         csn->nodeId());
 
     // Generate post assembly filter.
     if (csn->postAssemblyFilter) {
-        auto relevantSlots = sbe::makeSV(recordSlot);
+        auto relevantSlots = sbe::makeSV(reconstructedRecordSlot);
         if (ridSlot) {
             relevantSlots.push_back(*ridSlot);
         }
-        relevantSlots.insert(relevantSlots.end(), fieldSlotIds.begin(), fieldSlotIds.end());
 
         auto [_, outputStage] = generateFilter(_state,
                                                csn->postAssemblyFilter.get(),
                                                {std::move(stage), std::move(relevantSlots)},
-                                               recordSlot,
+                                               reconstructedRecordSlot,
                                                csn->nodeId());
         stage = std::move(outputStage.stage);
     }
-
     return {std::move(stage), std::move(outputs)};
 }
 
@@ -1494,7 +1495,7 @@ SlotBasedStageBuilder::buildProjectionSimple(const QuerySolutionNode* root,
                                                    childResult,
                                                    sbe::MakeBsonObjStage::FieldBehavior::keep,
                                                    pn->proj.getRequiredFields(),
-                                                   std::set<std::string>{},
+                                                   OrderedPathSet{},
                                                    sbe::value::SlotVector{},
                                                    true,
                                                    false,

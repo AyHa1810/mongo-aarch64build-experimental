@@ -49,7 +49,7 @@ Status ProfileCmdBase::checkAuthForCommand(Client* client,
                                            const BSONObj& cmdObj) const {
     AuthorizationSession* authzSession = AuthorizationSession::get(client);
 
-    auto request = ProfileCmdRequest::parse(IDLParserErrorContext("profile"), cmdObj);
+    auto request = ProfileCmdRequest::parse(IDLParserContext("profile"), cmdObj);
     const auto profilingLevel = request.getCommandParameter();
 
     if (profilingLevel < 0 && !request.getSlowms() && !request.getSampleRate()) {
@@ -71,7 +71,7 @@ bool ProfileCmdBase::run(OperationContext* opCtx,
                          const std::string& dbName,
                          const BSONObj& cmdObj,
                          BSONObjBuilder& result) {
-    auto request = ProfileCmdRequest::parse(IDLParserErrorContext("profile"), cmdObj);
+    auto request = ProfileCmdRequest::parse(IDLParserContext("profile"), cmdObj);
     const auto profilingLevel = request.getCommandParameter();
 
     // Validate arguments before making changes.
@@ -81,7 +81,7 @@ bool ProfileCmdBase::run(OperationContext* opCtx,
                 *sampleRate >= 0.0 && *sampleRate <= 1.0);
     }
 
-    // TODO SERVER-66561: For _applyProfilingLevel, takes the passed in "const DatabaseName& dbName"
+    // TODO SERVER-67459: For _applyProfilingLevel, takes the passed in "const DatabaseName& dbName"
     // directly.
     // Delegate to _applyProfilingLevel to set the profiling level appropriately whether
     // we are on mongoD or mongoS.
@@ -124,7 +124,7 @@ bool ProfileCmdBase::run(OperationContext* opCtx,
         }
         attrs.add("from", oldState.obj());
 
-        // TODO SERVER-66561: For getDatabaseProfileSettings, takes the passed in "const
+        // TODO SERVER-67459: For getDatabaseProfileSettings, takes the passed in "const
         // DatabaseName& dbName" directly.
 
         // newSettings.level may differ from profilingLevel: profilingLevel is part of the request,

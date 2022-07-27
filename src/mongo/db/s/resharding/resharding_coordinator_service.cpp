@@ -980,9 +980,10 @@ std::shared_ptr<repl::PrimaryOnlyService::Instance> ReshardingCoordinatorService
     BSONObj initialState) {
     return std::make_shared<ReshardingCoordinator>(
         this,
-        ReshardingCoordinatorDocument::parse(IDLParserErrorContext("ReshardingCoordinatorStateDoc"),
+        ReshardingCoordinatorDocument::parse(IDLParserContext("ReshardingCoordinatorStateDoc"),
                                              std::move(initialState)),
-        std::make_shared<ReshardingCoordinatorExternalStateImpl>());
+        std::make_shared<ReshardingCoordinatorExternalStateImpl>(),
+        _serviceContext);
 }
 
 ExecutorFuture<void> ReshardingCoordinatorService::_rebuildService(
@@ -1028,11 +1029,13 @@ void ReshardingCoordinatorService::abortAllReshardCollection(OperationContext* o
 ReshardingCoordinatorService::ReshardingCoordinator::ReshardingCoordinator(
     const ReshardingCoordinatorService* coordinatorService,
     const ReshardingCoordinatorDocument& coordinatorDoc,
-    std::shared_ptr<ReshardingCoordinatorExternalState> externalState)
+    std::shared_ptr<ReshardingCoordinatorExternalState> externalState,
+    ServiceContext* serviceContext)
     : PrimaryOnlyService::TypedInstance<ReshardingCoordinator>(),
       _id(coordinatorDoc.getReshardingUUID().toBSON()),
       _coordinatorService(coordinatorService),
-      _metrics{ReshardingMetrics::initializeFrom(coordinatorDoc, getGlobalServiceContext())},
+      _serviceContext(serviceContext),
+      _metrics{ReshardingMetrics::initializeFrom(coordinatorDoc, _serviceContext)},
       _metadata(coordinatorDoc.getCommonReshardingMetadata()),
       _coordinatorDoc(coordinatorDoc),
       _markKilledExecutor(std::make_shared<ThreadPool>([] {
@@ -1129,6 +1132,7 @@ ReshardingCoordinatorService::ReshardingCoordinator::_tellAllParticipantsReshard
                        _cancelableOpCtxFactory.emplace(_ctHolder->getStepdownToken(),
                                                        _markKilledExecutor);
                    })
+                   .then([this] { return _waitForMajority(_ctHolder->getStepdownToken()); })
                    .then([this, executor]() {
                        pauseBeforeTellDonorToRefresh.pauseWhileSet();
                        _establishAllDonorsAsParticipants(executor);
@@ -1159,8 +1163,7 @@ ExecutorFuture<void> ReshardingCoordinatorService::ReshardingCoordinator::_initi
     return resharding::WithAutomaticRetry([this, executor] {
                return ExecutorFuture<void>(**executor)
                    .then([this, executor] { _insertCoordDocAndChangeOrigCollEntry(); })
-                   .then([this, executor] { _calculateParticipantsAndChunksThenWriteToDisk(); })
-                   .then([this] { return _waitForMajority(_ctHolder->getAbortToken()); });
+                   .then([this, executor] { _calculateParticipantsAndChunksThenWriteToDisk(); });
            })
         .onTransientError([](const Status& status) {
             LOGV2(5093703,
@@ -1364,8 +1367,15 @@ SemiFuture<void> ReshardingCoordinatorService::ReshardingCoordinator::run(
         })
         .onCompletion([this, executor](Status status) {
             auto opCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
-            reshardingPauseCoordinatorBeforeCompletion.pauseWhileSetAndNotCanceled(
-                opCtx.get(), _ctHolder->getStepdownToken());
+            reshardingPauseCoordinatorBeforeCompletion.executeIf(
+                [&](const BSONObj&) {
+                    reshardingPauseCoordinatorBeforeCompletion.pauseWhileSetAndNotCanceled(
+                        opCtx.get(), _ctHolder->getStepdownToken());
+                },
+                [&](const BSONObj& data) {
+                    auto ns = data.getStringField("sourceNamespace");
+                    return ns.empty() ? true : ns.toString() == _coordinatorDoc.getSourceNss().ns();
+                });
 
             {
                 auto lg = stdx::lock_guard(_fulfillmentMutex);

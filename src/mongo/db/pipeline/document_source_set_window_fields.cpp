@@ -41,7 +41,7 @@
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/sort_pattern.h"
-#include "mongo/util/visit_helper.h"
+#include "mongo/util/overloaded_visitor.h"
 
 using boost::intrusive_ptr;
 using boost::optional;
@@ -93,8 +93,7 @@ list<intrusive_ptr<DocumentSource>> document_source_set_window_fields::createFro
                           << typeName(elem.type()),
             elem.type() == BSONType::Object);
 
-    auto spec =
-        SetWindowFieldsSpec::parse(IDLParserErrorContext(kStageName), elem.embeddedObject());
+    auto spec = SetWindowFieldsSpec::parse(IDLParserContext(kStageName), elem.embeddedObject());
     auto partitionBy = [&]() -> boost::optional<boost::intrusive_ptr<Expression>> {
         if (auto partitionBy = spec.getPartitionBy())
             return Expression::parseOperand(
@@ -330,8 +329,7 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceInternalSetWindowFields::crea
                           << typeName(elem.type()),
             elem.type() == BSONType::Object);
 
-    auto spec =
-        SetWindowFieldsSpec::parse(IDLParserErrorContext(kStageName), elem.embeddedObject());
+    auto spec = SetWindowFieldsSpec::parse(IDLParserContext(kStageName), elem.embeddedObject());
     auto partitionBy = [&]() -> boost::optional<boost::intrusive_ptr<Expression>> {
         if (auto partitionBy = spec.getPartitionBy())
             return Expression::parseOperand(

@@ -46,7 +46,7 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/index/wildcard_key_generator.h"
 #include "mongo/db/index_build_entry_helpers.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/cloner_utils.h"
 #include "mongo/db/repl/member_state.h"
@@ -189,6 +189,11 @@ void removeIndexBuildEntryAfterCommitOrAbort(OperationContext* opCtx,
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     if (!replCoord->canAcceptWritesFor(opCtx, dbAndUUID)) {
         return;
+    }
+
+    if (replCoord->getSettings().shouldRecoverFromOplogAsStandalone()) {
+        // TODO SERVER-60753: Remove this mixed-mode write.
+        opCtx->recoveryUnit()->allowUntimestampedWrite();
     }
 
     auto status = indexbuildentryhelpers::removeIndexBuildEntry(
@@ -361,8 +366,7 @@ repl::OpTime getLatestOplogOpTime(OperationContext* opCtx) {
     // exceptions and we must protect it from unanticipated write conflicts from reads.
     writeConflictRetry(
         opCtx, "getLatestOplogOpTime", NamespaceString::kRsOplogNamespace.ns(), [&]() {
-            invariant(Helpers::getLast(
-                opCtx, NamespaceString::kRsOplogNamespace.ns().c_str(), oplogEntryBSON));
+            invariant(Helpers::getLast(opCtx, NamespaceString::kRsOplogNamespace, oplogEntryBSON));
         });
 
     auto optime = repl::OpTime::parseFromOplogEntry(oplogEntryBSON);
@@ -546,6 +550,10 @@ Status IndexBuildsCoordinator::_startIndexBuildForRecovery(OperationContext* opC
 
     CollectionWriter collection(opCtx, nss);
     {
+        // TODO SERVER-64760: Remove this usage of `allowUntimestampedWrite`. We often have a valid
+        // timestamp for this write, but the callers of this function don't pass it through.
+        opCtx->recoveryUnit()->allowUntimestampedWrite();
+
         // These steps are combined into a single WUOW to ensure there are no commits without
         // the indexes.
         // 1) Drop all unfinished indexes.
@@ -1881,6 +1889,12 @@ Status IndexBuildsCoordinator::_setUpIndexBuildForTwoPhaseRecovery(
     const UUID& buildUUID) {
     NamespaceStringOrUUID nssOrUuid{dbName.toString(), collectionUUID};
 
+    if (opCtx->recoveryUnit()->isActive()) {
+        // This function is shared by multiple callers. Some of which have opened a transaction to
+        // perform reads. This function may make mixed-mode writes. Mixed-mode assertions can only
+        // be suppressed when beginning a fresh transaction.
+        opCtx->recoveryUnit()->abandonSnapshot();
+    }
     // Don't use the AutoGet helpers because they require an open database, which may not be the
     // case when an index builds is restarted during recovery.
 
@@ -2058,6 +2072,10 @@ IndexBuildsCoordinator::PostSetupAction IndexBuildsCoordinator::_setUpIndexBuild
     options.protocol = replState->protocol;
 
     try {
+        // TODO SERVER-64760: Remove this usage of `allowUntimestampedWrite`. There are cases where
+        // a timestamp is available to use, but the information is not passed through.
+        opCtx->recoveryUnit()->allowUntimestampedWrite();
+
         if (!replSetAndNotPrimary) {
             // On standalones and primaries, call setUpIndexBuild(), which makes the initial catalog
             // write. On primaries, this replicates the startIndexBuild oplog entry.
@@ -2535,7 +2553,7 @@ void IndexBuildsCoordinator::_buildIndex(OperationContext* opCtx,
 void IndexBuildsCoordinator::_scanCollectionAndInsertSortedKeysIntoIndex(
     OperationContext* opCtx,
     std::shared_ptr<ReplIndexBuildState> replState,
-    boost::optional<RecordId> resumeAfterRecordId) {
+    const boost::optional<RecordId>& resumeAfterRecordId) {
     // Collection scan and insert into index.
     {
         indexBuildsSSS.scanCollection.addAndFetch(1);
@@ -2682,9 +2700,10 @@ IndexBuildsCoordinator::CommitResult IndexBuildsCoordinator::_insertKeysFromSide
         hangIndexBuildBeforeCommit.pauseWhileSet();
     }
 
-    // TODO SERVER-67437 Once ReplIndexBuildState holds DatabaseName, use dbName directly for lock
+    // TODO SERVER-67437 Once ReplIndexBuildState holds DatabaseName, use dbName directly for
+    // lock
     DatabaseName dbName(boost::none, replState->dbName);
-    Lock::DBLock autoDb(opCtx, dbName, MODE_IX);
+    AutoGetDb autoDb(opCtx, dbName, MODE_IX);
 
     // Unlock RSTL to avoid deadlocks with prepare conflicts and state transitions caused by waiting
     // for a a strong collection lock. See SERVER-42621.
@@ -2762,12 +2781,6 @@ IndexBuildsCoordinator::CommitResult IndexBuildsCoordinator::_insertKeysFromSide
     try {
         failIndexBuildOnCommit.execute(
             [](const BSONObj&) { uasserted(4698903, "index build aborted due to failpoint"); });
-
-        {
-            auto dss = DatabaseShardingState::get(opCtx, replState->dbName);
-            auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, dss);
-            dss->checkDbVersion(opCtx, dssLock);
-        }
 
         // If we are no longer primary and a single phase index build started as primary attempts to
         // commit, trigger a self-abort.

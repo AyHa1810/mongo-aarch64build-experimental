@@ -114,8 +114,8 @@ TEST(IntervalIntersection, SingleFieldIntersection) {
          "    BindBlock:\n"
          "        [rid_0]\n"
          "            Source []\n"},
-        {"{$or: [{$and: [{a0: {$gt:9}}, {a0: {$lt: 12}}]}, {$and: [{a0: {$gt:40}}, {a0: {$lt: "
-         "44}}]}]}",
+        {"{$or: [{$and: [{a0: {$gt:9, $lt:999}}, {a0: {$gt: 0, $lt: 12}}]},"
+         "       {$and: [{a0: {$gt:40, $lt:997}}, {a0: {$gt:0, $lt: 44}}]}]}",
          "Root []\n"
          "|   |   projections: \n"
          "|   |       scan_0\n"
@@ -383,10 +383,10 @@ TEST(IntervalIntersection, VariableIntervals) {
                 IntervalReqExpr::make<IntervalReqExpr::Conjunction>(IntervalReqExpr::NodeVector{
                     IntervalReqExpr::make<IntervalReqExpr::Atom>(IntervalRequirement{
                         BoundRequirement(true /*inclusive*/, make<Variable>("v1")),
-                        BoundRequirement::makeInfinite()}),
+                        BoundRequirement::makePlusInf()}),
                     IntervalReqExpr::make<IntervalReqExpr::Atom>(IntervalRequirement{
                         BoundRequirement(false /*inclusive*/, make<Variable>("v2")),
-                        BoundRequirement::makeInfinite()})})});
+                        BoundRequirement::makePlusInf()})})});
 
         auto result = intersectDNFIntervals(interval);
         ASSERT_TRUE(result);
@@ -401,7 +401,7 @@ TEST(IntervalIntersection, VariableIntervals) {
             " U \n"
             "    {\n"
             "        {(If [] BinaryOp [Gte] Variable [v1] Variable [v2] Variable [v1] Variable "
-            "[v2], +inf)}\n"
+            "[v2], Const [maxKey]]}\n"
             "    }\n"
             "}\n",
             ExplainGenerator::explainIntervalExpr(*result));

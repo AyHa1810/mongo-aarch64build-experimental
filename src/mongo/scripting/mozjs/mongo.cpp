@@ -53,6 +53,7 @@
 #include "mongo/scripting/mozjs/valuewriter.h"
 #include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/exit_code.h"
 #include "mongo/util/quick_exit.h"
 
 namespace mongo {
@@ -584,8 +585,8 @@ void MongoExternalInfo::construct(JSContext* cx, JS::CallArgs args) {
             uassert(4938001,
                     "the 'api' option for Mongo() must be an object",
                     options["api"].isABSONObj());
-            apiParameters = ClientAPIVersionParameters::parse(IDLParserErrorContext("api"_sd),
-                                                              options["api"].Obj());
+            apiParameters =
+                ClientAPIVersionParameters::parse(IDLParserContext("api"_sd), options["api"].Obj());
             if (apiParameters.getDeprecationErrors().value_or(false) ||
                 apiParameters.getStrict().value_or(false)) {
                 uassert(4938002,
@@ -696,7 +697,10 @@ void MongoExternalInfo::Functions::load::call(JSContext* cx, JS::CallArgs args) 
 }
 
 void MongoExternalInfo::Functions::quit::call(JSContext* cx, JS::CallArgs args) {
-    quickExit(args.get(0).isNumber() ? args.get(0).toNumber() : 0);
+    auto arg = args.get(0);
+    quickExit(((arg.isNumber()) && (arg.toNumber() >= 0) && (arg.toNumber() <= 255))
+                  ? static_cast<ExitCode>(arg.toNumber())
+                  : ExitCode::clean);
 }
 
 void MongoExternalInfo::Functions::_forgetReplSet::call(JSContext* cx, JS::CallArgs args) {

@@ -1412,7 +1412,7 @@ std::unique_ptr<QuerySolution> QueryPlanner::extendWithAggPipeline(
                 query.getCollator());
             auto eqLookupNode =
                 std::make_unique<EqLookupNode>(std::move(solnForAgg),
-                                               lookupStage->getFromNs().toString(),
+                                               lookupStage->getFromNs(),
                                                lookupStage->getLocalField()->fullPath(),
                                                lookupStage->getForeignField()->fullPath(),
                                                lookupStage->getAsField().fullPath(),
@@ -1428,7 +1428,7 @@ std::unique_ptr<QuerySolution> QueryPlanner::extendWithAggPipeline(
     }
 
     solution->extendWith(std::move(solnForAgg));
-    return QueryPlannerAnalysis::removeProjectSimpleBelowGroup(std::move(solution));
+    return QueryPlannerAnalysis::removeInclusionProjectionBelowGroup(std::move(solution));
 }
 
 StatusWith<std::unique_ptr<QuerySolution>> QueryPlanner::choosePlanForSubqueries(

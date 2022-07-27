@@ -190,7 +190,7 @@ public:
             // 'result' evaluates the comparison on the array elements, and 'nonTraversedResult'
             // evaluates the comparison on the array itself.
 
-            result = make<PathTraverse>(std::move(result));
+            result = make<PathTraverse>(std::move(result), PathTraverse::kSingleLevel);
             maybeComposePath<PathComposeA>(result, std::move(nonTraversedResult));
 
             result = generateFieldPath(FieldPath(expr->path().toString()), std::move(result));
@@ -386,7 +386,7 @@ public:
         // The path can be empty if we are within an $elemMatch. In this case elemMatch would insert
         // a traverse.
         if (!expr->path().empty()) {
-            result = make<PathTraverse>(std::move(result));
+            result = make<PathTraverse>(std::move(result), PathTraverse::kSingleLevel);
             if (expr->typeSet().hasType(BSONType::Array)) {
                 // If we are testing against array type, insert a comparison against the
                 // non-traversed path (the array itself if we have one).
@@ -403,6 +403,10 @@ public:
     }
 
     void visit(const WhereNoOpMatchExpression* expr) override {
+        unsupportedExpression(expr);
+    }
+
+    void visit(const EncryptedBetweenMatchExpression* expr) override {
         unsupportedExpression(expr);
     }
 
@@ -428,10 +432,10 @@ private:
             maybeComposePath(result, _ctx.pop());
         }
         if constexpr (!isValueElemMatch) {
-            // Make sure we consider only objects as elements of the array.
-            maybeComposePath(result, make<PathObj>());
+            // Make sure we consider only objects or arrays as elements of the array.
+            maybeComposePath(result, make<PathComposeA>(make<PathObj>(), make<PathArr>()));
         }
-        result = make<PathTraverse>(std::move(result));
+        result = make<PathTraverse>(std::move(result), PathTraverse::kSingleLevel);
 
         // Make sure we consider only arrays fields on the path.
         maybeComposePath(result, make<PathArr>());
@@ -442,7 +446,7 @@ private:
                 std::move(result),
                 [&](const std::string& fieldName, const bool isLastElement, ABT input) {
                     if (!isLastElement) {
-                        input = make<PathTraverse>(std::move(input));
+                        input = make<PathTraverse>(std::move(input), PathTraverse::kSingleLevel);
                     }
                     return make<PathGet>(fieldName, std::move(input));
                 });
@@ -454,30 +458,117 @@ private:
     /**
      * Return the minimum or maximum value for the "class" of values represented by the input
      * constant. Used to support type bracketing.
+     * Return format is <min/max value, bool inclusive>
      */
     template <bool isMin>
     std::pair<boost::optional<ABT>, bool> getMinMaxBoundForType(const sbe::value::TypeTags& tag) {
-        if (isNumber(tag)) {
-            if constexpr (isMin) {
-                return {Constant::fromDouble(std::numeric_limits<double>::quiet_NaN()), true};
-            } else {
-                return {Constant::str(""), false};
-            };
-        } else if (isStringOrSymbol(tag)) {
-            if constexpr (isMin) {
-                return {Constant::str(""), true};
-            } else {
-                // TODO SERVER-67369: we need limit string from above.
-                return {boost::none, false};
+        switch (tag) {
+            case sbe::value::TypeTags::NumberInt32:
+            case sbe::value::TypeTags::NumberInt64:
+            case sbe::value::TypeTags::NumberDouble:
+            case sbe::value::TypeTags::NumberDecimal:
+                if constexpr (isMin)
+                    return {Constant::fromDouble(std::numeric_limits<double>::quiet_NaN()), true};
+                else
+                    return {Constant::str(""), false};
+            case sbe::value::TypeTags::StringSmall:
+            case sbe::value::TypeTags::StringBig:
+            case sbe::value::TypeTags::bsonString:
+            case sbe::value::TypeTags::bsonSymbol:
+                if constexpr (isMin)
+                    return {Constant::str(""), true};
+                else {
+                    return {Constant::emptyObject(), false};
+                }
+            case sbe::value::TypeTags::Date:
+                if constexpr (isMin)
+                    return {Constant::date(Date_t::min()), true};
+                else
+                    return {Constant::date(Date_t::max()), true};
+            case sbe::value::TypeTags::Timestamp:
+                if constexpr (isMin)
+                    return {Constant::timestamp(Timestamp::min()), true};
+                else
+                    return {Constant::timestamp(Timestamp::max()), true};
+            case sbe::value::TypeTags::Null:
+                return {Constant::null(), true};
+            case sbe::value::TypeTags::bsonUndefined: {
+                auto [tag, val] = convertFrom(mongo::Value(BSONUndefined));
+                return {make<Constant>(sbe::value::TypeTags::bsonUndefined, val), true};
             }
-        } else if (tag == sbe::value::TypeTags::Null) {
-            // Same bound above and below.
-            return {Constant::null(), true};
-        } else {
-            // TODO SERVER-67369: compute bounds for other types based on bsonobjbuilder.cpp.
-            return {boost::none, false};
+            case sbe::value::TypeTags::Object:
+            case sbe::value::TypeTags::bsonObject:
+                if constexpr (isMin)
+                    return {Constant::emptyObject(), true};
+                else
+                    return {Constant::emptyArray(), false};
+            case sbe::value::TypeTags::Array:
+            case sbe::value::TypeTags::ArraySet:
+            case sbe::value::TypeTags::bsonArray:
+                if constexpr (isMin) {
+                    return {Constant::emptyArray(), true};
+                } else {
+                    auto [tag, val] = mongo::optimizer::convertFrom(mongo::Value(BSONBinData()));
+                    return {make<Constant>(sbe::value::TypeTags::bsonBinData, val), false};
+                }
+            case sbe::value::TypeTags::bsonBinData:
+                if constexpr (isMin) {
+                    auto [tag, val] = mongo::optimizer::convertFrom(mongo::Value(BSONBinData()));
+                    return {make<Constant>(sbe::value::TypeTags::bsonBinData, val), true};
+                } else {
+                    auto [tag, val] = mongo::optimizer::convertFrom(mongo::Value(OID()));
+                    return {make<Constant>(sbe::value::TypeTags::ObjectId, val), false};
+                }
+            case sbe::value::TypeTags::Boolean:
+                if constexpr (isMin)
+                    return {Constant::boolean(false), true};
+                else
+                    return {Constant::boolean(true), true};
+            case sbe::value::TypeTags::ObjectId:
+            case sbe::value::TypeTags::bsonObjectId:
+                if constexpr (isMin) {
+                    auto [tag, val] = mongo::optimizer::convertFrom(mongo::Value(OID()));
+                    return {make<Constant>(sbe::value::TypeTags::ObjectId, val), true};
+                } else {
+                    auto [tag, val] = mongo::optimizer::convertFrom(mongo::Value(OID::max()));
+                    return {make<Constant>(sbe::value::TypeTags::ObjectId, val), true};
+                }
+            case sbe::value::TypeTags::bsonRegex:
+                if constexpr (isMin) {
+                    auto [tag, val] = convertFrom(mongo::Value(BSONRegEx("", "")));
+                    return {make<Constant>(sbe::value::TypeTags::bsonRegex, val), true};
+                } else {
+                    auto [tag, val] = convertFrom(mongo::Value(mongo::BSONDBRef()));
+                    return {make<Constant>(sbe::value::TypeTags::bsonDBPointer, val), false};
+                }
+            case sbe::value::TypeTags::bsonDBPointer:
+                if constexpr (isMin) {
+                    auto [tag, val] = convertFrom(mongo::Value(mongo::BSONDBRef()));
+                    return {make<Constant>(sbe::value::TypeTags::bsonDBPointer, val), true};
+                } else {
+                    auto [tag, val] = sbe::value::makeCopyBsonJavascript(StringData(""));
+                    return {make<Constant>(sbe::value::TypeTags::bsonJavascript, val), false};
+                }
+            case sbe::value::TypeTags::bsonJavascript:
+                if constexpr (isMin) {
+                    auto [tag, val] = sbe::value::makeCopyBsonJavascript(StringData(""));
+                    return {make<Constant>(sbe::value::TypeTags::bsonJavascript, val), true};
+                } else {
+                    auto bsonCode = BSONCodeWScope();
+                    auto [tag, val] = convertFrom(mongo::Value(bsonCode));
+                    return {make<Constant>(sbe::value::TypeTags::bsonCodeWScope, val), false};
+                }
+            case sbe::value::TypeTags::bsonCodeWScope:
+                if constexpr (isMin) {
+                    auto bsonCode = BSONCodeWScope();
+                    auto [tag, val] = convertFrom(mongo::Value(bsonCode));
+                    return {make<Constant>(sbe::value::TypeTags::bsonCodeWScope, val), true};
+                } else {
+                    return {Constant::maxKey(), false};
+                }
+            default:
+                return {boost::none, false};
         }
-
         MONGO_UNREACHABLE;
     }
 
@@ -487,7 +578,7 @@ private:
             std::move(initial),
             [&](const std::string& fieldName, const bool isLastElement, ABT input) {
                 if (!isLastElement) {
-                    input = make<PathTraverse>(std::move(input));
+                    input = make<PathTraverse>(std::move(input), PathTraverse::kSingleLevel);
                 }
                 return make<PathGet>(fieldName, std::move(input));
             });
@@ -543,17 +634,18 @@ private:
                 break;
         }
 
-        // The path can be empty if we are within an $elemMatch. In this case elemMatch would insert
-        // a traverse.
+        // The path can be empty if we are within an $elemMatch. In this case elemMatch would
+        // insert a traverse.
         if (!expr->path().empty()) {
             if (isArray) {
                 // When the path we are comparing is a path to an array, the comparison is
-                // considered true if it evaluates to true for the array itself or for any of the
-                // array’s elements.
+                // considered true if it evaluates to true for the array itself or for any of
+                // the array’s elements.
 
-                result = make<PathComposeA>(make<PathTraverse>(result), result);
+                result = make<PathComposeA>(make<PathTraverse>(result, PathTraverse::kSingleLevel),
+                                            result);
             } else {
-                result = make<PathTraverse>(std::move(result));
+                result = make<PathTraverse>(std::move(result), PathTraverse::kSingleLevel);
             }
 
             result = generateFieldPath(FieldPath(expr->path().toString()), std::move(result));

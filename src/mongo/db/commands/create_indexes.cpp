@@ -54,7 +54,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_builds_coordinator.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_set_config.h"
@@ -203,12 +203,6 @@ void validateTTLOptions(OperationContext* opCtx,
 void checkEncryptedFieldIndexRestrictions(OperationContext* opCtx,
                                           const NamespaceString& ns,
                                           const CreateIndexesCommand& cmd) {
-    // TODO (SERVER-65077): Remove FCV check once 6.0 is released
-    if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-        !gFeatureFlagFLE2.isEnabled(serverGlobalParams.featureCompatibility)) {
-        return;
-    }
-
     AutoGetCollection collection(opCtx, ns, MODE_IS);
     if (!collection) {
         return;
@@ -325,7 +319,6 @@ bool indexesAlreadyExist(OperationContext* opCtx,
 void checkDatabaseShardingState(OperationContext* opCtx, const NamespaceString& ns) {
     auto dss = DatabaseShardingState::get(opCtx, ns.db());
     auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, dss);
-    dss->checkDbVersion(opCtx, dssLock);
 
     Lock::CollectionLock collLock(opCtx, ns, MODE_IS);
     try {
@@ -449,7 +442,7 @@ CreateIndexesReply runCreateIndexesOnNewCollection(
 }
 
 bool isCreatingInternalConfigTxnsPartialIndex(const CreateIndexesCommand& cmd) {
-    if (cmd.getIndexes().size() > 1) {
+    if (cmd.getIndexes().size() != 1) {
         return false;
     }
     const auto& index = cmd.getIndexes()[0];
@@ -497,7 +490,8 @@ CreateIndexesReply runCreateIndexesWithCoordinator(OperationContext* opCtx,
     boost::optional<UUID> collectionUUID;
     CreateIndexesReply reply;
     {
-        Lock::DBLock dbLock(opCtx, ns.dbName(), MODE_IX);
+        AutoGetDb autoDb(opCtx, ns.db(), MODE_IX);
+
         checkDatabaseShardingState(opCtx, ns);
         if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, ns)) {
             uasserted(ErrorCodes::NotWritablePrimary,

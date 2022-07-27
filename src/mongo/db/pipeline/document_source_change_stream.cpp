@@ -276,7 +276,7 @@ list<intrusive_ptr<DocumentSource>> DocumentSourceChangeStream::createFromBson(
             "$changeStream stage expects a document as argument",
             elem.type() == BSONType::Object);
 
-    auto spec = DocumentSourceChangeStreamSpec::parse(IDLParserErrorContext("$changeStream"),
+    auto spec = DocumentSourceChangeStreamSpec::parse(IDLParserContext("$changeStream"),
                                                       elem.embeddedObject());
 
     // Make sure that it is legal to run this $changeStream before proceeding.
@@ -285,11 +285,6 @@ list<intrusive_ptr<DocumentSource>> DocumentSourceChangeStream::createFromBson(
     // Save a copy of the spec on the expression context. Used when building the oplog filter.
     expCtx->changeStreamSpec = spec;
 
-    // If we see this stage on a shard, it means that the raw $changeStream stage was dispatched to
-    // us from an old mongoS. Build a legacy shard pipeline.
-    if (expCtx->needsMerge) {
-        return change_stream_legacy::buildPipeline(expCtx, spec);
-    }
     return _buildPipeline(expCtx, spec);
 }
 
@@ -408,42 +403,6 @@ void DocumentSourceChangeStream::assertIsLegalSpecification(
                           << " collection"
                           << (spec.getAllowToRunOnSystemNS() ? " through mongos" : ""),
             !expCtx->ns.isSystem() || (spec.getAllowToRunOnSystemNS() && !expCtx->inMongos));
-
-    // TODO SERVER-58584: remove the feature flag.
-    if (!feature_flags::gFeatureFlagChangeStreamPreAndPostImages.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
-        const bool shouldAddPreImage =
-            (spec.getFullDocumentBeforeChange() != FullDocumentBeforeChangeModeEnum::kOff);
-        uassert(51771,
-                "the 'fullDocumentBeforeChange' option is not supported in a sharded cluster",
-                !(shouldAddPreImage && (expCtx->inMongos || expCtx->needsMerge)));
-
-        uassert(ErrorCodes::BadValue,
-                str::stream() << "Specified value '"
-                              << FullDocumentMode_serializer(spec.getFullDocument())
-                              << "' is not a valid option for the 'fullDocument' parameter of the "
-                                 "$changeStream stage",
-                spec.getFullDocument() == FullDocumentModeEnum::kDefault ||
-                    spec.getFullDocument() == FullDocumentModeEnum::kUpdateLookup);
-    }
-
-    uassert(6188501,
-            "the 'featureFlagChangeStreamsVisibility' should be enabled to use "
-            "'showExpandedEvents:true' in the change stream spec",
-            feature_flags::gFeatureFlagChangeStreamsVisibility.isEnabledAndIgnoreFCV() ||
-                !spec.getShowExpandedEvents());
-
-    uassert(6189400,
-            "the 'featureFlagChangeStreamsVisibility' should be enabled to use "
-            "'showRawUpdateDescription:true' in the change stream spec",
-            feature_flags::gFeatureFlagChangeStreamsVisibility.isEnabledAndIgnoreFCV() ||
-                !spec.getShowRawUpdateDescription());
-
-    uassert(6189301,
-            "the 'featureFlagChangeStreamsVisibility' should be enabled to use "
-            "'showSystemEvents:true' in the change stream spec",
-            feature_flags::gFeatureFlagChangeStreamsVisibility.isEnabledAndIgnoreFCV() ||
-                !spec.getShowSystemEvents());
 
     uassert(31123,
             "Change streams from mongos may not show migration events",

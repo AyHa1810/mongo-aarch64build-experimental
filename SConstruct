@@ -122,9 +122,9 @@ add_option(
     choices=list(BUILD_PROFILES.keys()),
     default='default',
     type='choice',
-    help='''Short hand for common build options. These profiles are well supported by SDP and are 
-    kept up to date. Unless you need something specific, it is recommended that you only build with 
-    these. san is the recommeneded profile since it exposes bugs before they are found in patch 
+    help='''Short hand for common build options. These profiles are well supported by SDP and are
+    kept up to date. Unless you need something specific, it is recommended that you only build with
+    these. san is the recommended profile since it exposes bugs before they are found in patch
     builds. Check out site_scons/mongo/build_profiles.py to see each profile.''',
 )
 
@@ -733,7 +733,7 @@ add_option(
     'build-metrics',
     metavar="FILE",
     const='build-metrics.json',
-    default='build-metrics.json',
+    default='',
     help='Enable tracking of build performance and output data as json.'
     ' Use "-" to output json to stdout, or supply a path to the desired'
     ' file to output to. If no argument is supplied, the default log'

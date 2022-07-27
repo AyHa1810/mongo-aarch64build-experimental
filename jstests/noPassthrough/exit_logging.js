@@ -59,12 +59,12 @@ function runAllTests(launcher) {
     testShutdownLogging(launcher,
                         makeShutdownByCrashFn('fault'),
                         makeRegExMatchFn(/Invalid access at address[\s\S]*printStackTrace/),
-                        -SIGSEGV);
+                        SIGSEGV);
 
     testShutdownLogging(launcher,
                         makeShutdownByCrashFn('abort'),
                         makeRegExMatchFn(/Got signal[\s\S]*printStackTrace/),
-                        -SIGABRT);
+                        SIGABRT);
 }
 
 if (_isWindows()) {
@@ -82,9 +82,7 @@ if (_isAddressSanitizerActive()) {
 
     runAllTests({
         start: function(opts) {
-            var actualOpts = {nojournal: ""};
-            Object.extend(actualOpts, opts);
-            return MongoRunner.runMongod(actualOpts);
+            return MongoRunner.runMongod(opts);
         },
 
         stop: MongoRunner.stopMongod

@@ -69,7 +69,7 @@
 #include "mongo/db/json.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/profile_filter_impl.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
@@ -168,7 +168,7 @@ protected:
         // Accessing system.profile collection should not conflict with oplog application.
         ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(
             opCtx->lockState());
-        AutoGetDb ctx(opCtx, dbName.db(), dbMode);
+        AutoGetDb ctx(opCtx, dbName, dbMode);
         Database* db = ctx.getDb();
 
         // Fetches the database profiling level + filter or the server default if the db does not
@@ -423,31 +423,6 @@ public:
     }
 
 } cmdFileMD5;
-
-class AvailableQueryOptions : public BasicCommand {
-public:
-    AvailableQueryOptions() : BasicCommand("availableQueryOptions", "availablequeryoptions") {}
-
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kAlways;
-    }
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return false;
-    }
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const {
-        return Status::OK();
-    }
-
-    virtual bool run(OperationContext* opCtx,
-                     const std::string& dbname,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
-        result << "options" << QueryOption_AllSupported;
-        return true;
-    }
-} availableQueryOptionsCmd;
 
 }  // namespace
 }  // namespace mongo

@@ -33,6 +33,7 @@
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/database_sharding_state.h"
@@ -64,6 +65,11 @@ void onDbVersionMismatch(OperationContext* opCtx,
     invariant(!opCtx->getClient()->isInDirectClient());
     invariant(ShardingState::get(opCtx)->canAcceptShardedCommands());
 
+    Timer t{};
+    ScopeGuard finishTiming([&] {
+        CurOp::get(opCtx)->debug().databaseVersionRefreshMillis += Milliseconds(t.millis());
+    });
+
     {
         // Take the DBLock directly rather than using AutoGetDb, to prevent a recursive call into
         // checkDbVersion().
@@ -73,9 +79,7 @@ void onDbVersionMismatch(OperationContext* opCtx,
         if (clientDbVersion) {
             // TODO SERVER-67440 Use dbName directly
             Lock::DBLock dbLock(opCtx, DatabaseName(boost::none, dbName), MODE_IS);
-            auto dss = DatabaseShardingState::get(opCtx, dbName);
-            auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, dss);
-            const auto serverDbVersion = dss->getDbVersion(opCtx, dssLock);
+            const auto serverDbVersion = DatabaseHolder::get(opCtx)->getDbVersion(opCtx, dbName);
             if (clientDbVersion <= serverDbVersion) {
                 // The client was stale
                 return;
@@ -242,6 +246,10 @@ void onShardVersionMismatch(OperationContext* opCtx,
     invariant(!opCtx->lockState()->isLocked());
     invariant(!opCtx->getClient()->isInDirectClient());
     invariant(ShardingState::get(opCtx)->canAcceptShardedCommands());
+
+    Timer t{};
+    ScopeGuard finishTiming(
+        [&] { CurOp::get(opCtx)->debug().shardVersionRefreshMillis += Milliseconds(t.millis()); });
 
     if (nss.isNamespaceAlwaysUnsharded()) {
         return;
@@ -488,8 +496,7 @@ void forceDatabaseRefresh(OperationContext* opCtx, const StringData dbName) {
         // db has been dropped, set the db version to boost::none
         // TODO SERVER-67440 Use dbName directly
         Lock::DBLock dbLock(opCtx, DatabaseName(boost::none, dbName), MODE_X);
-        auto dss = DatabaseShardingState::get(opCtx, dbName);
-        dss->clearDatabaseInfo(opCtx);
+        DatabaseHolder::get(opCtx)->clearDbInfo(opCtx, dbName);
         return;
     }
 
@@ -504,10 +511,7 @@ void forceDatabaseRefresh(OperationContext* opCtx, const StringData dbName) {
         // into checkDbVersion().
         // TODO SERVER-67440 Use dbName directly
         Lock::DBLock dbLock(opCtx, DatabaseName(boost::none, dbName), MODE_IS);
-        auto dss = DatabaseShardingState::get(opCtx, dbName);
-        auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, dss);
-
-        const auto cachedDbVersion = dss->getDbVersion(opCtx, dssLock);
+        const auto cachedDbVersion = DatabaseHolder::get(opCtx)->getDbVersion(opCtx, dbName);
         if (cachedDbVersion && *cachedDbVersion >= refreshedDBVersion) {
             LOGV2_DEBUG(5369130,
                         2,
@@ -523,10 +527,8 @@ void forceDatabaseRefresh(OperationContext* opCtx, const StringData dbName) {
     // The cached version is older than the refreshed version; update the cached version.
     // TODO SERVER-67440 Use dbName directly
     Lock::DBLock dbLock(opCtx, DatabaseName(boost::none, dbName), MODE_X);
-    auto dss = DatabaseShardingState::get(opCtx, dbName);
-    auto dssLock = DatabaseShardingState::DSSLock::lockExclusive(opCtx, dss);
-
-    dss->setDatabaseInfo(opCtx, DatabaseType(*refreshedDbInfo), dssLock);
+    DatabaseHolder::get(opCtx)->openDb(opCtx, dbName);
+    DatabaseHolder::get(opCtx)->setDbInfo(opCtx, dbName, *refreshedDbInfo);
 }
 
 }  // namespace mongo

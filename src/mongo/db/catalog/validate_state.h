@@ -35,7 +35,9 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
@@ -74,7 +76,7 @@ public:
     }
 
     bool isBackground() const {
-        return _mode == ValidateMode::kBackground;
+        return _mode == ValidateMode::kBackground || _mode == ValidateMode::kBackgroundCheckBSON;
     }
 
     bool shouldEnforceFastCount() const;
@@ -88,12 +90,37 @@ public:
         return isFullValidation() || _mode == ValidateMode::kForegroundFullIndexOnly;
     }
 
+    BSONValidateMode getBSONValidateMode() const {
+        return serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+                feature_flags::gExtendValidateCommand.isEnabled(
+                    serverGlobalParams.featureCompatibility) &&
+                (_mode == ValidateMode::kForegroundCheckBSON ||
+                 _mode == ValidateMode::kBackgroundCheckBSON || isFullValidation())
+            ? BSONValidateMode::kFull
+            : BSONValidateMode::kExtended;
+    }
+
     bool isCollectionSchemaViolated() const {
         return _collectionSchemaViolated;
     }
 
     void setCollectionSchemaViolated() {
         _collectionSchemaViolated = true;
+    }
+
+    bool isTimeseriesDataInconsistent() const {
+        return _timeseriesDataInconsistency;
+    }
+    void setTimeseriesDataInconsistent() {
+        _timeseriesDataInconsistency = true;
+    }
+
+    bool isBSONDataNonConformant() const {
+        return _BSONDataNonConformant;
+    }
+
+    void setBSONDataNonConformant() {
+        _BSONDataNonConformant = true;
     }
 
     bool fixErrors() const {
@@ -211,6 +238,8 @@ private:
     ValidateMode _mode;
     RepairMode _repairMode;
     bool _collectionSchemaViolated = false;
+    bool _timeseriesDataInconsistency = false;
+    bool _BSONDataNonConformant = false;
 
     boost::optional<ShouldNotConflictWithSecondaryBatchApplicationBlock> _noPBWM;
     boost::optional<Lock::GlobalLock> _globalLock;

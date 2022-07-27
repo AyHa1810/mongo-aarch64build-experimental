@@ -136,7 +136,7 @@ DepsTracker::State DocumentSourceReshardingIterateTransaction::getDependencies(
 
 DocumentSource::GetModPathsReturn DocumentSourceReshardingIterateTransaction::getModifiedPaths()
     const {
-    return {DocumentSource::GetModPathsReturn::Type::kAllPaths, std::set<std::string>{}, {}};
+    return {DocumentSource::GetModPathsReturn::Type::kAllPaths, OrderedPathSet{}, {}};
 }
 
 DocumentSource::GetNextResult DocumentSourceReshardingIterateTransaction::doGetNext() {
@@ -192,8 +192,7 @@ DocumentSource::GetNextResult DocumentSourceReshardingIterateTransaction::doGetN
 
 bool DocumentSourceReshardingIterateTransaction::_isTransactionOplogEntry(const Document& doc) {
     auto op = doc[repl::OplogEntry::kOpTypeFieldName];
-    auto opType =
-        repl::OpType_parse(IDLParserErrorContext("ReshardingEntry.op"), op.getStringData());
+    auto opType = repl::OpType_parse(IDLParserContext("ReshardingEntry.op"), op.getStringData());
     auto commandVal = doc["o"];
 
     if (opType != repl::OpTypeEnum::kCommand || doc["txnNumber"].missing() ||

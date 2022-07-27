@@ -40,6 +40,7 @@
 #include "mongo/db/matcher/expression_text_noop.h"
 #include "mongo/db/matcher/expression_where.h"
 #include "mongo/db/matcher/expression_where_noop.h"
+#include "mongo/db/pipeline/document_source_group.h"
 #include "mongo/db/pipeline/document_source_lookup.h"
 #include "mongo/db/query/analyze_regex.h"
 #include "mongo/db/query/projection.h"
@@ -446,6 +447,10 @@ void encodePipeline(const std::vector<std::unique_ptr<InnerPipelineStageInterfac
                     serializedArray.size() == 1 && serializedArray[0].getType() == Object);
             const auto bson = serializedArray[0].getDocument().toBson();
             bufBuilder->appendBuf(bson.objdata(), bson.objsize());
+        } else if (auto groupStage = dynamic_cast<DocumentSourceGroup*>(stage->documentSource())) {
+            auto serializedGroup = groupStage->serialize();
+            const auto bson = serializedGroup.getDocument().toBson();
+            bufBuilder->appendBuf(bson.objdata(), bson.objsize());
         } else {
             tasserted(6443200,
                       str::stream() << "Pipeline stage cannot be encoded in plan cache key: "
@@ -609,7 +614,7 @@ void encodeKeyForProj(const projection_ast::Projection* proj, StringBuilder* key
         return;
     }
 
-    std::set<std::string> requiredFields = proj->getRequiredFields();
+    auto requiredFields = proj->getRequiredFields();
 
     // If the only requirement is that $sortKey be included with some value, we just act as if the
     // entire document is needed.
@@ -929,6 +934,9 @@ public:
     void visit(const TwoDPtInAnnulusExpression* expr) final {
         MONGO_UNREACHABLE_TASSERT(6142133);
     }
+    void visit(const EncryptedBetweenMatchExpression* expr) final {
+        MONGO_UNREACHABLE_TASSERT(6762801);
+    }
 
 private:
     /**
@@ -1087,8 +1095,8 @@ void encodeKeyForAutoParameterizedMatchSBE(MatchExpression* matchExpr, BufBuilde
 
 std::string encodeSBE(const CanonicalQuery& cq) {
     tassert(6512900,
-            "using the SBE plan cache key encoding requires the SBE plan cache to be enabled",
-            feature_flags::gFeatureFlagSbePlanCache.isEnabledAndIgnoreFCV());
+            "using the SBE plan cache key encoding requires SBE to be fully enabled",
+            feature_flags::gFeatureFlagSbeFull.isEnabledAndIgnoreFCV());
     tassert(6142104,
             "attempting to encode SBE plan cache key for SBE-incompatible query",
             cq.isSbeCompatible());
@@ -1121,7 +1129,7 @@ std::string encodeSBE(const CanonicalQuery& cq) {
     return base64::encode(StringData(bufBuilder.buf(), bufBuilder.len()));
 }
 
-CanonicalQuery::IndexFilterKey encodeForIndexFilters(const CanonicalQuery& cq) {
+CanonicalQuery::PlanCacheCommandKey encodeForPlanCacheCommand(const CanonicalQuery& cq) {
     StringBuilder keyBuilder;
     encodeKeyForMatch(cq.root(), &keyBuilder);
     encodeKeyForSort(cq.getFindCommandRequest().getSort(), &keyBuilder);
@@ -1138,15 +1146,6 @@ CanonicalQuery::IndexFilterKey encodeForIndexFilters(const CanonicalQuery& cq) {
 
 uint32_t computeHash(StringData key) {
     return SimpleStringDataComparator::kInstance.hash(key);
-}
-
-bool canUseSbePlanCache(const CanonicalQuery& cq) {
-    for (auto& stage : cq.pipeline()) {
-        if (StringData{stage->documentSource()->getSourceName()} != "$lookup") {
-            return false;
-        }
-    }
-    return true;
 }
 }  // namespace canonical_query_encoder
 }  // namespace mongo

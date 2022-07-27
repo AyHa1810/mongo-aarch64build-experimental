@@ -278,9 +278,10 @@ def _encaps(val):
     if val is None:
         return '""'
 
-    for i in ["\\", '"', "'"]:
-        if i in val:
-            val = val.replace(i, '\\' + i)
+    for srch, repl in {"\\": "\\\\", '"': '\\"', "'": "\\'", "\n": "\\n"}.items():
+        if srch in val:
+            val = val.replace(srch, repl)
+
     return '"' + val + '"'
 
 
@@ -368,11 +369,10 @@ class _CppFileWriterBase(object):
     def gen_description_comment(self, description):
         # type: (str) -> None
         """Generate a multiline comment with the description from the IDL."""
-        self._writer.write_line(
-            textwrap.dedent("""\
-        /**
-         * %s
-         */""" % (description)))
+        self._writer.write_line("/**")
+        for desc in description.split("\n"):
+            self._writer.write_line(" * " + desc)
+        self._writer.write_line(" */")
 
     def _with_template(self, template_params):
         # type: (Mapping[str,str]) -> writer.TemplateContext
@@ -572,7 +572,7 @@ class _CppHeaderFileWriter(_CppFileWriterBase):
             # Declare method implemented in C++ file.
             self._writer.write_template('void ${method_name}(${param_type} value);')
             self._writer.write_template(
-                'void ${method_name}(IDLParserErrorContext& ctxt, ${param_type} value);')
+                'void ${method_name}(IDLParserContext& ctxt, ${param_type} value);')
 
         self._writer.write_empty_line()
 
@@ -629,6 +629,11 @@ class _CppHeaderFileWriter(_CppFileWriterBase):
                                      field_name=field.name))
 
         if isinstance(struct, ast.Command):
+            self._writer.write_line(
+                common.template_args(
+                    'static constexpr auto kCommandDescription = ${description}_sd;',
+                    description=_encaps(struct.description)))
+
             self._writer.write_line(
                 common.template_args('static constexpr auto kCommandName = "${command_name}"_sd;',
                                      command_name=struct.command_name))
@@ -1149,14 +1154,16 @@ class _CppSourceFileWriter(_CppFileWriterBase):
     # pylint: disable=too-many-public-methods
     """C++ .cpp File writer."""
 
+    _EMPTY_TENANT = "boost::optional<mongo::TenantId>{}"
+
     def __init__(self, indented_writer, target_arch):
         # type: (writer.IndentedTextWriter, str) -> None
         """Create a C++ .cpp file code writer."""
         self._target_arch = target_arch
         super(_CppSourceFileWriter, self).__init__(indented_writer)
 
-    def _gen_field_deserializer_expression(self, element_name, field, ast_type):
-        # type: (str, ast.Field, ast.Type) -> str
+    def _gen_field_deserializer_expression(self, element_name, field, ast_type, tenant):
+        # type: (str, ast.Field, ast.Type, str) -> str
         # pylint: disable=invalid-name,too-many-return-statements
         """
         Generate the C++ deserializer piece for a field.
@@ -1167,7 +1174,7 @@ class _CppSourceFileWriter(_CppFileWriterBase):
 
         if ast_type.is_struct:
             self._writer.write_line(
-                'IDLParserErrorContext tempContext(%s, &ctxt);' % (_get_field_constant_name(field)))
+                'IDLParserContext tempContext(%s, &ctxt);' % (_get_field_constant_name(field)))
             self._writer.write_line('const auto localObject = %s.Obj();' % (element_name))
             return '%s::parse(tempContext, localObject)' % (ast_type.cpp_type, )
         elif ast_type.deserializer and 'BSONElement::' in ast_type.deserializer:
@@ -1189,14 +1196,20 @@ class _CppSourceFileWriter(_CppFileWriterBase):
                 method_name = writer.get_method_name_from_qualified_method_name(
                     ast_type.deserializer)
 
-                # For fields which are enums, pass a IDLParserErrorContext
+                # For fields which are enums, pass a IDLParserContext
                 if ast_type.is_enum:
-                    self._writer.write_line('IDLParserErrorContext tempContext(%s, &ctxt);' %
+                    self._writer.write_line('IDLParserContext tempContext(%s, &ctxt);' %
                                             (_get_field_constant_name(field)))
                     return common.template_args("${method_name}(tempContext, ${expression})",
                                                 method_name=method_name, expression=expression)
-                return common.template_args("${method_name}(${expression})",
-                                            method_name=method_name, expression=expression)
+
+                if ast_type.deserialize_with_tenant:
+                    return common.template_args("${method_name}(${tenant}, ${expression})",
+                                                method_name=method_name, tenant=tenant,
+                                                expression=expression)
+                else:
+                    return common.template_args("${method_name}(${expression})",
+                                                method_name=method_name, expression=expression)
 
             # BSONObjects are allowed to be pass through without deserialization
             assert ast_type.bson_serialization_type in [['object'], ['array']]
@@ -1206,10 +1219,13 @@ class _CppSourceFileWriter(_CppFileWriterBase):
         # Class Class::method(const BSONElement& value)
         method_name = writer.get_method_name_from_qualified_method_name(ast_type.deserializer)
 
-        return '%s(%s)' % (method_name, element_name)
+        if ast_type.deserialize_with_tenant:
+            return '%s(%s, %s)' % (method_name, tenant, element_name)
+        else:
+            return '%s(%s)' % (method_name, element_name)
 
-    def _gen_array_deserializer(self, field, bson_element, ast_type):
-        # type: (ast.Field, str, ast.Type) -> None
+    def _gen_array_deserializer(self, field, bson_element, ast_type, tenant):
+        # type: (ast.Field, str, ast.Type, str) -> None
         """Generate the C++ deserializer piece for an array field."""
         assert ast_type.is_array
         cpp_type_info = cpp_types.get_cpp_type_from_cpp_type_name(field, ast_type.cpp_type, True)
@@ -1217,7 +1233,7 @@ class _CppSourceFileWriter(_CppFileWriterBase):
 
         self._writer.write_line('std::uint32_t expectedFieldNumber{0};')
         self._writer.write_line(
-            'const IDLParserErrorContext arrayCtxt(%s, &ctxt);' % (_get_field_constant_name(field)))
+            'const IDLParserContext arrayCtxt(%s, &ctxt);' % (_get_field_constant_name(field)))
         self._writer.write_line('std::vector<%s> values;' % (cpp_type))
         self._writer.write_empty_line()
 
@@ -1242,7 +1258,7 @@ class _CppSourceFileWriter(_CppFileWriterBase):
 
                 with self._predicate(_get_bson_type_check('arrayElement', 'arrayCtxt', ast_type)):
                     array_value = self._gen_field_deserializer_expression(
-                        'arrayElement', field, ast_type)
+                        'arrayElement', field, ast_type, tenant)
                     self._writer.write_line('values.emplace_back(%s);' % (array_value))
 
             with self._block('else {', '}'):
@@ -1264,8 +1280,8 @@ class _CppSourceFileWriter(_CppFileWriterBase):
         else:
             self._writer.write_line('%s = std::move(values);' % (_get_field_member_name(field)))
 
-    def _gen_variant_deserializer(self, field, bson_element):
-        # type: (ast.Field, str) -> None
+    def _gen_variant_deserializer(self, field, bson_element, tenant):
+        # type: (ast.Field, str, str) -> None
         # pylint: disable=too-many-statements
         """Generate the C++ deserializer piece for a variant field."""
         self._writer.write_empty_line()
@@ -1280,7 +1296,7 @@ class _CppSourceFileWriter(_CppFileWriterBase):
             self._writer.indent()
             with self._predicate('%s.Obj().isEmpty()' % (bson_element, )):
                 # Can't determine element type of an empty array, use the first array type.
-                self._gen_array_deserializer(field, bson_element, array_types[0])
+                self._gen_array_deserializer(field, bson_element, array_types[0], tenant)
 
             with self._block('else {', '}'):
                 self._writer.write_line(
@@ -1293,7 +1309,7 @@ class _CppSourceFileWriter(_CppFileWriterBase):
                         self._writer.write_line('case %s:' % (bson.cpp_bson_type_name(bson_type), ))
                     # Each copy of the array deserialization code gets an anonymous block.
                     with self._block('{', '}'):
-                        self._gen_array_deserializer(field, bson_element, array_type)
+                        self._gen_array_deserializer(field, bson_element, array_type, tenant)
                         self._writer.write_line('break;')
 
                 self._writer.write_line('default:')
@@ -1317,7 +1333,7 @@ class _CppSourceFileWriter(_CppFileWriterBase):
                 self._writer.write_line('case %s:' % (bson.cpp_bson_type_name(bson_type), ))
                 with self._block('{', '}'):
                     self.gen_field_deserializer(field, scalar_type, "bsonObject", bson_element,
-                                                None, check_type=False)
+                                                None, tenant, check_type=False)
                     self._writer.write_line('break;')
 
         if field.type.variant_struct_type:
@@ -1357,8 +1373,8 @@ class _CppSourceFileWriter(_CppFileWriterBase):
                 self._writer.write_line('%s = true;' % (_get_has_field_member_name(field)))
 
     def gen_field_deserializer(self, field, field_type, bson_object, bson_element,
-                               field_usage_check, is_command_field=False, check_type=True):
-        # type: (ast.Field, ast.Type, str, str, _FieldUsageCheckerBase, bool, bool) -> None
+                               field_usage_check, tenant, is_command_field=False, check_type=True):
+        # type: (ast.Field, ast.Type, str, str, _FieldUsageCheckerBase, str, bool, bool) -> None
         """Generate the C++ deserializer piece for a field.
 
         If field_type is scalar and check_type is True (the default), generate type-checking code.
@@ -1369,12 +1385,12 @@ class _CppSourceFileWriter(_CppFileWriterBase):
             predicate = "MONGO_likely(ctxt.checkAndAssertType(%s, Array))" % (bson_element)
             with self._predicate(predicate):
                 self._gen_usage_check(field, bson_element, field_usage_check)
-            self._gen_array_deserializer(field, bson_element, field_type)
+            self._gen_array_deserializer(field, bson_element, field_type, tenant)
             return
 
         elif field_type.is_variant:
             self._gen_usage_check(field, bson_element, field_usage_check)
-            self._gen_variant_deserializer(field, bson_element)
+            self._gen_variant_deserializer(field, bson_element, tenant)
             return
 
         def validate_and_assign_or_uassert(field, expression):
@@ -1417,7 +1433,7 @@ class _CppSourceFileWriter(_CppFileWriterBase):
                 self._gen_usage_check(field, bson_element, field_usage_check)
 
                 object_value = self._gen_field_deserializer_expression(
-                    bson_element, field, field_type)
+                    bson_element, field, field_type, tenant)
                 if field.chained_struct_field:
                     if field.optional:
                         # We must invoke the boost::optional constructor when setting optional view
@@ -1454,8 +1470,8 @@ class _CppSourceFileWriter(_CppFileWriterBase):
 
             # Either we are deserializing BSON Objects or IDL structs
             if field.type.is_struct:
-                self._writer.write_line('IDLParserErrorContext tempContext(%s, &ctxt);' %
-                                        (_get_field_constant_name(field)))
+                self._writer.write_line(
+                    'IDLParserContext tempContext(%s, &ctxt);' % (_get_field_constant_name(field)))
                 array_value = '%s::parse(tempContext, sequenceObject)' % (field.type.cpp_type, )
             else:
                 assert field.type.bson_serialization_type == ['object']
@@ -1568,23 +1584,23 @@ class _CppSourceFileWriter(_CppFileWriterBase):
 
         self._writer.write_empty_line()
 
-    def _gen_command_deserializer(self, struct, bson_object):
-        # type: (ast.Struct, str) -> None
+    def _gen_command_deserializer(self, struct, bson_object, tenant=_EMPTY_TENANT):
+        # type: (ast.Struct, str, str) -> None
         """Generate the command field deserializer."""
 
         if isinstance(struct, ast.Command) and struct.command_field:
             with self._block('{', '}'):
                 self.gen_field_deserializer(struct.command_field, struct.command_field.type,
-                                            bson_object, "commandElement", None,
-                                            is_command_field=True)
+                                            bson_object, "commandElement", None, tenant,
+                                            is_command_field=True, check_type=True)
         else:
             struct_type_info = struct_types.get_struct_info(struct)
 
             # Generate namespace check now that "$db" has been read or defaulted
-            struct_type_info.gen_namespace_check(self._writer, "_dbName", "commandElement")
+            struct_type_info.gen_namespace_check(self._writer, tenant, "_dbName", "commandElement")
 
-    def _gen_fields_deserializer_common(self, struct, bson_object):
-        # type: (ast.Struct, str) -> _FieldUsageCheckerBase
+    def _gen_fields_deserializer_common(self, struct, bson_object, tenant=_EMPTY_TENANT):
+        # type: (ast.Struct, str, str) -> _FieldUsageCheckerBase
         """Generate the C++ code to deserialize list of fields."""
         # pylint: disable=too-many-branches
         field_usage_check = _get_field_usage_checker(self._writer, struct)
@@ -1627,7 +1643,7 @@ class _CppSourceFileWriter(_CppFileWriterBase):
                         self._writer.write_line('// ignore field')
                     else:
                         self.gen_field_deserializer(field, field.type, bson_object, "element",
-                                                    field_usage_check)
+                                                    field_usage_check, tenant)
 
                 if first_field:
                     first_field = False
@@ -1660,7 +1676,7 @@ class _CppSourceFileWriter(_CppFileWriterBase):
                 continue
 
             # Simply generate deserializers since these are all 'any' types
-            self.gen_field_deserializer(field, field.type, bson_object, "element", None)
+            self.gen_field_deserializer(field, field.type, bson_object, "element", None, tenant)
             self._writer.write_empty_line()
 
         self._writer.write_empty_line()
@@ -1756,7 +1772,7 @@ class _CppSourceFileWriter(_CppFileWriterBase):
                 # Fields without validators are implemented in the header.
                 continue
 
-            for optional_params in [('IDLParserErrorContext& ctxt, ', 'ctxt, '), ('', '')]:
+            for optional_params in [('IDLParserContext& ctxt, ', 'ctxt, '), ('', '')]:
                 self._gen_field_validator(struct, field, optional_params)
 
     def gen_bson_deserializer_methods(self, struct):
@@ -1806,7 +1822,8 @@ class _CppSourceFileWriter(_CppFileWriterBase):
         with self._block('%s {' % (func_def), '}'):
 
             # Deserialize all the fields
-            field_usage_check = self._gen_fields_deserializer_common(struct, "request.body")
+            field_usage_check = self._gen_fields_deserializer_common(
+                struct, "request.body", "request.getValidatedTenantId()")
 
             # Iterate through the document sequences if we have any
             has_doc_sequence = len(
@@ -1855,7 +1872,7 @@ class _CppSourceFileWriter(_CppFileWriterBase):
             field_usage_check.add_final_checks()
             self._writer.write_empty_line()
 
-            self._gen_command_deserializer(struct, "request.body")
+            self._gen_command_deserializer(struct, "request.body", "request.getValidatedTenantId()")
 
     def _gen_serializer_method_custom(self, field):
         # type: (ast.Field) -> None
@@ -1964,7 +1981,7 @@ class _CppSourceFileWriter(_CppFileWriterBase):
         }
 
         with self._with_template(template_params):
-            with self._block('stdx::visit(visit_helper::Overloaded{', '}, ${access_member});'):
+            with self._block('stdx::visit(OverloadedVisitor{', '}, ${access_member});'):
                 for variant_type in itertools.chain(
                         field.type.variant_types,
                     [field.type.variant_struct_type] if field.type.variant_struct_type else []):
@@ -2080,7 +2097,7 @@ class _CppSourceFileWriter(_CppFileWriterBase):
         if isinstance(struct, ast.Command):
             known_name = "_knownOP_MSGFields" if is_op_msg_request else "_knownBSONFields"
             self._writer.write_line(
-                "IDLParserErrorContext::appendGenericCommandArguments(commandPassthroughFields, %s, builder);"
+                "IDLParserContext::appendGenericCommandArguments(commandPassthroughFields, %s, builder);"
                 % (known_name))
             self._writer.write_empty_line()
 
@@ -2626,7 +2643,7 @@ class _CppSourceFileWriter(_CppFileWriterBase):
         header_list = [
             'mongo/bson/bsonobjbuilder.h', 'mongo/db/auth/authorization_contract.h',
             'mongo/db/commands.h', 'mongo/idl/command_generic_argument.h',
-            'mongo/util/visit_helper.h'
+            'mongo/util/overloaded_visitor.h'
         ]
 
         if spec.server_parameters:

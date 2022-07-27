@@ -1867,6 +1867,97 @@ TEST(PipelineOptimizationTest, GraphLookupShouldSwapWithMatch) {
     assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
+TEST(PipelineOptimizationTest, GraphLookupShouldSwapWithSortNotOnAs) {
+    string inputPipe =
+        "["
+        "   {$graphLookup: {"
+        "       from: 'lookupColl',"
+        "       as: 'out',"
+        "       connectToField: 'to',"
+        "       connectFromField: 'from',"
+        "       startWith: '$start'"
+        "   }},"
+        "   {$sort: {from: 1}}"
+        "]";
+    string outputPipe =
+        "["
+        "   {$sort: {sortKey: {from: 1}}},"
+        "   {$graphLookup: {"
+        "       from: 'lookupColl',"
+        "       as: 'out',"
+        "       connectToField: 'to',"
+        "       connectFromField: 'from',"
+        "       startWith: '$start'"
+        "   }}"
+        "]";
+    string serializedPipe =
+        "["
+        "   {$sort: {from: 1}},"
+        "   {$graphLookup: {"
+        "       from: 'lookupColl',"
+        "       as: 'out',"
+        "       connectToField: 'to',"
+        "       connectFromField: 'from',"
+        "       startWith: '$start'"
+        "   }}"
+        "]";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
+}
+
+TEST(PipelineOptimizationTest, GraphLookupWithInternalUnwindShouldNotSwapWithSortNotOnAs) {
+    string inputPipe =
+        "["
+        "   {$graphLookup: {"
+        "       from: 'lookupColl',"
+        "       as: 'out',"
+        "       connectToField: 'to',"
+        "       connectFromField: 'from',"
+        "       startWith: '$start'"
+        "   }},"
+        "   {$unwind: {path: '$out', includeArrayIndex: 'index'}},"
+        "   {$sort: {from: 1}}"
+        "]";
+    string outputPipe =
+        "["
+        "   {$graphLookup: {"
+        "       from: 'lookupColl',"
+        "       as: 'out',"
+        "       connectToField: 'to',"
+        "       connectFromField: 'from',"
+        "       startWith: '$start',"
+        "       unwinding: {preserveNullAndEmptyArrays: false, includeArrayIndex: 'index'}"
+        "   }},"
+        "   {$sort: {sortKey: {from: 1}}}"
+        "]";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, inputPipe);
+}
+
+TEST(PipelineOptimizationTest, GraphLookupShouldNotSwapWithSortOnAs) {
+    string inputPipe =
+        "["
+        "   {$graphLookup: {"
+        "       from: 'lookupColl',"
+        "       as: 'out',"
+        "       connectToField: 'to',"
+        "       connectFromField: 'from',"
+        "       startWith: '$start'"
+        "   }},"
+        "   {$sort: {out: 1}}"
+        "]";
+    string outputPipe =
+        "["
+        "   {$graphLookup: {"
+        "       from: 'lookupColl',"
+        "       as: 'out',"
+        "       connectToField: 'to',"
+        "       connectFromField: 'from',"
+        "       startWith: '$start'"
+        "   }},"
+        "   {$sort: {sortKey: {out: 1}}}"
+        "]";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, inputPipe);
+}
+
 TEST(PipelineOptimizationTest, ExclusionProjectShouldSwapWithIndependentMatch) {
     string inputPipe = "[{$project: {redacted: 0}}, {$match: {unrelated: 4}}]";
     string outputPipe =
@@ -4600,7 +4691,7 @@ public:
      * Returns a description which communicate that this stage modifies nothing.
      */
     GetModPathsReturn getModifiedPaths() const final {
-        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>(), {}};
+        return {GetModPathsReturn::Type::kFiniteSet, OrderedPathSet(), {}};
     }
 };
 
@@ -4677,7 +4768,7 @@ public:
      * Returns a description which communicate that this stage modifies nothing.
      */
     GetModPathsReturn getModifiedPaths() const final {
-        return {GetModPathsReturn::Type::kNotSupported, std::set<std::string>(), {}};
+        return {GetModPathsReturn::Type::kNotSupported, OrderedPathSet(), {}};
     }
 };
 
@@ -4713,7 +4804,7 @@ public:
         return new RenamesAToB(expCtx);
     }
     GetModPathsReturn getModifiedPaths() const final {
-        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {{"b", "a"}}};
+        return {GetModPathsReturn::Type::kFiniteSet, OrderedPathSet{}, {{"b", "a"}}};
     }
 };
 
@@ -4837,7 +4928,7 @@ public:
         return new RenamesBToC(expCtx);
     }
     GetModPathsReturn getModifiedPaths() const final {
-        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {{"c", "b"}}};
+        return {GetModPathsReturn::Type::kFiniteSet, OrderedPathSet{}, {{"c", "b"}}};
     }
 };
 
@@ -4880,7 +4971,7 @@ public:
         return new RenamesBToA(expCtx);
     }
     GetModPathsReturn getModifiedPaths() const final {
-        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {{"a", "b"}}};
+        return {GetModPathsReturn::Type::kFiniteSet, OrderedPathSet{}, {{"a", "b"}}};
     }
 };
 

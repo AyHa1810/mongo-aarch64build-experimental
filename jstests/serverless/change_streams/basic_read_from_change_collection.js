@@ -1,7 +1,6 @@
 // Tests that a change stream can be opened on a change collection when one exists, and that an
 // exception is thrown if we attempt to open a stream while change streams are disabled.
 // @tags: [
-//   multiversion_incompatible,
 //   featureFlagMongoStore,
 //   requires_fcv_61,
 //   assumes_against_mongod_not_mongos,
@@ -10,7 +9,7 @@
 (function() {
 "use strict";
 
-// TODO SERVER-66632 replace this with change stream disablement command. Extend the test cases for
+// TODO SERVER-66631 replace this with change stream disablement command. Extend the test cases for
 // enablement/disablement combinations.
 function disableChangeStream(connection) {
     const configDB = connection.getDB("config");

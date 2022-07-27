@@ -184,9 +184,7 @@ ReplOperation MutableOplogEntry::makeInsertOperation(const NamespaceString& nss,
     ReplOperation op;
     op.setOpType(OpTypeEnum::kInsert);
 
-    // TODO SERVER-62114 Change to check for upgraded FCV rather than feature flag
-    if (gFeatureFlagRequireTenantID.isEnabled(serverGlobalParams.featureCompatibility))
-        op.setTid(nss.tenantId());
+    op.setTid(nss.tenantId());
     op.setNss(nss);
     op.setUuid(uuid);
     op.setObject(docToInsert.getOwned());
@@ -226,9 +224,7 @@ ReplOperation MutableOplogEntry::makeUpdateOperation(const NamespaceString nss,
     ReplOperation op;
     op.setOpType(OpTypeEnum::kUpdate);
 
-    // TODO SERVER-62114 Change to check for upgraded FCV rather than feature flag
-    if (gFeatureFlagRequireTenantID.isEnabled(serverGlobalParams.featureCompatibility))
-        op.setTid(nss.tenantId());
+    op.setTid(nss.tenantId());
     op.setNss(nss);
     op.setUuid(uuid);
     op.setObject(update.getOwned());
@@ -242,6 +238,8 @@ ReplOperation MutableOplogEntry::makeCreateCommand(const NamespaceString nss,
 
     ReplOperation op;
     op.setOpType(OpTypeEnum::kCommand);
+
+    op.setTid(nss.tenantId());
     op.setNss(nss.getCommandNS());
     op.setUuid(options.uuid);
     op.setObject(makeCreateCollCmdObj(nss, options, idIndex));
@@ -253,6 +251,8 @@ ReplOperation MutableOplogEntry::makeCreateIndexesCommand(const NamespaceString 
                                                           const BSONObj& indexDoc) {
     ReplOperation op;
     op.setOpType(OpTypeEnum::kCommand);
+
+    op.setTid(nss.tenantId());
     op.setNss(nss.getCommandNS());
     op.setUuid(uuid);
 
@@ -271,9 +271,7 @@ ReplOperation MutableOplogEntry::makeDeleteOperation(const NamespaceString& nss,
     ReplOperation op;
     op.setOpType(OpTypeEnum::kDelete);
 
-    // TODO SERVER-62114 Change to check for upgraded FCV rather than feature flag
-    if (gFeatureFlagRequireTenantID.isEnabled(serverGlobalParams.featureCompatibility))
-        op.setTid(nss.tenantId());
+    op.setTid(nss.tenantId());
     op.setNss(nss);
     op.setUuid(uuid);
     op.setObject(docToDelete.getOwned());
@@ -283,7 +281,7 @@ ReplOperation MutableOplogEntry::makeDeleteOperation(const NamespaceString& nss,
 StatusWith<MutableOplogEntry> MutableOplogEntry::parse(const BSONObj& object) {
     try {
         MutableOplogEntry oplogEntry;
-        oplogEntry.parseProtected(IDLParserErrorContext("OplogEntryBase"), object);
+        oplogEntry.parseProtected(IDLParserContext("OplogEntryBase"), object);
         return oplogEntry;
     } catch (...) {
         return exceptionToStatus();
@@ -324,7 +322,7 @@ StatusWith<DurableOplogEntry> DurableOplogEntry::parse(const BSONObj& object) {
 DurableOplogEntry::DurableOplogEntry(BSONObj rawInput) : _raw(std::move(rawInput)) {
     _raw = _raw.getOwned();
 
-    parseProtected(IDLParserErrorContext("OplogEntryBase"), _raw);
+    parseProtected(IDLParserContext("OplogEntryBase"), _raw);
 
     // Parse command type from 'o' and 'o2' fields.
     if (isCommand()) {

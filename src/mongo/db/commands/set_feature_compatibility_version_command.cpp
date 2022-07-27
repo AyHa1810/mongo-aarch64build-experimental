@@ -63,12 +63,9 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/tenant_migration_donor_service.h"
 #include "mongo/db/repl/tenant_migration_recipient_service.h"
-#include "mongo/db/s/active_migrations_registry.h"
 #include "mongo/db/s/balancer/balancer.h"
-#include "mongo/db/s/config/configsvr_coordinator_service.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/migration_coordinator_document_gen.h"
-#include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/range_deletion_util.h"
 #include "mongo/db/s/resharding/coordinator_document_gen.h"
 #include "mongo/db/s/resharding/resharding_coordinator_service.h"
@@ -76,7 +73,6 @@
 #include "mongo/db/s/sharding_ddl_coordinator_service.h"
 #include "mongo/db/s/sharding_util.h"
 #include "mongo/db/s/transaction_coordinator_service.h"
-#include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/serverless/shard_split_donor_service.h"
 #include "mongo/db/session_catalog.h"
@@ -86,8 +82,6 @@
 #include "mongo/idl/cluster_server_parameter_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/pm2423_feature_flags_gen.h"
-#include "mongo/s/resharding/resharding_feature_flag_gen.h"
 #include "mongo/s/sharding_feature_flags_gen.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/util/exit.h"
@@ -111,7 +105,6 @@ MONGO_FAIL_POINT_DEFINE(hangWhileUpgrading);
 MONGO_FAIL_POINT_DEFINE(failDowngrading);
 MONGO_FAIL_POINT_DEFINE(hangWhileDowngrading);
 MONGO_FAIL_POINT_DEFINE(hangBeforeUpdatingFcvDoc);
-MONGO_FAIL_POINT_DEFINE(hangBeforeDrainingMigrations);
 
 /**
  * Ensures that only one instance of setFeatureCompatibilityVersion can run at a given time.
@@ -274,7 +267,7 @@ public:
         Lock::ExclusiveLock setFCVCommandLock(opCtx->lockState(), commandMutex);
 
         auto request = SetFeatureCompatibilityVersion::parse(
-            IDLParserErrorContext("setFeatureCompatibilityVersion"), cmdObj);
+            IDLParserContext("setFeatureCompatibilityVersion"), cmdObj);
         const auto requestedVersion = request.getCommandParameter();
         const auto actualVersion = serverGlobalParams.featureCompatibility.getVersion();
         if (request.getDowngradeOnDiskChanges()) {
@@ -309,7 +302,7 @@ public:
                 auto fcvObj =
                     FeatureCompatibilityVersion::findFeatureCompatibilityVersionDocument(opCtx);
                 auto fcvDoc = FeatureCompatibilityVersionDocument::parse(
-                    IDLParserErrorContext("featureCompatibilityVersionDocument"), fcvObj.get());
+                    IDLParserContext("featureCompatibilityVersionDocument"), fcvObj.get());
                 changeTimestamp = fcvDoc.getChangeTimestamp();
                 uassert(5722800,
                         "The 'changeTimestamp' field is missing in the FCV document persisted by "
@@ -340,48 +333,10 @@ public:
 
         if (!request.getPhase() || request.getPhase() == SetFCVPhaseEnum::kStart) {
             {
-                boost::optional<MigrationBlockingGuard> drainNewMoveChunks;
-
-                // Drain moveChunks if the actualVersion relies on the new migration protocol but
-                // the requestedVersion uses the old one (downgrading).
-                if (feature_flags::gFeatureFlagMigrationRecipientCriticalSection.isEnabledOnVersion(
-                        actualVersion) &&
-                    !feature_flags::gFeatureFlagMigrationRecipientCriticalSection
-                         .isEnabledOnVersion(requestedVersion)) {
-                    drainNewMoveChunks.emplace(opCtx, "setFeatureCompatibilityVersionDowngrade");
-
-                    // At this point, because we are holding the MigrationBlockingGuard, no new
-                    // migrations can start and there are no active ongoing ones. Still, there could
-                    // be migrations pending recovery. Drain them.
-                    migrationutil::drainMigrationsPendingRecovery(opCtx);
-                }
-
                 // Start transition to 'requestedVersion' by updating the local FCV document to a
                 // 'kUpgrading' or 'kDowngrading' state, respectively.
                 const auto fcvChangeRegion(
                     FeatureCompatibilityVersion::enterFCVChangeRegion(opCtx));
-
-                if (!gFeatureFlagUserWriteBlocking.isEnabledOnVersion(requestedVersion)) {
-                    // TODO SERVER-65010 Remove this scope once 6.0 has branched out
-
-                    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-                        uassert(
-                            ErrorCodes::CannotDowngrade,
-                            "Cannot downgrade while user write blocking is being changed",
-                            ConfigsvrCoordinatorService::getService(opCtx)
-                                ->areAllCoordinatorsOfTypeFinished(
-                                    opCtx, ConfigsvrCoordinatorTypeEnum::kSetUserWriteBlockMode));
-                    }
-
-                    DBDirectClient client(opCtx);
-
-                    const bool isBlockingUserWrites =
-                        client.count(NamespaceString::kUserWritesCriticalSectionsNamespace) != 0;
-
-                    uassert(ErrorCodes::CannotDowngrade,
-                            "Cannot downgrade while user write blocking is enabled.",
-                            !isBlockingUserWrites);
-                }
 
                 FeatureCompatibilityVersion::updateFeatureCompatibilityVersionDocument(
                     opCtx,
@@ -394,24 +349,16 @@ public:
 
             if (request.getPhase() == SetFCVPhaseEnum::kStart) {
                 invariant(serverGlobalParams.clusterRole == ClusterRole::ShardServer);
-                if (actualVersion > requestedVersion &&
-                    !feature_flags::gOrphanTracking.isEnabledOnVersion(requestedVersion)) {
-                    BalancerStatsRegistry::get(opCtx)->terminate();
-                    ScopedRangeDeleterLock rangeDeleterLock(opCtx);
-                    clearOrphanCountersFromRangeDeletionTasks(opCtx);
-                }
 
-                // TODO SERVER-65077: Remove FCV check once 6.0 is released
+                // TODO SERVER-68008: Remove collMod draining mechanism after 7.0 becomes last LTS.
                 if (actualVersion > requestedVersion &&
-                    !gFeatureFlagFLE2.isEnabledOnVersion(requestedVersion)) {
-                    // No more (recoverable) CompactStructuredEncryptionDataCoordinator will start
-                    // because we have already switched the FCV value to kDowngrading. Wait for the
-                    // ongoing CompactStructuredEncryptionDataCoordinator to finish.
+                    !feature_flags::gCollModCoordinatorV3.isEnabledOnVersion(requestedVersion)) {
+                    // Drain all running collMod v3 coordinator because they produce backward
+                    // incompatible on disk metadata
                     ShardingDDLCoordinatorService::getService(opCtx)
                         ->waitForCoordinatorsOfGivenTypeToComplete(
-                            opCtx, DDLCoordinatorTypeEnum::kCompactStructuredEncryptionData);
+                            opCtx, DDLCoordinatorTypeEnum::kCollMod);
                 }
-
                 // If we are only running phase-1, then we are done
                 return true;
             }
@@ -426,35 +373,7 @@ public:
             _runDowngrade(opCtx, request, changeTimestamp);
         }
 
-        hangBeforeDrainingMigrations.pauseWhileSet();
         {
-            boost::optional<MigrationBlockingGuard> drainOldMoveChunks;
-
-            bool orphanTrackingCondition =
-                serverGlobalParams.clusterRole == ClusterRole::ShardServer &&
-                !feature_flags::gOrphanTracking.isEnabledOnVersion(actualVersion) &&
-                feature_flags::gOrphanTracking.isEnabledOnVersion(requestedVersion);
-            // Drain moveChunks if the actualVersion relies on the old migration protocol but the
-            // requestedVersion uses the new one (upgrading), we're persisting the new chunk
-            // version format, or we are adding the numOrphans field to range deletion documents.
-            if ((!feature_flags::gFeatureFlagMigrationRecipientCriticalSection.isEnabledOnVersion(
-                     actualVersion) &&
-                 feature_flags::gFeatureFlagMigrationRecipientCriticalSection.isEnabledOnVersion(
-                     requestedVersion)) ||
-                orphanTrackingCondition) {
-                drainOldMoveChunks.emplace(opCtx, "setFeatureCompatibilityVersionUpgrade");
-
-                // At this point, because we are holding the MigrationBlockingGuard, no new
-                // migrations can start and there are no active ongoing ones. Still, there could
-                // be migrations pending recovery. Drain them.
-                migrationutil::drainMigrationsPendingRecovery(opCtx);
-
-                if (orphanTrackingCondition) {
-                    setOrphanCountersOnRangeDeletionTasks(opCtx);
-                    BalancerStatsRegistry::get(opCtx)->initializeAsync(opCtx);
-                }
-            }
-
             // Complete transition by updating the local FCV document to the fully upgraded or
             // downgraded requestedVersion.
             const auto fcvChangeRegion(FeatureCompatibilityVersion::enterFCVChangeRegion(opCtx));
@@ -524,13 +443,6 @@ private:
                     opCtx, CommandHelpers::appendMajorityWriteConcern(requestPhase2.toBSON({}))));
         }
 
-        // Create the pre-images collection if the feature flag is enabled on the requested version.
-        // TODO SERVER-61770: Remove once FCV 6.0 becomes last-lts.
-        if (feature_flags::gFeatureFlagChangeStreamPreAndPostImages.isEnabledOnVersion(
-                requestedVersion)) {
-            createChangeStreamPreImagesCollection(opCtx);
-        }
-
         // TODO SERVER-67392: Remove once FCV 7.0 becomes last-lts.
         if (feature_flags::gGlobalIndexesShardingCatalog.isEnabledOnVersion(requestedVersion)) {
             uassertStatusOK(sharding_util::createGlobalIndexesIndexes(opCtx));
@@ -543,9 +455,6 @@ private:
                        const SetFeatureCompatibilityVersion& request,
                        boost::optional<Timestamp> changeTimestamp) {
         const auto requestedVersion = request.getCommandParameter();
-        const bool preImagesFeatureFlagDisabledOnDowngradeVersion =
-            !feature_flags::gFeatureFlagChangeStreamPreAndPostImages.isEnabledOnVersion(
-                requestedVersion);
 
         // TODO  SERVER-65332 remove logic bound to this future object When kLastLTS is 6.0
         boost::optional<SharedSemiFuture<void>> chunkResizeAsyncTask;
@@ -581,29 +490,6 @@ private:
                 .isFCVDowngradingOrAlreadyDowngradedFromLatest()) {
             for (const auto& dbName : DatabaseHolder::get(opCtx)->getNames()) {
                 Lock::DBLock dbLock(opCtx, dbName, MODE_IX);
-                catalog::forEachCollectionFromDb(
-                    opCtx,
-                    dbName,
-                    MODE_X,
-                    [&](const CollectionPtr& collection) {
-                        // Fail to downgrade if there exists a collection with
-                        // 'changeStreamPreAndPostImages' enabled.
-                        // TODO SERVER-61770: Remove once FCV 6.0 becomes last-lts.
-                        uassert(ErrorCodes::CannotDowngrade,
-                                str::stream() << "Cannot downgrade the cluster as collection "
-                                              << collection->ns()
-                                              << " has 'changeStreamPreAndPostImages' enabled",
-                                preImagesFeatureFlagDisabledOnDowngradeVersion &&
-                                    !collection->isChangeStreamPreAndPostImagesEnabled());
-                        return true;
-                    },
-                    [&](const CollectionPtr& collection) {
-                        // TODO SERVER-61770: Remove 'changeStreamPreAndPostImages' check once
-                        // FCV 6.0 becomes last-lts.
-                        return preImagesFeatureFlagDisabledOnDowngradeVersion &&
-                            collection->isChangeStreamPreAndPostImagesEnabled();
-                    });
-
                 catalog::forEachCollectionFromDb(
                     opCtx,
                     dbName,
@@ -646,38 +532,6 @@ private:
                         return collection->getTimeseriesOptions() != boost::none;
                     });
             }
-
-            // Drop the pre-images collection if 'changeStreamPreAndPostImages' feature flag is not
-            // enabled on the downgrade version.
-            // TODO SERVER-61770: Remove once FCV 6.0 becomes last-lts.
-            if (preImagesFeatureFlagDisabledOnDowngradeVersion) {
-                DropReply dropReply;
-                const auto deletionStatus =
-                    dropCollection(opCtx,
-                                   NamespaceString::kChangeStreamPreImagesNamespace,
-                                   &dropReply,
-                                   DropCollectionSystemCollectionMode::kAllowSystemCollectionDrops);
-                uassert(deletionStatus.code(),
-                        str::stream() << "Failed to drop the change stream pre-images collection"
-                                      << causedBy(deletionStatus.reason()),
-                        deletionStatus.isOK() ||
-                            deletionStatus.code() == ErrorCodes::NamespaceNotFound);
-            }
-
-            // Block downgrade for collections with encrypted fields
-            // TODO SERVER-65077: Remove once FCV 6.0 becomes last-lts.
-            for (const auto& dbName : DatabaseHolder::get(opCtx)->getNames()) {
-                Lock::DBLock dbLock(opCtx, dbName, MODE_IX);
-                catalog::forEachCollectionFromDb(
-                    opCtx, dbName, MODE_X, [&](const CollectionPtr& collection) {
-                        uassert(
-                            ErrorCodes::CannotDowngrade,
-                            str::stream() << "Cannot downgrade the cluster as collection "
-                                          << collection->ns() << " has 'encryptedFields'",
-                            !collection->getCollectionOptions().encryptedFieldConfig.has_value());
-                        return true;
-                    });
-            }
         }
 
         {
@@ -702,20 +556,6 @@ private:
             newOpCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
             LOGV2(5876101, "Completed removal of internal sessions from config.transactions.");
-        }
-
-        // TODO SERVER-62338 Remove when 6.0 branches-out
-        if (serverGlobalParams.clusterRole == ClusterRole::ShardServer &&
-            !resharding::gFeatureFlagRecoverableShardsvrReshardCollectionCoordinator
-                 .isEnabledOnVersion(requestedVersion)) {
-            // No more (recoverable) ReshardCollectionCoordinators will start because we
-            // have already switched the FCV value to kDowngrading. Wait for the ongoing
-            // ReshardCollectionCoordinators to finish. The fact that the the configsvr has already
-            // executed 'abortAllReshardCollection' after switching to kDowngrading FCV ensures that
-            // ReshardCollectionCoordinators will finish (Interrupted) promptly.
-            ShardingDDLCoordinatorService::getService(opCtx)
-                ->waitForCoordinatorsOfGivenTypeToComplete(
-                    opCtx, DDLCoordinatorTypeEnum::kReshardCollection);
         }
 
         // TODO SERVER-67392: Remove when 7.0 branches-out.

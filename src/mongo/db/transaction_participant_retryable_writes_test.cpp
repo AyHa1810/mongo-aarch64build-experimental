@@ -34,8 +34,8 @@
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/op_observer_noop.h"
-#include "mongo/db/op_observer_registry.h"
+#include "mongo/db/op_observer/op_observer_noop.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/mock_repl_coord_server_fixture.h"
 #include "mongo/db/repl/oplog.h"
@@ -279,7 +279,7 @@ protected:
 
         auto txnRecordObj = cursor->next();
         auto txnRecord = SessionTxnRecord::parse(
-            IDLParserErrorContext("SessionEntryWrittenAtFirstWrite"), txnRecordObj);
+            IDLParserContext("SessionEntryWrittenAtFirstWrite"), txnRecordObj);
         ASSERT(!cursor->more());
         ASSERT_EQ(session->getSessionId(), txnRecord.getSessionId());
         ASSERT_EQ(txnNum, txnRecord.getTxnNum());
@@ -350,8 +350,8 @@ TEST_F(TransactionParticipantRetryableWritesTest, SessionEntryWrittenAtFirstWrit
     ASSERT(cursor);
     ASSERT(cursor->more());
 
-    auto txnRecord = SessionTxnRecord::parse(
-        IDLParserErrorContext("SessionEntryWrittenAtFirstWrite"), cursor->next());
+    auto txnRecord = SessionTxnRecord::parse(IDLParserContext("SessionEntryWrittenAtFirstWrite"),
+                                             cursor->next());
     ASSERT(!cursor->more());
     ASSERT_EQ(sessionId, txnRecord.getSessionId());
     ASSERT_EQ(txnNum, txnRecord.getTxnNum());
@@ -377,8 +377,8 @@ TEST_F(TransactionParticipantRetryableWritesTest,
     ASSERT(cursor);
     ASSERT(cursor->more());
 
-    auto txnRecord = SessionTxnRecord::parse(
-        IDLParserErrorContext("SessionEntryWrittenAtFirstWrite"), cursor->next());
+    auto txnRecord = SessionTxnRecord::parse(IDLParserContext("SessionEntryWrittenAtFirstWrite"),
+                                             cursor->next());
     ASSERT(!cursor->more());
     ASSERT_EQ(sessionId, txnRecord.getSessionId());
     ASSERT_EQ(200, txnRecord.getTxnNum());

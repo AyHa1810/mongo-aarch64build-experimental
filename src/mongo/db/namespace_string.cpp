@@ -203,7 +203,23 @@ bool NamespaceString::isCollectionlessAggregateNS() const {
 
 bool NamespaceString::isLegalClientSystemNS(
     const ServerGlobalParams::FeatureCompatibility& currentFCV) const {
-    if (db() == kAdminDb) {
+    auto dbname = dbName().db();
+
+    NamespaceString parsedNSS;
+    if (gMultitenancySupport && !tenantId()) {
+        // TODO (SERVER-67423) Remove support for mangled dbname in isLegalClientSystemNS check
+        // Transitional support for accepting tenantId as a mangled database name.
+        try {
+            parsedNSS = parseFromStringExpectTenantIdInMultitenancyMode(ns());
+            if (parsedNSS.tenantId()) {
+                dbname = parsedNSS.dbName().db();
+            }
+        } catch (const DBException&) {
+            // Swallow exception.
+        }
+    }
+
+    if (dbname == kAdminDb) {
         if (coll() == "system.roles")
             return true;
         if (coll() == kServerConfigurationNamespace.coll())
@@ -212,7 +228,7 @@ bool NamespaceString::isLegalClientSystemNS(
             return true;
         if (coll() == "system.backup_users")
             return true;
-    } else if (db() == kConfigDb) {
+    } else if (dbname == kConfigDb) {
         if (coll() == "system.sessions")
             return true;
         if (coll() == kIndexBuildEntryNamespace.coll())
@@ -223,7 +239,7 @@ bool NamespaceString::isLegalClientSystemNS(
             return true;
         if (coll() == kConfigsvrCoordinatorsNamespace.coll())
             return true;
-    } else if (db() == kLocalDb) {
+    } else if (dbname == kLocalDb) {
         if (coll() == kSystemReplSetNamespace.coll())
             return true;
         if (coll() == "system.healthlog")
@@ -264,19 +280,22 @@ bool NamespaceString::isLegalClientSystemNS(
  * Process updates to 'admin.system.version' individually as well so the secondary's FCV when
  * processing each operation matches the primary's when committing that operation.
  *
- * Process updates to config.tenantMigrationRecipients individually so they serialize after inserts
- * into config.donatedFiles.<migrationId>.
+ * Process updates to 'config.tenantMigrationRecipients' individually so they serialize after
+ * inserts into 'config.donatedFiles.<migrationId>'.
  *
  * Oplog entries on 'config.shards' should be processed one at a time, otherwise the in-memory state
  * that its kept on the TopologyTimeTicker might be wrong.
  *
+ * Serialize updates to 'config.tenantMigrationDonors' and 'config.shardSplitDonors' to avoid races
+ * with creating tenant access blockers on secondaries.
  */
 bool NamespaceString::mustBeAppliedInOwnOplogBatch() const {
     return isSystemDotViews() || isServerConfigurationCollection() || isPrivilegeCollection() ||
         _ns == kDonorReshardingOperationsNamespace.ns() ||
         _ns == kForceOplogBatchBoundaryNamespace.ns() ||
         _ns == kTenantMigrationDonorsNamespace.ns() ||
-        _ns == kTenantMigrationRecipientsNamespace.ns() || _ns == kConfigsvrShardsNamespace.ns();
+        _ns == kTenantMigrationRecipientsNamespace.ns() || _ns == kShardSplitDonorsNamespace.ns() ||
+        _ns == kConfigsvrShardsNamespace.ns();
 }
 
 NamespaceString NamespaceString::makeListCollectionsNSS(const DatabaseName& dbName) {
@@ -297,6 +316,12 @@ NamespaceString NamespaceString::makeChangeCollectionNSS(
     const boost::optional<TenantId>& tenantId) {
     // TODO: SERVER-65950 create namespace for a particular tenant.
     return NamespaceString{NamespaceString::kConfigDb, NamespaceString::kChangeCollectionName};
+}
+
+NamespaceString NamespaceString::makePreImageCollectionNSS(
+    const boost::optional<TenantId>& tenantId) {
+    return tenantId ? NamespaceString(tenantId, kConfigDb, "system.preimages")
+                    : kChangeStreamPreImagesNamespace;
 }
 
 std::string NamespaceString::getSisterNS(StringData local) const {

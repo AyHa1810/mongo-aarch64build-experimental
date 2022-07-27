@@ -333,7 +333,7 @@ public:
             {
                 // Acquire only the global lock and set up a consistent in-memory catalog and
                 // storage snapshot.
-                AutoGetDbForReadMaybeLockFree lockFreeReadBlock(opCtx, db);
+                AutoGetDbForReadMaybeLockFree lockFreeReadBlock(opCtx, dbName);
                 auto catalog = CollectionCatalog::get(opCtx);
 
                 CurOpFailpointHelpers::waitWhileFailPointEnabled(&hangBeforeListCollections,
@@ -520,7 +520,7 @@ public:
 
                     try {
                         firstBatch.push_back(ListCollectionsReplyItem::parse(
-                            IDLParserErrorContext("ListCollectionsReplyItem"), nextDoc));
+                            IDLParserContext("ListCollectionsReplyItem"), nextDoc));
                     } catch (const DBException& exc) {
                         LOGV2_ERROR(
                             5254300,

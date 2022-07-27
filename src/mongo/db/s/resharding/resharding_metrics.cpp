@@ -83,7 +83,8 @@ ReshardingMetrics::ReshardingMetrics(UUID instanceId,
                                            role,
                                            startTime,
                                            clockSource,
-                                           cumulativeMetrics},
+                                           cumulativeMetrics,
+                                           std::make_unique<ReshardingMetricsFieldNameProvider>()},
       _state{getDefaultState(role)},
       _deletesApplied{0},
       _insertsApplied{0},
@@ -91,7 +92,9 @@ ReshardingMetrics::ReshardingMetrics(UUID instanceId,
       _oplogEntriesApplied{0},
       _oplogEntriesFetched{0},
       _applyingStartTime{kNoDate},
-      _applyingEndTime{kNoDate} {}
+      _applyingEndTime{kNoDate},
+      _reshardingFieldNames{static_cast<ReshardingMetricsFieldNameProvider*>(_fieldNames.get())},
+      _scopedObserver(registerInstanceMetrics()) {}
 
 ReshardingMetrics::ReshardingMetrics(const CommonReshardingMetadata& metadata,
                                      Role role,
@@ -105,6 +108,12 @@ ReshardingMetrics::ReshardingMetrics(const CommonReshardingMetadata& metadata,
                         clockSource,
                         cumulativeMetrics} {}
 
+ReshardingMetrics::~ReshardingMetrics() {
+    // Deregister the observer first to ensure that the observer will no longer be able to reach
+    // this object while destructor is running.
+    _scopedObserver.reset();
+}
+
 std::string ReshardingMetrics::createOperationDescription() const noexcept {
     return fmt::format("ReshardingMetrics{}Service {}",
                        ShardingDataTransformMetrics::getRoleName(_role),
@@ -113,8 +122,8 @@ std::string ReshardingMetrics::createOperationDescription() const noexcept {
 
 Milliseconds ReshardingMetrics::getRecipientHighEstimateRemainingTimeMillis() const {
     auto estimate = resharding::estimateRemainingRecipientTime(_applyingStartTime.load() != kNoDate,
-                                                               getBytesCopiedCount(),
-                                                               getApproxBytesToCopyCount(),
+                                                               getBytesWrittenCount(),
+                                                               getApproxBytesToScanCount(),
                                                                getCopyingElapsedTimeSecs(),
                                                                _oplogEntriesApplied.load(),
                                                                _oplogEntriesFetched.load(),
@@ -144,7 +153,7 @@ std::unique_ptr<ReshardingMetrics> ReshardingMetrics::makeInstance(UUID instance
 
 StringData ReshardingMetrics::getStateString() const noexcept {
     return stdx::visit(
-        visit_helper::Overloaded{
+        OverloadedVisitor{
             [](CoordinatorStateEnum state) { return CoordinatorState_serializer(state); },
             [](RecipientStateEnum state) { return RecipientState_serializer(state); },
             [](DonorStateEnum state) { return DonorState_serializer(state); }},
@@ -153,20 +162,23 @@ StringData ReshardingMetrics::getStateString() const noexcept {
 
 BSONObj ReshardingMetrics::reportForCurrentOp() const noexcept {
     BSONObjBuilder builder;
-    builder.append(kDescription, createOperationDescription());
     switch (_role) {
         case Role::kCoordinator:
-            builder.append(kApplyTimeElapsed, getApplyingElapsedTimeSecs().count());
+            builder.append(_reshardingFieldNames->getForApplyTimeElapsed(),
+                           getApplyingElapsedTimeSecs().count());
             break;
         case Role::kDonor:
             break;
         case Role::kRecipient:
-            builder.append(kApplyTimeElapsed, getApplyingElapsedTimeSecs().count());
-            builder.append(kInsertsApplied, _insertsApplied.load());
-            builder.append(kUpdatesApplied, _updatesApplied.load());
-            builder.append(kDeletesApplied, _deletesApplied.load());
-            builder.append(kOplogEntriesApplied, _oplogEntriesApplied.load());
-            builder.append(kOplogEntriesFetched, _oplogEntriesFetched.load());
+            builder.append(_reshardingFieldNames->getForApplyTimeElapsed(),
+                           getApplyingElapsedTimeSecs().count());
+            builder.append(_reshardingFieldNames->getForInsertsApplied(), _insertsApplied.load());
+            builder.append(_reshardingFieldNames->getForUpdatesApplied(), _updatesApplied.load());
+            builder.append(_reshardingFieldNames->getForDeletesApplied(), _deletesApplied.load());
+            builder.append(_reshardingFieldNames->getForOplogEntriesApplied(),
+                           _oplogEntriesApplied.load());
+            builder.append(_reshardingFieldNames->getForOplogEntriesFetched(),
+                           _oplogEntriesFetched.load());
             break;
         default:
             MONGO_UNREACHABLE;
@@ -193,12 +205,12 @@ void ReshardingMetrics::restoreRecipientSpecificFields(
     auto docsToCopy = metrics->getApproxDocumentsToCopy();
     auto bytesToCopy = metrics->getApproxBytesToCopy();
     if (docsToCopy && bytesToCopy) {
-        setDocumentsToCopyCounts(*docsToCopy, *bytesToCopy);
+        setDocumentsToProcessCounts(*docsToCopy, *bytesToCopy);
     }
     auto docsCopied = metrics->getFinalDocumentsCopiedCount();
     auto bytesCopied = metrics->getFinalBytesCopiedCount();
     if (docsCopied && bytesCopied) {
-        restoreDocumentsCopied(*docsCopied, *bytesCopied);
+        restoreDocumentsProcessed(*docsCopied, *bytesCopied);
     }
     restorePhaseDurationFields(document);
 }

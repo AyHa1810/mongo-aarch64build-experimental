@@ -48,7 +48,7 @@ class IndexScanTest {
 public:
     IndexScanTest()
         : _dbLock(&_opCtx, nss().dbName(), MODE_X),
-          _ctx(&_opCtx, ns()),
+          _ctx(&_opCtx, nss()),
           _coll(nullptr),
           _expCtx(make_intrusive<ExpressionContext>(&_opCtx, nullptr, nss())) {}
 
@@ -136,7 +136,7 @@ public:
         params.bounds.fields.push_back(oil);
 
         MatchExpression* filter = nullptr;
-        return new IndexScan(_expCtx.get(), _coll, params, &_ws, filter);
+        return new IndexScan(_expCtx.get(), _collPtr, params, &_ws, filter);
     }
 
     static const char* ns() {

@@ -98,6 +98,8 @@ void RecoverableCriticalSectionService::acquireRecoverableCriticalSectionBlockWr
 
     {
         Lock::GlobalLock lk(opCtx, MODE_IX);
+        // TODO SERVER-68084 add the AutoGetCollectionViewMode::kViewsPermitted parameter to
+        // construct cCollLock.
         AutoGetCollection cCollLock(opCtx, nss, MODE_S);
 
         DBDirectClient dbClient(opCtx);
@@ -110,7 +112,7 @@ void RecoverableCriticalSectionService::acquireRecoverableCriticalSectionBlockWr
         if (cursor->more()) {
             const auto bsonObj = cursor->next();
             const auto collCSDoc = CollectionCriticalSectionDocument::parse(
-                IDLParserErrorContext("AcquireRecoverableCSBW"), bsonObj);
+                IDLParserContext("AcquireRecoverableCSBW"), bsonObj);
 
             invariant(collCSDoc.getReason().woCompare(reason) == 0,
                       str::stream()
@@ -184,6 +186,8 @@ void RecoverableCriticalSectionService::promoteRecoverableCriticalSectionToBlock
     invariant(!opCtx->lockState()->isLocked());
 
     {
+        // TODO SERVER-68084 add the AutoGetCollectionViewMode::kViewsPermitted parameter to
+        // construct cCollLock.
         AutoGetCollection cCollLock(opCtx, nss, MODE_X);
 
         DBDirectClient dbClient(opCtx);
@@ -199,7 +203,7 @@ void RecoverableCriticalSectionService::promoteRecoverableCriticalSectionToBlock
                           << " but the critical section wasn't acquired first blocking writers.");
         BSONObj bsonObj = cursor->next();
         const auto collCSDoc = CollectionCriticalSectionDocument::parse(
-            IDLParserErrorContext("AcquireRecoverableCSBR"), bsonObj);
+            IDLParserContext("AcquireRecoverableCSBR"), bsonObj);
 
         invariant(
             collCSDoc.getReason().woCompare(reason) == 0,
@@ -284,6 +288,8 @@ void RecoverableCriticalSectionService::releaseRecoverableCriticalSection(
     invariant(!opCtx->lockState()->isLocked());
 
     {
+        // TODO SERVER-68084 add the AutoGetCollectionViewMode::kViewsPermitted parameter to
+        // construct cCollLock.
         AutoGetCollection collLock(opCtx, nss, MODE_X);
 
         DBDirectClient dbClient(opCtx);
@@ -307,7 +313,7 @@ void RecoverableCriticalSectionService::releaseRecoverableCriticalSection(
 
         BSONObj bsonObj = cursor->next();
         const auto collCSDoc = CollectionCriticalSectionDocument::parse(
-            IDLParserErrorContext("ReleaseRecoverableCS"), bsonObj);
+            IDLParserContext("ReleaseRecoverableCS"), bsonObj);
 
         invariant(
             collCSDoc.getReason().woCompare(reason) == 0,

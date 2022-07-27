@@ -300,8 +300,8 @@ void DocumentSourceSort::serializeToArray(
         if (explain >= ExplainOptions::Verbosity::kExecStats) {
             mutDoc["totalDataSizeSortedBytesEstimate"] =
                 Value(static_cast<long long>(_timeSorter->totalDataSizeBytes()));
-            mutDoc["usedDisk"] = Value(_timeSorter->numSpills() > 0);
-            mutDoc["spills"] = Value(static_cast<long long>(_timeSorter->numSpills()));
+            mutDoc["usedDisk"] = Value(_timeSorter->stats().spilledRanges() > 0);
+            mutDoc["spills"] = Value(static_cast<long long>(_timeSorter->stats().spilledRanges()));
         }
 
         array.push_back(Value{mutDoc.freeze()});
@@ -648,7 +648,7 @@ boost::optional<DocumentSource::DistributedPlanLogic> DocumentSourceSort::distri
 }
 
 bool DocumentSourceSort::canRunInParallelBeforeWriteStage(
-    const std::set<std::string>& nameOfShardKeyFieldsUponEntryToStage) const {
+    const OrderedPathSet& nameOfShardKeyFieldsUponEntryToStage) const {
     // This is an interesting special case. If there are no further stages which require merging the
     // streams into one, a $sort should not require it. This is only the case because the sort order
     // doesn't matter for a pipeline ending with a write stage. We may encounter it here as an

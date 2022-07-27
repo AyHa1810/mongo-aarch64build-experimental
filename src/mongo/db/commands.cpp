@@ -155,22 +155,17 @@ BSONObj CommandHelpers::runCommandDirectly(OperationContext* opCtx, const OpMsgR
     return replyBuilder.releaseBody();
 }
 
-Future<void> CommandHelpers::runCommandInvocation(
-    std::shared_ptr<RequestExecutionContext> rec,
-    std::shared_ptr<CommandInvocation> invocation,
-    transport::ServiceExecutor::ThreadingModel threadingModel) {
-    switch (threadingModel) {
-        case transport::ServiceExecutor::ThreadingModel::kBorrowed:
-            return runCommandInvocationAsync(std::move(rec), std::move(invocation));
-        case transport::ServiceExecutor::ThreadingModel::kDedicated:
-            return makeReadyFutureWith([opCtx = rec->getOpCtx(),
-                                        request = rec->getRequest(),
-                                        invocation = invocation.get(),
-                                        replyBuilder = rec->getReplyBuilder()] {
-                runCommandInvocation(opCtx, request, invocation, replyBuilder);
-            });
-    }
-    MONGO_UNREACHABLE;
+Future<void> CommandHelpers::runCommandInvocation(std::shared_ptr<RequestExecutionContext> rec,
+                                                  std::shared_ptr<CommandInvocation> invocation,
+                                                  bool useDedicatedThread) {
+    if (useDedicatedThread)
+        return makeReadyFutureWith([opCtx = rec->getOpCtx(),
+                                    request = rec->getRequest(),
+                                    invocation = invocation.get(),
+                                    replyBuilder = rec->getReplyBuilder()] {
+            runCommandInvocation(opCtx, request, invocation, replyBuilder);
+        });
+    return runCommandInvocationAsync(std::move(rec), std::move(invocation));
 }
 
 void CommandHelpers::runCommandInvocation(OperationContext* opCtx,
@@ -352,8 +347,7 @@ bool CommandHelpers::appendCommandStatusNoThrow(BSONObjBuilder& result, const St
     // construct an invalid error reply.
     if (!status.isOK() && getTestCommandsEnabled()) {
         try {
-            ErrorReply::parse(IDLParserErrorContext("appendCommandStatusNoThrow"),
-                              result.asTempObj());
+            ErrorReply::parse(IDLParserContext("appendCommandStatusNoThrow"), result.asTempObj());
         } catch (const DBException&) {
             invariant(false,
                       "invalid error-response to a command constructed in "
@@ -876,7 +870,7 @@ public:
         : CommandInvocation(command),
           _command(command),
           _request(request),
-          _dbName(_request.getDatabase().toString()) {}
+          _dbName(_request.getValidatedTenantId(), _request.getDatabase().toString()) {}
 
 private:
     void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) override {
@@ -905,7 +899,7 @@ private:
     }
 
     NamespaceString ns() const override {
-        return NamespaceString(_command->parseNs(_dbName, cmdObj()));
+        return NamespaceString(_dbName.tenantId(), _command->parseNs(_dbName.toString(), cmdObj()));
     }
 
     bool supportsWriteConcern() const override {
@@ -945,7 +939,7 @@ private:
 
     BasicCommandWithReplyBuilderInterface* const _command;
     const OpMsgRequest _request;
-    const std::string _dbName;
+    const DatabaseName _dbName;
 };
 
 Command::~Command() = default;

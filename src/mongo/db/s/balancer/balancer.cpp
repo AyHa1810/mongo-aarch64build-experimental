@@ -96,6 +96,9 @@ static constexpr StringData kBalancerPolicyStatusZoneViolation = "zoneViolation"
 static constexpr StringData kBalancerPolicyStatusChunksImbalance = "chunksImbalance"_sd;
 static constexpr StringData kBalancerPolicyStatusDefragmentingChunks = "defragmentingChunks"_sd;
 
+// Time interval between checks on draining shards.
+constexpr Minutes kDrainingShardsCheckInterval{10};
+
 /**
  * Utility class to generate timing and statistics for a single balancer round.
  */
@@ -229,6 +232,36 @@ std::tuple<bool, WriteConcernOptions> getSecondaryThrottleAndWriteConcern(
 const auto _balancerDecoration = ServiceContext::declareDecoration<Balancer>();
 
 const ReplicaSetAwareServiceRegistry::Registerer<Balancer> _balancerRegisterer("Balancer");
+
+/**
+ * Returns the names of shards that are currently draining. When the balancer is disabled, draining
+ * shards are stuck in this state as chunks cannot be migrated.
+ */
+std::vector<std::string> getDrainingShardNames(OperationContext* opCtx) {
+    // Find the shards that are currently draining.
+    const auto configShard{Grid::get(opCtx)->shardRegistry()->getConfigShard()};
+    const auto drainingShardsDocs{
+        uassertStatusOK(
+            configShard->exhaustiveFindOnConfig(opCtx,
+                                                ReadPreferenceSetting{ReadPreference::Nearest},
+                                                repl::ReadConcernLevel::kMajorityReadConcern,
+                                                NamespaceString::kConfigsvrShardsNamespace,
+                                                BSON(ShardType::draining << true),
+                                                BSONObj() /* No sorting */,
+                                                boost::none /* No limit */))
+            .docs};
+
+    // Build the list of the draining shard names.
+    std::vector<std::string> drainingShardNames;
+    std::transform(drainingShardsDocs.begin(),
+                   drainingShardsDocs.end(),
+                   std::back_inserter(drainingShardNames),
+                   [](const auto& shardDoc) {
+                       const auto shardEntry{uassertStatusOK(ShardType::fromBSON(shardDoc))};
+                       return shardEntry.getName();
+                   });
+    return drainingShardNames;
+}
 
 }  // namespace
 
@@ -434,6 +467,7 @@ void Balancer::report(OperationContext* opCtx, BSONObjBuilder* builder) {
     builder->append("mode", BalancerSettingsType::kBalancerModes[mode]);
     builder->append("inBalancerRound", _inBalancerRound);
     builder->append("numBalancerRounds", _numBalancerRounds);
+    builder->append("term", repl::ReplicationCoordinator::get(opCtx)->getTerm());
 }
 
 void Balancer::_consumeActionStreamLoop() {
@@ -523,7 +557,7 @@ void Balancer::_consumeActionStreamLoop() {
 
         _outstandingStreamingOps.fetchAndAdd(1);
         stdx::visit(
-            visit_helper::Overloaded{
+            OverloadedVisitor{
                 [&, selectedStream](MergeInfo&& mergeAction) {
                     applyThrottling();
                     auto result =
@@ -663,6 +697,7 @@ void Balancer::_mainThread() {
 
     // Main balancer loop
     auto lastMigrationTime = Date_t::fromMillisSinceEpoch(0);
+    auto lastDrainingShardsCheckTime{Date_t::fromMillisSinceEpoch(0)};
     while (!_stopRequested()) {
         BalanceRoundDetails roundDetails;
 
@@ -685,6 +720,20 @@ void Balancer::_mainThread() {
 
             if (!balancerConfig->shouldBalance() || _stopRequested() ||
                 _clusterChunksResizePolicy->isActive()) {
+
+                if (balancerConfig->getBalancerMode() == BalancerSettingsType::BalancerMode::kOff &&
+                    Date_t::now() - lastDrainingShardsCheckTime >= kDrainingShardsCheckInterval) {
+                    const auto drainingShardNames{getDrainingShardNames(opCtx.get())};
+                    if (!drainingShardNames.empty()) {
+                        LOGV2_WARNING(6434000,
+                                      "Draining of removed shards cannot be completed because the "
+                                      "balancer is disabled",
+                                      "shards"_attr = drainingShardNames);
+                    }
+
+                    lastDrainingShardsCheckTime = Date_t::now();
+                }
+
                 LOGV2_DEBUG(21859, 1, "Skipping balancing round because balancing is disabled");
                 _endRound(opCtx.get(), kBalanceRoundDefaultInterval);
                 continue;
@@ -732,7 +781,7 @@ void Balancer::_mainThread() {
                                   "Failed to split chunks",
                                   "error"_attr = status);
                 } else {
-                    LOGV2_DEBUG(21861, 1, "Done enforcing tag range boundaries.");
+                    LOGV2_DEBUG(21861, 1, "Done enforcing zone range boundaries.");
                 }
 
                 stdx::unordered_set<ShardId> usedShards;
@@ -845,7 +894,7 @@ void Balancer::_sleepFor(OperationContext* opCtx, Milliseconds waitTimeout) {
 bool Balancer::_checkOIDs(OperationContext* opCtx) {
     auto shardingContext = Grid::get(opCtx);
 
-    const auto all = shardingContext->shardRegistry()->getAllShardIdsNoReload();
+    const auto all = shardingContext->shardRegistry()->getAllShardIds(opCtx);
 
     // map of OID machine ID => shardId
     map<int, ShardId> oids;
@@ -859,7 +908,7 @@ bool Balancer::_checkOIDs(OperationContext* opCtx) {
         if (!shardStatus.isOK()) {
             continue;
         }
-        const auto s = shardStatus.getValue();
+        const auto s = std::move(shardStatus.getValue());
 
         auto result = uassertStatusOK(
             s->runCommandWithFixedRetryAttempts(opCtx,

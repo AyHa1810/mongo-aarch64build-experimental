@@ -42,7 +42,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
@@ -95,7 +95,7 @@ public:
                            string& errmsg,
                            BSONObjBuilder& result) {
         auto renameRequest =
-            RenameCollectionCommand::parse(IDLParserErrorContext("renameCollection"), cmdObj);
+            RenameCollectionCommand::parse(IDLParserContext("renameCollection"), cmdObj);
 
         const auto& fromNss = renameRequest.getCommandParameter();
         const auto& toNss = renameRequest.getTo();
@@ -107,7 +107,7 @@ public:
         options.stayTemp = renameRequest.getStayTemp();
         options.expectedSourceUUID = renameRequest.getCollectionUUID();
         stdx::visit(
-            visit_helper::Overloaded{
+            OverloadedVisitor{
                 [&options](bool dropTarget) { options.dropTarget = dropTarget; },
                 [&options](const UUID& uuid) {
                     options.dropTarget = true;

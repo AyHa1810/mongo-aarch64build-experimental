@@ -745,8 +745,7 @@ void ReplicationCoordinatorImpl::_startInitialSync(
                     onCompletion);
             };
 
-            if (repl::feature_flags::gFileCopyBasedInitialSync.isEnabledAndIgnoreFCV() &&
-                !fallbackToLogical) {
+            if (!fallbackToLogical) {
                 auto swInitialSyncer = createInitialSyncer(initialSyncMethod);
                 if (swInitialSyncer.getStatus().code() == ErrorCodes::NotImplemented &&
                     initialSyncMethod != "logical") {
@@ -1328,7 +1327,9 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* opCtx,
     _updateWriteAbilityFromTopologyCoordinator(lk, opCtx);
     _updateMemberStateFromTopologyCoordinator(lk);
 
-    LOGV2(21331, "Transition to primary complete; database writes are now permitted");
+    LOGV2(21331,
+          "Transition to primary complete; database writes are now permitted",
+          "term"_attr = _termShadow.load());
     _externalState->startNoopWriter(_getMyLastAppliedOpTime_inlock());
 }
 
@@ -4892,7 +4893,7 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig(WithLock lk,
         }
     }
 
-    // Warn if using the in-memory (ephemeral) storage engine or running running --nojournal with
+    // Warn if using the in-memory (ephemeral) storage engine with
     // writeConcernMajorityJournalDefault=true.
     StorageEngine* storageEngine = opCtx->getServiceContext()->getStorageEngine();
     if (storageEngine && newConfig.getWriteConcernMajorityShouldJournal() &&
@@ -4925,33 +4926,6 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig(WithLock lk,
                           {logv2::LogTag::kStartupWarnings},
                           "**          available free RAM is exhausted.");
             LOGV2_OPTIONS(21386, {logv2::LogTag::kStartupWarnings}, "");
-        } else if (!storageEngine->isDurable()) {
-            LOGV2_OPTIONS(21369, {logv2::LogTag::kStartupWarnings}, "");
-            LOGV2_OPTIONS(
-                21370,
-                {logv2::LogTag::kStartupWarnings},
-                "** WARNING: This replica set node is running without journaling enabled but the ");
-            LOGV2_OPTIONS(
-                21371,
-                {logv2::LogTag::kStartupWarnings},
-                "**          writeConcernMajorityJournalDefault option to the replica set config ");
-            LOGV2_OPTIONS(21372,
-                          {logv2::LogTag::kStartupWarnings},
-                          "**          is set to true. The writeConcernMajorityJournalDefault ");
-            LOGV2_OPTIONS(21373,
-                          {logv2::LogTag::kStartupWarnings},
-                          "**          option to the replica set config must be set to false ");
-            LOGV2_OPTIONS(21374,
-                          {logv2::LogTag::kStartupWarnings},
-                          "**          or w:majority write concerns will never complete.");
-            LOGV2_OPTIONS(
-                21375,
-                {logv2::LogTag::kStartupWarnings},
-                "**          In addition, this node's memory consumption may increase until all");
-            LOGV2_OPTIONS(21376,
-                          {logv2::LogTag::kStartupWarnings},
-                          "**          available free RAM is exhausted.");
-            LOGV2_OPTIONS(21377, {logv2::LogTag::kStartupWarnings}, "");
         }
     }
 
@@ -5087,10 +5061,21 @@ Status ReplicationCoordinatorImpl::processReplSetUpdatePosition(const UpdatePosi
     }
     _updateStateAfterRemoteOpTimeUpdates(lock, maxRemoteOpTime);
 
-    if (gotValidUpdate && !_getMemberState_inlock().primary()) {
+    if (gotValidUpdate) {
+        // If we become primary after the unlock below, the forwardSecondaryProgress will do nothing
+        // (slightly expensively).  If we become secondary after the unlock below, BackgroundSync
+        // will take care of forwarding our progress by calling signalUpstreamUpdater() once we
+        // select a new sync source.  So it's OK to depend on the stale value of wasPrimary here.
+        bool wasPrimary = _getMemberState_inlock().primary();
         lock.unlock();
-        // Must do this outside _mutex
-        _externalState->forwardSecondaryProgress();
+        // maxRemoteOpTime is null here if we got valid updates but no downstream node had
+        // actually advanced any optime.
+        if (!maxRemoteOpTime.isNull())
+            _externalState->notifyOtherMemberDataChanged();
+        if (!wasPrimary) {
+            // Must do this outside _mutex
+            _externalState->forwardSecondaryProgress();
+        }
     }
     return status;
 }
@@ -5188,7 +5173,7 @@ ReadPreference ReplicationCoordinatorImpl::_getSyncSourceReadPreference(WithLock
         if (!initialSyncSourceReadPreference.empty()) {
             try {
                 readPreference =
-                    ReadPreference_parse(IDLParserErrorContext("initialSyncSourceReadPreference"),
+                    ReadPreference_parse(IDLParserContext("initialSyncSourceReadPreference"),
                                          initialSyncSourceReadPreference);
                 parsedSyncSourceFromInitialSync = true;
             } catch (const DBException& e) {

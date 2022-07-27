@@ -49,8 +49,8 @@
 #include "mongo/db/index/index_access_method_factory_impl.h"
 #include "mongo/db/kill_sessions_local.h"
 #include "mongo/db/logical_session_cache_impl.h"
-#include "mongo/db/op_observer_impl.h"
-#include "mongo/db/op_observer_registry.h"
+#include "mongo/db/op_observer/op_observer_impl.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/s/collection_sharding_state_factory_standalone.h"
 #include "mongo/db/service_liaison_mongod.h"
@@ -63,6 +63,7 @@
 #include "mongo/db/ttl.h"
 #include "mongo/embedded/embedded_options_parser_init.h"
 #include "mongo/embedded/index_builds_coordinator_embedded.h"
+#include "mongo/embedded/oplog_writer_embedded.h"
 #include "mongo/embedded/periodic_runner_embedded.h"
 #include "mongo/embedded/read_write_concern_defaults_cache_lookup_embedded.h"
 #include "mongo/embedded/replication_coordinator_embedded.h"
@@ -72,6 +73,7 @@
 #include "mongo/scripting/dbdirectclient_factory.h"
 #include "mongo/util/background.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/exit_code.h"
 #include "mongo/util/periodic_runner_factory.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/time_support.h"
@@ -207,7 +209,8 @@ ServiceContext* initialize(const char* yaml_config) {
     serviceContext->setServiceEntryPoint(std::make_unique<ServiceEntryPointEmbedded>());
 
     auto opObserverRegistry = std::make_unique<OpObserverRegistry>();
-    opObserverRegistry->addObserver(std::make_unique<OpObserverImpl>());
+    opObserverRegistry->addObserver(
+        std::make_unique<OpObserverImpl>(std::make_unique<OplogWriterEmbedded>()));
     serviceContext->setOpObserver(std::move(opObserverRegistry));
 
     DBDirectClientFactory::get(serviceContext).registerImplementation([](OperationContext* opCtx) {
@@ -303,7 +306,7 @@ ServiceContext* initialize(const char* yaml_config) {
                             logv2::LogOptions(LogComponent::kControl, logv2::FatalMode::kContinue),
                             "** IMPORTANT: {error_toStatus_reason}",
                             "error_toStatus_reason"_attr = error.toStatus().reason());
-        quickExit(EXIT_NEED_DOWNGRADE);
+        quickExit(ExitCode::needDowngrade);
     }
 
     // Ensure FCV document exists and is initialized in-memory. Fatally asserts if there is an
@@ -316,7 +319,7 @@ ServiceContext* initialize(const char* yaml_config) {
 
     if (storageGlobalParams.upgrade) {
         LOGV2(22553, "finished checking dbs");
-        exitCleanly(EXIT_CLEAN);
+        exitCleanly(ExitCode::clean);
     }
 
     // This is for security on certain platforms (nonce generation)

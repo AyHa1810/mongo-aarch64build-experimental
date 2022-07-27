@@ -682,7 +682,7 @@ void CollectionCatalog::dropCollection(OperationContext* opCtx, Collection* coll
 void CollectionCatalog::onOpenDatabase(OperationContext* opCtx,
                                        const DatabaseName& dbName,
                                        ViewsForDatabase&& viewsForDb) {
-    invariant(opCtx->lockState()->isDbLockedForMode(dbName.db(), MODE_IS));
+    invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_IS));
     uassert(ErrorCodes::AlreadyInitialized,
             str::stream() << "Database " << dbName << " is already initialized",
             _viewsForDatabase.find(dbName) == _viewsForDatabase.end());
@@ -691,7 +691,7 @@ void CollectionCatalog::onOpenDatabase(OperationContext* opCtx,
 }
 
 void CollectionCatalog::onCloseDatabase(OperationContext* opCtx, DatabaseName dbName) {
-    invariant(opCtx->lockState()->isDbLockedForMode(dbName.db(), MODE_X));
+    invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_X));
     auto rid = ResourceId(RESOURCE_DATABASE, dbName.toString());
     removeResource(rid, dbName.toString());
     _viewsForDatabase.erase(dbName);
@@ -1057,7 +1057,7 @@ std::vector<UUID> CollectionCatalog::getAllCollectionUUIDsFromDb(const DatabaseN
 
 std::vector<NamespaceString> CollectionCatalog::getAllCollectionNamesFromDb(
     OperationContext* opCtx, const DatabaseName& dbName) const {
-    invariant(opCtx->lockState()->isDbLockedForMode(dbName.db(), MODE_S));
+    invariant(opCtx->lockState()->isDbLockedForMode(dbName, MODE_S));
 
     auto minUuid = UUID::parse("00000000-0000-0000-0000-000000000000").getValue();
 
@@ -1429,7 +1429,7 @@ Status CollectionCatalog::_createOrUpdateView(
     BSONObj viewDef = viewDefBuilder.obj();
     BSONObj ownedPipeline = pipeline.getOwned();
     ViewDefinition view(
-        viewName.db(), viewName.coll(), viewOn.coll(), ownedPipeline, std::move(collator));
+        viewName.dbName(), viewName.coll(), viewOn.coll(), ownedPipeline, std::move(collator));
 
     // If the view is already in the durable view catalog, we don't need to validate the graph. If
     // we need to update the durable view catalog, we need to check that the resulting dependency
@@ -1550,10 +1550,7 @@ const Collection* LookupCollectionForYieldRestore::operator()(OperationContext* 
     // state. After a query yields its locks, the replication state may have changed, invalidating
     // our current choice of ReadSource. Using the same preconditions, change our ReadSource if
     // necessary.
-    auto [newReadSource, _] = SnapshotHelper::shouldChangeReadSource(opCtx, collection->ns());
-    if (newReadSource) {
-        opCtx->recoveryUnit()->setTimestampReadSource(*newReadSource);
-    }
+    SnapshotHelper::changeReadSourceIfNeeded(opCtx, collection->ns());
 
     return collection.get();
 }

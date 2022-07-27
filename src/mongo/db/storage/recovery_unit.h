@@ -203,7 +203,7 @@ public:
     /**
      * Waits until all commits that happened before this call are durable in the journal. Returns
      * true, unless the storage engine cannot guarantee durability, which should never happen when
-     * isDurable() returned true. This cannot be called from inside a unit of work, and should
+     * the engine is non-ephemeral. This cannot be called from inside a unit of work, and should
      * fail if it is. This method invariants if the caller holds any locks, except for repair.
      *
      * Can throw write interruption errors from the JournalListener.
@@ -408,6 +408,14 @@ public:
     virtual Timestamp getCatalogConflictingTimestamp() const {
         return {};
     }
+
+    /**
+     * MongoDB must update documents with non-decreasing timestamp values. A storage engine is
+     * allowed to assert when this contract is violated. An untimestamped write is a subset of these
+     * violations, which may be necessary in limited circumstances. This API can be called before a
+     * transaction begins to suppress this subset of errors.
+     */
+    virtual void allowUntimestampedWrite() {}
 
     /**
      * Fetches the storage level statistics.

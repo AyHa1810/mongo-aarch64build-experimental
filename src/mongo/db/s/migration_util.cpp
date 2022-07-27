@@ -44,7 +44,7 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/logical_session_cache.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/op_observer.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
@@ -70,7 +70,6 @@
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/pm2423_feature_flags_gen.h"
 #include "mongo/s/request_types/ensure_chunk_version_is_greater_than_gen.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/exit.h"
@@ -526,7 +525,7 @@ void resubmitRangeDeletionsOnStepUp(ServiceContext* serviceContext) {
             while (cursor->more()) {
                 retFuture = migrationutil::submitRangeDeletionTask(
                     opCtx.get(),
-                    RangeDeletionTask::parse(IDLParserErrorContext("rangeDeletionRecovery"),
+                    RangeDeletionTask::parse(IDLParserContext("rangeDeletionRecovery"),
                                              cursor->next()));
                 rangeDeletionsMarkedAsProcessing++;
             }
@@ -554,12 +553,6 @@ void resubmitRangeDeletionsOnStepUp(ServiceContext* serviceContext) {
             submitPendingDeletions(opCtx.get());
         })
         .getAsync([](auto) {});
-}
-
-void dropRangeDeletionsCollection(OperationContext* opCtx) {
-    DBDirectClient client(opCtx);
-    client.dropCollection(NamespaceString::kRangeDeletionNamespace.toString(),
-                          WriteConcerns::kMajorityWriteConcernShardingTimeout);
 }
 
 template <typename Callable>
@@ -607,72 +600,6 @@ void forEachOrphanRange(OperationContext* opCtx, const NamespaceString& nss, Cal
     }
 }
 
-void submitOrphanRanges(OperationContext* opCtx, const NamespaceString& nss, const UUID& uuid) {
-    try {
-
-        onShardVersionMismatch(opCtx, nss, boost::none);
-
-        LOGV2_DEBUG(22031,
-                    2,
-                    "Upgrade: Cleaning up existing orphans",
-                    "namespace"_attr = nss,
-                    "uuid"_attr = uuid);
-
-        std::vector<RangeDeletionTask> deletions;
-        forEachOrphanRange(opCtx, nss, [&deletions, &opCtx, &nss, &uuid](const auto& range) {
-            // Since this is not part of an active migration, the migration UUID and the donor shard
-            // are set to unused values so that they don't conflict.
-            RangeDeletionTask task(
-                UUID::gen(), nss, uuid, ShardId("fromFCVUpgrade"), range, CleanWhenEnum::kDelayed);
-            const auto currentTime = VectorClock::get(opCtx)->getTime();
-            task.setTimestamp(currentTime.clusterTime().asTimestamp());
-            deletions.emplace_back(task);
-        });
-
-        if (deletions.empty())
-            return;
-
-        PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
-
-        for (const auto& task : deletions) {
-            LOGV2_DEBUG(22032,
-                        2,
-                        "Upgrade: Submitting chunk range for cleanup",
-                        "range"_attr = redact(task.getRange().toString()),
-                        "namespace"_attr = nss);
-            store.add(opCtx, task);
-        }
-    } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>& e) {
-        LOGV2(22033,
-              "Upgrade: Failed to clean up orphans because the namespace was not found; the "
-              "collection must have been dropped",
-              "namespace"_attr = nss,
-              "error"_attr = redact(e.what()));
-    }
-}
-
-void submitOrphanRangesForCleanup(OperationContext* opCtx) {
-    auto catalog = CollectionCatalog::get(opCtx);
-    const auto& dbNames = catalog->getAllDbNames();
-
-    for (const auto& dbName : dbNames) {
-        if (dbName.db() == NamespaceString::kLocalDb)
-            continue;
-
-        for (auto collIt = catalog->begin(opCtx, dbName); collIt != catalog->end(opCtx); ++collIt) {
-            auto uuid = collIt.uuid().get();
-            auto nss = catalog->lookupNSSByUUID(opCtx, uuid).get();
-            LOGV2_DEBUG(22034,
-                        2,
-                        "Upgrade: Processing collection for orphaned range cleanup",
-                        "namespace"_attr = nss);
-            if (!nss.isNamespaceAlwaysUnsharded()) {
-                submitOrphanRanges(opCtx, nss, uuid);
-            }
-        }
-    }
-}
-
 void persistMigrationCoordinatorLocally(OperationContext* opCtx,
                                         const MigrationCoordinatorDocument& migrationDoc) {
     PersistentTaskStore<MigrationCoordinatorDocument> store(
@@ -713,7 +640,8 @@ void persistUpdatedNumOrphans(OperationContext* opCtx,
     try {
         PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
         ScopedRangeDeleterLock rangeDeleterLock(opCtx, collectionUuid);
-        // TODO SERVER-65996 Remove writeConflictRetry loop
+        // The DBDirectClient will not retry WriteConflictExceptions internally while holding an X
+        // mode lock, so we need to retry at this level.
         writeConflictRetry(
             opCtx, "updateOrphanCount", NamespaceString::kRangeDeletionNamespace.ns(), [&] {
                 store.update(opCtx,
@@ -1091,15 +1019,12 @@ void recoverMigrationCoordinations(OperationContext* opCtx,
 
     unsigned migrationRecoveryCount = 0;
 
-    const auto acquireCSOnRecipient =
-        feature_flags::gFeatureFlagMigrationRecipientCriticalSection.isEnabled(
-            serverGlobalParams.featureCompatibility);
     PersistentTaskStore<MigrationCoordinatorDocument> store(
         NamespaceString::kMigrationCoordinatorsNamespace);
     store.forEach(
         opCtx,
         BSON(MigrationCoordinatorDocument::kNssFieldName << nss.toString()),
-        [&opCtx, &nss, &migrationRecoveryCount, acquireCSOnRecipient, &cancellationToken](
+        [&opCtx, &nss, &migrationRecoveryCount, &cancellationToken](
             const MigrationCoordinatorDocument& doc) {
             LOGV2_DEBUG(4798502,
                         2,
@@ -1117,7 +1042,7 @@ void recoverMigrationCoordinations(OperationContext* opCtx,
 
             if (doc.getDecision()) {
                 // The decision is already known.
-                coordinator.completeMigration(opCtx, acquireCSOnRecipient);
+                coordinator.completeMigration(opCtx);
                 return true;
             }
 
@@ -1142,7 +1067,7 @@ void recoverMigrationCoordinations(OperationContext* opCtx,
             }
 
             auto setFilteringMetadata = [&opCtx, &currentMetadata, &doc, &cancellationToken]() {
-                AutoGetDb autoDb(opCtx, doc.getNss().db(), MODE_IX);
+                AutoGetDb autoDb(opCtx, doc.getNss().dbName(), MODE_IX);
                 Lock::CollectionLock collLock(opCtx, doc.getNss(), MODE_IX);
                 auto* const csr = CollectionShardingRuntime::get(opCtx, doc.getNss());
 
@@ -1199,7 +1124,7 @@ void recoverMigrationCoordinations(OperationContext* opCtx,
                 }
             }
 
-            coordinator.completeMigration(opCtx, acquireCSOnRecipient);
+            coordinator.completeMigration(opCtx);
             setFilteringMetadata();
             return true;
         });
@@ -1318,7 +1243,7 @@ void resumeMigrationRecipientsOnStepUp(OperationContext* opCtx) {
                     nss,
                     doc.getRange(),
                     doc.getDonorShardIdForLoggingPurposesOnly(),
-                    true /* waitForOngoingMigrations */)));
+                    true /* waitForCompletionOfConflictingOps */)));
 
             const auto mdm = MigrationDestinationManager::get(opCtx);
             uassertStatusOK(

@@ -126,7 +126,7 @@ public:
      * set of the GroupNode. If that condition is met the ProjectionNodeSimple is redundant and can
      * thus be elimiated to improve performance of the plan. Otherwise, this is a noop.
      */
-    static std::unique_ptr<QuerySolution> removeProjectSimpleBelowGroup(
+    static std::unique_ptr<QuerySolution> removeInclusionProjectionBelowGroup(
         std::unique_ptr<QuerySolution> soln);
 
     /**
@@ -147,6 +147,12 @@ public:
         const std::map<NamespaceString, SecondaryCollectionInfo>& collectionsInfo,
         bool allowDiskUse,
         const CollatorInterface* collator);
+
+    /**
+     * Checks if the foreign collection is eligible for the hash join algorithm. We conservatively
+     * choose the hash join algorithm for cases when the hash table is unlikely to spill to disk.
+     */
+    static bool isEligibleForHashJoin(const SecondaryCollectionInfo& foreignCollInfo);
 };
 
 }  // namespace mongo

@@ -33,6 +33,7 @@
 #include "mongo/db/s/sharding_ddl_coordinator_service.h"
 
 #include "mongo/base/checked_cast.h"
+#include "mongo/db/catalog/catalog_helper.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/document_source_count.h"
@@ -87,14 +88,12 @@ std::shared_ptr<ShardingDDLCoordinator> constructShardingDDLCoordinatorInstance(
                                                                    std::move(initialState));
             break;
         case DDLCoordinatorTypeEnum::kCollMod:
+        case DDLCoordinatorTypeEnum::kCollModPre61Compatible:  // TODO SERVER-68008 Remove once 7.0
+                                                               // becomes last LTS
             return std::make_shared<CollModCoordinator>(service, std::move(initialState));
             break;
         case DDLCoordinatorTypeEnum::kReshardCollection:
             return std::make_shared<ReshardCollectionCoordinator>(service, std::move(initialState));
-            break;
-        case DDLCoordinatorTypeEnum::kReshardCollectionNoResilient:
-            return std::make_shared<ReshardCollectionCoordinator_NORESILIENT>(
-                service, std::move(initialState));
             break;
         case DDLCoordinatorTypeEnum::kCompactStructuredEncryptionData:
             return std::make_shared<CompactStructuredEncryptionDataCoordinator>(
@@ -268,7 +267,7 @@ ShardingDDLCoordinatorService::getOrCreateInstance(OperationContext* opCtx, BSON
         uassert(ErrorCodes::IllegalOperation,
                 "Request sent without attaching database version",
                 clientDbVersion);
-        DatabaseShardingState::checkIsPrimaryShardForDb(opCtx, nss.db());
+        catalog_helper::assertIsPrimaryShardForDb(opCtx, nss.db());
         coorMetadata.setDatabaseVersion(clientDbVersion);
     }
 

@@ -19,7 +19,6 @@ if (!checkSBEEnabled(db)) {
 }
 
 const sbeFullEnabled = checkSBEEnabled(db, ["featureFlagSbeFull"]);
-const sbePlanCacheEnabled = checkSBEEnabled(db, ["featureFlagSbePlanCache"]);
 
 assert.commandWorked(coll.insert({a: 1}));
 assert.commandWorked(coll.createIndex({a: 1, a1: 1}));
@@ -102,20 +101,23 @@ const groupStage = {
 
 (function testLoweredPipelineCombination() {
     setupForeignColl();
+    const expectedVersion = sbeFullEnabled ? 2 : 1;
 
     coll.getPlanCache().clear();
     testLoweredPipeline(
-        {pipeline: [multiPlanningQueryStage, lookupStage], version: sbePlanCacheEnabled ? 2 : 1});
-
-    // TODO SERVER-61507: Update tests on $group when it's integrated to the SBE cache.
-    coll.getPlanCache().clear();
-    testLoweredPipeline({pipeline: [multiPlanningQueryStage, groupStage], version: 1});
+        {pipeline: [multiPlanningQueryStage, lookupStage], version: expectedVersion});
 
     coll.getPlanCache().clear();
-    testLoweredPipeline({pipeline: [multiPlanningQueryStage, lookupStage, groupStage], version: 1});
+    testLoweredPipeline(
+        {pipeline: [multiPlanningQueryStage, groupStage], version: expectedVersion});
 
     coll.getPlanCache().clear();
-    testLoweredPipeline({pipeline: [multiPlanningQueryStage, groupStage, lookupStage], version: 1});
+    testLoweredPipeline(
+        {pipeline: [multiPlanningQueryStage, lookupStage, groupStage], version: expectedVersion});
+
+    coll.getPlanCache().clear();
+    testLoweredPipeline(
+        {pipeline: [multiPlanningQueryStage, groupStage, lookupStage], version: expectedVersion});
 })();
 
 (function testPartiallyLoweredPipeline() {
@@ -123,14 +125,13 @@ const groupStage = {
     setupForeignColl();
     testLoweredPipeline({
         pipeline: [multiPlanningQueryStage, lookupStage, {$_internalInhibitOptimization: {}}],
-        version: sbePlanCacheEnabled ? 2 : 1
+        version: sbeFullEnabled ? 2 : 1
     });
 })();
 
 (function testNonExistentForeignCollectionCache() {
-    if (!sbePlanCacheEnabled) {
-        jsTestLog(
-            "Skipping testNonExistentForeignCollectionCache when SBE plan cache is not enabled");
+    if (!sbeFullEnabled) {
+        jsTestLog("Skipping testNonExistentForeignCollectionCache when SBE is not fully enabled");
         return;
     }
 
@@ -153,9 +154,9 @@ const groupStage = {
 })();
 
 (function testForeignCollectionDropCacheInvalidation() {
-    if (!sbePlanCacheEnabled) {
+    if (!sbeFullEnabled) {
         jsTestLog(
-            "Skipping testForeignCollectionDropCacheInvalidation when SBE plan cache is not enabled");
+            "Skipping testForeignCollectionDropCacheInvalidation when SBE is not fully enabled");
         return;
     }
 
@@ -168,9 +169,8 @@ const groupStage = {
 })();
 
 (function testForeignIndexDropCacheInvalidation() {
-    if (!sbePlanCacheEnabled) {
-        jsTestLog(
-            "Skipping testForeignIndexDropCacheInvalidation when SBE plan cache is not enabled");
+    if (!sbeFullEnabled) {
+        jsTestLog("Skipping testForeignIndexDropCacheInvalidation when SBE is not fully enabled");
         return;
     }
 
@@ -183,9 +183,8 @@ const groupStage = {
 })();
 
 (function testForeignIndexBuildCacheInvalidation() {
-    if (!sbePlanCacheEnabled) {
-        jsTestLog(
-            "Skipping testForeignIndexBuildCacheInvalidation when SBE plan cache is not enabled");
+    if (!sbeFullEnabled) {
+        jsTestLog("Skipping testForeignIndexBuildCacheInvalidation when SBE is not fully enabled");
         return;
     }
 
@@ -198,9 +197,8 @@ const groupStage = {
 })();
 
 (function testLookupSbeAndClassicPlanCacheKey() {
-    if (!sbeFullEnabled || !sbePlanCacheEnabled) {
-        jsTestLog(
-            "Skipping testLookupWithClassicPlanCache when SBE full or SBE plan cache is not enabled");
+    if (!sbeFullEnabled) {
+        jsTestLog("Skipping testLookupWithClassicPlanCache when SBE is not fully enabled");
         return;
     }
 
