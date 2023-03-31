@@ -34,7 +34,6 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
-#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/s/database_sharding_state.h"
@@ -63,7 +62,8 @@ public:
         // The command parameter happens to be string so it's historically been interpreted
         // by parseNs as a collection. Continuing to do so here for unexamined compatibility.
         NamespaceString ns() const override {
-            return NamespaceString(request().getDbName(), _targetDb());
+            return NamespaceStringUtil::parseNamespaceFromRequest(request().getDbName(),
+                                                                  _targetDb());
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const override {
@@ -78,12 +78,15 @@ public:
         void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) override {
             uassert(ErrorCodes::IllegalOperation,
                     str::stream() << definition()->getName() << " can only be run on shard servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ShardServer);
-            BSONObj versionObj;
-            AutoGetDb autoDb(opCtx, DatabaseName(boost::none, _targetDb()), MODE_IS);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ShardServer));
 
-            if (const auto dbVersion =
-                    DatabaseHolder::get(opCtx)->getDbVersion(opCtx, _targetDb())) {
+            DatabaseName dbName(boost::none, _targetDb());
+            AutoGetDb autoDb(opCtx, dbName, MODE_IS);
+            const auto scopedDss =
+                DatabaseShardingState::assertDbLockedAndAcquireShared(opCtx, dbName);
+
+            BSONObj versionObj;
+            if (const auto dbVersion = scopedDss->getDbVersion(opCtx)) {
                 versionObj = dbVersion->toBSON();
             }
             result->getBodyBuilder().append("dbVersion", versionObj);

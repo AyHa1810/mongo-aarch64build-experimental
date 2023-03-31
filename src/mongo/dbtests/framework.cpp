@@ -27,9 +27,6 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/dbtests/framework.h"
 
 #include <string>
@@ -40,9 +37,7 @@
 #include "mongo/db/catalog/collection_impl.h"
 #include "mongo/db/catalog/database_holder_impl.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/index/index_access_method_factory_impl.h"
 #include "mongo/db/index_builds_coordinator_mongod.h"
 #include "mongo/db/op_observer/op_observer_registry.h"
 #include "mongo/db/s/collection_sharding_state_factory_shard.h"
@@ -64,7 +59,6 @@
 #include "mongo/util/version.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
-
 
 namespace mongo {
 namespace dbtests {
@@ -107,7 +101,7 @@ int runDbTests(int argc, char** argv) {
             return std::unique_ptr<DBClientBase>(new DBDirectClient(opCtx));
         });
 
-    srand((unsigned)frameworkGlobalParams.seed);
+    srand((unsigned)frameworkGlobalParams.seed);  // NOLINT
 
     // Set up the periodic runner for background job execution, which is required by the storage
     // engine to be running beforehand.
@@ -121,8 +115,6 @@ int runDbTests(int argc, char** argv) {
 
     StorageControl::startStorageControls(globalServiceContext, true /*forTestOnly*/);
     DatabaseHolder::set(globalServiceContext, std::make_unique<DatabaseHolderImpl>());
-    IndexAccessMethodFactory::set(globalServiceContext,
-                                  std::make_unique<IndexAccessMethodFactoryImpl>());
     Collection::Factory::set(globalServiceContext, std::make_unique<CollectionImpl::FactoryImpl>());
     IndexBuildsCoordinator::set(globalServiceContext,
                                 std::make_unique<IndexBuildsCoordinatorMongod>());

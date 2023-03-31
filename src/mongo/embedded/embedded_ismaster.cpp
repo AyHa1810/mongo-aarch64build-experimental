@@ -60,14 +60,16 @@ public:
         return false;
     }
 
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {}  // No auth required
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        return Status::OK();  // No auth required
+    }
 
     CmdIsMaster() : BasicCommand("isMaster", "ismaster") {}
 
     virtual bool run(OperationContext* opCtx,
-                     const std::string&,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
 

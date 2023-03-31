@@ -7,24 +7,19 @@
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
  *   requires_persistence,
- *   requires_fcv_52,
- *   featureFlagShardSplit,
+ *   requires_fcv_63,
  *   serverless,
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/serverless/libs/basic_serverless_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
+import {ShardSplitTest} from "jstests/serverless/libs/shard_split_test.js";
 
 const test =
-    new BasicServerlessTest({recipientSetName: "recipientSet", recipientTagName: "recipientTag"});
+    new ShardSplitTest({recipientSetName: "recipientSet", recipientTagName: "recipientTag"});
 
 const donorPrimary = test.donor.getPrimary();
 
-const tenantId = "testTenantId";
+const tenantId = ObjectId();
 
 jsTestLog("Testing 'commitShardSplit' command without recipient nodes.");
 
@@ -47,4 +42,3 @@ unsupportedtenantIds.forEach((invalidTenantId) => {
 });
 
 test.stop();
-})();

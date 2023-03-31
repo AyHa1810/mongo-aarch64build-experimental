@@ -29,7 +29,7 @@
 
 #include "mongo/stdx/exception.h"
 
-#include <stdlib.h>
+#include <cstdlib>
 
 #include <iostream>
 
@@ -50,8 +50,7 @@ void testTerminateDispatch() {
     stdx::thread{[] {
         std::cout << "Setting terminate handler" << std::endl;
         stdx::set_terminate(writeFeedbackAndCleanlyExit);
-    }}
-        .join();
+    }}.join();
     std::cout << "Calling terminate." << std::endl;
     std::terminate();
     exit(static_cast<int>(mongo::ExitCode::fail));

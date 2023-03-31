@@ -63,9 +63,8 @@ using RecipientStateTransitionController =
     resharding_service_test_helpers::StateTransitionController<RecipientStateEnum>;
 using PauseDuringStateTransitions =
     resharding_service_test_helpers::PauseDuringStateTransitions<RecipientStateEnum>;
-using OpObserverForTest =
-    resharding_service_test_helpers::OpObserverForTest<RecipientStateEnum,
-                                                       ReshardingRecipientDocument>;
+using OpObserverForTest = resharding_service_test_helpers::
+    StateTransitionControllerOpObserver<RecipientStateEnum, ReshardingRecipientDocument>;
 const ShardId recipientShardId{"myShardId"};
 
 class ExternalStateForTest : public ReshardingRecipientService::RecipientStateMachineExternalState {
@@ -76,8 +75,8 @@ public:
 
     void refreshCatalogCache(OperationContext* opCtx, const NamespaceString& nss) override {}
 
-    ChunkManager getShardedCollectionRoutingInfo(OperationContext* opCtx,
-                                                 const NamespaceString& nss) override {
+    CollectionRoutingInfo getShardedCollectionRoutingInfo(OperationContext* opCtx,
+                                                          const NamespaceString& nss) override {
         invariant(nss == _sourceNss);
 
         const OID epoch = OID::gen();
@@ -96,14 +95,21 @@ public:
                                                Timestamp(1, 1),
                                                boost::none /* timeseriesFields */,
                                                boost::none /* reshardingFields */,
-                                               boost::none /* chunkSizeBytes */,
                                                true /* allowMigrations */,
                                                chunks);
+        IndexCatalogTypeMap shardingIndexesCatalogMap;
+        shardingIndexesCatalogMap.emplace(
+            "randomKey_1",
+            IndexCatalogType(
+                "randomKey_1", BSON("randomKey" << 1), BSONObj(), Timestamp(1, 0), _sourceUUID));
 
-        return ChunkManager(_someDonorId,
-                            DatabaseVersion(UUID::gen(), Timestamp(1, 1)),
-                            _makeStandaloneRoutingTableHistory(std::move(rt)),
-                            boost::none /* clusterTime */);
+        return CollectionRoutingInfo{
+            ChunkManager(_someDonorId,
+                         DatabaseVersion(UUID::gen(), Timestamp(1, 1)),
+                         _makeStandaloneRoutingTableHistory(std::move(rt)),
+                         boost::none /* clusterTime */),
+            ShardingIndexesCatalogCache(CollectionIndexes(_sourceUUID, Timestamp(1, 0)),
+                                        std::move(shardingIndexesCatalogMap))};
     }
 
     MigrationDestinationManager::CollectionOptionsAndUUID getCollectionOptions(
@@ -124,6 +130,11 @@ public:
         StringData reason) override {
         invariant(nss == _sourceNss);
         return {std::vector<BSONObj>{}, BSONObj()};
+    }
+
+    boost::optional<ShardingIndexesCatalogCache> getCollectionIndexInfoWithRefresh(
+        OperationContext* opCtx, const NamespaceString& nss) {
+        return boost::none;
     }
 
     void withShardVersionRetry(OperationContext* opCtx,
@@ -151,21 +162,11 @@ private:
 
     const StringData _currentShardKey = "oldKey";
 
-    const NamespaceString _sourceNss{"sourcedb", "sourcecollection"};
+    const NamespaceString _sourceNss =
+        NamespaceString::createNamespaceString_forTest("sourcedb", "sourcecollection");
     const UUID _sourceUUID = UUID::gen();
 
     const ShardId _someDonorId{"myDonorId"};
-};
-
-class RecipientOpObserverForTest : public OpObserverForTest {
-public:
-    RecipientOpObserverForTest(std::shared_ptr<RecipientStateTransitionController> controller)
-        : OpObserverForTest(std::move(controller),
-                            NamespaceString::kRecipientReshardingOperationsNamespace) {}
-
-    RecipientStateEnum getState(const ReshardingRecipientDocument& recipientDoc) override {
-        return recipientDoc.getMutableState().getState();
-    }
 };
 
 class DataReplicationForTest : public ReshardingDataReplicationInterface {
@@ -203,7 +204,8 @@ public:
         BSONObj initialState) override {
         return std::make_shared<RecipientStateMachine>(
             this,
-            ReshardingRecipientDocument::parse({"ReshardingRecipientServiceForTest"}, initialState),
+            ReshardingRecipientDocument::parse(
+                IDLParserContext{"ReshardingRecipientServiceForTest"}, initialState),
             std::make_unique<ExternalStateForTest>(),
             [](auto...) { return std::make_unique<DataReplicationForTest>(); },
             _serviceContext);
@@ -234,7 +236,12 @@ public:
         repl::StorageInterface::set(serviceContext, std::move(storageMock));
 
         _controller = std::make_shared<RecipientStateTransitionController>();
-        _opObserverRegistry->addObserver(std::make_unique<RecipientOpObserverForTest>(_controller));
+        _opObserverRegistry->addObserver(std::make_unique<OpObserverForTest>(
+            _controller,
+            NamespaceString::kRecipientReshardingOperationsNamespace,
+            [](const ReshardingRecipientDocument& stateDoc) {
+                return stateDoc.getMutableState().getState();
+            }));
     }
 
     RecipientStateTransitionController* controller() {
@@ -255,7 +262,8 @@ public:
                                          ShardId{"donor3"}},
                                         durationCount<Milliseconds>(Milliseconds{5}));
 
-        NamespaceString sourceNss("sourcedb", "sourcecollection");
+        NamespaceString sourceNss =
+            NamespaceString::createNamespaceString_forTest("sourcedb", "sourcecollection");
         auto sourceUUID = UUID::gen();
         auto commonMetadata = CommonReshardingMetadata(
             UUID::gen(),
@@ -306,6 +314,15 @@ public:
         ASSERT_TRUE(bool(recipientColl->isEmpty(opCtx)));
     }
 
+    ReshardingRecipientDocument getStateDoc(OperationContext* opCtx) {
+        DBDirectClient client(opCtx);
+
+        auto doc =
+            client.findOne(NamespaceString::kRecipientReshardingOperationsNamespace, BSONObj{});
+        IDLParserContext errCtx("reshardingRecipientFromTest");
+        return ReshardingRecipientDocument::parse(errCtx, doc);
+    }
+
 private:
     TypeCollectionRecipientFields _makeRecipientFields(
         const ReshardingRecipientDocument& recipientDoc) {
@@ -350,14 +367,64 @@ TEST_F(ReshardingRecipientServiceTest, CanTransitionThroughEachStateToCompletion
               "Running case",
               "test"_attr = _agent.getTestName(),
               "isAlsoDonor"_attr = isAlsoDonor);
+        auto removeRecipientDocFailpoint =
+            globalFailPointRegistry().find("removeRecipientDocFailpoint");
+        auto timesEnteredFailPoint = removeRecipientDocFailpoint->setMode(FailPoint::alwaysOn);
         auto doc = makeStateDocument(isAlsoDonor);
         auto opCtx = makeOperationContext();
         RecipientStateMachine::insertStateDocument(opCtx.get(), doc);
         auto recipient = RecipientStateMachine::getOrCreate(opCtx.get(), _service, doc.toBSON());
 
         notifyToStartCloning(opCtx.get(), *recipient, doc);
+
         notifyReshardingCommitting(opCtx.get(), *recipient, doc);
 
+        removeRecipientDocFailpoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+
+        // Search metrics in the state document and verify they are valid and the same as the ones
+        // in memory.
+        auto persistedRecipientDocument = getStateDoc(opCtx.get());
+
+        Date_t copyBegin = recipient->getMetrics()
+                               .getStartFor(ReshardingMetrics::TimedPhase::kCloning)
+                               .value_or(Date_t::min());
+        Date_t copyEnd = recipient->getMetrics()
+                             .getEndFor(ReshardingMetrics::TimedPhase::kCloning)
+                             .value_or(Date_t::min());
+        Date_t applyBegin = recipient->getMetrics()
+                                .getStartFor(ReshardingMetrics::TimedPhase::kApplying)
+                                .value_or(Date_t::min());
+        Date_t applyEnd = recipient->getMetrics()
+                              .getEndFor(ReshardingMetrics::TimedPhase::kApplying)
+                              .value_or(Date_t::min());
+
+        auto copyBeginDoc = persistedRecipientDocument.getMetrics()->getDocumentCopy()->getStart();
+        auto copyEndDoc = persistedRecipientDocument.getMetrics()->getDocumentCopy()->getStop();
+        auto applyBeginDoc =
+            persistedRecipientDocument.getMetrics()->getOplogApplication()->getStart();
+        auto applyEndDoc =
+            persistedRecipientDocument.getMetrics()->getOplogApplication()->getStop();
+
+        ASSERT_NE(copyBegin, Date_t::min());
+        ASSERT_NE(copyEnd, Date_t::min());
+        ASSERT_NE(applyBegin, Date_t::min());
+        ASSERT_NE(applyEnd, Date_t::min());
+        ASSERT_LTE(copyBegin, copyEnd);
+        ASSERT_LTE(applyBegin, applyEnd);
+
+        ASSERT_TRUE(copyBeginDoc.has_value());
+        ASSERT_EQ(copyBegin, copyBeginDoc.get());
+
+        ASSERT_TRUE(copyEndDoc.has_value());
+        ASSERT_EQ(copyEnd, copyEndDoc.get());
+
+        ASSERT_TRUE(applyBeginDoc.has_value());
+        ASSERT_EQ(applyBegin, applyBeginDoc.get());
+
+        ASSERT_TRUE(applyEndDoc.has_value());
+        ASSERT_EQ(applyEnd, applyEndDoc.get());
+
+        removeRecipientDocFailpoint->setMode(FailPoint::off);
         ASSERT_OK(recipient->getCompletionFuture().getNoThrow());
         checkStateDocumentRemoved(opCtx.get());
     }
@@ -432,8 +499,7 @@ TEST_F(ReshardingRecipientServiceTest, StepDownStepUpEachTransition) {
             stateTransitionsGuard.wait(state);
             stepDown();
 
-            ASSERT_EQ(recipient->getCompletionFuture().getNoThrow(),
-                      ErrorCodes::InterruptedDueToReplStateChange);
+            ASSERT_EQ(recipient->getCompletionFuture().getNoThrow(), ErrorCodes::CallbackCanceled);
 
             prevState = state;
 
@@ -543,8 +609,7 @@ TEST_F(ReshardingRecipientServiceTest, DropsTemporaryReshardingCollectionOnAbort
         doneTransitionGuard->wait(RecipientStateEnum::kDone);
         stepDown();
 
-        ASSERT_EQ(recipient->getCompletionFuture().getNoThrow(),
-                  ErrorCodes::InterruptedDueToReplStateChange);
+        ASSERT_EQ(recipient->getCompletionFuture().getNoThrow(), ErrorCodes::CallbackCanceled);
 
         recipient.reset();
         stepUp(opCtx.get());
@@ -628,8 +693,7 @@ TEST_F(ReshardingRecipientServiceTest, WritesNoopOplogEntryOnReshardDoneCatchUp)
 
     stepDown();
     doneTransitionGuard.reset();
-    ASSERT_EQ(recipient->getCompletionFuture().getNoThrow(),
-              ErrorCodes::InterruptedDueToReplStateChange);
+    ASSERT_EQ(recipient->getCompletionFuture().getNoThrow(), ErrorCodes::CallbackCanceled);
 
     DBDirectClient client(opCtx.get());
     NamespaceString sourceNss =
@@ -675,8 +739,7 @@ TEST_F(ReshardingRecipientServiceTest, WritesNoopOplogEntryForImplicitShardColle
 
     stepDown();
     doneTransitionGuard.reset();
-    ASSERT_EQ(recipient->getCompletionFuture().getNoThrow(),
-              ErrorCodes::InterruptedDueToReplStateChange);
+    ASSERT_EQ(recipient->getCompletionFuture().getNoThrow(), ErrorCodes::CallbackCanceled);
 
     DBDirectClient client(opCtx.get());
     NamespaceString sourceNss =
@@ -869,7 +932,7 @@ TEST_F(ReshardingRecipientServiceTest, RestoreMetricsAfterStepUp) {
                               ->reportForCurrentOp(
                                   MongoProcessInterface::CurrentOpConnectionsMode::kExcludeIdle,
                                   MongoProcessInterface::CurrentOpSessionsMode::kExcludeIdle)
-                              .get();
+                              .value();
 
             ASSERT_EQ(currOp.getField("documentsCopied").numberLong(), 1L);
             ASSERT_EQ(currOp.getField("bytesCopied").numberLong(), (long)reshardedDoc.objsize());
@@ -880,7 +943,7 @@ TEST_F(ReshardingRecipientServiceTest, RestoreMetricsAfterStepUp) {
                               ->reportForCurrentOp(
                                   MongoProcessInterface::CurrentOpConnectionsMode::kExcludeIdle,
                                   MongoProcessInterface::CurrentOpSessionsMode::kExcludeIdle)
-                              .get();
+                              .value();
 
             ASSERT_EQ(currOp.getField("documentsCopied").numberLong(), 1L);
             ASSERT_EQ(currOp.getField("bytesCopied").numberLong(), (long)reshardedDoc.objsize());
@@ -893,8 +956,7 @@ TEST_F(ReshardingRecipientServiceTest, RestoreMetricsAfterStepUp) {
         }
         stepDown();
 
-        ASSERT_EQ(recipient->getCompletionFuture().getNoThrow(),
-                  ErrorCodes::InterruptedDueToReplStateChange);
+        ASSERT_EQ(recipient->getCompletionFuture().getNoThrow(), ErrorCodes::CallbackCanceled);
 
         prevState = state;
         if (state == RecipientStateEnum::kApplying ||

@@ -37,7 +37,6 @@
 #include "mongo/db/coll_mod_reply_validation.h"
 #include "mongo/db/commands.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/chunk_manager_targeter.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
@@ -71,10 +70,11 @@ public:
         return false;
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        auto* client = opCtx->getClient();
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
         return auth::checkAuthForCollMod(
             client->getOperationContext(), AuthorizationSession::get(client), nss, cmdObj, true);
     }
@@ -94,19 +94,27 @@ public:
                     1,
                     "collMod: {namespace} cmd: {command}",
                     "CMD: collMod",
-                    "namespace"_attr = nss,
+                    logAttrs(nss),
                     "command"_attr = redact(cmdObj));
 
-        auto swDbInfo = Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, cmd.getDbName());
+        auto swDbInfo = Grid::get(opCtx)->catalogCache()->getDatabase(
+            opCtx, cmd.getDbName().toStringWithTenantId());
         if (swDbInfo == ErrorCodes::NamespaceNotFound) {
-            uassert(CollectionUUIDMismatchInfo(cmd.getDbName().toString(),
-                                               *cmd.getCollectionUUID(),
-                                               nss.coll().toString(),
-                                               boost::none),
-                    "Database does not exist",
-                    !cmd.getCollectionUUID());
+            uassert(
+                CollectionUUIDMismatchInfo(
+                    cmd.getDbName(), *cmd.getCollectionUUID(), nss.coll().toString(), boost::none),
+                "Database does not exist",
+                !cmd.getCollectionUUID());
         }
         const auto dbInfo = uassertStatusOK(swDbInfo);
+
+        if (cmd.getValidator() || cmd.getValidationLevel() || cmd.getValidationAction()) {
+            // Check for config.settings in the user command since a validator is allowed
+            // internally on this collection but the user may not modify the validator.
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << "Document validators not allowed on system collection " << nss,
+                    nss != NamespaceString::kConfigSettingsNamespace);
+        }
 
         ShardsvrCollMod collModCommand(nss);
         collModCommand.setCollModRequest(cmd.getCollModRequest());

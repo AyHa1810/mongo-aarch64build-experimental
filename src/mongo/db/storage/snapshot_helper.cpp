@@ -86,6 +86,16 @@ bool shouldReadAtLastApplied(OperationContext* opCtx,
         return false;
     }
 
+    // Non-replicated collections do not need to read at lastApplied, as those collections are not
+    // written by the replication system. However, the oplog is special, as it *is* written by the
+    // replication system.
+    if (!nss.isReplicated() && !nss.isOplog()) {
+        if (reason) {
+            *reason = "unreplicated collection";
+        }
+        return false;
+    }
+
     // If this node can accept writes (i.e. primary), then no conflicting replication batches are
     // being applied and we can read from the default snapshot. If we are in a replication state
     // (like secondary or primary catch-up) where we are not accepting writes, we should read at
@@ -108,24 +118,19 @@ bool shouldReadAtLastApplied(OperationContext* opCtx,
         return false;
     }
 
-    // Non-replicated collections do not need to read at lastApplied, as those collections are not
-    // written by the replication system.  However, the oplog is special, as it *is* written by the
-    // replication system.
-    if (!nss.isReplicated() && !nss.isOplog()) {
-        if (reason) {
-            *reason = "unreplicated collection";
-        }
-        return false;
-    }
-
     // Linearizable read concern should never be read at lastApplied, they must always read from
-    // latest and are only allowed on primaries.
+    // latest and are only allowed on primaries. We are either a primary not accepting writes or
+    // secondary at this point, neither which can satisfy the noop write after the read. However, if
+    // we manage to transition to a writable primary when we do the noop write we may have read data
+    // during oplog application with kNoTimestamp which should be an error. In both cases it is OK
+    // to error with NotWritablePrimary here and we do not need to do any further checks after
+    // acquiring the snapshot because state transitions causes the repl term to increment and we
+    // can't transition directly from primary to primary catchup without a repl term increase
+    // happening.
     if (repl::ReadConcernArgs::get(opCtx).getLevel() ==
         repl::ReadConcernLevel::kLinearizableReadConcern) {
-        if (reason) {
-            *reason = "linearizable read concern";
-        }
-        return false;
+        uasserted(ErrorCodes::NotWritablePrimary,
+                  "cannot satisfy linearizable read concern on non-primary node");
     }
 
     return true;

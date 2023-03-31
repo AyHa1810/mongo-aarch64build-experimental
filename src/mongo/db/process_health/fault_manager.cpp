@@ -222,7 +222,11 @@ void FaultManager::setupStateMachine() {
         {FaultState::kActiveFault, {}},
     });
 
-    auto bindThis = [&](auto&& pmf) { return [=](auto&&... a) { return (this->*pmf)(a...); }; };
+    auto bindThis = [&](auto&& pmf) {
+        return [=](auto&&... a) {
+            return (this->*pmf)(a...);
+        };
+    };
 
     registerHandler(FaultState::kStartupCheck, bindThis(&FaultManager::handleStartupCheck))
         ->enter(bindThis(&FaultManager::logCurrentState))
@@ -360,7 +364,7 @@ boost::optional<FaultState> FaultManager::handleActiveFault(const OptionalMessag
 void FaultManager::logMessageReceived(FaultState state, const HealthCheckStatus& status) {
     LOGV2_DEBUG(5936504,
                 1,
-                "Fault manager recieved health check result",
+                "Fault manager received health check result",
                 "state"_attr = (str::stream() << state),
                 "observer_type"_attr = (str::stream() << status.getType()),
                 "result"_attr = status,
@@ -450,7 +454,7 @@ FaultManager::~FaultManager() {
         for (auto& pair : _healthCheckContexts) {
             auto cbHandle = pair.second.callbackHandle;
             if (cbHandle) {
-                _taskExecutor->cancel(cbHandle.get());
+                _taskExecutor->cancel(cbHandle.value());
             }
         }
     }

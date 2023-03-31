@@ -97,7 +97,10 @@ static std::set<StringData> allowedFieldNames = {
     ListIndexesReplyItem::kUniqueFieldName,
     ListIndexesReplyItem::kVFieldName,
     ListIndexesReplyItem::kWeightsFieldName,
-    ListIndexesReplyItem::kWildcardProjectionFieldName};
+    ListIndexesReplyItem::kWildcardProjectionFieldName,
+    ListIndexesReplyItem::kColumnstoreProjectionFieldName,
+    ListIndexesReplyItem::kColumnstoreCompressorFieldName,
+};
 
 /**
  * Returns index specs, with resolved namespace, from the catalog for this listIndexes request.
@@ -110,9 +113,9 @@ IndexSpecsWithNamespaceString getIndexSpecsWithNamespaceString(OperationContext*
     bool buildUUID = cmd.getIncludeBuildUUIDs().value_or(false);
     bool indexBuildInfo = cmd.getIncludeIndexBuildInfo().value_or(false);
     invariant(!(buildUUID && indexBuildInfo));
-    ListIndexesInclude additionalInclude = buildUUID
-        ? ListIndexesInclude::BuildUUID
-        : indexBuildInfo ? ListIndexesInclude::IndexBuildInfo : ListIndexesInclude::Nothing;
+    ListIndexesInclude additionalInclude = buildUUID ? ListIndexesInclude::BuildUUID
+        : indexBuildInfo                             ? ListIndexesInclude::IndexBuildInfo
+                                                     : ListIndexesInclude::Nothing;
 
     // Since time-series collections don't have UUIDs, we skip the time-series lookup
     // if the target collection is specified as a UUID.
@@ -214,6 +217,10 @@ public:
         return "list indexes for a collection";
     }
 
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
+
     class Invocation final : public InvocationBaseGen {
     public:
         using InvocationBaseGen::InvocationBaseGen;
@@ -226,10 +233,10 @@ public:
             auto nss = request().getNamespaceOrUUID();
             if (nss.uuid()) {
                 // UUID requires opCtx to resolve, settle on just the dbname.
-                return NamespaceString(request().getDbName(), "");
+                return NamespaceString(request().getDbName());
             }
             invariant(nss.nss());
-            return nss.nss().get();
+            return nss.nss().value();
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const final {
@@ -307,7 +314,7 @@ public:
                                             nss));
 
             std::vector<mongo::ListIndexesReplyItem> firstBatch;
-            size_t bytesBuffered = 0;
+            FindCommon::BSONArrayResponseSizeTracker responseSizeTracker;
             for (long long objCount = 0; objCount < batchSize; objCount++) {
                 BSONObj nextDoc;
                 PlanExecutor::ExecState state = exec->getNext(&nextDoc, nullptr);
@@ -319,7 +326,7 @@ public:
 
                 // If we can't fit this result inside the current batch, then we stash it for
                 // later.
-                if (!FindCommon::haveSpaceForNext(nextDoc, objCount, bytesBuffered)) {
+                if (!responseSizeTracker.haveSpaceForNext(nextDoc)) {
                     exec->stashResult(nextDoc);
                     break;
                 }
@@ -338,7 +345,7 @@ public:
                                           nextDoc.toString(),
                                           exc.toString()));
                 }
-                bytesBuffered += nextDoc.objsize();
+                responseSizeTracker.add(nextDoc);
             }
 
             if (exec->isEOF()) {

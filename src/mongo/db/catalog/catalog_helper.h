@@ -29,25 +29,32 @@
 
 #pragma once
 
-#include "mongo/base/string_data.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/s/database_version.h"
 
 namespace mongo::catalog_helper {
 
 /**
- * Checks that the cached database version matches the one attached to the operation, which means
- * that the operation is routed to the right shard (database owner).
+ * Fills the input 'collLocks' with CollectionLocks, acquiring locks on namespaces 'nsOrUUID' and
+ * 'secondaryNssOrUUIDs' in ResourceId(RESOURCE_COLLECTION, nss) order.
  *
- * Throws `StaleDbRoutingVersion` exception when the critical section is taken, there is no cached
- * database version, or the cached database version does not match the one sent by the client.
+ * The namespaces will be resolved, the locks acquired, and then the namespaces will be checked for
+ * changes in case there is a race with rename and a UUID no longer matches the locked namespace.
+ *
+ * Handles duplicate namespaces across 'nsOrUUID' and 'secondaryNssOrUUIDs'. Only one lock will be
+ * taken on each namespace.
  */
-void assertMatchingDbVersion(OperationContext* opCtx, const StringData& dbName);
+void acquireCollectionLocksInResourceIdOrder(
+    OperationContext* opCtx,
+    const NamespaceStringOrUUID& nsOrUUID,
+    LockMode modeColl,
+    Date_t deadline,
+    const std::vector<NamespaceStringOrUUID>& secondaryNssOrUUIDs,
+    std::vector<CollectionNamespaceOrUUIDLock>* collLocks);
 
 /**
- * Checks that the current shard server is the primary for the given database, throwing
- * `IllegalOperation` if it is not.
+ * Executes the provided callback on the 'setAutoGetCollectionWait' FailPoint.
  */
-void assertIsPrimaryShardForDb(OperationContext* opCtx, const StringData& dbName);
+void setAutoGetCollectionWaitFailpointExecute(std::function<void(const BSONObj&)> callback);
 
 }  // namespace mongo::catalog_helper

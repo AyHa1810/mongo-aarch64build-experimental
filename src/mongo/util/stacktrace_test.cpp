@@ -31,6 +31,7 @@
 #include "mongo/platform/basic.h"
 
 #include <array>
+#include <csignal>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -39,7 +40,6 @@
 #include <functional>
 #include <map>
 #include <random>
-#include <signal.h>
 #include <sstream>
 #include <utility>
 #include <vector>
@@ -64,8 +64,8 @@
 #endif
 
 #ifdef __linux__
+#include <ctime>
 #include <sys/syscall.h>
-#include <time.h>
 #include <unistd.h>
 #endif  //  __linux__
 
@@ -234,7 +234,7 @@ TEST(StackTrace, PosixFormat) {
 std::vector<std::string> splitLines(std::string in) {
     std::vector<std::string> lines;
     while (true) {
-        auto pos = in.find("\n");
+        auto pos = in.find('\n');
         if (pos == std::string::npos) {
             break;
         } else {

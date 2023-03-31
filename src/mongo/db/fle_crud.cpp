@@ -28,10 +28,10 @@
  */
 
 
-#include "mongo/db/fle_crud.h"
-
+#include <algorithm>
 #include <memory>
 
+#include "mongo/base/data_range.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
@@ -40,7 +40,9 @@
 #include "mongo/crypto/encryption_fields_gen.h"
 #include "mongo/crypto/fle_crypto.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/commands/fle2_get_count_info_command_gen.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/fle_crud.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_time_tracker.h"
 #include "mongo/db/ops/write_ops_gen.h"
@@ -50,7 +52,7 @@
 #include "mongo/db/query/fle/server_rewrite.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/transaction_api.h"
+#include "mongo/db/transaction/transaction_api.h"
 #include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/factory.h"
@@ -149,6 +151,73 @@ boost::optional<BSONObj> mergeLetAndCVariables(const boost::optional<BSONObj>& l
     }
     return c;
 }
+
+template <FLETokenType TokenT>
+FLEToken<TokenT> FLETokenFromCDR(ConstDataRange cdr) {
+    auto block = PrfBlockfromCDR(cdr);
+    return FLEToken<TokenT>(block);
+}
+
+std::vector<QECountInfoRequestTokenSet> toTagSets(
+    const std::vector<std::vector<FLEEdgePrfBlock>>& blockSets) {
+
+    std::vector<QECountInfoRequestTokenSet> nestedBlocks;
+    nestedBlocks.reserve(blockSets.size());
+
+    for (const auto& tags : blockSets) {
+        std::vector<QECountInfoRequestTokens> tagsets;
+
+        tagsets.reserve(tags.size());
+
+        for (auto& tag : tags) {
+            tagsets.emplace_back(FLEUtil::vectorFromCDR(tag.esc));
+            auto& tokenSet = tagsets.back();
+
+            if (tag.edc.has_value()) {
+                tokenSet.setEDCDerivedFromDataTokenAndContentionFactorToken(
+                    ConstDataRange(tag.edc.value()));
+            }
+        }
+
+        nestedBlocks.emplace_back();
+        nestedBlocks.back().setTokens(std::move(tagsets));
+    }
+
+    return nestedBlocks;
+}
+
+std::vector<std::vector<FLEEdgeCountInfo>> toEdgeCounts(
+    const std::vector<QECountInfoReplyTokenSet>& tupleSet) {
+
+    std::vector<std::vector<FLEEdgeCountInfo>> nestedBlocks;
+    nestedBlocks.reserve(tupleSet.size());
+
+    for (const auto& tuple : tupleSet) {
+        std::vector<FLEEdgeCountInfo> blocks;
+
+        const auto& tuples = tuple.getTokens();
+
+        blocks.reserve(tuples.size());
+
+        for (auto& tuple : tuples) {
+            blocks.emplace_back(tuple.getCount(),
+                                FLETokenFromCDR<FLETokenType::ESCTwiceDerivedTagToken>(
+                                    tuple.getESCTwiceDerivedTagToken()));
+            auto& p = blocks.back();
+
+            if (tuple.getEDCDerivedFromDataTokenAndContentionFactorToken().has_value()) {
+                p.edc =
+                    FLETokenFromCDR<FLETokenType::EDCDerivedFromDataTokenAndContentionFactorToken>(
+                        tuple.getEDCDerivedFromDataTokenAndContentionFactorToken().value());
+            }
+        }
+
+        nestedBlocks.emplace_back(std::move(blocks));
+    }
+
+    return nestedBlocks;
+}
+
 }  // namespace
 
 std::shared_ptr<txn_api::SyncTransactionWithRetries> getTransactionWithRetriesForMongoS(
@@ -171,7 +240,7 @@ boost::intrusive_ptr<ExpressionContext> makeExpCtx(OperationContext* opCtx,
     std::unique_ptr<CollatorInterface> collator;
     if (op.getCollation()) {
         auto statusWithCollator = CollatorFactoryInterface::get(opCtx->getServiceContext())
-                                      ->makeFromBSON(op.getCollation().get());
+                                      ->makeFromBSON(op.getCollation().value());
 
         uassertStatusOK(statusWithCollator.getStatus());
         collator = std::move(statusWithCollator.getValue());
@@ -187,40 +256,53 @@ boost::intrusive_ptr<ExpressionContext> makeExpCtx(OperationContext* opCtx,
 
 }  // namespace
 
-std::pair<FLEBatchResult, write_ops::InsertCommandReply> processInsert(
-    OperationContext* opCtx,
-    const write_ops::InsertCommandRequest& insertRequest,
-    GetTxnCallback getTxns) {
+using VTS = auth::ValidatedTenancyScope;
 
+/**
+ * Checks that all encrypted payloads correspond to an encrypted field,
+ * and that the encryption keyId used was appropriate for that field.
+ */
+void validateInsertUpdatePayloads(const std::vector<EncryptedField>& fields,
+                                  const std::vector<EDCServerPayloadInfo>& payload) {
+    std::map<StringData, UUID> pathToKeyIdMap;
+    for (const auto& field : fields) {
+        pathToKeyIdMap.insert({field.getPath(), field.getKeyId()});
+    }
+
+    for (const auto& field : payload) {
+        auto& fieldPath = field.fieldPathName;
+        auto expect = pathToKeyIdMap.find(fieldPath);
+        uassert(6726300,
+                str::stream() << "Field '" << fieldPath << "' is unexpectedly encrypted",
+                expect != pathToKeyIdMap.end());
+        auto& indexKeyId = field.payload.getIndexKeyId();
+        uassert(6726301,
+                str::stream() << "Mismatched keyId for field '" << fieldPath << "' expected "
+                              << expect->second << ", found " << indexKeyId,
+                indexKeyId == expect->second);
+    }
+}
+
+std::pair<mongo::StatusWith<mongo::txn_api::CommitResult>,
+          std::shared_ptr<write_ops::InsertCommandReply>>
+insertSingleDocument(OperationContext* opCtx,
+                     const write_ops::InsertCommandRequest& insertRequest,
+                     BSONObj& document,
+                     int32_t* stmtId,
+                     GetTxnCallback getTxns) {
     auto edcNss = insertRequest.getNamespace();
-    auto ei = insertRequest.getEncryptionInformation().get();
+    auto ei = insertRequest.getEncryptionInformation().value();
 
     bool bypassDocumentValidation =
         insertRequest.getWriteCommandRequestBase().getBypassDocumentValidation();
 
     auto efc = EncryptionInformationHelpers::getAndValidateSchema(edcNss, ei);
 
-    auto documents = insertRequest.getDocuments();
-    // TODO - how to check if a document will be too large???
-
-    uassert(6371202,
-            "Only single insert batches are supported in Queryable Encryption",
-            documents.size() == 1);
-
-    auto document = documents[0];
     EDCServerCollection::validateEncryptedFieldInfo(document, efc, bypassDocumentValidation);
     auto serverPayload = std::make_shared<std::vector<EDCServerPayloadInfo>>(
         EDCServerCollection::getEncryptedFieldInfo(document));
 
-    if (serverPayload->size() == 0) {
-        // No actual FLE2 indexed fields
-        return std::pair<FLEBatchResult, write_ops::InsertCommandReply>{
-            FLEBatchResult::kNotProcessed, write_ops::InsertCommandReply()};
-    }
-
-    auto reply = std::make_shared<write_ops::InsertCommandReply>();
-
-    uint32_t stmtId = getStmtIdForWriteAt(insertRequest, 0);
+    validateInsertUpdatePayloads(efc.getFields(), *serverPayload);
 
     std::shared_ptr<txn_api::SyncTransactionWithRetries> trun = getTxns(opCtx);
 
@@ -229,6 +311,8 @@ std::pair<FLEBatchResult, write_ops::InsertCommandReply> processInsert(
     auto ownedDocument = document.getOwned();
     auto insertBlock = std::make_tuple(edcNss, efc, serverPayload, stmtId);
     auto sharedInsertBlock = std::make_shared<decltype(insertBlock)>(insertBlock);
+
+    auto reply = std::make_shared<write_ops::InsertCommandReply>();
 
     auto swResult = trun->runNoThrow(
         opCtx,
@@ -268,22 +352,75 @@ std::pair<FLEBatchResult, write_ops::InsertCommandReply> processInsert(
             return SemiFuture<void>::makeReady();
         });
 
-    if (!swResult.isOK()) {
-        // FLETransactionAbort is used for control flow so it means we have a valid
-        // InsertCommandReply with write errors so we should return that.
-        if (swResult.getStatus() == ErrorCodes::FLETransactionAbort) {
-            return std::pair<FLEBatchResult, write_ops::InsertCommandReply>{
-                FLEBatchResult::kProcessed, *reply};
-        }
+    return {swResult, reply};
+}
 
-        appendSingleStatusToWriteErrors(swResult.getStatus(), &reply->getWriteCommandReplyBase());
-    } else if (!swResult.getValue().getEffectiveStatus().isOK()) {
-        appendSingleStatusToWriteErrors(swResult.getValue().getEffectiveStatus(),
-                                        &reply->getWriteCommandReplyBase());
+std::pair<FLEBatchResult, write_ops::InsertCommandReply> processInsert(
+    OperationContext* opCtx,
+    const write_ops::InsertCommandRequest& insertRequest,
+    GetTxnCallback getTxns) {
+
+    CurOp::get(opCtx)->debug().shouldOmitDiagnosticInformation = true;
+    auto documents = insertRequest.getDocuments();
+
+    std::vector<write_ops::WriteError> writeErrors;
+    int32_t stmtId = getStmtIdForWriteAt(insertRequest, 0);
+    uint32_t iter = 0;
+    uint32_t numDocs = 0;
+    write_ops::WriteCommandReplyBase writeBase;
+
+    // TODO: Remove with SERVER-73714
+    if (documents.size() == 1) {
+        auto serverPayload = EDCServerCollection::getEncryptedFieldInfo(documents[0]);
+        if (serverPayload.size() == 0) {
+            return std::pair<FLEBatchResult, write_ops::InsertCommandReply>{
+                FLEBatchResult::kNotProcessed, write_ops::InsertCommandReply()};
+        }
     }
 
-    return std::pair<FLEBatchResult, write_ops::InsertCommandReply>{FLEBatchResult::kProcessed,
-                                                                    *reply};
+    for (auto& document : documents) {
+        const auto& [swResult, reply] =
+            insertSingleDocument(opCtx, insertRequest, document, &stmtId, getTxns);
+
+        writeBase.setElectionId(reply->getElectionId());
+
+        if (!swResult.isOK()) {
+            if (swResult.getStatus() == ErrorCodes::FLETransactionAbort) {
+                // FLETransactionAbort is used for control flow so it means we have a valid
+                // InsertCommandReply with write errors so we should return that.
+                const auto& errors = reply->getWriteErrors().get();
+                writeErrors.insert(writeErrors.end(), errors.begin(), errors.end());
+            }
+            writeErrors.push_back(write_ops::WriteError(iter, swResult.getStatus()));
+
+            // If the request is ordered (inserts are ordered by default) we will return
+            // early.
+            if (insertRequest.getOrdered()) {
+                break;
+            }
+        } else if (!swResult.getValue().getEffectiveStatus().isOK()) {
+            writeErrors.push_back(
+                write_ops::WriteError(iter, swResult.getValue().getEffectiveStatus()));
+            // If the request is ordered (inserts are ordered by default) we will return
+            // early.
+            if (insertRequest.getOrdered()) {
+                break;
+            }
+        } else {
+            numDocs++;
+        }
+        iter++;
+    }
+
+    write_ops::InsertCommandReply returnReply;
+
+    writeBase.setN(numDocs);
+    if (!writeErrors.empty()) {
+        writeBase.setWriteErrors(writeErrors);
+    }
+    returnReply.setWriteCommandReplyBase(writeBase);
+
+    return {FLEBatchResult::kProcessed, returnReply};
 }
 
 write_ops::DeleteCommandReply processDelete(OperationContext* opCtx,
@@ -293,22 +430,34 @@ write_ops::DeleteCommandReply processDelete(OperationContext* opCtx,
         auto deletes = deleteRequest.getDeletes();
         uassert(6371302, "Only single document deletes are permitted", deletes.size() == 1);
 
-        auto deleteOpEntry = deletes[0];
+        // TODO: SERVER-73303 delete when v2 is enabled by default
+        if (!gFeatureFlagFLE2ProtocolVersion2.isEnabled(serverGlobalParams.featureCompatibility)) {
+            auto deleteOpEntry = deletes[0];
 
-        uassert(6371303,
-                "FLE only supports single document deletes",
-                deleteOpEntry.getMulti() == false);
+            uassert(6371303,
+                    "FLE only supports single document deletes",
+                    deleteOpEntry.getMulti() == false);
+        }
     }
 
+    CurOp::get(opCtx)->debug().shouldOmitDiagnosticInformation = true;
     std::shared_ptr<txn_api::SyncTransactionWithRetries> trun = getTxns(opCtx);
 
     auto reply = std::make_shared<write_ops::DeleteCommandReply>();
 
     auto ownedRequest = deleteRequest.serialize({});
+    const auto tenantId = deleteRequest.getDbName().tenantId();
+    if (tenantId && gMultitenancySupport) {
+        // `ownedRequest` is OpMsgRequest type which will parse the tenantId from ValidatedTenantId.
+        // Before parsing we should ensure that validatedTenancyScope is set in order not to lose
+        // the tenantId after the parsing.
+        ownedRequest.validatedTenancyScope =
+            VTS(tenantId.get(), VTS::TrustedForInnerOpMsgRequestTag{});
+    }
+
     auto ownedDeleteRequest =
         write_ops::DeleteCommandRequest::parse(IDLParserContext("delete"), ownedRequest);
     auto ownedDeleteOpEntry = ownedDeleteRequest.getDeletes()[0];
-
     auto expCtx = makeExpCtx(opCtx, ownedDeleteRequest, ownedDeleteOpEntry);
     // The function that handles the transaction may outlive this function so we need to use
     // shared_ptrs
@@ -386,6 +535,7 @@ write_ops::UpdateCommandReply processUpdate(OperationContext* opCtx,
                         write_ops::UpdateModification::Type::kReplacement);
     }
 
+    CurOp::get(opCtx)->debug().shouldOmitDiagnosticInformation = true;
     std::shared_ptr<txn_api::SyncTransactionWithRetries> trun = getTxns(opCtx);
 
     // The function that handles the transaction may outlive this function so we need to use
@@ -393,6 +543,11 @@ write_ops::UpdateCommandReply processUpdate(OperationContext* opCtx,
     auto reply = std::make_shared<write_ops::UpdateCommandReply>();
 
     auto ownedRequest = updateRequest.serialize({});
+    const auto tenantId = updateRequest.getDbName().tenantId();
+    if (tenantId && gMultitenancySupport) {
+        ownedRequest.validatedTenancyScope =
+            VTS(tenantId.get(), VTS::TrustedForInnerOpMsgRequestTag{});
+    }
     auto ownedUpdateRequest =
         write_ops::UpdateCommandRequest::parse(IDLParserContext("update"), ownedRequest);
     auto ownedUpdateOpEntry = ownedUpdateRequest.getUpdates()[0];
@@ -451,14 +606,16 @@ write_ops::UpdateCommandReply processUpdate(OperationContext* opCtx,
 
 namespace {
 
-void processFieldsForInsert(FLEQueryInterface* queryImpl,
-                            const NamespaceString& edcNss,
-                            std::vector<EDCServerPayloadInfo>& serverPayload,
-                            const EncryptedFieldConfig& efc,
-                            int32_t* pStmtId,
-                            bool bypassDocumentValidation) {
+// TODO: SERVER-73303 delete when v2 is enabled by default
+void processFieldsForInsertV1(FLEQueryInterface* queryImpl,
+                              const NamespaceString& edcNss,
+                              std::vector<EDCServerPayloadInfo>& serverPayload,
+                              const EncryptedFieldConfig& efc,
+                              int32_t* pStmtId,
+                              bool bypassDocumentValidation) {
 
-    NamespaceString nssEsc(edcNss.db(), efc.getEscCollection().get());
+    const NamespaceString nssEsc = NamespaceStringUtil::parseNamespaceFromRequest(
+        edcNss.dbName(), efc.getEscCollection().value());
 
     auto docCount = queryImpl->countDocuments(nssEsc);
 
@@ -466,69 +623,263 @@ void processFieldsForInsert(FLEQueryInterface* queryImpl,
 
     for (auto& payload : serverPayload) {
 
-        auto escToken = payload.getESCToken();
-        auto tagToken = FLETwiceDerivedTokenGenerator::generateESCTwiceDerivedTagToken(escToken);
-        auto valueToken =
-            FLETwiceDerivedTokenGenerator::generateESCTwiceDerivedValueToken(escToken);
+        const auto insertTokens = [&](ConstDataRange encryptedTokens,
+                                      ConstDataRange escDerivedToken) {
+            int position = 1;
+            int count = 1;
 
-        int position = 1;
-        int count = 1;
-        auto alpha = ESCCollection::emuBinary(reader, tagToken, valueToken);
+            auto escToken = EDCServerPayloadInfo::getESCToken(escDerivedToken);
+            auto tagToken =
+                FLETwiceDerivedTokenGenerator::generateESCTwiceDerivedTagToken(escToken);
+            auto valueToken =
+                FLETwiceDerivedTokenGenerator::generateESCTwiceDerivedValueToken(escToken);
 
-        if (alpha.has_value() && alpha.value() == 0) {
-            position = 1;
-            count = 1;
-        } else if (!alpha.has_value()) {
-            auto block = ESCCollection::generateId(tagToken, boost::none);
+            auto alpha = ESCCollection::emuBinary(reader, tagToken, valueToken);
 
-            auto r_esc = reader.getById(block);
-            uassert(6371203, "ESC document not found", !r_esc.isEmpty());
+            if (alpha.has_value() && alpha.value() == 0) {
+                position = 1;
+                count = 1;
+            } else if (!alpha.has_value()) {
+                auto block = ESCCollection::generateId(tagToken, boost::none);
 
-            auto escNullDoc =
-                uassertStatusOK(ESCCollection::decryptNullDocument(valueToken, r_esc));
+                auto r_esc = reader.getById(block);
+                uassert(6371203, "ESC document not found", !r_esc.isEmpty());
 
-            position = escNullDoc.position + 2;
-            count = escNullDoc.count + 1;
-        } else {
-            auto block = ESCCollection::generateId(tagToken, alpha);
+                auto escNullDoc =
+                    uassertStatusOK(ESCCollection::decryptNullDocument(valueToken, r_esc));
 
-            auto r_esc = reader.getById(block);
-            uassert(6371204, "ESC document not found", !r_esc.isEmpty());
+                position = escNullDoc.position + 2;
+                count = escNullDoc.count + 1;
+            } else {
+                auto block = ESCCollection::generateId(tagToken, alpha);
 
-            auto escDoc = uassertStatusOK(ESCCollection::decryptDocument(valueToken, r_esc));
+                auto r_esc = reader.getById(block);
+                uassert(6371204, "ESC document not found", !r_esc.isEmpty());
 
-            position = alpha.value() + 1;
-            count = escDoc.count + 1;
+                auto escDoc = uassertStatusOK(ESCCollection::decryptDocument(valueToken, r_esc));
 
-            if (escDoc.compactionPlaceholder) {
-                uassertStatusOK(Status(ErrorCodes::FLECompactionPlaceholder,
-                                       "Found ESC contention placeholder"));
+                position = alpha.value() + 1;
+                count = escDoc.count + 1;
+
+                if (escDoc.compactionPlaceholder) {
+                    uassertStatusOK(Status(ErrorCodes::FLECompactionPlaceholder,
+                                           "Found ESC contention placeholder"));
+                }
             }
+
+            payload.counts.push_back(count);
+
+            auto escInsertReply = uassertStatusOK(queryImpl->insertDocuments(
+                nssEsc,
+                {ESCCollection::generateInsertDocument(tagToken, valueToken, position, count)},
+                pStmtId,
+                true));
+            checkWriteErrors(escInsertReply);
+
+
+            const NamespaceString nssEcoc = NamespaceStringUtil::parseNamespaceFromRequest(
+                edcNss.dbName(), efc.getEcocCollection().value());
+
+            // TODO - should we make this a batch of ECOC updates?
+            const auto ecocInsertReply = uassertStatusOK(queryImpl->insertDocuments(
+                nssEcoc,
+                {ECOCCollection::generateDocument(payload.fieldPathName, encryptedTokens)},
+                pStmtId,
+                false,
+                bypassDocumentValidation));
+            checkWriteErrors(ecocInsertReply);
+        };
+
+        payload.counts.clear();
+        const bool isRangePayload = payload.payload.getEdgeTokenSet().has_value();
+        if (isRangePayload) {
+            const auto ets = payload.payload.getEdgeTokenSet().get();
+            for (size_t i = 0; i < ets.size(); ++i) {
+                insertTokens(ets[i].getEncryptedTokens(), ets[i].getEscDerivedToken());
+            }
+        } else {
+            insertTokens(payload.payload.getEncryptedTokens(),
+                         payload.payload.getEscDerivedToken());
         }
-
-        payload.count = count;
-
-        auto escInsertReply = uassertStatusOK(queryImpl->insertDocument(
-            nssEsc,
-            ESCCollection::generateInsertDocument(tagToken, valueToken, position, count),
-            pStmtId,
-            true));
-        checkWriteErrors(escInsertReply);
-
-
-        NamespaceString nssEcoc(edcNss.db(), efc.getEcocCollection().get());
-
-        // TODO - should we make this a batch of ECOC updates?
-        auto ecocInsertReply = uassertStatusOK(queryImpl->insertDocument(
-            nssEcoc,
-            ECOCCollection::generateDocument(payload.fieldPathName,
-                                             payload.payload.getEncryptedTokens()),
-            pStmtId,
-            false,
-            bypassDocumentValidation));
-        checkWriteErrors(ecocInsertReply);
     }
 }
+
+void processFieldsForInsertV2(FLEQueryInterface* queryImpl,
+                              const NamespaceString& edcNss,
+                              std::vector<EDCServerPayloadInfo>& serverPayload,
+                              const EncryptedFieldConfig& efc,
+                              int32_t* pStmtId,
+                              bool bypassDocumentValidation) {
+    if (serverPayload.empty()) {
+        return;
+    }
+
+    const NamespaceString nssEsc = NamespaceStringUtil::parseNamespaceFromRequest(
+        edcNss.dbName(), efc.getEscCollection().value());
+
+    uint32_t totalTokens = 0;
+
+    std::vector<std::vector<FLEEdgePrfBlock>> tokensSets;
+    tokensSets.reserve(serverPayload.size());
+
+    for (auto& payload : serverPayload) {
+        payload.counts.clear();
+
+        const bool isRangePayload = payload.payload.getEdgeTokenSet().has_value();
+        if (isRangePayload) {
+            const auto& edgeTokenSet = payload.payload.getEdgeTokenSet().get();
+
+            std::vector<FLEEdgePrfBlock> tokens;
+            tokens.reserve(edgeTokenSet.size());
+
+            for (const auto& et : edgeTokenSet) {
+                FLEEdgePrfBlock block;
+                block.esc = PrfBlockfromCDR(et.getEscDerivedToken());
+                tokens.push_back(block);
+                totalTokens++;
+            }
+
+            tokensSets.emplace_back(tokens);
+        } else {
+            FLEEdgePrfBlock block;
+            block.esc = PrfBlockfromCDR(payload.payload.getEscDerivedToken());
+            tokensSets.push_back({block});
+            totalTokens++;
+        }
+    }
+
+    auto countInfoSets =
+        queryImpl->getTags(nssEsc, tokensSets, FLETagQueryInterface::TagQueryType::kInsert);
+
+    uassert(7415101,
+            "Mismatch in the number of expected tokens",
+            countInfoSets.size() == serverPayload.size());
+
+    std::vector<BSONObj> escDocuments;
+    escDocuments.reserve(totalTokens);
+
+    for (size_t i = 0; i < countInfoSets.size(); i++) {
+        auto& countInfos = countInfoSets[i];
+
+        uassert(7415104,
+                "Mismatch in the number of expected counts for a token",
+                countInfos.size() == tokensSets[i].size());
+
+        for (auto const& countInfo : countInfos) {
+            serverPayload[i].counts.push_back(countInfo.count);
+
+            escDocuments.push_back(
+                ESCCollection::generateNonAnchorDocument(countInfo.tagToken, countInfo.count));
+        }
+    }
+
+    auto escInsertReply =
+        uassertStatusOK(queryImpl->insertDocuments(nssEsc, escDocuments, pStmtId, true));
+    checkWriteErrors(escInsertReply);
+
+    NamespaceString nssEcoc = NamespaceStringUtil::parseNamespaceFromRequest(
+        edcNss.dbName(), efc.getEcocCollection().value());
+    std::vector<BSONObj> ecocDocuments;
+    ecocDocuments.reserve(totalTokens);
+
+    for (auto& payload : serverPayload) {
+        const bool isRangePayload = payload.payload.getEdgeTokenSet().has_value();
+        if (isRangePayload) {
+            const auto& edgeTokenSet = payload.payload.getEdgeTokenSet().get();
+
+            for (const auto& et : edgeTokenSet) {
+                ecocDocuments.push_back(ECOCCollection::generateDocument(payload.fieldPathName,
+                                                                         et.getEncryptedTokens()));
+            }
+        } else {
+            ecocDocuments.push_back(ECOCCollection::generateDocument(
+                payload.fieldPathName, payload.payload.getEncryptedTokens()));
+        }
+    }
+
+    auto ecocInsertReply = uassertStatusOK(queryImpl->insertDocuments(
+        nssEcoc, ecocDocuments, pStmtId, false, bypassDocumentValidation));
+    checkWriteErrors(ecocInsertReply);
+}
+
+void processFieldsForInsert(FLEQueryInterface* queryImpl,
+                            const NamespaceString& edcNss,
+                            std::vector<EDCServerPayloadInfo>& serverPayload,
+                            const EncryptedFieldConfig& efc,
+                            int32_t* pStmtId,
+                            bool bypassDocumentValidation) {
+    if (gFeatureFlagFLE2ProtocolVersion2.isEnabled(serverGlobalParams.featureCompatibility)) {
+        processFieldsForInsertV2(
+            queryImpl, edcNss, serverPayload, efc, pStmtId, bypassDocumentValidation);
+    } else {
+        processFieldsForInsertV1(
+            queryImpl, edcNss, serverPayload, efc, pStmtId, bypassDocumentValidation);
+    }
+}
+
+void processRemovedFieldsHelper(FLEQueryInterface* queryImpl,
+                                const EncryptedFieldConfig& efc,
+                                const ESCDerivedFromDataTokenAndContentionFactorToken& esc,
+                                const ECCDerivedFromDataTokenAndContentionFactorToken& ecc,
+                                uint64_t count,
+                                const EDCIndexedFields& deletedField,
+                                const FLEDeleteToken& deleteToken,
+                                const TxnCollectionReader& reader,
+                                const NamespaceString& eccNss,
+                                const NamespaceString& edcNss,
+                                int32_t* pStmtId) {
+    auto tagToken = FLETwiceDerivedTokenGenerator::generateECCTwiceDerivedTagToken(ecc);
+    auto valueToken = FLETwiceDerivedTokenGenerator::generateECCTwiceDerivedValueToken(ecc);
+
+    auto alpha = ECCCollection::emuBinary(reader, tagToken, valueToken);
+
+    uint64_t index = 0;
+    if (alpha.has_value() && alpha.value() == 0) {
+        index = 1;
+    } else if (!alpha.has_value()) {
+        auto block = ECCCollection::generateId(tagToken, boost::none);
+
+        auto r_ecc = reader.getById(block);
+        uassert(6371306, "ECC null document not found", !r_ecc.isEmpty());
+
+        auto eccNullDoc = uassertStatusOK(ECCCollection::decryptNullDocument(valueToken, r_ecc));
+        index = eccNullDoc.position + 2;
+    } else {
+        auto block = ECCCollection::generateId(tagToken, alpha);
+
+        auto r_ecc = reader.getById(block);
+        uassert(6371307, "ECC document not found", !r_ecc.isEmpty());
+
+        auto eccDoc = uassertStatusOK(ECCCollection::decryptDocument(valueToken, r_ecc));
+
+        if (eccDoc.valueType == ECCValueType::kCompactionPlaceholder) {
+            uassertStatusOK(
+                Status(ErrorCodes::FLECompactionPlaceholder, "Found contention placeholder"));
+        }
+
+        index = alpha.value() + 1;
+    }
+
+    auto eccInsertReply = uassertStatusOK(queryImpl->insertDocuments(
+        eccNss,
+        {ECCCollection::generateDocument(tagToken, valueToken, index, count)},
+        pStmtId,
+        true));
+    checkWriteErrors(eccInsertReply);
+
+    const NamespaceString nssEcoc = NamespaceStringUtil::parseNamespaceFromRequest(
+        edcNss.dbName(), efc.getEcocCollection().value());
+
+    // TODO - make this a batch of ECOC updates?
+    EncryptedStateCollectionTokens tokens(esc, ecc);
+    auto encryptedTokens = uassertStatusOK(tokens.serialize(deleteToken.ecocToken));
+    auto ecocInsertReply = uassertStatusOK(queryImpl->insertDocuments(
+        nssEcoc,
+        {ECOCCollection::generateDocument(deletedField.fieldPathName, encryptedTokens)},
+        pStmtId,
+        false));
+    checkWriteErrors(ecocInsertReply);
+};
 
 void processRemovedFields(FLEQueryInterface* queryImpl,
                           const NamespaceString& edcNss,
@@ -537,13 +888,12 @@ void processRemovedFields(FLEQueryInterface* queryImpl,
                           const std::vector<EDCIndexedFields>& deletedFields,
                           int32_t* pStmtId) {
 
-    NamespaceString nssEcc(edcNss.db(), efc.getEccCollection().get());
+    const NamespaceString eccNss = NamespaceStringUtil::parseNamespaceFromRequest(
+        edcNss.dbName(), efc.getEccCollection().value());
 
+    auto docCount = queryImpl->countDocuments(eccNss);
 
-    auto docCount = queryImpl->countDocuments(nssEcc);
-
-    TxnCollectionReader reader(docCount, queryImpl, nssEcc);
-
+    TxnCollectionReader reader(docCount, queryImpl, eccNss);
 
     for (const auto& deletedField : deletedFields) {
         // TODO - verify each indexed fields is listed in EncryptionInformation for the
@@ -561,65 +911,45 @@ void processRemovedFields(FLEQueryInterface* queryImpl,
 
         // TODO - add support other types
         uassert(6371305,
-                "Ony support deleting equality indexed fields",
-                encryptedTypeBinding == EncryptedBinDataType::kFLE2EqualityIndexedValue);
+                "Ony support deleting equality indexed fields or range indexed fields",
+                encryptedTypeBinding == EncryptedBinDataType::kFLE2EqualityIndexedValue ||
+                    encryptedTypeBinding == EncryptedBinDataType::kFLE2RangeIndexedValue);
 
-        auto plainTextField = uassertStatusOK(FLE2IndexedEqualityEncryptedValue::decryptAndParse(
-            deleteToken.serverEncryptionToken, subCdr));
-
-        auto tagToken =
-            FLETwiceDerivedTokenGenerator::generateECCTwiceDerivedTagToken(plainTextField.ecc);
-        auto valueToken =
-            FLETwiceDerivedTokenGenerator::generateECCTwiceDerivedValueToken(plainTextField.ecc);
-
-        auto alpha = ECCCollection::emuBinary(reader, tagToken, valueToken);
-
-        uint64_t index = 0;
-        if (alpha.has_value() && alpha.value() == 0) {
-            index = 1;
-        } else if (!alpha.has_value()) {
-            auto block = ECCCollection::generateId(tagToken, boost::none);
-
-            auto r_ecc = reader.getById(block);
-            uassert(6371306, "ECC null document not found", !r_ecc.isEmpty());
-
-            auto eccNullDoc =
-                uassertStatusOK(ECCCollection::decryptNullDocument(valueToken, r_ecc));
-            index = eccNullDoc.position + 2;
+        if (encryptedTypeBinding == EncryptedBinDataType::kFLE2EqualityIndexedValue) {
+            auto plainTextField =
+                uassertStatusOK(FLE2IndexedEqualityEncryptedValue::decryptAndParse(
+                    deleteToken.serverEncryptionToken, subCdr));
+            processRemovedFieldsHelper(queryImpl,
+                                       efc,
+                                       plainTextField.esc,
+                                       plainTextField.ecc,
+                                       plainTextField.count,
+                                       deletedField,
+                                       deleteToken,
+                                       reader,
+                                       eccNss,
+                                       edcNss,
+                                       pStmtId);
         } else {
-            auto block = ECCCollection::generateId(tagToken, alpha);
+            auto plainTextField = uassertStatusOK(FLE2IndexedRangeEncryptedValue::decryptAndParse(
+                deleteToken.serverEncryptionToken, subCdr));
 
-            auto r_ecc = reader.getById(block);
-            uassert(6371307, "ECC document not found", !r_ecc.isEmpty());
-
-            auto eccDoc = uassertStatusOK(ECCCollection::decryptDocument(valueToken, r_ecc));
-
-            if (eccDoc.valueType == ECCValueType::kCompactionPlaceholder) {
-                uassertStatusOK(
-                    Status(ErrorCodes::FLECompactionPlaceholder, "Found contention placeholder"));
+            for (size_t i = 0; i < plainTextField.counters.size(); i++) {
+                const auto& edgeTokenSet = plainTextField.tokens[i];
+                const auto& count = plainTextField.counters[i];
+                processRemovedFieldsHelper(queryImpl,
+                                           efc,
+                                           edgeTokenSet.esc,
+                                           edgeTokenSet.ecc,
+                                           count,
+                                           deletedField,
+                                           deleteToken,
+                                           reader,
+                                           eccNss,
+                                           edcNss,
+                                           pStmtId);
             }
-
-            index = alpha.value() + 1;
         }
-
-        auto eccInsertReply = uassertStatusOK(queryImpl->insertDocument(
-            nssEcc,
-            ECCCollection::generateDocument(tagToken, valueToken, index, plainTextField.count),
-            pStmtId,
-            true));
-        checkWriteErrors(eccInsertReply);
-
-        NamespaceString nssEcoc(edcNss.db(), efc.getEcocCollection().get());
-
-        // TODO - make this a batch of ECOC updates?
-        EncryptedStateCollectionTokens tokens(plainTextField.esc, plainTextField.ecc);
-        auto encryptedTokens = uassertStatusOK(tokens.serialize(deleteToken.ecocToken));
-        auto ecocInsertReply = uassertStatusOK(queryImpl->insertDocument(
-            nssEcoc,
-            ECOCCollection::generateDocument(deletedField.fieldPathName, encryptedTokens),
-            pStmtId,
-            false));
-        checkWriteErrors(ecocInsertReply);
     }
 }
 
@@ -633,6 +963,54 @@ std::shared_ptr<write_ops::FindAndModifyCommandRequest> constructDefaultReply() 
     return std::make_shared<write_ops::FindAndModifyCommandRequest>(NamespaceString());
 }
 
+/**
+ * Extracts update payloads from a {findAndModify: nss, ...} request,
+ * and proxies to `validateInsertUpdatePayload()`.
+ */
+void validateFindAndModifyRequest(const write_ops::FindAndModifyCommandRequest& request) {
+    // Is this a delete?
+    const bool isDelete = request.getRemove().value_or(false);
+
+    // User can only specify either remove = true or update != {}
+    uassert(6371401,
+            "Must specify either update or remove to findAndModify, not both",
+            !(request.getUpdate().has_value() && isDelete));
+
+    uassert(6371402,
+            "findAndModify with encryption only supports new: false",
+            request.getNew().value_or(false) == false);
+
+    uassert(6371408,
+            "findAndModify fields must be empty",
+            request.getFields().value_or(BSONObj()).isEmpty());
+
+    // pipeline - is agg specific, delta is oplog, transform is internal (timeseries)
+    auto updateMod = request.getUpdate().get_value_or({});
+    const auto updateModicationType = updateMod.type();
+
+    uassert(6439901,
+            "FLE only supports modifier and replacement style updates",
+            updateModicationType == write_ops::UpdateModification::Type::kModifier ||
+                updateModicationType == write_ops::UpdateModification::Type::kReplacement);
+
+    auto nss = request.getNamespace();
+    auto ei = request.getEncryptionInformation().get();
+    auto efc = EncryptionInformationHelpers::getAndValidateSchema(nss, ei);
+
+    BSONObj update;
+    if (updateMod.type() == write_ops::UpdateModification::Type::kReplacement) {
+        update = updateMod.getUpdateReplacement();
+    } else {
+        invariant(updateMod.type() == write_ops::UpdateModification::Type::kModifier);
+        update = updateMod.getUpdateModifier().getObjectField("$set"_sd);
+    }
+
+    if (!update.firstElement().eoo()) {
+        auto serverPayload = EDCServerCollection::getEncryptedFieldInfo(update);
+        validateInsertUpdatePayloads(efc.getFields(), serverPayload);
+    }
+}
+
 }  // namespace
 
 template <typename ReplyType>
@@ -642,29 +1020,8 @@ StatusWith<std::pair<ReplyType, OpMsgRequest>> processFindAndModifyRequest(
     GetTxnCallback getTxns,
     ProcessFindAndModifyCallback<ReplyType> processCallback) {
 
-    // Is this a delete
-    bool isDelete = findAndModifyRequest.getRemove().value_or(false);
-
-    // User can only specify either remove = true or update != {}
-    uassert(6371401,
-            "Must specify either update or remove to findAndModify, not both",
-            !(findAndModifyRequest.getUpdate().has_value() && isDelete));
-
-    uassert(6371402,
-            "findAndModify with encryption only supports new: false",
-            findAndModifyRequest.getNew().value_or(false) == false);
-
-    uassert(6371408,
-            "findAndModify fields must be empty",
-            findAndModifyRequest.getFields().value_or(BSONObj()).isEmpty());
-
-    // pipeline - is agg specific, delta is oplog, transform is internal (timeseries)
-    auto updateModicationType =
-        findAndModifyRequest.getUpdate().value_or(write_ops::UpdateModification()).type();
-    uassert(6439901,
-            "FLE only supports modifier and replacement style updates",
-            updateModicationType == write_ops::UpdateModification::Type::kModifier ||
-                updateModicationType == write_ops::UpdateModification::Type::kReplacement);
+    CurOp::get(opCtx)->debug().shouldOmitDiagnosticInformation = true;
+    validateFindAndModifyRequest(findAndModifyRequest);
 
     std::shared_ptr<txn_api::SyncTransactionWithRetries> trun = getTxns(opCtx);
 
@@ -673,6 +1030,11 @@ StatusWith<std::pair<ReplyType, OpMsgRequest>> processFindAndModifyRequest(
     std::shared_ptr<ReplyType> reply = constructDefaultReply<ReplyType>();
 
     auto ownedRequest = findAndModifyRequest.serialize({});
+    const auto tenantId = findAndModifyRequest.getDbName().tenantId();
+    if (tenantId && gMultitenancySupport) {
+        ownedRequest.validatedTenancyScope =
+            VTS(tenantId.get(), VTS::TrustedForInnerOpMsgRequestTag{});
+    }
     auto ownedFindAndModifyRequest = write_ops::FindAndModifyCommandRequest::parse(
         IDLParserContext("findAndModify"), ownedRequest);
 
@@ -727,23 +1089,24 @@ processFindAndModifyRequest<write_ops::FindAndModifyCommandRequest>(
     GetTxnCallback getTxns,
     ProcessFindAndModifyCallback<write_ops::FindAndModifyCommandRequest> processCallback);
 
-FLEQueryInterface::~FLEQueryInterface() {}
-
 StatusWith<write_ops::InsertCommandReply> processInsert(
     FLEQueryInterface* queryImpl,
     const NamespaceString& edcNss,
     std::vector<EDCServerPayloadInfo>& serverPayload,
     const EncryptedFieldConfig& efc,
-    int32_t stmtId,
+    int32_t* stmtId,
     BSONObj document,
     bool bypassDocumentValidation) {
 
-    processFieldsForInsert(
-        queryImpl, edcNss, serverPayload, efc, &stmtId, bypassDocumentValidation);
+    if (serverPayload.empty()) {
+        return queryImpl->insertDocuments(edcNss, {document}, stmtId, false);
+    }
+
+    processFieldsForInsert(queryImpl, edcNss, serverPayload, efc, stmtId, bypassDocumentValidation);
 
     auto finalDoc = EDCServerCollection::finalizeForInsert(document, serverPayload);
 
-    return queryImpl->insertDocument(edcNss, finalDoc, &stmtId, false);
+    return queryImpl->insertDocuments(edcNss, {finalDoc}, stmtId, false);
 }
 
 write_ops::DeleteCommandReply processDelete(FLEQueryInterface* queryImpl,
@@ -751,40 +1114,74 @@ write_ops::DeleteCommandReply processDelete(FLEQueryInterface* queryImpl,
                                             const write_ops::DeleteCommandRequest& deleteRequest) {
 
     auto edcNss = deleteRequest.getNamespace();
-    auto ei = deleteRequest.getEncryptionInformation().get();
+    auto ei = deleteRequest.getEncryptionInformation().value();
 
     auto efc = EncryptionInformationHelpers::getAndValidateSchema(edcNss, ei);
-    auto tokenMap = EncryptionInformationHelpers::getDeleteTokens(edcNss, ei);
+
+    // TODO: SERVER-73303 delete when v2 is enabled by default
+    StringMap<FLEDeleteToken> tokenMap;
+    if (!gFeatureFlagFLE2ProtocolVersion2.isEnabled(serverGlobalParams.featureCompatibility)) {
+        tokenMap = EncryptionInformationHelpers::getDeleteTokens(edcNss, ei);
+    } else if (ei.getDeleteTokens().has_value()) {
+        uasserted(7293102, "Illegal delete tokens encountered in EncryptionInformation");
+    }
+
     int32_t stmtId = getStmtIdForWriteAt(deleteRequest, 0);
 
     auto newDeleteRequest = deleteRequest;
 
     auto newDeleteOp = newDeleteRequest.getDeletes()[0];
     newDeleteOp.setQ(fle::rewriteEncryptedFilterInsideTxn(
-        queryImpl, deleteRequest.getDbName(), efc, expCtx, newDeleteOp.getQ()));
+        queryImpl, edcNss.dbName(), efc, expCtx, newDeleteOp.getQ()));
+
     newDeleteRequest.setDeletes({newDeleteOp});
 
     newDeleteRequest.getWriteCommandRequestBase().setStmtIds(boost::none);
-    newDeleteRequest.getWriteCommandRequestBase().setStmtId(stmtId);
-    ++stmtId;
 
-    auto [deleteReply, deletedDocument] =
-        queryImpl->deleteWithPreimage(edcNss, ei, newDeleteRequest);
-    checkWriteErrors(deleteReply);
+    // TODO: SERVER-73303 delete when v2 is enabled by default
+    if (!gFeatureFlagFLE2ProtocolVersion2.isEnabled(serverGlobalParams.featureCompatibility)) {
+        newDeleteRequest.getWriteCommandRequestBase().setStmtId(stmtId);
+        ++stmtId;
 
-    // If the delete did not actually delete anything, we are done
-    if (deletedDocument.isEmpty()) {
-        write_ops::DeleteCommandReply reply;
-        reply.getWriteCommandReplyBase().setN(0);
-        return reply;
+        auto [deleteReply, deletedDocument] =
+            queryImpl->deleteWithPreimage(edcNss, ei, newDeleteRequest);
+        checkWriteErrors(deleteReply);
+
+        // If the delete did not actually delete anything, we are done
+        if (deletedDocument.isEmpty()) {
+            write_ops::DeleteCommandReply reply;
+            reply.getWriteCommandReplyBase().setN(0);
+            return reply;
+        }
+        auto deletedFields = EDCServerCollection::getEncryptedIndexedFields(deletedDocument);
+
+        processRemovedFields(queryImpl, edcNss, efc, tokenMap, deletedFields, &stmtId);
+        return deleteReply;
     }
 
-
-    auto deletedFields = EDCServerCollection::getEncryptedIndexedFields(deletedDocument);
-
-    processRemovedFields(queryImpl, edcNss, efc, tokenMap, deletedFields, &stmtId);
+    newDeleteRequest.getWriteCommandRequestBase().setStmtId(boost::none);
+    newDeleteRequest.getWriteCommandRequestBase().setEncryptionInformation(boost::none);
+    auto deleteReply = queryImpl->deleteDocument(edcNss, stmtId, newDeleteRequest);
+    checkWriteErrors(deleteReply);
 
     return deleteReply;
+}
+
+bool hasIndexedFieldsInSchema(const std::vector<EncryptedField>& fields) {
+    for (const auto& field : fields) {
+        if (field.getQueries().has_value()) {
+            const auto& queries = field.getQueries().get();
+            if (stdx::holds_alternative<std::vector<mongo::QueryTypeConfig>>(queries)) {
+                const auto& vec = stdx::get<0>(queries);
+                if (!vec.empty()) {
+                    return true;
+                }
+            } else {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 /**
@@ -796,7 +1193,7 @@ write_ops::DeleteCommandReply processDelete(FLEQueryInterface* queryImpl,
  * 3. Run the update with findAndModify to get the pre-image
  * 4. Run a find to get the post-image update with the id from the pre-image
  * -- Fail if we cannot find the new document. This could happen if they updated _id.
- * 5. Find the removed fields and update ECC
+ * 5. Find the removed fields
  * 6. Remove the stale tags from the original document with a new push
  */
 write_ops::UpdateCommandReply processUpdate(FLEQueryInterface* queryImpl,
@@ -804,10 +1201,18 @@ write_ops::UpdateCommandReply processUpdate(FLEQueryInterface* queryImpl,
                                             const write_ops::UpdateCommandRequest& updateRequest) {
 
     auto edcNss = updateRequest.getNamespace();
-    auto ei = updateRequest.getEncryptionInformation().get();
+    auto ei = updateRequest.getEncryptionInformation().value();
 
     auto efc = EncryptionInformationHelpers::getAndValidateSchema(edcNss, ei);
-    auto tokenMap = EncryptionInformationHelpers::getDeleteTokens(edcNss, ei);
+
+    // TODO: SERVER-73303 delete when v2 is enabled by default
+    StringMap<FLEDeleteToken> tokenMap;
+    if (!gFeatureFlagFLE2ProtocolVersion2.isEnabled(serverGlobalParams.featureCompatibility)) {
+        tokenMap = EncryptionInformationHelpers::getDeleteTokens(edcNss, ei);
+    } else if (ei.getDeleteTokens().has_value()) {
+        uasserted(7293201, "Illegal delete tokens encountered in EncryptionInformation");
+    }
+
     const auto updateOpEntry = updateRequest.getUpdates()[0];
 
     auto bypassDocumentValidation =
@@ -821,22 +1226,23 @@ write_ops::UpdateCommandReply processUpdate(FLEQueryInterface* queryImpl,
     std::vector<EDCServerPayloadInfo> serverPayload;
     auto newUpdateOpEntry = updateRequest.getUpdates()[0];
 
-    auto highCardinalityModeAllowed = newUpdateOpEntry.getUpsert()
-        ? fle::HighCardinalityModeAllowed::kDisallow
-        : fle::HighCardinalityModeAllowed::kAllow;
+    auto encryptedCollScanModeAllowed = newUpdateOpEntry.getUpsert()
+        ? fle::EncryptedCollScanModeAllowed::kDisallow
+        : fle::EncryptedCollScanModeAllowed::kAllow;
 
     newUpdateOpEntry.setQ(fle::rewriteEncryptedFilterInsideTxn(queryImpl,
-                                                               updateRequest.getDbName(),
+                                                               edcNss.dbName(),
                                                                efc,
                                                                expCtx,
                                                                newUpdateOpEntry.getQ(),
-                                                               highCardinalityModeAllowed));
+                                                               encryptedCollScanModeAllowed));
 
     if (updateModification.type() == write_ops::UpdateModification::Type::kModifier) {
         auto updateModifier = updateModification.getUpdateModifier();
         auto setObject = updateModifier.getObjectField("$set");
         EDCServerCollection::validateEncryptedFieldInfo(setObject, efc, bypassDocumentValidation);
         serverPayload = EDCServerCollection::getEncryptedFieldInfo(setObject);
+        validateInsertUpdatePayloads(efc.getFields(), serverPayload);
 
         processFieldsForInsert(
             queryImpl, edcNss, serverPayload, efc, &stmtId, bypassDocumentValidation);
@@ -851,6 +1257,7 @@ write_ops::UpdateCommandReply processUpdate(FLEQueryInterface* queryImpl,
         EDCServerCollection::validateEncryptedFieldInfo(
             replacementDocument, efc, bypassDocumentValidation);
         serverPayload = EDCServerCollection::getEncryptedFieldInfo(replacementDocument);
+        validateInsertUpdatePayloads(efc.getFields(), serverPayload);
 
         processFieldsForInsert(
             queryImpl, edcNss, serverPayload, efc, &stmtId, bypassDocumentValidation);
@@ -884,6 +1291,10 @@ write_ops::UpdateCommandReply processUpdate(FLEQueryInterface* queryImpl,
         return updateReply;
     }
 
+    // Validate that the original document does not contain values with on-disk version
+    // incompatible with the current protocol version.
+    EDCServerCollection::validateModifiedDocumentCompatibility(originalDocument);
+
     // Step 4 ----
     auto idElement = originalDocument.firstElement();
     uassert(6371504,
@@ -894,29 +1305,62 @@ write_ops::UpdateCommandReply processUpdate(FLEQueryInterface* queryImpl,
     // Fail if we could not find the new document
     uassert(6371505, "Could not find pre-image document by _id", !newDocument.isEmpty());
 
-    // Check the user did not remove/destroy the __safeContent__ array
-    FLEClientCrypto::validateTagsArray(newDocument);
+    if (hasIndexedFieldsInSchema(efc.getFields())) {
+        // Check the user did not remove/destroy the __safeContent__ array. If there are no
+        // indexed fields, then there will not be a safeContent array in the document.
+        FLEClientCrypto::validateTagsArray(newDocument);
+    }
 
     // Step 5 ----
     auto originalFields = EDCServerCollection::getEncryptedIndexedFields(originalDocument);
     auto newFields = EDCServerCollection::getEncryptedIndexedFields(newDocument);
-    auto deletedFields = EDCServerCollection::getRemovedTags(originalFields, newFields);
 
-    processRemovedFields(queryImpl, edcNss, efc, tokenMap, deletedFields, &stmtId);
+    // TODO: SERVER-73303 delete when v2 is enabled by default
+    if (!gFeatureFlagFLE2ProtocolVersion2.isEnabled(serverGlobalParams.featureCompatibility)) {
+
+        auto deletedFields = EDCServerCollection::getRemovedFields(originalFields, newFields);
+
+        processRemovedFields(queryImpl, edcNss, efc, tokenMap, deletedFields, &stmtId);
+
+        // Step 6 ----
+        BSONObj pullUpdate =
+            EDCServerCollection::generateUpdateToRemoveTags(deletedFields, tokenMap);
+        auto pullUpdateOpEntry = write_ops::UpdateOpEntry();
+        pullUpdateOpEntry.setUpsert(false);
+        pullUpdateOpEntry.setMulti(false);
+        pullUpdateOpEntry.setQ(BSON("_id"_sd << idElement));
+        pullUpdateOpEntry.setU(mongo::write_ops::UpdateModification(
+            pullUpdate, write_ops::UpdateModification::ModifierUpdateTag{}));
+        newUpdateRequest.setUpdates({pullUpdateOpEntry});
+        newUpdateRequest.getWriteCommandRequestBase().setStmtId(boost::none);
+        newUpdateRequest.setLegacyRuntimeConstants(boost::none);
+        newUpdateRequest.getWriteCommandRequestBase().setEncryptionInformation(boost::none);
+        /* ignore */ queryImpl->update(edcNss, stmtId, newUpdateRequest);
+
+        return updateReply;
+    }
 
     // Step 6 ----
-    BSONObj pullUpdate = EDCServerCollection::generateUpdateToRemoveTags(deletedFields, tokenMap);
-    auto pullUpdateOpEntry = write_ops::UpdateOpEntry();
-    pullUpdateOpEntry.setUpsert(false);
-    pullUpdateOpEntry.setMulti(false);
-    pullUpdateOpEntry.setQ(BSON("_id"_sd << idElement));
-    pullUpdateOpEntry.setU(mongo::write_ops::UpdateModification(
-        pullUpdate, write_ops::UpdateModification::ModifierUpdateTag{}));
-    newUpdateRequest.setUpdates({pullUpdateOpEntry});
-    newUpdateRequest.getWriteCommandRequestBase().setStmtId(boost::none);
-    newUpdateRequest.setLegacyRuntimeConstants(boost::none);
-    newUpdateRequest.getWriteCommandRequestBase().setEncryptionInformation(boost::none);
-    /* ignore */ queryImpl->update(edcNss, stmtId, newUpdateRequest);
+    // GarbageCollect steps:
+    //  1. Gather the tags from the metadata block(s) of each removed field. These are stale tags.
+    //  2. Generate the update command that pulls the stale tags from __safeContent__
+    //  3. Perform the update
+    auto staleTags = EDCServerCollection::getRemovedTags(originalFields, newFields);
+
+    if (!staleTags.empty()) {
+        BSONObj pullUpdate = EDCServerCollection::generateUpdateToRemoveTags(staleTags);
+        auto pullUpdateOpEntry = write_ops::UpdateOpEntry();
+        pullUpdateOpEntry.setUpsert(false);
+        pullUpdateOpEntry.setMulti(false);
+        pullUpdateOpEntry.setQ(BSON("_id"_sd << idElement));
+        pullUpdateOpEntry.setU(mongo::write_ops::UpdateModification(
+            pullUpdate, write_ops::UpdateModification::ModifierUpdateTag{}));
+        newUpdateRequest.setUpdates({pullUpdateOpEntry});
+        newUpdateRequest.getWriteCommandRequestBase().setStmtId(boost::none);
+        newUpdateRequest.setLegacyRuntimeConstants(boost::none);
+        newUpdateRequest.getWriteCommandRequestBase().setEncryptionInformation(boost::none);
+        /* ignore */ queryImpl->update(edcNss, stmtId, newUpdateRequest);
+    }
 
     return updateReply;
 }
@@ -927,6 +1371,7 @@ FLEBatchResult processFLEBatch(OperationContext* opCtx,
                                BatchedCommandResponse* response,
                                boost::optional<OID> targetEpoch) {
 
+    CurOp::get(opCtx)->debug().shouldOmitDiagnosticInformation = true;
     if (request.getWriteCommandRequestBase().getEncryptionInformation()->getCrudProcessed()) {
         return FLEBatchResult::kNotProcessed;
     }
@@ -996,33 +1441,35 @@ std::unique_ptr<BatchedCommandRequest> processFLEBatchExplain(
         return expCtx;
     };
 
+    CurOp::get(opCtx)->debug().shouldOmitDiagnosticInformation = true;
+
     if (request.getBatchType() == BatchedCommandRequest::BatchType_Delete) {
         auto deleteRequest = request.getDeleteRequest();
         auto newDeleteOp = deleteRequest.getDeletes()[0];
         newDeleteOp.setQ(fle::rewriteQuery(opCtx,
                                            getExpCtx(newDeleteOp),
                                            request.getNS(),
-                                           deleteRequest.getEncryptionInformation().get(),
+                                           deleteRequest.getEncryptionInformation().value(),
                                            newDeleteOp.getQ(),
                                            &getTransactionWithRetriesForMongoS,
-                                           fle::HighCardinalityModeAllowed::kAllow));
+                                           fle::EncryptedCollScanModeAllowed::kAllow));
         deleteRequest.setDeletes({newDeleteOp});
         deleteRequest.getWriteCommandRequestBase().setEncryptionInformation(boost::none);
         return std::make_unique<BatchedCommandRequest>(deleteRequest);
     } else if (request.getBatchType() == BatchedCommandRequest::BatchType_Update) {
         auto updateRequest = request.getUpdateRequest();
         auto newUpdateOp = updateRequest.getUpdates()[0];
-        auto highCardinalityModeAllowed = newUpdateOp.getUpsert()
-            ? fle::HighCardinalityModeAllowed::kDisallow
-            : fle::HighCardinalityModeAllowed::kAllow;
+        auto encryptedCollScanModeAllowed = newUpdateOp.getUpsert()
+            ? fle::EncryptedCollScanModeAllowed::kDisallow
+            : fle::EncryptedCollScanModeAllowed::kAllow;
 
         newUpdateOp.setQ(fle::rewriteQuery(opCtx,
                                            getExpCtx(newUpdateOp),
                                            request.getNS(),
-                                           updateRequest.getEncryptionInformation().get(),
+                                           updateRequest.getEncryptionInformation().value(),
                                            newUpdateOp.getQ(),
                                            &getTransactionWithRetriesForMongoS,
-                                           highCardinalityModeAllowed));
+                                           encryptedCollScanModeAllowed));
         updateRequest.setUpdates({newUpdateOp});
         updateRequest.getWriteCommandRequestBase().setEncryptionInformation(boost::none);
         return std::make_unique<BatchedCommandRequest>(updateRequest);
@@ -1036,11 +1483,20 @@ write_ops::FindAndModifyCommandReply processFindAndModify(
     FLEQueryInterface* queryImpl,
     const write_ops::FindAndModifyCommandRequest& findAndModifyRequest) {
 
+    CurOp::get(expCtx->opCtx)->debug().shouldOmitDiagnosticInformation = true;
     auto edcNss = findAndModifyRequest.getNamespace();
-    auto ei = findAndModifyRequest.getEncryptionInformation().get();
+    auto ei = findAndModifyRequest.getEncryptionInformation().value();
 
     auto efc = EncryptionInformationHelpers::getAndValidateSchema(edcNss, ei);
-    auto tokenMap = EncryptionInformationHelpers::getDeleteTokens(edcNss, ei);
+
+    // TODO: SERVER-73303 delete when v2 is enabled by default
+    StringMap<FLEDeleteToken> tokenMap;
+    if (!gFeatureFlagFLE2ProtocolVersion2.isEnabled(serverGlobalParams.featureCompatibility)) {
+        tokenMap = EncryptionInformationHelpers::getDeleteTokens(edcNss, ei);
+    } else if (ei.getDeleteTokens().has_value()) {
+        uasserted(7293301, "Illegal delete tokens encountered in EncryptionInformation");
+    }
+
     int32_t stmtId = findAndModifyRequest.getStmtId().value_or(0);
 
     auto newFindAndModifyRequest = findAndModifyRequest;
@@ -1050,17 +1506,17 @@ write_ops::FindAndModifyCommandReply processFindAndModify(
 
     // Step 0 ----
     // Rewrite filter
-    auto highCardinalityModeAllowed = findAndModifyRequest.getUpsert().value_or(false)
-        ? fle::HighCardinalityModeAllowed::kDisallow
-        : fle::HighCardinalityModeAllowed::kAllow;
+    auto encryptedCollScanModeAllowed = findAndModifyRequest.getUpsert().value_or(false)
+        ? fle::EncryptedCollScanModeAllowed::kDisallow
+        : fle::EncryptedCollScanModeAllowed::kAllow;
 
     newFindAndModifyRequest.setQuery(
         fle::rewriteEncryptedFilterInsideTxn(queryImpl,
-                                             edcNss.db(),
+                                             edcNss.dbName(),
                                              efc,
                                              expCtx,
                                              findAndModifyRequest.getQuery(),
-                                             highCardinalityModeAllowed));
+                                             encryptedCollScanModeAllowed));
 
     // Make sure not to inherit the command's writeConcern, this should be set at the transaction
     // level.
@@ -1126,36 +1582,95 @@ write_ops::FindAndModifyCommandReply processFindAndModify(
             "Missing _id field in pre-image document, the fields document must contain _id",
             idElement.fieldNameStringData() == "_id"_sd);
 
-    BSONObj newDocument;
-    std::vector<EDCIndexedFields> newFields;
+    // TODO: SERVER-73303 remove once v2 is enabled by default
+    if (!gFeatureFlagFLE2ProtocolVersion2.isEnabled(serverGlobalParams.featureCompatibility)) {
+        BSONObj newDocument;
+        std::vector<EDCIndexedFields> newFields;
 
-    // Is this a delete
-    bool isDelete = findAndModifyRequest.getRemove().value_or(false);
+        // Is this a delete
+        bool isDelete = findAndModifyRequest.getRemove().value_or(false);
 
-    // Unlike update, there will not always be a new document since users can delete the document
-    if (!isDelete) {
-        newDocument = queryImpl->getById(edcNss, idElement);
+        // Unlike update, there will not always be a new document since users can delete the
+        // document
+        if (!isDelete) {
+            newDocument = queryImpl->getById(edcNss, idElement);
 
-        // Fail if we could not find the new document
-        uassert(6371404, "Could not find pre-image document by _id", !newDocument.isEmpty());
+            // Fail if we could not find the new document
+            uassert(6371404, "Could not find pre-image document by _id", !newDocument.isEmpty());
 
-        // Check the user did not remove/destroy the __safeContent__ array
+            if (hasIndexedFieldsInSchema(efc.getFields())) {
+                // Check the user did not remove/destroy the __safeContent__ array. If there are no
+                // indexed fields, then there will not be a safeContent array in the document.
+                FLEClientCrypto::validateTagsArray(newDocument);
+            }
+
+            newFields = EDCServerCollection::getEncryptedIndexedFields(newDocument);
+        }
+
+        // Step 5 ----
+        auto originalFields = EDCServerCollection::getEncryptedIndexedFields(originalDocument);
+        auto deletedFields = EDCServerCollection::getRemovedFields(originalFields, newFields);
+
+        processRemovedFields(queryImpl, edcNss, efc, tokenMap, deletedFields, &stmtId);
+
+        // Step 6 ----
+        // We don't need to make a second update in the case of a delete
+        if (!isDelete) {
+            BSONObj pullUpdate =
+                EDCServerCollection::generateUpdateToRemoveTags(deletedFields, tokenMap);
+            auto newUpdateRequest =
+                write_ops::UpdateCommandRequest(findAndModifyRequest.getNamespace());
+            auto pullUpdateOpEntry = write_ops::UpdateOpEntry();
+            pullUpdateOpEntry.setUpsert(false);
+            pullUpdateOpEntry.setMulti(false);
+            pullUpdateOpEntry.setQ(BSON("_id"_sd << idElement));
+            pullUpdateOpEntry.setU(mongo::write_ops::UpdateModification(
+                pullUpdate, write_ops::UpdateModification::ModifierUpdateTag{}));
+            newUpdateRequest.setUpdates({pullUpdateOpEntry});
+            newUpdateRequest.setLegacyRuntimeConstants(boost::none);
+            newUpdateRequest.getWriteCommandRequestBase().setStmtId(boost::none);
+            newUpdateRequest.getWriteCommandRequestBase().setEncryptionInformation(boost::none);
+
+            auto finalUpdateReply = queryImpl->update(edcNss, stmtId, newUpdateRequest);
+            checkWriteErrors(finalUpdateReply);
+        }
+
+        return reply;
+    }
+
+    // Is this a delete? If so, there's no need to GarbageCollect.
+    if (findAndModifyRequest.getRemove().value_or(false)) {
+        return reply;
+    }
+
+    // Validate that the original document does not contain values with on-disk version
+    // incompatible with the current protocol version.
+    EDCServerCollection::validateModifiedDocumentCompatibility(originalDocument);
+
+    auto newDocument = queryImpl->getById(edcNss, idElement);
+
+    // Fail if we could not find the new document
+    uassert(7293302, "Could not find pre-image document by _id", !newDocument.isEmpty());
+
+    if (hasIndexedFieldsInSchema(efc.getFields())) {
+        // Check the user did not remove/destroy the __safeContent__ array. If there are no
+        // indexed fields, then there will not be a safeContent array in the document.
         FLEClientCrypto::validateTagsArray(newDocument);
-
-        newFields = EDCServerCollection::getEncryptedIndexedFields(newDocument);
     }
 
     // Step 5 ----
     auto originalFields = EDCServerCollection::getEncryptedIndexedFields(originalDocument);
-    auto deletedFields = EDCServerCollection::getRemovedTags(originalFields, newFields);
-
-    processRemovedFields(queryImpl, edcNss, efc, tokenMap, deletedFields, &stmtId);
+    auto newFields = EDCServerCollection::getEncryptedIndexedFields(newDocument);
 
     // Step 6 ----
-    // We don't need to make a second update in the case of a delete
-    if (!isDelete) {
-        BSONObj pullUpdate =
-            EDCServerCollection::generateUpdateToRemoveTags(deletedFields, tokenMap);
+    // GarbageCollect steps:
+    //  1. Gather the tags from the metadata block(s) of each removed field. These are stale tags.
+    //  2. Generate the update command that pulls the stale tags from __safeContent__
+    //  3. Perform the update
+    auto staleTags = EDCServerCollection::getRemovedTags(originalFields, newFields);
+
+    if (!staleTags.empty()) {
+        BSONObj pullUpdate = EDCServerCollection::generateUpdateToRemoveTags(staleTags);
         auto newUpdateRequest =
             write_ops::UpdateCommandRequest(findAndModifyRequest.getNamespace());
         auto pullUpdateOpEntry = write_ops::UpdateOpEntry();
@@ -1182,22 +1697,22 @@ write_ops::FindAndModifyCommandRequest processFindAndModifyExplain(
     const write_ops::FindAndModifyCommandRequest& findAndModifyRequest) {
 
     auto edcNss = findAndModifyRequest.getNamespace();
-    auto ei = findAndModifyRequest.getEncryptionInformation().get();
+    auto ei = findAndModifyRequest.getEncryptionInformation().value();
 
     auto efc = EncryptionInformationHelpers::getAndValidateSchema(edcNss, ei);
 
     auto newFindAndModifyRequest = findAndModifyRequest;
-    auto highCardinalityModeAllowed = findAndModifyRequest.getUpsert().value_or(false)
-        ? fle::HighCardinalityModeAllowed::kDisallow
-        : fle::HighCardinalityModeAllowed::kAllow;
+    auto encryptedCollScanModeAllowed = findAndModifyRequest.getUpsert().value_or(false)
+        ? fle::EncryptedCollScanModeAllowed::kDisallow
+        : fle::EncryptedCollScanModeAllowed::kAllow;
 
     newFindAndModifyRequest.setQuery(
         fle::rewriteEncryptedFilterInsideTxn(queryImpl,
-                                             edcNss.db(),
+                                             edcNss.dbName(),
                                              efc,
                                              expCtx,
                                              findAndModifyRequest.getQuery(),
-                                             highCardinalityModeAllowed));
+                                             encryptedCollScanModeAllowed));
 
     newFindAndModifyRequest.setEncryptionInformation(boost::none);
     return newFindAndModifyRequest;
@@ -1247,6 +1762,10 @@ BSONObj FLEQueryInterfaceImpl::getById(const NamespaceString& nss, BSONElement e
     FindCommandRequest find(nss);
     find.setFilter(BSON("_id" << element));
     find.setSingleBatch(true);
+    const auto tenantId = nss.tenantId();
+    if (tenantId && gMultitenancySupport) {
+        find.setDollarTenant(tenantId);
+    }
 
     // Throws on error
     auto docs = _txnClient.exhaustiveFind(find).get();
@@ -1273,6 +1792,10 @@ uint64_t FLEQueryInterfaceImpl::countDocuments(const NamespaceString& nss) {
     as->grantInternalAuthorization(opCtx.get());
 
     CountCommandRequest ccr(nss);
+    const auto tenantId = nss.tenantId();
+    if (tenantId && gMultitenancySupport) {
+        ccr.setDollarTenant(*tenantId);
+    }
     auto opMsgRequest = ccr.serialize(BSONObj());
 
     DBDirectClient directClient(opCtx.get());
@@ -1291,15 +1814,45 @@ uint64_t FLEQueryInterfaceImpl::countDocuments(const NamespaceString& nss) {
     return static_cast<uint64_t>(signedDocCount);
 }
 
-StatusWith<write_ops::InsertCommandReply> FLEQueryInterfaceImpl::insertDocument(
+std::vector<std::vector<FLEEdgeCountInfo>> FLEQueryInterfaceImpl::getTags(
     const NamespaceString& nss,
-    BSONObj obj,
+    const std::vector<std::vector<FLEEdgePrfBlock>>& tokensSets,
+    FLEQueryInterface::TagQueryType type) {
+
+    GetQueryableEncryptionCountInfo getCountsCmd(nss);
+
+    const auto tenantId = nss.tenantId();
+    if (tenantId && gMultitenancySupport) {
+        getCountsCmd.setDollarTenant(tenantId);
+    }
+
+    getCountsCmd.setTokens(toTagSets(tokensSets));
+    getCountsCmd.setForInsert(type == FLEQueryInterface::TagQueryType::kInsert);
+
+    auto response = _txnClient.runCommand(nss.db(), getCountsCmd.toBSON({})).get();
+    auto status = getStatusFromWriteCommandReply(response);
+    uassertStatusOK(status);
+
+    auto reply = QECountInfosReply::parse(IDLParserContext("reply"), response);
+
+    return toEdgeCounts(reply.getCounts());
+}
+
+StatusWith<write_ops::InsertCommandReply> FLEQueryInterfaceImpl::insertDocuments(
+    const NamespaceString& nss,
+    std::vector<BSONObj> objs,
     StmtId* pStmtId,
     bool translateDuplicateKey,
     bool bypassDocumentValidation) {
     write_ops::InsertCommandRequest insertRequest(nss);
-    insertRequest.setDocuments({obj});
+    auto documentCount = objs.size();
+    dassert(documentCount > 0);
+    insertRequest.setDocuments(std::move(objs));
 
+    const auto tenantId = nss.tenantId();
+    if (tenantId && gMultitenancySupport) {
+        insertRequest.setDollarTenant(tenantId);
+    }
     EncryptionInformation encryptionInformation;
     encryptionInformation.setCrudProcessed(true);
 
@@ -1309,12 +1862,19 @@ StatusWith<write_ops::InsertCommandReply> FLEQueryInterfaceImpl::insertDocument(
     insertRequest.getWriteCommandRequestBase().setBypassDocumentValidation(
         bypassDocumentValidation);
 
+    std::vector<StmtId> stmtIds;
     int32_t stmtId = *pStmtId;
     if (stmtId != kUninitializedStmtId) {
-        (*pStmtId)++;
+        (*pStmtId) += documentCount;
+
+        stmtIds.reserve(documentCount);
+        for (size_t i = 0; i < documentCount; i++) {
+            stmtIds.push_back(stmtId + i);
+        }
     }
 
-    auto response = _txnClient.runCRUDOp(BatchedCommandRequest(insertRequest), {stmtId}).get();
+
+    auto response = _txnClient.runCRUDOp(BatchedCommandRequest(insertRequest), stmtIds).get();
 
     auto status = response.toStatus();
 
@@ -1343,12 +1903,16 @@ std::pair<write_ops::DeleteCommandReply, BSONObj> FLEQueryInterfaceImpl::deleteW
     findAndModifyRequest.setCollation(deleteOpEntry.getCollation());
     findAndModifyRequest.setLet(deleteRequest.getLet());
     findAndModifyRequest.setStmtId(deleteRequest.getStmtId());
+    const auto tenantId = nss.tenantId();
+    if (tenantId && gMultitenancySupport) {
+        findAndModifyRequest.setDollarTenant(tenantId);
+    }
 
     auto ei2 = ei;
     ei2.setCrudProcessed(true);
     findAndModifyRequest.setEncryptionInformation(ei2);
 
-    auto response = _txnClient.runCommand(nss.db(), findAndModifyRequest.toBSON({})).get();
+    auto response = _txnClient.runCommand(nss.dbName(), findAndModifyRequest.toBSON({})).get();
     auto status = getStatusFromWriteCommandReply(response);
 
     BSONObj returnObj;
@@ -1360,7 +1924,6 @@ std::pair<write_ops::DeleteCommandReply, BSONObj> FLEQueryInterfaceImpl::deleteW
     } else {
         auto reply =
             write_ops::FindAndModifyCommandReply::parse(IDLParserContext("reply"), response);
-
         if (reply.getLastErrorObject().getNumDocs() > 0) {
             deleteReply.getWriteCommandReplyBase().setN(1);
         }
@@ -1369,6 +1932,18 @@ std::pair<write_ops::DeleteCommandReply, BSONObj> FLEQueryInterfaceImpl::deleteW
     }
 
     return {deleteReply, returnObj};
+}
+
+write_ops::DeleteCommandReply FLEQueryInterfaceImpl::deleteDocument(
+    const NamespaceString& nss, int32_t stmtId, write_ops::DeleteCommandRequest& deleteRequest) {
+
+    dassert(!deleteRequest.getWriteCommandRequestBase().getEncryptionInformation());
+    dassert(deleteRequest.getStmtIds().value_or(std::vector<int32_t>()).empty());
+
+    auto response = _txnClient.runCRUDOp(BatchedCommandRequest(deleteRequest), {stmtId}).get();
+    write_ops::DeleteCommandReply reply;
+    responseToReply(response, reply.getWriteCommandReplyBase());
+    return {reply};
 }
 
 std::pair<write_ops::UpdateCommandReply, BSONObj> FLEQueryInterfaceImpl::updateWithPreimage(
@@ -1395,11 +1970,14 @@ std::pair<write_ops::UpdateCommandReply, BSONObj> FLEQueryInterfaceImpl::updateW
     findAndModifyRequest.setStmtId(updateRequest.getStmtId());
     findAndModifyRequest.setBypassDocumentValidation(updateRequest.getBypassDocumentValidation());
 
+    if (nss.tenantId() && gMultitenancySupport) {
+        findAndModifyRequest.setDollarTenant(nss.tenantId());
+    }
     auto ei2 = ei;
     ei2.setCrudProcessed(true);
     findAndModifyRequest.setEncryptionInformation(ei2);
 
-    auto response = _txnClient.runCommand(nss.db(), findAndModifyRequest.toBSON({})).get();
+    auto response = _txnClient.runCommand(nss.dbName(), findAndModifyRequest.toBSON({})).get();
     auto status = getStatusFromWriteCommandReply(response);
     uassertStatusOK(status);
 
@@ -1469,7 +2047,7 @@ write_ops::FindAndModifyCommandReply FLEQueryInterfaceImpl::findAndModify(
     // WriteConcern is set at the transaction level so strip it out
     newFindAndModifyRequest.setWriteConcern(boost::none);
 
-    auto response = _txnClient.runCommand(nss.db(), newFindAndModifyRequest.toBSON({})).get();
+    auto response = _txnClient.runCommand(nss.dbName(), newFindAndModifyRequest.toBSON({})).get();
     auto status = getStatusFromWriteCommandReply(response);
     uassertStatusOK(status);
 
@@ -1479,6 +2057,10 @@ write_ops::FindAndModifyCommandReply FLEQueryInterfaceImpl::findAndModify(
 std::vector<BSONObj> FLEQueryInterfaceImpl::findDocuments(const NamespaceString& nss,
                                                           BSONObj filter) {
     FindCommandRequest find(nss);
+    const auto tenantId = nss.tenantId();
+    if (tenantId && gMultitenancySupport) {
+        find.setDollarTenant(tenantId);
+    }
     find.setFilter(filter);
 
     // Throws on error
@@ -1504,5 +2086,55 @@ std::unique_ptr<Pipeline, PipelineDeleter> processFLEPipelineS(
     std::unique_ptr<Pipeline, PipelineDeleter> toRewrite) {
     return fle::processPipeline(
         opCtx, nss, encryptInfo, std::move(toRewrite), &getTransactionWithRetriesForMongoS);
+}
+
+FLETagNoTXNQuery::FLETagNoTXNQuery(OperationContext* opCtx) : _opCtx(opCtx) {}
+
+BSONObj FLETagNoTXNQuery::getById(const NamespaceString& nss, BSONElement element) {
+    invariant(false);
+    return {};
+};
+
+uint64_t FLETagNoTXNQuery::countDocuments(const NamespaceString& nss) {
+    invariant(false);
+    return 0;
+}
+
+std::vector<std::vector<FLEEdgeCountInfo>> FLETagNoTXNQuery::getTags(
+    const NamespaceString& nss,
+    const std::vector<std::vector<FLEEdgePrfBlock>>& tokensSets,
+    TagQueryType type) {
+
+    invariant(!_opCtx->inMultiDocumentTransaction());
+
+    // Pop off the current op context so we can get a fresh set of read concern settings
+    auto client = _opCtx->getServiceContext()->makeClient("FLETagNoTXNQuery");
+    AlternativeClientRegion clientRegion(client);
+    auto opCtx = cc().makeOperationContext();
+    auto as = AuthorizationSession::get(cc());
+    as->grantInternalAuthorization(opCtx.get());
+
+    GetQueryableEncryptionCountInfo getCountsCmd(nss);
+
+    const auto tenantId = nss.tenantId();
+    if (tenantId && gMultitenancySupport) {
+        getCountsCmd.setDollarTenant(tenantId);
+    }
+
+    getCountsCmd.setTokens(toTagSets(tokensSets));
+    getCountsCmd.setForInsert(type == FLEQueryInterface::TagQueryType::kInsert);
+
+    DBDirectClient directClient(opCtx.get());
+
+    auto uniqueReply = directClient.runCommand(getCountsCmd.serialize({}));
+
+    auto response = uniqueReply->getCommandReply();
+
+    auto status = getStatusFromWriteCommandReply(response);
+    uassertStatusOK(status);
+
+    auto reply = QECountInfosReply::parse(IDLParserContext("reply"), response);
+
+    return toEdgeCounts(reply.getCounts());
 }
 }  // namespace mongo

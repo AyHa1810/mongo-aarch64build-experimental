@@ -19,10 +19,10 @@
  * the session get rollback reason API call. Users of the API could have a dependency on the format
  * of these messages so changing them must be done with care.
  */
-#define WT_TXN_ROLLBACK_REASON_OLDEST_FOR_EVICTION \
-    "oldest pinned transaction ID rolled back for eviction"
 #define WT_TXN_ROLLBACK_REASON_CACHE_OVERFLOW "transaction rolled back because of cache overflow"
 #define WT_TXN_ROLLBACK_REASON_CONFLICT "conflict between concurrent operations"
+#define WT_TXN_ROLLBACK_REASON_OLDEST_FOR_EVICTION \
+    "oldest pinned transaction ID rolled back for eviction"
 
 /* AUTOMATIC FLAG VALUE GENERATION START 0 */
 #define WT_TXN_LOG_CKPT_CLEANUP 0x01u
@@ -164,8 +164,6 @@ struct __wt_txn_global {
     volatile uint32_t checkpoint_id;     /* Checkpoint's session ID */
     WT_TXN_SHARED checkpoint_txn_shared; /* Checkpoint's txn shared state */
     wt_timestamp_t checkpoint_timestamp; /* Checkpoint's timestamp */
-    volatile uint64_t checkpoint_reserved_txn_id; /* A transaction ID reserved by checkpoint for
-                                            prepared transaction resolution. */
 
     volatile uint64_t debug_ops;       /* Debug mode op counter */
     uint64_t debug_rollback;           /* Debug mode rollback */
@@ -297,6 +295,7 @@ struct __wt_txn {
      * the current oldest/pinned timestamp, respectively.
      */
     wt_timestamp_t checkpoint_read_timestamp;
+    wt_timestamp_t checkpoint_stable_timestamp;
     wt_timestamp_t checkpoint_oldest_timestamp;
 
     /* Array of modifications by this transaction. */

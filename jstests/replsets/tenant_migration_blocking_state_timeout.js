@@ -10,16 +10,15 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    runMigrationAsync,
+} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");
 load("jstests/libs/parallelTester.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
-
-const kTenantIdPrefix = "testTenantId";
+load("jstests/replsets/rslib.js");  // 'createRstArgs'
 
 const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
 
@@ -34,7 +33,7 @@ function testTimeoutBlockingState() {
     assert.commandWorked(
         donorPrimary.adminCommand({setParameter: 1, tenantMigrationBlockingStateTimeoutMS: 5000}));
 
-    const tenantId = `${kTenantIdPrefix}-blockingTimeout`;
+    const tenantId = ObjectId().str;
     const migrationId = UUID();
     const migrationOpts = {
         migrationIdString: extractUUIDFromObject(migrationId),
@@ -42,7 +41,7 @@ function testTimeoutBlockingState() {
         recipientConnString: tenantMigrationTest.getRecipientConnString(),
     };
 
-    const donorRstArgs = TenantMigrationUtil.createRstArgs(donorRst);
+    const donorRstArgs = createRstArgs(donorRst);
 
     // Fail point to pause right before entering the blocking mode.
     let afterDataSyncFp =
@@ -50,8 +49,7 @@ function testTimeoutBlockingState() {
 
     // Run the migration in its own thread, since the initial 'donorStartMigration' command will
     // hang due to the fail point.
-    let migrationThread =
-        new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
+    let migrationThread = new Thread(runMigrationAsync, migrationOpts, donorRstArgs);
     migrationThread.start();
 
     afterDataSyncFp.wait();
@@ -78,4 +76,3 @@ jsTest.log("Test timeout of the blocking state");
 testTimeoutBlockingState();
 
 tenantMigrationTest.stop();
-}());

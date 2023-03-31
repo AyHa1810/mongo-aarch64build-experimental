@@ -1,4 +1,5 @@
-load("jstests/aggregation/extras/utils.js");  // For assertErrorCode and assertErrMsgContains.
+load("jstests/aggregation/extras/utils.js");        // For assertErrorCode and assertErrMsgContains.
+load("jstests/libs/sbe_assert_error_override.js");  // Override error-code-checking APIs.
 
 (function() {
 "use strict";
@@ -553,6 +554,7 @@ testCases = [
     {inputString: "2017, Day 5", format: "%G, Day %u", expect: "2017-01-06T00:00:00Z"},
     {inputString: "53.7.2017", format: "%V.%u.%G", expect: "2018-01-07T00:00:00Z"},
     {inputString: "1.1.1", format: "%V.%u.%G", expect: "0001-01-01T00:00:00Z"},
+    {inputString: "2017, Day 5", format: "%Y, Day %j", expect: "2017-01-06T00:00:00Z"},
 ];
 testCases.forEach(function(testCase) {
     assert.eq(
@@ -726,7 +728,7 @@ assertErrorCode(coll, pipeline, ErrorCodes.ConversionFailure);
 
 // Test umatched format specifier string.
 pipeline = [{$project: {date: {$dateFromString: {dateString: "2018-01", format: "%Y-%m-%d"}}}}];
-assertErrCodeAndErrMsgContains(coll, pipeline, ErrorCodes.ConversionFailure, "Data missing");
+assertErrCodeAndErrMsgContains(coll, pipeline, ErrorCodes.ConversionFailure, "Not enough data");
 
 pipeline = [{$project: {date: {$dateFromString: {dateString: "2018-01", format: "%Y"}}}}];
 assertErrCodeAndErrMsgContains(coll, pipeline, ErrorCodes.ConversionFailure, "Trailing data");
@@ -792,7 +794,7 @@ assertErrCodeAndErrMsgContains(
 // Test embedded null bytes in the 'dateString' and 'format' fields.
 pipeline =
     [{$project: {date: {$dateFromString: {dateString: "12/31\0/2018", format: "%m/%d/%Y"}}}}];
-assertErrCodeAndErrMsgContains(coll, pipeline, ErrorCodes.ConversionFailure, "Data missing");
+assertErrCodeAndErrMsgContains(coll, pipeline, ErrorCodes.ConversionFailure, "Not enough data");
 
 pipeline =
     [{$project: {date: {$dateFromString: {dateString: "12/31/2018", format: "%m/%d\0/%Y"}}}}];

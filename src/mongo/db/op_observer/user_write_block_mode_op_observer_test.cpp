@@ -27,9 +27,9 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog/create_collection.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/op_observer/user_write_block_mode_op_observer.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_mock.h"
@@ -59,6 +59,25 @@ public:
         // Ensure that we are primary.
         auto replCoord = repl::ReplicationCoordinator::get(opCtx.get());
         ASSERT_OK(replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
+
+        ASSERT_OK(createCollection(
+            opCtx.get(),
+            CreateCommand(NamespaceString::createNamespaceString_forTest("userDB.coll"))));
+        ASSERT_OK(createCollection(opCtx.get(),
+                                   CreateCommand(NamespaceString::createNamespaceString_forTest(
+                                       "userDB.system.profile"))));
+        ASSERT_OK(createCollection(
+            opCtx.get(),
+            CreateCommand(NamespaceString::createNamespaceString_forTest("admin.coll"))));
+        ASSERT_OK(createCollection(
+            opCtx.get(),
+            CreateCommand(NamespaceString::createNamespaceString_forTest("admin.collForRename"))));
+        ASSERT_OK(createCollection(
+            opCtx.get(),
+            CreateCommand(NamespaceString::createNamespaceString_forTest("local.coll"))));
+        ASSERT_OK(createCollection(
+            opCtx.get(),
+            CreateCommand(NamespaceString::createNamespaceString_forTest("config.coll"))));
     }
 
 protected:
@@ -68,31 +87,48 @@ protected:
                 const NamespaceString& nss,
                 bool shouldSucceed,
                 bool fromMigrate) {
+        ASSERT(nss.isValid());
+
+        AutoGetCollection autoColl(opCtx, nss, MODE_IX);
+        if (!autoColl)
+            FAIL(str::stream() << "Collection " << nss << " doesn't exist");
+
         UserWriteBlockModeOpObserver opObserver;
         std::vector<InsertStatement> inserts;
-        CollectionUpdateArgs collectionUpdateArgs;
+        const auto criteria = BSON("_id" << 0);
+        const auto preImageDoc = criteria;
+        CollectionUpdateArgs collectionUpdateArgs{preImageDoc};
+        collectionUpdateArgs.criteria = criteria;
         collectionUpdateArgs.source =
             fromMigrate ? OperationSource::kFromMigrate : OperationSource::kStandard;
-        auto uuid = UUID::gen();
-        OplogUpdateEntryArgs updateArgs(&collectionUpdateArgs, nss, uuid);
-        updateArgs.nss = nss;
+        OplogUpdateEntryArgs updateArgs(&collectionUpdateArgs, *autoColl);
         OplogDeleteEntryArgs deleteArgs;
         deleteArgs.fromMigrate = fromMigrate;
         if (shouldSucceed) {
             try {
-                opObserver.onInserts(opCtx, nss, uuid, inserts.begin(), inserts.end(), fromMigrate);
+                opObserver.onInserts(opCtx,
+                                     *autoColl,
+                                     inserts.begin(),
+                                     inserts.end(),
+                                     /*fromMigrate=*/std::vector<bool>(inserts.size(), fromMigrate),
+                                     /*defaultFromMigrate=*/fromMigrate);
                 opObserver.onUpdate(opCtx, updateArgs);
-                opObserver.onDelete(opCtx, nss, uuid, StmtId(), deleteArgs);
+                opObserver.onDelete(opCtx, *autoColl, StmtId(), deleteArgs);
             } catch (...) {
                 // Make it easier to see that this is where we failed.
                 ASSERT_OK(exceptionToStatus());
             }
         } else {
             ASSERT_THROWS(
-                opObserver.onInserts(opCtx, nss, uuid, inserts.begin(), inserts.end(), fromMigrate),
+                opObserver.onInserts(opCtx,
+                                     *autoColl,
+                                     inserts.begin(),
+                                     inserts.end(),
+                                     /*fromMigrate=*/std::vector<bool>(inserts.size(), fromMigrate),
+                                     /*defaultFromMigrate=*/fromMigrate),
                 AssertionException);
             ASSERT_THROWS(opObserver.onUpdate(opCtx, updateArgs), AssertionException);
-            ASSERT_THROWS(opObserver.onDelete(opCtx, nss, uuid, StmtId(), deleteArgs),
+            ASSERT_THROWS(opObserver.onDelete(opCtx, *autoColl, StmtId(), deleteArgs),
                           AssertionException);
         }
     }
@@ -106,7 +142,8 @@ protected:
         runCUD(opCtx, nss, shouldSucceed, fromMigrate);
         UserWriteBlockModeOpObserver opObserver;
         auto uuid = UUID::gen();
-        NamespaceString adminNss = NamespaceString("admin");
+        NamespaceString adminNss =
+            NamespaceString::createNamespaceString_forTest("admin.collForRename");
 
         if (shouldSucceed) {
             try {
@@ -114,7 +151,7 @@ protected:
                 opObserver.onStartIndexBuild(opCtx, nss, uuid, uuid, {}, false);
                 opObserver.onStartIndexBuildSinglePhase(opCtx, nss);
                 opObserver.onCreateCollection(
-                    opCtx, nullptr, nss, {}, BSONObj(), OplogSlot(), false);
+                    opCtx, CollectionPtr(), nss, {}, BSONObj(), OplogSlot(), false);
                 opObserver.onCollMod(opCtx, nss, uuid, BSONObj(), {}, boost::none);
                 opObserver.onDropDatabase(opCtx, DatabaseName(boost::none, nss.db()));
                 opObserver.onDropCollection(
@@ -141,7 +178,7 @@ protected:
                           AssertionException);
             ASSERT_THROWS(opObserver.onStartIndexBuildSinglePhase(opCtx, nss), AssertionException);
             ASSERT_THROWS(opObserver.onCreateCollection(
-                              opCtx, nullptr, nss, {}, BSONObj(), OplogSlot(), false),
+                              opCtx, CollectionPtr(), nss, {}, BSONObj(), OplogSlot(), false),
                           AssertionException);
             ASSERT_THROWS(opObserver.onCollMod(opCtx, nss, uuid, BSONObj(), {}, boost::none),
                           AssertionException);
@@ -193,10 +230,10 @@ TEST_F(UserWriteBlockModeOpObserverTest, WriteBlockingDisabledNoBypass) {
     ASSERT(!WriteBlockBypass::get(opCtx.get()).isWriteBlockBypassEnabled());
 
     // Ensure writes succeed
-    runCheckedOps(opCtx.get(), NamespaceString("a.b"), true);
-    runCheckedOps(opCtx.get(), NamespaceString("admin"), true);
-    runCheckedOps(opCtx.get(), NamespaceString("local"), true);
-    runCheckedOps(opCtx.get(), NamespaceString("config"), true);
+    runCheckedOps(opCtx.get(), NamespaceString::createNamespaceString_forTest("userDB.coll"), true);
+    runCheckedOps(opCtx.get(), NamespaceString::createNamespaceString_forTest("admin.coll"), true);
+    runCheckedOps(opCtx.get(), NamespaceString::createNamespaceString_forTest("local.coll"), true);
+    runCheckedOps(opCtx.get(), NamespaceString::createNamespaceString_forTest("config.coll"), true);
 }
 
 TEST_F(UserWriteBlockModeOpObserverTest, WriteBlockingDisabledWithBypass) {
@@ -213,10 +250,10 @@ TEST_F(UserWriteBlockModeOpObserverTest, WriteBlockingDisabledWithBypass) {
     ASSERT(WriteBlockBypass::get(opCtx.get()).isWriteBlockBypassEnabled());
 
     // Ensure writes succeed
-    runCheckedOps(opCtx.get(), NamespaceString("a.b"), true);
-    runCheckedOps(opCtx.get(), NamespaceString("admin"), true);
-    runCheckedOps(opCtx.get(), NamespaceString("local"), true);
-    runCheckedOps(opCtx.get(), NamespaceString("config"), true);
+    runCheckedOps(opCtx.get(), NamespaceString::createNamespaceString_forTest("userDB.coll"), true);
+    runCheckedOps(opCtx.get(), NamespaceString::createNamespaceString_forTest("admin.coll"), true);
+    runCheckedOps(opCtx.get(), NamespaceString::createNamespaceString_forTest("local.coll"), true);
+    runCheckedOps(opCtx.get(), NamespaceString::createNamespaceString_forTest("config.coll"), true);
 }
 
 TEST_F(UserWriteBlockModeOpObserverTest, WriteBlockingEnabledNoBypass) {
@@ -228,17 +265,21 @@ TEST_F(UserWriteBlockModeOpObserverTest, WriteBlockingEnabledNoBypass) {
     ASSERT(!WriteBlockBypass::get(opCtx.get()).isWriteBlockBypassEnabled());
 
     // Ensure user writes now fail, while non-user writes still succeed
-    runCheckedOps(opCtx.get(), NamespaceString("a.b"), false);
-    runCheckedOps(opCtx.get(), NamespaceString("admin"), true);
-    runCheckedOps(opCtx.get(), NamespaceString("local"), true);
-    runCheckedOps(opCtx.get(), NamespaceString("config"), true);
+    runCheckedOps(
+        opCtx.get(), NamespaceString::createNamespaceString_forTest("userDB.coll"), false);
+    runCheckedOps(opCtx.get(), NamespaceString::createNamespaceString_forTest("admin.coll"), true);
+    runCheckedOps(opCtx.get(), NamespaceString::createNamespaceString_forTest("local.coll"), true);
+    runCheckedOps(opCtx.get(), NamespaceString::createNamespaceString_forTest("config.coll"), true);
 
     // Ensure that CUD ops from migrations succeed
-    runCUD(opCtx.get(), NamespaceString("a.b"), true, true /* fromMigrate */);
+    runCUD(opCtx.get(),
+           NamespaceString::createNamespaceString_forTest("userDB.coll"),
+           true,
+           true /* fromMigrate */);
 
     // Ensure that writes to the <db>.system.profile collections are always allowed
     runCUD(opCtx.get(),
-           NamespaceString("a.system.profile"),
+           NamespaceString::createNamespaceString_forTest("userDB.system.profile"),
            true /* shouldSucceed */,
            false /* fromMigrate */);
 }
@@ -258,10 +299,10 @@ TEST_F(UserWriteBlockModeOpObserverTest, WriteBlockingEnabledWithBypass) {
 
     // Ensure user writes succeed
 
-    runCheckedOps(opCtx.get(), NamespaceString("a.b"), true);
-    runCheckedOps(opCtx.get(), NamespaceString("admin"), true);
-    runCheckedOps(opCtx.get(), NamespaceString("local"), true);
-    runCheckedOps(opCtx.get(), NamespaceString("config"), true);
+    runCheckedOps(opCtx.get(), NamespaceString::createNamespaceString_forTest("userDB.coll"), true);
+    runCheckedOps(opCtx.get(), NamespaceString::createNamespaceString_forTest("admin.coll"), true);
+    runCheckedOps(opCtx.get(), NamespaceString::createNamespaceString_forTest("local.coll"), true);
+    runCheckedOps(opCtx.get(), NamespaceString::createNamespaceString_forTest("config.coll"), true);
 }
 
 }  // namespace

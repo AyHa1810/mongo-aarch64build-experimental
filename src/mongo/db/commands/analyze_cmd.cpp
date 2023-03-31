@@ -29,12 +29,83 @@
 
 #include <string>
 
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/analyze_cmd.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/query/allowed_contexts.h"
 #include "mongo/db/query/analyze_command_gen.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
+#include "mongo/db/query/stats/stats_catalog.h"
+#include "mongo/db/query/stats/stats_gen.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 
 namespace mongo {
 namespace {
+
+StatusWith<BSONObj> analyzeCommandAsAggregationCommand(OperationContext* opCtx,
+                                                       StringData db,
+                                                       StringData collection,
+                                                       StringData keyPath,
+                                                       boost::optional<double> sampleRate,
+                                                       boost::optional<int> numBuckets) {
+    // Build a pipeline that accomplishes the analyze request. The building code constructs a
+    // pipeline that looks like this, assuming the analyze is on the key "a.b.c"
+    //
+    //      [
+    //          { $match: { $expr: {$lt: [{$rand: {}, sampleRate]} } }, // If sampleRate is
+    //          specified, otherwise this stage is omitted
+    //          { $project: { val : "$a.b.c" } },
+    //          { $group: {
+    //              _id: "a.b.c",
+    //              statistics: { $_internalConstructStats: {
+    //                              val: "$$ROOT",
+    //                              sampleRate: sampleRate,
+    //                              numberBuckets: numberBuckets }
+    //              }
+    //          },
+    //          { $merge: {
+    //              into: "system.statistics." + collection,
+    //              on: "key",
+    //              whenMatched: "replace",
+    //              whenNotMatched: "insert" }
+    //          }
+    //      ]
+    //
+    std::string into(str::stream() << NamespaceString::kStatisticsCollectionPrefix << collection);
+    FieldPath fieldPath(keyPath);
+
+    BSONArrayBuilder pipelineBuilder;
+
+    if (sampleRate) {
+        pipelineBuilder << BSON(
+            "$match" << BSON(
+                "$expr" << BSON("$lt" << BSON_ARRAY(BSON("$rand" << BSONObj()) << *sampleRate))));
+    }
+
+    InternalConstructStatsAccumulatorParams statsAccumParams;
+    statsAccumParams.setVal("$$ROOT");
+    statsAccumParams.setSampleRate(sampleRate ? *sampleRate : 1.0);
+    statsAccumParams.setNumberBuckets(numBuckets ? *numBuckets
+                                                 : mongo::stats::ScalarHistogram::kMaxBuckets);
+
+    pipelineBuilder << BSON("$project" << BSON("val" << fieldPath.fullPathWithPrefix()))
+                    << BSON("$group" << BSON("_id" << keyPath << "statistics"
+                                                   << BSON("$_internalConstructStats"
+                                                           << statsAccumParams.toBSON())))
+                    << BSON("$merge" << BSON("into" << std::move(into) << "on"
+                                                    << "_id"
+                                                    << "whenMatched"
+                                                    << "replace"
+                                                    << "whenNotMatched"
+                                                    << "insert"));
+
+    return BSON("aggregate" << collection << "pipeline" << pipelineBuilder.arr() << "cursor"
+                            << BSONObj());
+}
 
 class CmdAnalyze final : public TypedCommand<CmdAnalyze> {
 public:
@@ -71,15 +142,115 @@ public:
                         feature_flags::gFeatureFlagCommonQueryFramework.isEnabled(
                             serverGlobalParams.featureCompatibility));
 
-            uasserted(ErrorCodes::NotImplemented, "Analyze command not yet implemented");
+            const auto& cmd = request();
+            const NamespaceString& nss = ns();
+
+            // Sample rate and sample size can't both be present
+            auto sampleRate = cmd.getSampleRate();
+            auto sampleSize = cmd.getSampleSize();
+            uassert(6799705,
+                    "Only one of sample rate and sample size may be present",
+                    !sampleRate || !sampleSize);
+
+            // Validate collection
+            {
+                AutoGetCollectionForReadMaybeLockFree autoColl(opCtx, nss);
+                const auto& collection = autoColl.getCollection();
+
+                // Namespace exists
+                uassert(
+                    6799700, str::stream() << "Couldn't find collection " << nss.ns(), collection);
+
+                // Namespace cannot be capped collection
+                const bool isCapped = collection->isCapped();
+                uassert(6799701,
+                        str::stream() << "Analyze command is not supported on capped collections",
+                        !isCapped);
+
+                // Namespace is normal or clustered collection
+                const bool isNormalColl = nss.isNormalCollection();
+                const bool isClusteredColl = collection->isClustered();
+                uassert(6799702,
+                        str::stream()
+                            << nss.toString() << " is not a normal or clustered collection",
+                        isNormalColl || isClusteredColl);
+
+                if (sampleSize) {
+                    auto numRecords = collection->numRecords(opCtx);
+                    if (numRecords == 0 || *sampleSize > numRecords) {
+                        sampleRate = 1.0;
+                    } else {
+                        sampleRate = double(*sampleSize) / collection->numRecords(opCtx);
+                    }
+                }
+            }
+
+            // Validate key
+            auto key = cmd.getKey();
+            if (key) {
+                const FieldRef keyFieldRef(*key);
+
+                // Empty path
+                uassert(6799703, "Key path is empty", !keyFieldRef.empty());
+
+                for (size_t i = 0; i < keyFieldRef.numParts(); ++i) {
+                    FieldPath::uassertValidFieldName(keyFieldRef.getPart(i));
+                }
+
+                // Numerics
+                const auto numericPathComponents = keyFieldRef.getNumericPathComponents(0);
+                uassert(6799704,
+                        str::stream() << "Key path contains numeric component "
+                                      << keyFieldRef.getPart(*(numericPathComponents.begin())),
+                        numericPathComponents.empty());
+
+                // We need to perform this operation with internal permissions.
+                const bool wasInternalClient = isInternalClient(opCtx->getClient());
+                if (!wasInternalClient) {
+                    opCtx->getClient()->session()->setTags(transport::Session::kInternalClient);
+                }
+
+                DBDirectClient client(opCtx);
+
+                // Run Aggregate
+                BSONObj analyzeResult;
+                client.runCommand(nss.dbName(),
+                                  analyzeCommandAsAggregationCommand(opCtx,
+                                                                     nss.db(),
+                                                                     nss.coll(),
+                                                                     key->toString(),
+                                                                     sampleRate,
+                                                                     cmd.getNumberBuckets())
+                                      .getValue(),
+                                  analyzeResult);
+
+                // We must reset the internal flag.
+                if (!wasInternalClient) {
+                    opCtx->getClient()->session()->unsetTags(transport::Session::kInternalClient);
+                }
+
+                uassertStatusOK(getStatusFromCommandResult(analyzeResult));
+
+                // Invalidate statistics in the cache for the analyzed path
+                stats::StatsCatalog& statsCatalog = stats::StatsCatalog::get(opCtx);
+                uassertStatusOK(statsCatalog.invalidatePath(nss, key->toString()));
+
+            } else if (sampleSize || sampleRate) {
+                uassert(
+                    6799706, "It is illegal to pass sampleRate or sampleSize without a key", key);
+            }
         }
 
     private:
         void doCheckAuthorization(OperationContext* opCtx) const override {
-            // TODO SERVER-67656
+            auto* authzSession = AuthorizationSession::get(opCtx->getClient());
+            const NamespaceString& ns = request().getNamespace();
+
+            uassert(ErrorCodes::Unauthorized,
+                    str::stream() << "Not authorized to call analyze on collection " << ns,
+                    authzSession->isAuthorizedForActionsOnNamespace(ns, ActionType::analyze));
         }
     };
-
 } cmdAnalyze;
 
 }  // namespace

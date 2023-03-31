@@ -109,7 +109,8 @@ public:
         /**
          * Interrupts the migration for garbage collection.
          */
-        void onReceiveRecipientForgetMigration(OperationContext* opCtx);
+        void onReceiveRecipientForgetMigration(OperationContext* opCtx,
+                                               const TenantMigrationRecipientStateEnum& nextState);
 
         /**
          * Returns a Future that will be resolved when data sync associated with this Instance has
@@ -120,11 +121,11 @@ public:
         }
 
         /**
-         * Returns a Future that will be resolved when the work associated with this Instance has
-         * completed to indicate whether the migration is forgotten successfully.
+         * Returns a Future that will be resolved when the instance has been durably marked garbage
+         * collectable.
          */
-        SharedSemiFuture<void> getCompletionFuture() const {
-            return _taskCompletionPromise.getFuture();
+        SharedSemiFuture<void> getForgetMigrationDurableFuture() const {
+            return _forgetMigrationDurablePromise.getFuture();
         }
 
         /**
@@ -213,6 +214,18 @@ public:
 
     private:
         friend class TenantMigrationRecipientServiceTest;
+        friend class TenantMigrationRecipientServiceShardMergeTest;
+
+        /**
+         * Only used for testing. Allows setting a custom task executor for backup cursor fetcher.
+         */
+        void setBackupCursorFetcherExecutor_forTest(
+            std::shared_ptr<executor::TaskExecutor> taskExecutor) {
+            _backupCursorExecutor = taskExecutor;
+        }
+
+        const NamespaceString _stateDocumentsNS =
+            NamespaceString::kTenantMigrationRecipientsNamespace;
 
         using ConnectionPair =
             std::pair<std::unique_ptr<DBClientConnection>, std::unique_ptr<DBClientConnection>>;
@@ -334,6 +347,16 @@ public:
         SemiFuture<void> _markStateDocAsGarbageCollectable();
 
         /**
+         * Deletes the state document. Does not return the opTime for the delete, since it's not
+         * necessary to wait for this delete to be majority committed (this is one of the last steps
+         * in the chain, and if the delete rolls back, the new primary will re-do the delete).
+         */
+        SemiFuture<void> _removeStateDoc(const CancellationToken& token);
+
+        SemiFuture<void> _waitForGarbageCollectionDelayThenDeleteStateDoc(
+            const CancellationToken& token);
+
+        /**
          * Creates a client, connects it to the donor. If '_transientSSLParams' is not none, uses
          * the migration certificate to do SSL authentication. Otherwise, uses the default
          * authentication mode. Throws a user assertion on failure.
@@ -400,10 +423,10 @@ public:
                                  const OplogFetcher::DocumentsInfo& info);
 
         /**
-         * Creates the oplog buffer that will be populated by donor oplog entries from the retryable
-         * writes fetching stage and oplog fetching stage.
+         * Validates the tenantIds field is consistent with the protocol given. Throws an exception
+         * if there is a mismatch.
          */
-        void _createOplogBuffer(WithLock, OperationContext* opCtx);
+        void _validateTenantIdsForProtocol();
 
         /**
          * Runs an aggregation that gets the entire oplog chain for every retryable write entry in
@@ -561,6 +584,13 @@ public:
          */
         void _stopOrHangOnFailPoint(FailPoint* fp, OperationContext* opCtx = nullptr);
 
+        /*
+         * Parse the "state" field contained in the failpoint into a
+         * TenantMigrationRecipientStateEnum. The field must be present and be a valid terminal
+         * state.
+         */
+        TenantMigrationRecipientStateEnum _getTerminalStateFromFailpoint(FailPoint* fp);
+
         /**
          * Updates the state doc in the database and waits for that to be propagated to a majority.
          */
@@ -582,12 +612,6 @@ public:
         void _compareRecipientAndDonorFCV() const;
 
         /*
-         * Increments either 'totalSuccessfulMigrationsReceived' or 'totalFailedMigrationsReceived'
-         * in TenantMigrationStatistics by examining status and promises.
-         */
-        void _setMigrationStatsOnCompletion(Status completionStatus) const;
-
-        /*
          * Sets up internal state to begin migration.
          */
         void _setup();
@@ -597,6 +621,18 @@ public:
 
         SemiFuture<TenantOplogApplier::OpTimePair> _migrateUsingShardMergeProtocol(
             const CancellationToken& token);
+
+        /*
+         * Drops ephemeral collections used for tenant migrations.
+         */
+        void _dropTempCollections();
+
+        /*
+         * Send the killBackupCursor command to the remote in order to close the backup cursor
+         * connection on the donor.
+         */
+        StatusWith<executor::TaskExecutor::CallbackHandle> _scheduleKillBackupCursorWithLock(
+            WithLock lk, std::shared_ptr<executor::TaskExecutor> executor);
 
         mutable Mutex _mutex = MONGO_MAKE_LATCH("TenantMigrationRecipientService::_mutex");
 
@@ -611,11 +647,13 @@ public:
         ServiceContext* const _serviceContext;
         const TenantMigrationRecipientService* const _recipientService;  // (R) (not owned)
         std::shared_ptr<executor::ScopedTaskExecutor> _scopedExecutor;   // (M)
+        std::shared_ptr<executor::TaskExecutor> _backupCursorExecutor;   // (M)
         TenantMigrationRecipientDocument _stateDoc;                      // (M)
 
         // This data is provided in the initial state doc and never changes.  We keep copies to
         // avoid having to obtain the mutex to access them.
         const std::string _tenantId;                                                     // (R)
+        const std::vector<TenantId> _tenantIds;                                          // (R)
         const MigrationProtocolEnum _protocol;                                           // (R)
         const UUID _migrationUuid;                                                       // (R)
         const std::string _donorConnectionString;                                        // (R)
@@ -647,7 +685,7 @@ public:
 
         std::unique_ptr<OplogFetcherFactory> _createOplogFetcherFn =
             std::make_unique<CreateOplogFetcherFn>();                               // (M)
-        std::unique_ptr<OplogBufferCollection> _donorOplogBuffer;                   // (M)
+        std::shared_ptr<OplogBufferCollection> _donorOplogBuffer;                   // (M)
         std::unique_ptr<DataReplicatorExternalState> _dataReplicatorExternalState;  // (M)
         std::unique_ptr<OplogFetcher> _donorOplogFetcher;                           // (M)
         std::unique_ptr<TenantAllDatabaseCloner> _tenantAllDatabaseCloner;          // (M)
@@ -678,10 +716,10 @@ public:
         SharedPromise<void> _dataSyncCompletionPromise;  // (W)
         // Promise that is resolved when the recipientForgetMigration command is received or on
         // stepDown/shutDown with errors.
-        SharedPromise<void> _receivedRecipientForgetMigrationPromise;  // (W)
-        // Promise that is resolved when the chain of work kicked off by run() has completed to
-        // indicate whether the state doc is successfully marked as garbage collectable.
-        SharedPromise<void> _taskCompletionPromise;  // (W)
+        SharedPromise<TenantMigrationRecipientStateEnum>
+            _receivedRecipientForgetMigrationPromise;  // (W)
+        // Promise that is resolved when the instance has been durably marked garbage collectable
+        SharedPromise<void> _forgetMigrationDurablePromise;  // (W)
         // Waiters are notified when 'tenantOplogApplier' is valid on restart.
         stdx::condition_variable _restartOplogApplierCondVar;  // (M)
         // Waiters are notified when 'tenantOplogApplier' is ready to use.

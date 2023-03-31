@@ -36,6 +36,7 @@
 #include "mongo/db/s/collection_sharding_runtime_test.cpp"
 #include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/s/range_deletion_util.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/shard_server_catalog_cache_loader.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
@@ -103,9 +104,15 @@ TEST_F(MigrationUtilsTest, TestOverlappingRangeQueryWithIntegerShardKey) {
     const auto uuid = UUID::gen();
     PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
 
-    store.add(opCtx, createDeletionTask(opCtx, NamespaceString{"one"}, uuid, 0, 10));
-    store.add(opCtx, createDeletionTask(opCtx, NamespaceString{"two"}, uuid, 10, 20));
-    store.add(opCtx, createDeletionTask(opCtx, NamespaceString{"three"}, uuid, 40, 50));
+    store.add(opCtx,
+              createDeletionTask(
+                  opCtx, NamespaceString::createNamespaceString_forTest("one"), uuid, 0, 10));
+    store.add(opCtx,
+              createDeletionTask(
+                  opCtx, NamespaceString::createNamespaceString_forTest("two"), uuid, 10, 20));
+    store.add(opCtx,
+              createDeletionTask(
+                  opCtx, NamespaceString::createNamespaceString_forTest("three"), uuid, 40, 50));
 
     ASSERT_EQ(store.count(opCtx), 3);
 
@@ -161,17 +168,17 @@ TEST_F(MigrationUtilsTest, TestOverlappingRangeQueryWithCompoundShardKeyWhereFir
 
     auto deletionTasks = {
         createDeletionTask(opCtx,
-                           NamespaceString{"one"},
+                           NamespaceString::createNamespaceString_forTest("one"),
                            uuid,
                            BSON("a" << 0 << "b" << 0),
                            BSON("a" << 0 << "b" << 10)),
         createDeletionTask(opCtx,
-                           NamespaceString{"two"},
+                           NamespaceString::createNamespaceString_forTest("two"),
                            uuid,
                            BSON("a" << 0 << "b" << 10),
                            BSON("a" << 0 << "b" << 20)),
         createDeletionTask(opCtx,
-                           NamespaceString{"one"},
+                           NamespaceString::createNamespaceString_forTest("one"),
                            uuid,
                            BSON("a" << 0 << "b" << 40),
                            BSON("a" << 0 << "b" << 50)),
@@ -244,17 +251,17 @@ TEST_F(MigrationUtilsTest,
 
     auto deletionTasks = {
         createDeletionTask(opCtx,
-                           NamespaceString{"one"},
+                           NamespaceString::createNamespaceString_forTest("one"),
                            uuid,
                            BSON("a" << 0 << "b" << 0),
                            BSON("a" << 10 << "b" << 0)),
         createDeletionTask(opCtx,
-                           NamespaceString{"two"},
+                           NamespaceString::createNamespaceString_forTest("two"),
                            uuid,
                            BSON("a" << 10 << "b" << 0),
                            BSON("a" << 20 << "b" << 0)),
         createDeletionTask(opCtx,
-                           NamespaceString{"one"},
+                           NamespaceString::createNamespaceString_forTest("one"),
                            uuid,
                            BSON("a" << 40 << "b" << 0),
                            BSON("a" << 50 << "b" << 0)),
@@ -324,9 +331,15 @@ TEST_F(MigrationUtilsTest, TestInvalidUUID) {
     const auto uuid = UUID::gen();
     PersistentTaskStore<RangeDeletionTask> store(NamespaceString::kRangeDeletionNamespace);
 
-    store.add(opCtx, createDeletionTask(opCtx, NamespaceString{"one"}, uuid, 0, 10));
-    store.add(opCtx, createDeletionTask(opCtx, NamespaceString{"two"}, uuid, 10, 20));
-    store.add(opCtx, createDeletionTask(opCtx, NamespaceString{"three"}, uuid, 40, 50));
+    store.add(opCtx,
+              createDeletionTask(
+                  opCtx, NamespaceString::createNamespaceString_forTest("one"), uuid, 0, 10));
+    store.add(opCtx,
+              createDeletionTask(
+                  opCtx, NamespaceString::createNamespaceString_forTest("two"), uuid, 10, 20));
+    store.add(opCtx,
+              createDeletionTask(
+                  opCtx, NamespaceString::createNamespaceString_forTest("three"), uuid, 40, 50));
 
     ASSERT_EQ(store.count(opCtx), 3);
 
@@ -344,11 +357,11 @@ TEST_F(MigrationUtilsTest, TestUpdateNumberOfOrphans) {
     auto rangeDeletionDoc = createDeletionTask(opCtx, kTestNss, collectionUuid, 0, 10);
     store.add(opCtx, rangeDeletionDoc);
 
-    migrationutil::persistUpdatedNumOrphans(opCtx, rangeDeletionDoc.getId(), collectionUuid, 5);
+    persistUpdatedNumOrphans(opCtx, collectionUuid, rangeDeletionDoc.getRange(), 5);
     rangeDeletionDoc.setNumOrphanDocs(5);
     ASSERT_EQ(store.count(opCtx, rangeDeletionDoc.toBSON().removeField("timestamp")), 1);
 
-    migrationutil::persistUpdatedNumOrphans(opCtx, rangeDeletionDoc.getId(), collectionUuid, -5);
+    persistUpdatedNumOrphans(opCtx, collectionUuid, rangeDeletionDoc.getRange(), -5);
     rangeDeletionDoc.setNumOrphanDocs(0);
     ASSERT_EQ(store.count(opCtx, rangeDeletionDoc.toBSON().removeField("timestamp")), 1);
 }
@@ -418,28 +431,44 @@ public:
             return repl::OpTimeWith<std::vector<ShardType>>(_shards);
         }
 
-        std::vector<CollectionType> getCollections(
-            OperationContext* opCtx,
-            StringData dbName,
-            repl::ReadConcernLevel readConcernLevel) override {
+        std::vector<CollectionType> getCollections(OperationContext* opCtx,
+                                                   StringData dbName,
+                                                   repl::ReadConcernLevel readConcernLevel,
+                                                   const BSONObj& sort) override {
             return _colls;
+        }
+
+        std::pair<CollectionType, std::vector<IndexCatalogType>>
+        getCollectionAndShardingIndexCatalogEntries(
+            OperationContext* opCtx,
+            const NamespaceString& nss,
+            const repl::ReadConcernArgs& readConcern) override {
+            if (!_coll) {
+                uasserted(ErrorCodes::NamespaceNotFound, "dummy errmsg");
+            }
+            return std::make_pair(*_coll, std::vector<IndexCatalogType>());
         }
 
         void setCollections(std::vector<CollectionType> colls) {
             _colls = std::move(colls);
         }
 
+        void setCollection(boost::optional<CollectionType> coll) {
+            _coll = coll;
+        }
+
     private:
         const std::vector<ShardType> _shards;
         std::vector<CollectionType> _colls;
+        boost::optional<CollectionType> _coll;
     };
 
     UUID createCollectionAndGetUUID(const NamespaceString& nss) {
         {
             OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE
                 unsafeCreateCollection(operationContext());
-            uassertStatusOK(createCollection(
-                operationContext(), nss.db().toString(), BSON("create" << nss.coll())));
+            uassertStatusOK(
+                createCollection(operationContext(), nss.dbName(), BSON("create" << nss.coll())));
         }
 
         AutoGetCollection autoColl(operationContext(), nss, MODE_IX);
@@ -489,6 +518,8 @@ public:
 
     CatalogCacheLoaderMock* _mockCatalogCacheLoader;
     StaticCatalogClient* _mockCatalogClient;
+
+    RAIIServerParameterControllerForTest enableFeatureFlag{"featureFlagRangeDeleterService", false};
 };
 
 TEST_F(SubmitRangeDeletionTaskTest,
@@ -499,7 +530,8 @@ TEST_F(SubmitRangeDeletionTaskTest,
 
     store.add(opCtx, deletionTask);
     ASSERT_EQ(store.count(opCtx), 1);
-    migrationutil::markAsReadyRangeDeletionTaskLocally(opCtx, deletionTask.getId());
+    migrationutil::markAsReadyRangeDeletionTaskLocally(
+        opCtx, deletionTask.getCollectionUuid(), deletionTask.getRange());
 
     // Make the refresh triggered by submitting the task return an empty result when loading the
     // database.
@@ -525,7 +557,8 @@ TEST_F(SubmitRangeDeletionTaskTest, FailsAndDeletesTaskIfNamespaceIsUnshardedEve
 
     store.add(opCtx, deletionTask);
     ASSERT_EQ(store.count(opCtx), 1);
-    migrationutil::markAsReadyRangeDeletionTaskLocally(opCtx, deletionTask.getId());
+    migrationutil::markAsReadyRangeDeletionTaskLocally(
+        opCtx, deletionTask.getCollectionUuid(), deletionTask.getRange());
 
     // Make the refresh triggered by submitting the task return an empty result when loading the
     // collection so it is considered unsharded.
@@ -553,7 +586,8 @@ TEST_F(SubmitRangeDeletionTaskTest,
 
     store.add(opCtx, deletionTask);
     ASSERT_EQ(store.count(opCtx), 1);
-    migrationutil::markAsReadyRangeDeletionTaskLocally(opCtx, deletionTask.getId());
+    migrationutil::markAsReadyRangeDeletionTaskLocally(
+        opCtx, deletionTask.getCollectionUuid(), deletionTask.getRange());
 
     // Mock an empty result for the task's collection and force a refresh so the node believes the
     // collection is unsharded.
@@ -582,7 +616,8 @@ TEST_F(SubmitRangeDeletionTaskTest, SucceedsIfFilteringMetadataUUIDMatchesTaskUU
 
     store.add(opCtx, deletionTask);
     ASSERT_EQ(store.count(opCtx), 1);
-    migrationutil::markAsReadyRangeDeletionTaskLocally(opCtx, deletionTask.getId());
+    migrationutil::markAsReadyRangeDeletionTaskLocally(
+        opCtx, deletionTask.getCollectionUuid(), deletionTask.getRange());
 
     // Force a metadata refresh with the task's UUID before the task is submitted.
     auto coll = makeCollectionType(collectionUUID, kEpoch, kDefaultTimestamp);
@@ -591,6 +626,7 @@ TEST_F(SubmitRangeDeletionTaskTest, SucceedsIfFilteringMetadataUUIDMatchesTaskUU
     _mockCatalogCacheLoader->setChunkRefreshReturnValue(
         makeChangedChunks(ChunkVersion({kEpoch, kDefaultTimestamp}, {1, 0})));
     _mockCatalogClient->setCollections({coll});
+    _mockCatalogClient->setCollection(coll);
     forceShardFilteringMetadataRefresh(opCtx, kTestNss);
 
     // The task should have been submitted successfully.
@@ -610,7 +646,8 @@ TEST_F(
 
     store.add(opCtx, deletionTask);
     ASSERT_EQ(store.count(opCtx), 1);
-    migrationutil::markAsReadyRangeDeletionTaskLocally(opCtx, deletionTask.getId());
+    migrationutil::markAsReadyRangeDeletionTaskLocally(
+        opCtx, deletionTask.getCollectionUuid(), deletionTask.getRange());
 
     // Make the refresh triggered by submitting the task return a UUID that matches the task's UUID.
     auto coll = makeCollectionType(collectionUUID, kEpoch, kDefaultTimestamp);
@@ -621,7 +658,7 @@ TEST_F(
     _mockCatalogClient->setCollections({coll});
 
     auto metadata = makeShardedMetadata(opCtx, collectionUUID);
-    csr().setFilteringMetadata(opCtx, metadata);
+    csr()->setFilteringMetadata(opCtx, metadata);
 
     // The task should have been submitted successfully.
     auto cleanupCompleteFuture = migrationutil::submitRangeDeletionTask(opCtx, deletionTask);
@@ -646,7 +683,8 @@ TEST_F(SubmitRangeDeletionTaskTest,
 
     store.add(opCtx, deletionTask);
     ASSERT_EQ(store.count(opCtx), 1);
-    migrationutil::markAsReadyRangeDeletionTaskLocally(opCtx, deletionTask.getId());
+    migrationutil::markAsReadyRangeDeletionTaskLocally(
+        opCtx, deletionTask.getCollectionUuid(), deletionTask.getRange());
 
     // Make the refresh triggered by submitting the task return a UUID that matches the task's UUID.
     auto matchingColl = makeCollectionType(collectionUUID, kEpoch, kDefaultTimestamp);
@@ -654,9 +692,10 @@ TEST_F(SubmitRangeDeletionTaskTest,
     _mockCatalogCacheLoader->setChunkRefreshReturnValue(
         makeChangedChunks(ChunkVersion({kEpoch, kDefaultTimestamp}, {10, 0})));
     _mockCatalogClient->setCollections({matchingColl});
+    _mockCatalogClient->setCollection({matchingColl});
 
     auto metadata = makeShardedMetadata(opCtx, collectionUUID);
-    csr().setFilteringMetadata(opCtx, metadata);
+    csr()->setFilteringMetadata(opCtx, metadata);
 
     // The task should have been submitted successfully.
     auto cleanupCompleteFuture = migrationutil::submitRangeDeletionTask(opCtx, deletionTask);
@@ -673,7 +712,8 @@ TEST_F(SubmitRangeDeletionTaskTest,
 
     store.add(opCtx, deletionTask);
     ASSERT_EQ(store.count(opCtx), 1);
-    migrationutil::markAsReadyRangeDeletionTaskLocally(opCtx, deletionTask.getId());
+    migrationutil::markAsReadyRangeDeletionTaskLocally(
+        opCtx, deletionTask.getCollectionUuid(), deletionTask.getRange());
 
     // Make the refresh triggered by submitting the task return an arbitrary UUID.
     const auto otherEpoch = OID::gen();

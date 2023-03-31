@@ -27,12 +27,7 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/exec/plan_cache_util.h"
-
-#include "mongo/db/query/canonical_query_encoder.h"
 #include "mongo/logv2/log.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
@@ -79,10 +74,7 @@ void updatePlanCache(OperationContext* opCtx,
                      const QuerySolution& solution,
                      const sbe::PlanStage& root,
                      const stage_builder::PlanStageData& data) {
-    // TODO SERVER-67576: re-enable caching of "explode for sort" plans in the SBE cache.
-    if (shouldCacheQuery(query) && collections.getMainCollection() &&
-        !solution.hasExplodedForSort &&
-        feature_flags::gFeatureFlagSbeFull.isEnabledAndIgnoreFCV()) {
+    if (shouldCacheQuery(query) && collections.getMainCollection()) {
         auto key = plan_cache_key_factory::make(query, collections);
         auto plan = std::make_unique<sbe::CachedSbePlan>(root.clone(), data);
         plan->indexFilterApplied = solution.indexFilterApplied;
@@ -159,6 +151,11 @@ plan_cache_debug_info::DebugInfoSBE buildDebugInfo(const QuerySolution* solution
             case STAGE_IXSCAN: {
                 auto ixn = static_cast<const IndexScanNode*>(node);
                 debugInfo.mainStats.indexesUsed.push_back(ixn->index.identifier.catalogName);
+                break;
+            }
+            case STAGE_COLUMN_SCAN: {
+                auto cisn = static_cast<const ColumnIndexScanNode*>(node);
+                debugInfo.mainStats.indexesUsed.push_back(cisn->indexEntry.identifier.catalogName);
                 break;
             }
             case STAGE_TEXT_MATCH: {

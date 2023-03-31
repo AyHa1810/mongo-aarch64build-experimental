@@ -39,10 +39,9 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/commands/txn_two_phase_commit_cmds_gen.h"
-#include "mongo/db/internal_transactions_feature_flag_gen.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/logical_session_id.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/session/logical_session_id.h"
 #include "mongo/db/transaction_validation.h"
 #include "mongo/db/txn_retry_counter_too_old_info.h"
 #include "mongo/db/vector_clock.h"
@@ -186,7 +185,7 @@ BSONObj sendCommitDirectlyToShards(OperationContext* opCtx, const std::vector<Sh
     std::vector<AsyncRequestsSender::Request> requests;
     for (const auto& shardId : shardIds) {
         CommitTransaction commitCmd;
-        commitCmd.setDbName(NamespaceString::kAdminDb);
+        commitCmd.setDbName(DatabaseName::kAdmin);
         const auto commitCmdObj = commitCmd.toBSON(
             BSON(WriteConcernOptions::kWriteConcernField << opCtx->getWriteConcern().toBSON()));
         requests.emplace_back(shardId, commitCmdObj);
@@ -196,7 +195,7 @@ BSONObj sendCommitDirectlyToShards(OperationContext* opCtx, const std::vector<Sh
     MultiStatementTransactionRequestsSender ars(
         opCtx,
         Grid::get(opCtx)->getExecutorPool()->getFixedExecutor(),
-        NamespaceString::kAdminDb,
+        DatabaseName::kAdmin,
         requests,
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         Shard::RetryPolicy::kIdempotent);
@@ -410,7 +409,7 @@ void TransactionRouter::Observer::_reportTransactionState(OperationContext* opCt
 }
 
 bool TransactionRouter::Observer::_atClusterTimeHasBeenSet() const {
-    return o().atClusterTime.is_initialized() && o().atClusterTime->timeHasBeenSet();
+    return o().atClusterTime.has_value() && o().atClusterTime->timeHasBeenSet();
 }
 
 const LogicalSessionId& TransactionRouter::Observer::_sessionId() const {
@@ -473,8 +472,8 @@ BSONObj TransactionRouter::Participant::attachTxnFieldsIfNeeded(
         newCmd.append(OperationSessionInfo::kTxnNumberFieldName,
                       sharedOptions.txnNumberAndRetryCounter.getTxnNumber());
     } else {
-        auto osi =
-            OperationSessionInfoFromClient::parse("OperationSessionInfo"_sd, newCmd.asTempObj());
+        auto osi = OperationSessionInfoFromClient::parse(IDLParserContext{"OperationSessionInfo"},
+                                                         newCmd.asTempObj());
         invariant(sharedOptions.txnNumberAndRetryCounter.getTxnNumber() == *osi.getTxnNumber());
     }
 
@@ -515,7 +514,7 @@ void TransactionRouter::Router::processParticipantResponse(OperationContext* opC
     }
 
     auto txnResponseMetadata =
-        TxnResponseMetadata::parse("processParticipantResponse"_sd, responseObj);
+        TxnResponseMetadata::parse(IDLParserContext{"processParticipantResponse"}, responseObj);
 
     if (txnResponseMetadata.getReadOnly()) {
         if (participant->readOnly == Participant::ReadOnly::kUnset) {
@@ -565,6 +564,23 @@ void TransactionRouter::Router::processParticipantResponse(OperationContext* opC
             p().recoveryShardId = shardId;
         }
     }
+
+    if (txnResponseMetadata.getAdditionalParticipants()) {
+        auto additionalParticipants = *txnResponseMetadata.getAdditionalParticipants();
+        for (auto&& participantElem : additionalParticipants) {
+            mongo::ShardId addingParticipant = ShardId(std::string(
+                participantElem.getField(StringData{"shardId"}).checkAndGetStringData()));
+            _createParticipant(opCtx, addingParticipant);
+            _setReadOnlyForParticipant(
+                opCtx, addingParticipant, Participant::ReadOnly::kNotReadOnly);
+
+            if (!p().isRecoveringCommit) {
+                // Don't update participant stats during recovery since the participant list isn't
+                // known.
+                RouterTransactionsMetrics::get(opCtx)->incrementTotalContactedParticipants();
+            }
+        }
+    }
 }
 
 LogicalTime TransactionRouter::AtClusterTime::getTime() const {
@@ -588,7 +604,7 @@ bool TransactionRouter::AtClusterTime::canChange(StmtId currentStmtId) const {
 }
 
 bool TransactionRouter::Router::mustUseAtClusterTime() const {
-    return o().atClusterTime.is_initialized();
+    return o().atClusterTime.has_value();
 }
 
 LogicalTime TransactionRouter::Router::getSelectedAtClusterTime() const {
@@ -755,7 +771,7 @@ void TransactionRouter::Router::_clearPendingParticipants(OperationContext* opCt
                                             << WriteConcernOptions().toBSON()));
         }
         auto responses = gatherResponses(opCtx,
-                                         NamespaceString::kAdminDb,
+                                         DatabaseName::kAdmin.db(),
                                          ReadPreferenceSetting{ReadPreference::PrimaryOnly},
                                          Shard::RetryPolicy::kIdempotent,
                                          abortRequests);
@@ -852,7 +868,7 @@ void TransactionRouter::Router::onViewResolutionError(OperationContext* opCtx,
         "sessionId"_attr = _sessionId(),
         "txnNumber"_attr = o().txnNumberAndRetryCounter.getTxnNumber(),
         "txnRetryCounter"_attr = o().txnNumberAndRetryCounter.getTxnRetryCounter(),
-        "namespace"_attr = nss);
+        logAttrs(nss));
 
     // Requests against views are always routed to the primary shard for its database, but the retry
     // on the resolved namespace does not have to re-target the primary, so pending participants
@@ -1102,7 +1118,9 @@ BSONObj TransactionRouter::Router::_handOffCommitToCoordinator(OperationContext*
     }
 
     CoordinateCommitTransaction coordinateCommitCmd;
-    coordinateCommitCmd.setDbName("admin");
+    // Empty tenant id is acceptable here as command's tenant id will not be serialized to BSON.
+    // TODO SERVER-62491: Use system tenant id.
+    coordinateCommitCmd.setDbName(DatabaseName(boost::none, "admin"));
     coordinateCommitCmd.setParticipants(participantList);
     const auto coordinateCommitCmdObj = coordinateCommitCmd.toBSON(
         BSON(WriteConcernOptions::kWriteConcernField << opCtx->getWriteConcern().toBSON()));
@@ -1120,7 +1138,7 @@ BSONObj TransactionRouter::Router::_handOffCommitToCoordinator(OperationContext*
     MultiStatementTransactionRequestsSender ars(
         opCtx,
         Grid::get(opCtx)->getExecutorPool()->getFixedExecutor(),
-        NamespaceString::kAdminDb,
+        DatabaseName::kAdmin,
         {{*o().coordinatorId, coordinateCommitCmdObj}},
         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
         Shard::RetryPolicy::kIdempotent);
@@ -1313,7 +1331,7 @@ BSONObj TransactionRouter::Router::abortTransaction(OperationContext* opCtx) {
                 "numParticipantShards"_attr = o().participants.size());
 
     const auto responses = gatherResponses(opCtx,
-                                           NamespaceString::kAdminDb,
+                                           DatabaseName::kAdmin.db(),
                                            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
                                            Shard::RetryPolicy::kIdempotent,
                                            abortRequests);
@@ -1400,7 +1418,7 @@ void TransactionRouter::Router::implicitlyAbortTransaction(OperationContext* opC
     try {
         // Ignore the responses.
         gatherResponses(opCtx,
-                        NamespaceString::kAdminDb,
+                        DatabaseName::kAdmin.db(),
                         ReadPreferenceSetting{ReadPreference::PrimaryOnly},
                         Shard::RetryPolicy::kIdempotent,
                         abortRequests);
@@ -1518,7 +1536,9 @@ BSONObj TransactionRouter::Router::_commitWithRecoveryToken(OperationContext* op
 
     auto coordinateCommitCmd = [&] {
         CoordinateCommitTransaction coordinateCommitCmd;
-        coordinateCommitCmd.setDbName("admin");
+        // Empty tenant id is acceptable here as command's tenant id will not be serialized to BSON.
+        // TODO SERVER-62491: Use system tenant id.
+        coordinateCommitCmd.setDbName(DatabaseName(boost::none, "admin"));
         coordinateCommitCmd.setParticipants({});
 
         auto rawCoordinateCommit = coordinateCommitCmd.toBSON(
@@ -1708,7 +1728,7 @@ void TransactionRouter::Router::_endTransactionTrackingIfNecessary(
     if (shouldLogSlowOpWithSampling(opCtx,
                                     MONGO_LOGV2_DEFAULT_COMPONENT,
                                     opDuration,
-                                    Milliseconds(serverGlobalParams.slowMS))
+                                    Milliseconds(serverGlobalParams.slowMS.load()))
             .first) {
         _logSlowTransaction(opCtx, terminationCause);
     }

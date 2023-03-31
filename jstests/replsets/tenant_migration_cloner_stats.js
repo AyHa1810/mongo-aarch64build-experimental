@@ -15,19 +15,16 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
 load("jstests/libs/uuid_util.js");        // For extractUUIDFromObject().
 load("jstests/libs/fail_point_util.js");  // For configureFailPoint().
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 
 // Limit the batch size to test the stat in between batches.
 const tenantMigrationTest = new TenantMigrationTest(
     {name: jsTestName(), sharedOptions: {setParameter: {collectionClonerBatchSize: 10}}});
 
 const kMigrationId = UUID();
-const kTenantId = 'testTenantId';
+const kTenantId = ObjectId().str;
 const kReadPreference = {
     mode: "primary"
 };
@@ -195,4 +192,3 @@ assertNothingClonedBeforeFailover(res);
 assert.eq(currOp.remainingReceiveEstimatedMillis, 0, res);
 
 tenantMigrationTest.stop();
-})();

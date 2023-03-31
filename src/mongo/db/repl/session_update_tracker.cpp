@@ -33,11 +33,12 @@
 #include "mongo/db/repl/session_update_tracker.h"
 
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/ops/write_ops_retryability.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/session.h"
-#include "mongo/db/session_txn_record_gen.h"
-#include "mongo/db/transaction_participant_gen.h"
+#include "mongo/db/session/session.h"
+#include "mongo/db/session/session_txn_record_gen.h"
+#include "mongo/db/transaction/transaction_participant_gen.h"
 #include "mongo/db/update/update_oplog_entry_serialization.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
@@ -57,7 +58,6 @@ OplogEntry createOplogEntryForTransactionTableUpdate(repl::OpTime opTime,
                                                      const BSONObj& o2Field,
                                                      Date_t wallClockTime) {
     return {repl::DurableOplogEntry(opTime,
-                                    boost::none,  // hash
                                     repl::OpTypeEnum::kUpdate,
                                     NamespaceString::kSessionTransactionsTableNamespace,
                                     boost::none,  // uuid
@@ -212,7 +212,8 @@ boost::optional<std::vector<OplogEntry>> SessionUpdateTracker::_updateSessionInf
             return {};
         }
 
-        if (!entry.getObject2()) {
+        if (!entry.getObject2() ||
+            (entry.getObject2()->isEmpty() && !isWouldChangeOwningShardSentinelOplogEntry(entry))) {
             return {};
         }
     }
@@ -266,6 +267,13 @@ std::vector<OplogEntry> SessionUpdateTracker::_flush(const OplogEntry& entry) {
 
         case OpTypeEnum::kCommand:
             return flushAll();
+
+        // The following cases should never be hit, we break to hit MONGO_UNREACHABLE. Reason:
+        // SessionUpdateTracker should only be called when the ns target is config.transactions or
+        // config.$cmd. This should never be the case with global index operations.
+        case OpTypeEnum::kInsertGlobalIndexKey:
+        case OpTypeEnum::kDeleteGlobalIndexKey:
+            break;
     }
 
     MONGO_UNREACHABLE;

@@ -1,17 +1,12 @@
 /**
  *
  * Runs a number of shard split and moveChunk to compare the time it takes for both operations.
- * @tags: [requires_fcv_52, featureFlagShardSplit]
+ * @tags: [requires_fcv_63, serverless]
  */
 
-load("jstests/serverless/libs/basic_serverless_test.js");
-load("jstests/replsets/rslib.js");
+import {assertMigrationState, ShardSplitTest} from "jstests/serverless/libs/shard_split_test.js";
 
-const kBlockStart = "Entering 'blocking' state.";
-const kReconfig = "Applying the split config";
-const kWaitForRecipients = "Waiting for recipient to accept the split.";
-const kEndMsg = "Shard split decision reached";
-const kMoveChunkLog = "ctx\":\"MoveChunk\",\"msg\":\"Exiting commit critical section";
+load("jstests/replsets/rslib.js");
 
 function runOneMoveChunk() {
     'use strict';
@@ -39,6 +34,7 @@ function runOneMoveChunk() {
     assert.commandWorked(mongos.adminCommand({moveChunk: ns, find: keyDoc, to: shard1}));
     assert.eq(shard1, mongos.getDB('config').chunks.findOne({_id: chunkId}).shard);
 
+    const kMoveChunkLog = "ctx\":\"MoveChunk\",\"msg\":\"Exiting commit critical section";
     const moveMsg = checkLog.getLogMessage(st.shard0, kMoveChunkLog);
     assert(moveMsg);
 
@@ -60,42 +56,103 @@ function extractTs(message) {
     return Date.parse(msgJson.t["$date"]);
 }
 
+function printLog(connection) {
+    const log = cat(connection.fullOptions.logFile);
+    jsTestLog(`Printing log for ${connection}`);
+    for (let line of log.split("\n")) {
+        print(`d${connection.port} | ${line}`);
+    }
+
+    return log;
+}
+
+function extractTimingsForSplitSteps(connection) {
+    const log = printLog(connection);
+    const logLines = {
+        enterBlockingState: "Entering 'blocking' state.",
+        waitingForCatchup: "Waiting for recipient nodes to reach block timestamp.",
+        applyingSplitConfig: "Applying the split config.",
+        triggeringRecipientElection:
+            "Triggering an election after recipient has accepted the split.",
+        waitForMajorityWrite: "Waiting for majority commit on recipient primary",
+        committed: "Entering 'committed' state.",
+        decisionReached: "Shard split decision reached",
+    };
+
+    const result = {};
+
+    for (let line of log.split("\n")) {
+        for (let key in logLines) {
+            if (line.includes(logLines[key])) {
+                result[key] = extractTs(line);
+                break;
+            }
+        }
+    }
+
+    return result;
+}
+
 function runOneSplit() {
     "use strict";
 
-    const recipientTagName = "recipientNode";
-    const recipientSetName = "recipientSetName";
-    const test =
-        new BasicServerlessTest({recipientTagName, recipientSetName, quickGarbageCollection: true});
+    const test = new ShardSplitTest({
+        quickGarbageCollection: true,
+        nodeOptions: {
+            useLogFiles: true,
+            setParameter: {logComponentVerbosity: tojson({replication: 4, command: 4})}
+        }
+    });
+    test.addAndAwaitRecipientNodes();
 
-    test.addRecipientNodes();
-    test.donor.awaitSecondaryNodes();
-
-    const primary = test.donor.getPrimary();
-
-    const tenantIds = ["tenant1", "tenant2"];
+    const tenantIds = [ObjectId(), ObjectId()];
     const operation = test.createSplitOperation(tenantIds);
     assert.commandWorked(operation.commit());
-
     test.removeRecipientNodesFromDonor();
-    assertMigrationState(test.donor.getPrimary(), operation.migrationId, "committed");
 
-    const blockTS = extractTs(checkLog.getLogMessage(primary, kBlockStart));
-    const reconfigTS = extractTs(checkLog.getLogMessage(primary, kReconfig));
-    const waitForRecipientsTS = extractTs(checkLog.getLogMessage(primary, kWaitForRecipients));
-    const endTS = extractTs(checkLog.getLogMessage(primary, kEndMsg));
+    const donorPrimary = test.donor.getPrimary();
 
-    const blockDurationMs = endTS - blockTS;
-    const waitForRecipientsDurationMs = endTS - waitForRecipientsTS;
-    const reconfigDurationMs = endTS - reconfigTS;
+    assertMigrationState(donorPrimary, operation.migrationId, "committed");
 
-    const splitResult = {blockDurationMs, reconfigDurationMs, waitForRecipientsDurationMs};
+    const result = extractTimingsForSplitSteps(donorPrimary);
+    test.donor.getSecondaries().forEach(node => {
+        printLog(node);
+    });
 
-    jsTestLog(`Performance result of shard split: ${tojson(splitResult)}`);
-    const maximumReconfigDuration = 500;
-    assert.lt(reconfigDurationMs,
-              maximumReconfigDuration,
-              `The reconfig critical section of split must be below ${maximumReconfigDuration}ms`);
+    const report = {
+        // shard split critical section:
+        //  - wait to abort index builds
+        waitToAbortIndexBuilds: result.waitingForCatchup - result.enterBlockingState,
+        //  - wait for recipient nodes to catch up with blockTimestamp
+        waitForRecipientCatchup: result.applyingSplitConfig - result.waitingForCatchup,
+        //  - wait for split acceptance
+        waitForSplitAcceptance: result.triggeringRecipientElection - result.applyingSplitConfig,
+        //  - wait for recipient primary to step up
+        waitForRecipientStepUp: result.waitForMajorityWrite - result.triggeringRecipientElection,
+        //  - wait for recipient to majority commit write
+        waitForRecipientMajorityWrite: result.committed - result.waitForMajorityWrite,
+        //  - total duration
+        totalDuration: result.decisionReached - result.enterBlockingState,
+        totalDurationWithoutCatchup: result.decisionReached - result.applyingSplitConfig,
+    };
+
+    jsTestLog(`Shard split performance report: ${tojson(report)}`);
+
+    // Validate using metrics from log output
+    const maxCriticalSectionDurationWithoutCatchup = 500;
+    assert.lt(report.totalDurationWithoutCatchup,
+              maxCriticalSectionDurationWithoutCatchup,
+              `The total duration without recipient catchup must be less than ${
+                  maxCriticalSectionDurationWithoutCatchup}ms`);
+
+    // Validate using reported values in serverStatus
+    const serverStatus = assert.commandWorked(donorPrimary.adminCommand({serverStatus: 1}));
+    const splitStats = serverStatus.shardSplits;
+    assert.eq(splitStats.totalCommitted, 1);
+    assert.lt(splitStats.totalCommittedDurationWithoutCatchupMillis,
+              maxCriticalSectionDurationWithoutCatchup,
+              `The total duration without recipient catchup must be less than ${
+                  maxCriticalSectionDurationWithoutCatchup}ms`);
 
     test.stop();
 }

@@ -28,16 +28,11 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/s/sharding_ddl_coordinator_service.h"
 
 #include "mongo/base/checked_cast.h"
-#include "mongo/db/catalog/catalog_helper.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/pipeline/aggregate_command_gen.h"
-#include "mongo/db/pipeline/document_source_count.h"
-#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/s/collmod_coordinator.h"
 #include "mongo/db/s/compact_structured_encryption_data_coordinator.h"
 #include "mongo/db/s/create_collection_coordinator.h"
@@ -45,6 +40,7 @@
 #include "mongo/db/s/drop_collection_coordinator.h"
 #include "mongo/db/s/drop_database_coordinator.h"
 #include "mongo/db/s/move_primary_coordinator.h"
+#include "mongo/db/s/move_primary_coordinator_no_resilient.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/refine_collection_shard_key_coordinator.h"
 #include "mongo/db/s/rename_collection_coordinator.h"
@@ -65,18 +61,31 @@ std::shared_ptr<ShardingDDLCoordinator> constructShardingDDLCoordinatorInstance(
     LOGV2(
         5390510, "Constructing new sharding DDL coordinator", "coordinatorDoc"_attr = op.toBSON());
     switch (op.getId().getOperationType()) {
+        // TODO (SERVER-71309): Remove once 7.0 becomes last LTS.
+        case DDLCoordinatorTypeEnum::kMovePrimaryNoResilient:
+            return std::make_shared<MovePrimaryCoordinatorNoResilient>(service,
+                                                                       std::move(initialState));
+            break;
         case DDLCoordinatorTypeEnum::kMovePrimary:
             return std::make_shared<MovePrimaryCoordinator>(service, std::move(initialState));
             break;
+        // TODO SERVER-73627: Remove once 7.0 becomes last LTS.
         case DDLCoordinatorTypeEnum::kDropDatabase:
+        case DDLCoordinatorTypeEnum::kDropDatabasePre70Compatible:
             return std::make_shared<DropDatabaseCoordinator>(service, std::move(initialState));
             break;
+        // TODO SERVER-73627: Remove once 7.0 becomes last LTS.
         case DDLCoordinatorTypeEnum::kDropCollection:
+        case DDLCoordinatorTypeEnum::kDropCollectionPre70Compatible:
             return std::make_shared<DropCollectionCoordinator>(service, std::move(initialState));
             break;
         case DDLCoordinatorTypeEnum::kRenameCollection:
+        // TODO SERVER-72796: Remove once gGlobalIndexesShardingCatalog is enabled.
+        case DDLCoordinatorTypeEnum::kRenameCollectionPre63Compatible:
             return std::make_shared<RenameCollectionCoordinator>(service, std::move(initialState));
         case DDLCoordinatorTypeEnum::kCreateCollection:
+        // TODO SERVER-68008 Remove the Pre61Compatible case once 7.0 becomes last LTS
+        case DDLCoordinatorTypeEnum::kCreateCollectionPre61Compatible:
             return std::make_shared<CreateCollectionCoordinator>(service, std::move(initialState));
             break;
         case DDLCoordinatorTypeEnum::kRefineCollectionShardKey:
@@ -95,6 +104,8 @@ std::shared_ptr<ShardingDDLCoordinator> constructShardingDDLCoordinatorInstance(
         case DDLCoordinatorTypeEnum::kReshardCollection:
             return std::make_shared<ReshardCollectionCoordinator>(service, std::move(initialState));
             break;
+        case DDLCoordinatorTypeEnum::kCompactStructuredEncryptionDataPre61Compatible:
+            // TODO SERVER-68373 remove once 7.0 becomes last LTS
         case DDLCoordinatorTypeEnum::kCompactStructuredEncryptionData:
             return std::make_shared<CompactStructuredEncryptionDataCoordinator>(
                 service, std::move(initialState));
@@ -192,14 +203,9 @@ void ShardingDDLCoordinatorService::_afterStepDown() {
 
 size_t ShardingDDLCoordinatorService::_countCoordinatorDocs(OperationContext* opCtx) {
     constexpr auto kNumCoordLabel = "numCoordinators"_sd;
+    static const auto countStage = BSON("$count" << kNumCoordLabel);
 
-    auto aggRequest = [&]() -> AggregateCommandRequest {
-        auto expCtx = make_intrusive<ExpressionContext>(opCtx, nullptr, getStateDocumentsNS());
-        const auto countSpec = BSON("$count" << kNumCoordLabel);
-        auto stages = DocumentSourceCount::createFromBson(countSpec.firstElement(), expCtx);
-        auto pipeline = Pipeline::create(std::move(stages), expCtx);
-        return {getStateDocumentsNS(), pipeline->serializeToBson()};
-    }();
+    AggregateCommandRequest aggRequest{getStateDocumentsNS(), {countStage}};
 
     DBDirectClient client(opCtx);
     auto cursor = uassertStatusOKWithContext(
@@ -217,7 +223,7 @@ size_t ShardingDDLCoordinatorService::_countCoordinatorDocs(OperationContext* op
     return numCoordField.numberLong();
 }
 
-void ShardingDDLCoordinatorService::_waitForRecoveryCompletion(OperationContext* opCtx) const {
+void ShardingDDLCoordinatorService::waitForRecoveryCompletion(OperationContext* opCtx) const {
     stdx::unique_lock lk(_mutex);
     opCtx->waitForConditionOrInterrupt(
         _recoveredOrCoordinatorCompletedCV, lk, [this]() { return _state == State::kRecovered; });
@@ -256,18 +262,18 @@ std::shared_ptr<ShardingDDLCoordinatorService::Instance>
 ShardingDDLCoordinatorService::getOrCreateInstance(OperationContext* opCtx, BSONObj coorDoc) {
 
     // Wait for all coordinators to be recovered before to allow the creation of new ones.
-    _waitForRecoveryCompletion(opCtx);
+    waitForRecoveryCompletion(opCtx);
 
     auto coorMetadata = extractShardingDDLCoordinatorMetadata(coorDoc);
     const auto& nss = coorMetadata.getId().getNss();
 
-    if (!nss.isConfigDB()) {
+    if (!nss.isConfigDB() && !nss.isAdminDB()) {
         // Check that the operation context has a database version for this namespace
         const auto clientDbVersion = OperationShardingState::get(opCtx).getDbVersion(nss.db());
         uassert(ErrorCodes::IllegalOperation,
                 "Request sent without attaching database version",
                 clientDbVersion);
-        catalog_helper::assertIsPrimaryShardForDb(opCtx, nss.db());
+        DatabaseShardingState::assertIsPrimaryShardForDb(opCtx, nss.db());
         coorMetadata.setDatabaseVersion(clientDbVersion);
     }
 

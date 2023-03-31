@@ -61,6 +61,20 @@ public:
     ReshardingOpObserver();
     ~ReshardingOpObserver() override;
 
+    void onModifyCollectionShardingIndexCatalog(OperationContext* opCtx,
+                                                const NamespaceString& nss,
+                                                const UUID& uuid,
+                                                BSONObj indexDoc) override {}
+
+    void onCreateGlobalIndex(OperationContext* opCtx,
+                             const NamespaceString& globalIndexNss,
+                             const UUID& globalIndexUUID) final{};
+
+    void onDropGlobalIndex(OperationContext* opCtx,
+                           const NamespaceString& globalIndexNss,
+                           const UUID& globalIndexUUID,
+                           long long numKeys) final{};
+
     void onCreateIndex(OperationContext* opCtx,
                        const NamespaceString& nss,
                        const UUID& uuid,
@@ -96,22 +110,32 @@ public:
                            bool fromMigrate) override {}
 
     void onInserts(OperationContext* opCtx,
-                   const NamespaceString& nss,
-                   const UUID& uuid,
+                   const CollectionPtr& coll,
                    std::vector<InsertStatement>::const_iterator begin,
                    std::vector<InsertStatement>::const_iterator end,
-                   bool fromMigrate) override;
+                   std::vector<bool> fromMigrate,
+                   bool defaultFromMigrate) override;
+
+    void onInsertGlobalIndexKey(OperationContext* opCtx,
+                                const NamespaceString& globalIndexNss,
+                                const UUID& globalIndexUuid,
+                                const BSONObj& key,
+                                const BSONObj& docKey) final{};
+
+    void onDeleteGlobalIndexKey(OperationContext* opCtx,
+                                const NamespaceString& globalIndexNss,
+                                const UUID& globalIndexUuid,
+                                const BSONObj& key,
+                                const BSONObj& docKey) final {}
 
     void onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) override;
 
     void aboutToDelete(OperationContext* opCtx,
-                       const NamespaceString& nss,
-                       const UUID& uuid,
+                       const CollectionPtr& coll,
                        const BSONObj& doc) override {}
 
     void onDelete(OperationContext* opCtx,
-                  const NamespaceString& nss,
-                  const UUID& uuid,
+                  const CollectionPtr& coll,
                   StmtId stmtId,
                   const OplogDeleteEntryArgs& args) override;
 
@@ -201,9 +225,10 @@ public:
                        const NamespaceString& collectionName,
                        const UUID& uuid) override {}
 
-    void onUnpreparedTransactionCommit(OperationContext* opCtx,
-                                       std::vector<repl::ReplOperation>* statements,
-                                       size_t numberOfPrePostImagesToWrite) override {}
+    void onTransactionStart(OperationContext* opCtx) override {}
+
+    void onUnpreparedTransactionCommit(
+        OperationContext* opCtx, const TransactionOperations& transactionOperations) override {}
 
     void onPreparedTransactionCommit(
         OperationContext* opCtx,
@@ -214,19 +239,22 @@ public:
     std::unique_ptr<ApplyOpsOplogSlotAndOperationAssignment> preTransactionPrepare(
         OperationContext* opCtx,
         const std::vector<OplogSlot>& reservedSlots,
-        size_t numberOfPrePostImagesToWrite,
-        Date_t wallClockTime,
-        std::vector<repl::ReplOperation>* statements) override {
+        const TransactionOperations& transactionOperations,
+        Date_t wallClockTime) override {
         return nullptr;
     }
 
     void onTransactionPrepare(
         OperationContext* opCtx,
         const std::vector<OplogSlot>& reservedSlots,
-        std::vector<repl::ReplOperation>* statements,
-        const ApplyOpsOplogSlotAndOperationAssignment* applyOpsOperationAssignment,
+        const TransactionOperations& transactionOperations,
+        const ApplyOpsOplogSlotAndOperationAssignment& applyOpsOperationAssignment,
         size_t numberOfPrePostImagesToWrite,
         Date_t wallClockTime) override {}
+
+    void onTransactionPrepareNonPrimary(OperationContext* opCtx,
+                                        const std::vector<repl::OplogEntry>& statements,
+                                        const repl::OpTime& prepareOpTime) override {}
 
     void onTransactionAbort(OperationContext* opCtx,
                             boost::optional<OplogSlot> abortOplogEntryOpTime) override {}

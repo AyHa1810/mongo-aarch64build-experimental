@@ -43,7 +43,7 @@
 
 namespace mongo {
 
-const NamespaceString ChunkType::ConfigNS("config.chunks");
+const NamespaceString ChunkType::ConfigNS(NamespaceString::kConfigsvrChunksNamespace);
 
 // The final namespace of the cached chunks metadata is composed of the namespace of the related
 // sharded collection (i.e., config.cache.chunks.<ns>). As a result, the maximum namespace length of
@@ -60,6 +60,7 @@ const BSONField<bool> ChunkType::jumbo("jumbo");
 const BSONField<Date_t> ChunkType::lastmod("lastmod");
 const BSONField<BSONObj> ChunkType::history("history");
 const BSONField<int64_t> ChunkType::estimatedSizeBytes("estimatedDataSizeBytes");
+const BSONField<Timestamp> ChunkType::onCurrentShardSince("onCurrentShardSince");
 const BSONField<bool> ChunkType::historyIsAt40("historyIsAt40");
 
 namespace {
@@ -164,13 +165,27 @@ bool ChunkRange::operator!=(const ChunkRange& other) const {
     return !(*this == other);
 }
 
+bool ChunkRange::operator<(const ChunkRange& other) const {
+    auto minCompare = _minKey.woCompare(other._minKey);
+    if (minCompare < 0) {
+        return true;
+    } else if (minCompare == 0 && _maxKey.woCompare(other._maxKey) < 0) {
+        return true;
+    }
+    return false;
+}
+
 bool ChunkRange::covers(ChunkRange const& other) const {
-    auto le = [](auto const& a, auto const& b) { return a.woCompare(b) <= 0; };
+    auto le = [](auto const& a, auto const& b) {
+        return a.woCompare(b) <= 0;
+    };
     return le(_minKey, other._minKey) && le(other._maxKey, _maxKey);
 }
 
 boost::optional<ChunkRange> ChunkRange::overlapWith(ChunkRange const& other) const {
-    auto le = [](auto const& a, auto const& b) { return a.woCompare(b) <= 0; };
+    auto le = [](auto const& a, auto const& b) {
+        return a.woCompare(b) <= 0;
+    };
     if (le(other._maxKey, _minKey) || le(_maxKey, other._minKey)) {
         return boost::none;
     }
@@ -183,7 +198,9 @@ bool ChunkRange::overlaps(const ChunkRange& other) const {
 }
 
 ChunkRange ChunkRange::unionWith(ChunkRange const& other) const {
-    auto le = [](auto const& a, auto const& b) { return a.woCompare(b) <= 0; };
+    auto le = [](auto const& a, auto const& b) {
+        return a.woCompare(b) <= 0;
+    };
     return ChunkRange(le(_minKey, other._minKey) ? _minKey : other._minKey,
                       le(_maxKey, other._maxKey) ? other._maxKey : _maxKey);
 }
@@ -236,10 +253,32 @@ StatusWith<ChunkType> ChunkType::_parseChunkBase(const BSONObj& source) {
                 return history.getStatus();
 
             chunk._history = std::move(history.getValue());
+
         } else if (status == ErrorCodes::NoSuchKey) {
             // History is missing, so it will be presumed empty
         } else {
             return status;
+        }
+    }
+
+    {
+        if (!chunk._history.empty()) {
+            Timestamp onCurrentShardSinceValue;
+            Status status = bsonExtractTimestampField(
+                source, onCurrentShardSince.name(), &onCurrentShardSinceValue);
+            if (status.isOK()) {
+                chunk._onCurrentShardSince = onCurrentShardSinceValue;
+                if (chunk._history.front().getValidAfter() != onCurrentShardSinceValue) {
+                    return {ErrorCodes::BadValue,
+                            str::stream()
+                                << "The first `validAfter` in the chunk's history is not "
+                                   "consistent with `onCurrentShardSince`: validAfter is "
+                                << chunk._history.front().getValidAfter()
+                                << " while onCurrentShardSince is " << *chunk._onCurrentShardSince};
+                }
+            } else {
+                chunk._onCurrentShardSince = boost::none;
+            }
         }
     }
 
@@ -514,7 +553,7 @@ void ChunkType::setShard(const ShardId& shard) {
 void ChunkType::setEstimatedSizeBytes(const boost::optional<int64_t>& estimatedSize) {
     uassert(ErrorCodes::BadValue,
             "estimatedSizeBytes cannot be negative",
-            !estimatedSize.is_initialized() || estimatedSize.get() >= 0);
+            !estimatedSize.has_value() || estimatedSize.value() >= 0);
     _estimatedSizeBytes = estimatedSize;
 }
 
@@ -522,30 +561,45 @@ void ChunkType::setJumbo(bool jumbo) {
     _jumbo = jumbo;
 }
 
+void ChunkType::setOnCurrentShardSince(const Timestamp& onCurrentShardSince) {
+    _onCurrentShardSince = onCurrentShardSince;
+}
+
 void ChunkType::addHistoryToBSON(BSONObjBuilder& builder) const {
     if (_history.size()) {
-        BSONArrayBuilder arrayBuilder(builder.subarrayStart(history.name()));
-        for (const auto& item : _history) {
-            BSONObjBuilder subObjBuilder(arrayBuilder.subobjStart());
-            item.serialize(&subObjBuilder);
+        if (_onCurrentShardSince.has_value()) {
+            uassert(ErrorCodes::BadValue,
+                    str::stream() << "The first `validAfter` in the chunk's history is not "
+                                     "consistent with `onCurrentShardSince`: validAfter is "
+                                  << _history.front().getValidAfter()
+                                  << " while onCurrentShardSince is " << *_onCurrentShardSince,
+                    _history.front().getValidAfter() == *_onCurrentShardSince);
+            builder.append(onCurrentShardSince.name(), *_onCurrentShardSince);
+        }
+        {
+            BSONArrayBuilder arrayBuilder(builder.subarrayStart(history.name()));
+            for (const auto& item : _history) {
+                BSONObjBuilder subObjBuilder(arrayBuilder.subobjStart());
+                item.serialize(&subObjBuilder);
+            }
         }
     }
 }
 
 Status ChunkType::validate() const {
-    if (!_min.is_initialized() || _min->isEmpty()) {
+    if (!_min.has_value() || _min->isEmpty()) {
         return Status(ErrorCodes::NoSuchKey, str::stream() << "missing " << min.name() << " field");
     }
 
-    if (!_max.is_initialized() || _max->isEmpty()) {
+    if (!_max.has_value() || _max->isEmpty()) {
         return Status(ErrorCodes::NoSuchKey, str::stream() << "missing " << max.name() << " field");
     }
 
-    if (!_version.is_initialized() || !_version->isSet()) {
+    if (!_version.has_value() || !_version->isSet()) {
         return Status(ErrorCodes::NoSuchKey, str::stream() << "missing version field");
     }
 
-    if (!_shard.is_initialized() || !_shard->isValid()) {
+    if (!_shard.has_value() || !_shard->isValid()) {
         return Status(ErrorCodes::NoSuchKey,
                       str::stream() << "missing " << shard.name() << " field");
     }
@@ -555,7 +609,7 @@ Status ChunkType::validate() const {
     while (minIt.more() && maxIt.more()) {
         BSONElement minElem = minIt.next();
         BSONElement maxElem = maxIt.next();
-        if (strcmp(minElem.fieldName(), maxElem.fieldName())) {
+        if (strcmp(minElem.fieldName(), maxElem.fieldName()) != 0) {
             return {ErrorCodes::BadValue,
                     str::stream() << "min and max don't have matching keys: " << *_min << ", "
                                   << *_max};
@@ -579,6 +633,14 @@ Status ChunkType::validate() const {
             return {ErrorCodes::BadValue,
                     str::stream() << "History contains an invalid shard "
                                   << _history.front().getShard()};
+        }
+        if (_onCurrentShardSince.has_value() &&
+            _history.front().getValidAfter() != *_onCurrentShardSince) {
+            return {ErrorCodes::BadValue,
+                    str::stream() << "The first `validAfter` in the chunk's `history` is not "
+                                     "consistent with `onCurrentShardSince`: validAfter is "
+                                  << _history.front().getValidAfter()
+                                  << " while onCurrentShardSince is " << *_onCurrentShardSince};
         }
     }
 

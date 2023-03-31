@@ -6,6 +6,9 @@
  * ]
  */
 
+// Cannot run the filtering metadata check on tests that run refineCollectionShardKey.
+TestData.skipCheckShardFilteringMetadata = true;
+
 (function() {
 "use strict";
 
@@ -156,10 +159,12 @@ function assertRangeMatch(savedRange, paramRange) {
         {index: {[metaField]: 1, [timeField]: 1}, shardKey: {[metaField]: 1, [timeField]: 1}});
     const shardingStateRes = mongo.getPrimaryShard(dbName).adminCommand({shardingState: 1});
     const shardingStateColls = shardingStateRes.versions;
-    const bucketNssIsSharded = (bucketNss in shardingStateColls &&
-                                timestampCmp(shardingStateColls[bucketNss], Timestamp(0, 0)) !== 0);
-    const viewNssIsSharded = (viewNss in shardingStateColls &&
-                              timestampCmp(shardingStateColls[viewNss], Timestamp(0, 0)) !== 0);
+    const bucketNssIsSharded =
+        (bucketNss in shardingStateColls &&
+         timestampCmp(shardingStateColls[bucketNss]["placementVersion"], Timestamp(0, 0)) !== 0);
+    const viewNssIsSharded =
+        (viewNss in shardingStateColls &&
+         timestampCmp(shardingStateColls[viewNss]["placementVersion"], Timestamp(0, 0)) !== 0);
     assert(bucketNssIsSharded && !viewNssIsSharded);
     dropTimeSeriesColl();
 })();
@@ -290,7 +295,8 @@ function assertRangeMatch(savedRange, paramRange) {
     assert.commandFailedWithCode(
         mongo.s.adminCommand({renameCollection: viewNss, to: newViewNss}), [
             ErrorCodes.IllegalOperation,
-            ErrorCodes.NamespaceNotFound /* TODO SERVER-67929 Remove this error code */
+            ErrorCodes.CommandNotSupportedOnView, /* TODO SERVER-67929 Remove this error code */
+            ErrorCodes.NamespaceNotFound,         /* TODO SERVER-67929 Remove this error code */
         ]);
     dropTimeSeriesColl();
 })();

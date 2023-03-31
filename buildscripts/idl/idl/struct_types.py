@@ -27,6 +27,7 @@
 #
 """Provide code generation information for structs and commands in a polymorphic way."""
 
+import textwrap
 from abc import ABCMeta, abstractmethod
 from typing import Optional, List
 
@@ -56,9 +57,16 @@ def _get_arg_for_field(field):
 def _get_required_parameters(struct):
     # type: (ast.Struct) -> List[str]
     """Get a list of arguments for required parameters."""
-    return [
+    params = [
         _get_arg_for_field(field) for field in struct.fields if _is_required_constructor_arg(field)
     ]
+    # Since this contains defaults, we need to push this to the end of the list.
+    params.append(_get_serialization_ctx_arg())
+    return params
+
+
+def _get_serialization_ctx_arg():
+    return 'boost::optional<SerializationContext> serializationContext = boost::none'
 
 
 class ArgumentInfo(object):
@@ -67,22 +75,31 @@ class ArgumentInfo(object):
     def __init__(self, arg):
         # type: (str) -> None
         """Create a instance of the ArgumentInfo class by parsing the argument string."""
-        parts = arg.split(' ')
-        self.type = ' '.join(parts[0:-1])
-        self.name = parts[-1]
+        self.defaults = None
+        equal_tokens = arg.split('=')
+        if len(equal_tokens) > 1:
+            self.defaults = equal_tokens[-1].strip()
 
-    def __str__(self):
-        # type: () -> str
+        space_tokens = equal_tokens[0].strip().split(' ')
+        self.type = ' '.join(space_tokens[0:-1])
+        self.name = space_tokens[-1]
+
+    def get_string(self, get_defaults):
+        # type: (bool) -> str
         """Return a formatted argument string."""
+        if self.defaults and get_defaults:
+            return "%s %s = %s" % (self.type, self.name, self.defaults)  # type: ignore
         return "%s %s" % (self.type, self.name)  # type: ignore
 
 
 class MethodInfo(object):
     """Class that encapslates information about a method and how to declare, define, and call it."""
 
+    # pylint: disable=too-many-instance-attributes
+
     def __init__(self, class_name, method_name, args, return_type=None, static=False, const=False,
-                 explicit=False):
-        # type: (str, str, List[str], str, bool, bool, bool) -> None
+                 explicit=False, desc_for_comment=None):
+        # type: (str, str, List[str], str, bool, bool, bool, Optional[str]) -> None
         # pylint: disable=too-many-arguments
         """Create a MethodInfo instance."""
         self.class_name = class_name
@@ -92,6 +109,7 @@ class MethodInfo(object):
         self.static = static
         self.const = const
         self.explicit = explicit
+        self.desc_for_comment = desc_for_comment
 
     def get_declaration(self):
         # type: () -> str
@@ -115,7 +133,8 @@ class MethodInfo(object):
         return common.template_args(
             "${pre_modifiers}${return_type}${method_name}(${args})${post_modifiers};",
             pre_modifiers=pre_modifiers, return_type=return_type_str, method_name=self.method_name,
-            args=', '.join([str(arg) for arg in self.args]), post_modifiers=post_modifiers)
+            args=', '.join(
+                [arg.get_string(True) for arg in self.args]), post_modifiers=post_modifiers)
 
     def get_definition(self):
         # type: () -> str
@@ -134,11 +153,11 @@ class MethodInfo(object):
             "${pre_modifiers}${return_type}${class_name}::${method_name}(${args})${post_modifiers}",
             pre_modifiers=pre_modifiers, return_type=return_type_str, class_name=self.class_name,
             method_name=self.method_name, args=', '.join(
-                [str(arg) for arg in self.args]), post_modifiers=post_modifiers)
+                [arg.get_string(False) for arg in self.args]), post_modifiers=post_modifiers)
 
     def get_call(self, obj):
         # type: (Optional[str]) -> str
-        """Generate a simply call to the method using the defined args list."""
+        """Generate a simple call to the method using the defined args list."""
 
         args = ', '.join([arg.name for arg in self.args])
 
@@ -148,6 +167,11 @@ class MethodInfo(object):
 
         return common.template_args("${method_name}(${args});", method_name=self.method_name,
                                     args=args)
+
+    def get_desc_for_comment(self):
+        # type: () -> Optional[str]
+        """Get the description of this method suitable for commenting it."""
+        return self.desc_for_comment
 
 
 class StructTypeInfoBase(object, metaclass=ABCMeta):
@@ -184,6 +208,18 @@ class StructTypeInfoBase(object, metaclass=ABCMeta):
         pass
 
     @abstractmethod
+    def get_sharing_deserializer_static_method(self):
+        # type: () -> MethodInfo
+        """Get the public static deserializer method for a struct that participates in shared ownership of underlying data we are deserializing from."""
+        pass
+
+    @abstractmethod
+    def get_owned_deserializer_static_method(self):
+        # type: () -> MethodInfo
+        """Get the public static deserializer method for a struct that takes exclusive ownership of underlying data we are deserializing from."""
+        pass
+
+    @abstractmethod
     def get_deserializer_method(self):
         # type: () -> MethodInfo
         """Get the protected deserializer method for a struct."""
@@ -193,21 +229,18 @@ class StructTypeInfoBase(object, metaclass=ABCMeta):
     def get_op_msg_request_serializer_method(self):
         # type: () -> Optional[MethodInfo]
         """Get the OpMsg serializer method for a struct."""
-        # pylint: disable=invalid-name
         pass
 
     @abstractmethod
     def get_op_msg_request_deserializer_static_method(self):
         # type: () -> Optional[MethodInfo]
         """Get the public static OpMsg deserializer method for a struct."""
-        # pylint: disable=invalid-name
         pass
 
     @abstractmethod
     def get_op_msg_request_deserializer_method(self):
         # type: () -> Optional[MethodInfo]
         """Get the protected OpMsg deserializer method for a struct."""
-        # pylint: disable=invalid-name
         pass
 
     @abstractmethod
@@ -229,8 +262,8 @@ class StructTypeInfoBase(object, metaclass=ABCMeta):
         pass
 
     @abstractmethod
-    def gen_namespace_check(self, indented_writer, tenant, db_name, element):
-        # type: (writer.IndentedTextWriter, str, str, str) -> None
+    def gen_namespace_check(self, indented_writer, db_name, element):
+        # type: (writer.IndentedTextWriter, str, str) -> None
         """Generate the namespace check predicate for a command."""
         pass
 
@@ -246,19 +279,45 @@ class _StructTypeInfo(StructTypeInfoBase):
     def get_constructor_method(self, gen_header=False):
         # type: (bool) -> MethodInfo
         class_name = common.title_case(self._struct.cpp_name)
-        return MethodInfo(class_name, class_name, [])
+        return MethodInfo(class_name, class_name, [_get_serialization_ctx_arg()])
 
     def get_required_constructor_method(self, gen_header=False):
         # type: (bool) -> MethodInfo
         class_name = common.title_case(self._struct.cpp_name)
         return MethodInfo(class_name, class_name, _get_required_parameters(self._struct))
 
+    def get_sharing_deserializer_static_method(self):
+        # type: () -> MethodInfo
+        class_name = common.title_case(self._struct.cpp_name)
+        comment = textwrap.dedent(f"""\
+                Factory function that parses a {class_name} from a BSONObj. A {class_name} parsed
+                this way participates in ownership of the data underlying the BSONObj.""")
+        return MethodInfo(class_name, 'parseSharingOwnership',
+                          ['const IDLParserContext& ctxt', 'const BSONObj& bsonObject'], class_name,
+                          static=True, desc_for_comment=comment)
+
+    def get_owned_deserializer_static_method(self):
+        # type: () -> MethodInfo
+        class_name = common.title_case(self._struct.cpp_name)
+        comment = textwrap.dedent(f"""\
+                Factory function that parses a {class_name} from a BSONObj. A {class_name} parsed
+                this way takes ownership of the data underlying the BSONObj.""")
+        return MethodInfo(class_name, 'parseOwned',
+                          ['const IDLParserContext& ctxt', 'BSONObj&& bsonObject'], class_name,
+                          static=True, desc_for_comment=comment)
+
     def get_deserializer_static_method(self):
         # type: () -> MethodInfo
         class_name = common.title_case(self._struct.cpp_name)
+        comment = textwrap.dedent(f"""\
+                Factory function that parses a {class_name} from a BSONObj. A {class_name} parsed
+                this way is strictly a view onto that BSONObj; the BSONObj must be kept valid to
+                ensure the validity any members of this struct that point-into the BSONObj (i.e.
+                unowned
+                objects).""")
         return MethodInfo(class_name, 'parse',
                           ['const IDLParserContext& ctxt', 'const BSONObj& bsonObject'], class_name,
-                          static=True)
+                          static=True, desc_for_comment=comment)
 
     def get_deserializer_method(self):
         # type: () -> MethodInfo
@@ -301,8 +360,8 @@ class _StructTypeInfo(StructTypeInfoBase):
         # type: (writer.IndentedTextWriter) -> None
         pass
 
-    def gen_namespace_check(self, indented_writer, tenant, db_name, element):
-        # type: (writer.IndentedTextWriter, str, str, str) -> None
+    def gen_namespace_check(self, indented_writer, db_name, element):
+        # type: (writer.IndentedTextWriter, str, str) -> None
         pass
 
 
@@ -364,8 +423,8 @@ class _IgnoredCommandTypeInfo(_CommandBaseTypeInfo):
         # type: (writer.IndentedTextWriter) -> None
         indented_writer.write_line('builder->append("%s"_sd, 1);' % (self._command.name))
 
-    def gen_namespace_check(self, indented_writer, tenant, db_name, element):
-        # type: (writer.IndentedTextWriter, str, str, str) -> None
+    def gen_namespace_check(self, indented_writer, db_name, element):
+        # type: (writer.IndentedTextWriter, str, str) -> None
         pass
 
 
@@ -396,7 +455,8 @@ class _CommandFromType(_CommandBaseTypeInfo):
         class_name = common.title_case(self._struct.cpp_name)
 
         arg = _get_command_type_parameter(self._command, gen_header)
-        return MethodInfo(class_name, class_name, [arg], explicit=True)
+        sc_arg = _get_serialization_ctx_arg()
+        return MethodInfo(class_name, class_name, [arg, sc_arg], explicit=True)
 
     def get_required_constructor_method(self, gen_header=False):
         # type: (bool) -> MethodInfo
@@ -437,8 +497,8 @@ class _CommandFromType(_CommandBaseTypeInfo):
         # type: (writer.IndentedTextWriter) -> None
         raise NotImplementedError
 
-    def gen_namespace_check(self, indented_writer, tenant, db_name, element):
-        # type: (writer.IndentedTextWriter, str, str, str) -> None
+    def gen_namespace_check(self, indented_writer, db_name, element):
+        # type: (writer.IndentedTextWriter, str, str) -> None
         # TODO: should the name of the first element be validated??
         raise NotImplementedError
 
@@ -463,7 +523,9 @@ class _CommandWithNamespaceTypeInfo(_CommandBaseTypeInfo):
     def get_constructor_method(self, gen_header=False):
         # type: (bool) -> MethodInfo
         class_name = common.title_case(self._struct.cpp_name)
-        return MethodInfo(class_name, class_name, [self._get_nss_param(gen_header)], explicit=True)
+        sc_arg = _get_serialization_ctx_arg()
+        return MethodInfo(class_name, class_name, [self._get_nss_param(gen_header), sc_arg],
+                          explicit=True)
 
     def get_required_constructor_method(self, gen_header=False):
         # type: (bool) -> MethodInfo
@@ -512,14 +574,13 @@ class _CommandWithNamespaceTypeInfo(_CommandBaseTypeInfo):
                 'builder->append("%s"_sd, _nss.coll());' % (self._command.name))
         indented_writer.write_empty_line()
 
-    def gen_namespace_check(self, indented_writer, tenant, db_name, element):
-        # type: (writer.IndentedTextWriter, str, str, str) -> None
+    def gen_namespace_check(self, indented_writer, db_name, element):
+        # type: (writer.IndentedTextWriter, str, str) -> None
         # TODO: should the name of the first element be validated??
         indented_writer.write_line('invariant(_nss.isEmpty());')
-        indented_writer.write_line('DatabaseName dbName(%s, %s);' % (tenant, db_name))
         allow_global = 'true' if self._struct.allow_global_collection_name else 'false'
-        indented_writer.write_line('_nss = ctxt.parseNSCollectionRequired(%s, %s, %s);' %
-                                   ('dbName', element, allow_global))
+        indented_writer.write_line(
+            '_nss = ctxt.parseNSCollectionRequired(%s, %s, %s);' % (db_name, element, allow_global))
 
 
 class _CommandWithUUIDNamespaceTypeInfo(_CommandBaseTypeInfo):
@@ -542,7 +603,9 @@ class _CommandWithUUIDNamespaceTypeInfo(_CommandBaseTypeInfo):
     def get_constructor_method(self, gen_header=False):
         # type: (bool) -> MethodInfo
         class_name = common.title_case(self._struct.cpp_name)
-        return MethodInfo(class_name, class_name, [self._get_nss_param(gen_header)], explicit=True)
+        sc_arg = _get_serialization_ctx_arg()
+        return MethodInfo(class_name, class_name, [self._get_nss_param(gen_header), sc_arg],
+                          explicit=True)
 
     def get_required_constructor_method(self, gen_header=False):
         # type: (bool) -> MethodInfo
@@ -587,11 +650,10 @@ class _CommandWithUUIDNamespaceTypeInfo(_CommandBaseTypeInfo):
         indented_writer.write_line('_nssOrUUID.serialize(builder, "%s"_sd);' % (self._command.name))
         indented_writer.write_empty_line()
 
-    def gen_namespace_check(self, indented_writer, tenant, db_name, element):
-        # type: (writer.IndentedTextWriter, str, str, str) -> None
-        indented_writer.write_line('DatabaseName dbName(%s, %s);' % (tenant, db_name))
+    def gen_namespace_check(self, indented_writer, db_name, element):
+        # type: (writer.IndentedTextWriter, str, str) -> None
         indented_writer.write_line('invariant(_nssOrUUID.nss() || _nssOrUUID.uuid());')
-        indented_writer.write_line('_nssOrUUID = ctxt.parseNsOrUUID(%s, %s);' % ('dbName', element))
+        indented_writer.write_line('_nssOrUUID = ctxt.parseNsOrUUID(%s, %s);' % (db_name, element))
 
 
 def get_struct_info(struct):

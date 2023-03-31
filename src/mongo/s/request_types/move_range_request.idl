@@ -34,7 +34,7 @@ global:
 
 imports:
     - "mongo/db/write_concern_options.idl"
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/s/sharding_types.idl"
 
 enums:
@@ -63,7 +63,7 @@ structs:
                 type: shard_id
                 description: "ID of the recipient shard"
                 validator:
-                    callback: "validateShardId"
+                    callback: "ShardId::validate"
             min:
                 type: object_owned
                 description: "The min key of the range to move"
@@ -119,7 +119,6 @@ commands:
 
     _shardsvrMoveRange:
         command_name: _shardsvrMoveRange
-        command_alias: moveChunk
         cpp_name: ShardsvrMoveRange
         description: "Definition of the moveRange command called from the config server on shards."
         namespace: type
@@ -137,7 +136,7 @@ commands:
                 type: shard_id
                 description: "ID of the donor shard"
                 validator:
-                    callback: "validateShardId"
+                    callback: "ShardId::validate"
             maxChunkSizeBytes:
                 type: safeInt64
                 description: "Max size of data to move"

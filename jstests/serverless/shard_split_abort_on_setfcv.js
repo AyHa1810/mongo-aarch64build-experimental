@@ -2,26 +2,20 @@
  * Prove that shard splits are eagerly aborted when the `setFeatureCompatibilityVersion` command is
  * received for both upgrade and downgrade paths.
  *
- * @tags: [requires_fcv_52, featureFlagShardSplit, serverless]
+ * @tags: [requires_fcv_63, serverless]
  */
 
-(function() {
-"use strict";
+import {ShardSplitTest} from "jstests/serverless/libs/shard_split_test.js";
+
 load("jstests/libs/fail_point_util.js");
-load("jstests/serverless/libs/basic_serverless_test.js");
 
 // Skip db hash check because secondary is left with a different config.
 TestData.skipCheckDBHashes = true;
-const test = new BasicServerlessTest({
-    recipientTagName: "recipientNode",
-    recipientSetName: "recipient",
-    quickGarbageCollection: true
-});
-
+const test = new ShardSplitTest({quickGarbageCollection: true});
 test.addRecipientNodes();
 
 const donorPrimary = test.donor.getPrimary();
-const tenantIds = ["tenant1", "tenant2"];
+const tenantIds = [ObjectId(), ObjectId()];
 const pauseAfterBlockingFp = configureFailPoint(donorPrimary, "pauseShardSplitAfterBlocking");
 
 jsTestLog("Test FCV Downgrade");
@@ -34,7 +28,7 @@ pauseAfterBlockingFp.off();
 assert.commandFailedWithCode(commitThread.returnData(), ErrorCodes.TenantMigrationAborted);
 
 jsTestLog("Test FCV Upgrade");
-if (lastContinuousFCV == "6.0") {
+if (lastContinuousFCV == "6.2") {
     const secondSplit = test.createSplitOperation(tenantIds);
     assert.commandFailedWithCode(secondSplit.commit(), ErrorCodes.IllegalOperation);
 } else {
@@ -43,6 +37,8 @@ if (lastContinuousFCV == "6.0") {
     split.forget();
     test.cleanupSuccesfulAborted(split.migrationId, tenantIds);
 
+    test.addRecipientNodes();
+    const pauseAfterBlockingFp = configureFailPoint(donorPrimary, "pauseShardSplitAfterBlocking");
     const secondSplit = test.createSplitOperation(tenantIds);
     const commitThread = secondSplit.commitAsync();
     pauseAfterBlockingFp.wait();
@@ -54,4 +50,3 @@ if (lastContinuousFCV == "6.0") {
 }
 
 test.stop();
-})();

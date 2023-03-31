@@ -54,13 +54,11 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/error_labels.h"
 #include "mongo/db/initialize_api_parameters.h"
-#include "mongo/db/initialize_operation_session_info.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/logical_session_id.h"
-#include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/not_primary_error_tracker.h"
+#include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/ops/write_ops_exec.h"
 #include "mongo/db/query/find.h"
@@ -80,17 +78,22 @@
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/sharding_statistics.h"
 #include "mongo/db/s/transaction_coordinator_factory.h"
+#include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/db/service_entry_point_common.h"
-#include "mongo/db/session_catalog_mongod.h"
+#include "mongo/db/session/initialize_operation_session_info.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
+#include "mongo/db/session/session_catalog_mongod.h"
 #include "mongo/db/stats/api_version_metrics.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/resource_consumption_metrics.h"
 #include "mongo/db/stats/server_read_concern_metrics.h"
 #include "mongo/db/stats/top.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/db/transaction_validation.h"
 #include "mongo/db/vector_clock.h"
 #include "mongo/logv2/log.h"
+#include "mongo/rpc/check_allowed_op_query_cmd.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/message.h"
@@ -101,7 +104,7 @@
 #include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/reply_builder_interface.h"
-#include "mongo/rpc/warn_unsupported_wire_ops.h"
+#include "mongo/s/query_analysis_sampler.h"
 #include "mongo/s/shard_cannot_refresh_due_to_locks_held_exception.h"
 #include "mongo/s/would_change_owning_shard_exception.h"
 #include "mongo/transport/hello_metrics.h"
@@ -128,6 +131,7 @@ MONGO_FAIL_POINT_DEFINE(hangBeforeSessionCheckOut);
 MONGO_FAIL_POINT_DEFINE(hangAfterSessionCheckOut);
 MONGO_FAIL_POINT_DEFINE(hangBeforeSettingTxnInterruptFlag);
 MONGO_FAIL_POINT_DEFINE(hangAfterCheckingWritabilityForMultiDocumentTransactions);
+MONGO_FAIL_POINT_DEFINE(includeAdditionalParticipantInResponse);
 
 // Tracks the number of times a legacy unacknowledged write failed due to
 // not primary error resulted in network disconnection.
@@ -201,8 +205,13 @@ struct HandleRequest {
             }
         }
 
+        /**
+         * Note that DBDirectClient is treated as an internal client in relation to letting
+         * internal errors escape.
+         */
         bool isInternalClient() const {
-            return session() && (session()->getTags() & transport::Session::kInternalClient);
+            return (client().isInDirectClient()) ||
+                (session() && (session()->getTags() & transport::Session::kInternalClient));
         }
 
         std::unique_ptr<const ServiceEntryPointCommon::Hooks> behaviors;
@@ -303,8 +312,8 @@ StatusWith<repl::ReadConcernArgs> _extractReadConcern(OperationContext* opCtx,
                 "received command without explicit readConcern on an internalClient connection {}"_format(
                     redact(cmdObj.toString())),
                 readConcernArgs.isSpecified());
-        } else if (serverGlobalParams.clusterRole == ClusterRole::ShardServer ||
-                   serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+        } else if (serverGlobalParams.clusterRole.has(ClusterRole::ShardServer) ||
+                   serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
             if (!readConcernArgs.isSpecified()) {
                 // TODO: Disabled until after SERVER-44539, to avoid log spam.
                 // LOGV2(21954, "Missing readConcern on {command}", "Missing readConcern "
@@ -323,7 +332,7 @@ StatusWith<repl::ReadConcernArgs> _extractReadConcern(OperationContext* opCtx,
                     const auto readConcernSource = rwcDefaults.getDefaultReadConcernSource();
                     customDefaultWasApplied =
                         (readConcernSource &&
-                         readConcernSource.get() == DefaultReadConcernSourceEnum::kGlobal);
+                         readConcernSource.value() == DefaultReadConcernSourceEnum::kGlobal);
 
                     applyDefaultReadConcern(*rcDefault);
                 }
@@ -524,6 +533,35 @@ void appendErrorLabelsAndTopologyVersion(OperationContext* opCtx,
     const auto topologyVersion = replCoord->getTopologyVersion();
     BSONObjBuilder topologyVersionBuilder(commandBodyFieldsBob->subobjStart("topologyVersion"));
     topologyVersion.serialize(&topologyVersionBuilder);
+}
+
+void appendAdditionalParticipants(OperationContext* opCtx,
+                                  BSONObjBuilder* commandBodyFieldsBob,
+                                  const std::string& commandName,
+                                  const std::string& ns) {
+    if (gFeatureFlagAdditionalParticipants.isEnabledAndIgnoreFCV()) {
+        std::vector<BSONElement> shardIdsFromFpData;
+        if (MONGO_unlikely(
+                includeAdditionalParticipantInResponse.shouldFail([&](const BSONObj& data) {
+                    if (data.hasField("cmdName") && data.hasField("ns") &&
+                        data.hasField("shardId")) {
+                        shardIdsFromFpData = data.getField("shardId").Array();
+                        return ((data.getStringField("cmdName") == commandName) &&
+                                (data.getStringField("ns").toString() == ns));
+                    }
+                    return false;
+                }))) {
+
+            std::vector<BSONObj> participantArray;
+            for (auto& element : shardIdsFromFpData) {
+                auto participant = BSON("shardId" << ShardId(element.valueStringData().toString()));
+                participantArray.emplace_back(participant);
+            }
+            auto additionalParticipants = BSON("additionalParticipants" << participantArray);
+
+            commandBodyFieldsBob->appendElements(additionalParticipants);
+        }
+    }
 }
 
 class RunCommandOpTimes {
@@ -825,17 +863,18 @@ private:
 
     ExecCommandDatabase* const _ecd;
 
-    std::unique_ptr<MongoDOperationContextSession> _sessionTxnState;
+    std::unique_ptr<MongoDSessionCatalog::Session> _sessionTxnState;
     bool _shouldCleanUp = false;
 };
 
 Future<void> InvokeCommand::run() {
     return makeReadyFutureWith([&] {
                auto execContext = _ecd->getExecutionContext();
+               const auto dbName = _ecd->getInvocation()->ns().dbName();
                // TODO SERVER-53761: find out if we can do this more asynchronously. The client
-               // Strand is locked to current thread in ServiceStateMachine::Impl::startNewLoop().
-               tenant_migration_access_blocker::checkIfCanReadOrBlock(execContext->getOpCtx(),
-                                                                      execContext->getRequest())
+               // Strand is locked to current thread in SessionWorkflow::Impl::startNewLoop().
+               tenant_migration_access_blocker::checkIfCanReadOrBlock(
+                   execContext->getOpCtx(), dbName, execContext->getRequest())
                    .get(execContext->getOpCtx());
                return runCommandInvocation(_ecd->getExecutionContext(), _ecd->getInvocation());
            })
@@ -851,9 +890,10 @@ Future<void> CheckoutSessionAndInvokeCommand::run() {
                _checkOutSession();
 
                auto execContext = _ecd->getExecutionContext();
+               const auto dbName = _ecd->getInvocation()->ns().dbName();
                // TODO SERVER-53761: find out if we can do this more asynchronously.
-               tenant_migration_access_blocker::checkIfCanReadOrBlock(execContext->getOpCtx(),
-                                                                      execContext->getRequest())
+               tenant_migration_access_blocker::checkIfCanReadOrBlock(
+                   execContext->getOpCtx(), dbName, execContext->getRequest())
                    .get(execContext->getOpCtx());
                return runCommandInvocation(_ecd->getExecutionContext(), _ecd->getInvocation());
            })
@@ -945,15 +985,15 @@ void CheckoutSessionAndInvokeCommand::_checkOutSession() {
     // for both multi-statement transactions and retryable writes. Currently, only requests with
     // a transaction number will check out the session.
     hangBeforeSessionCheckOut.pauseWhileSet();
-    _sessionTxnState = std::make_unique<MongoDOperationContextSession>(opCtx);
+    auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+    _sessionTxnState = mongoDSessionCatalog->checkOutSession(opCtx);
     auto txnParticipant = TransactionParticipant::get(opCtx);
     hangAfterSessionCheckOut.pauseWhileSet();
 
     // Used for waiting for an in-progress transaction to transition out of the conflicting state.
-    auto waitForInProgressTxn = [](OperationContext* opCtx, auto& stateTransitionFuture) {
+    auto waitForInProgressTxn = [this](OperationContext* opCtx, auto& stateTransitionFuture) {
         // Check the session back in and wait for the conflict to resolve.
-        MongoDOperationContextSession::checkIn(opCtx,
-                                               OperationContextSession::CheckInReason::kYield);
+        _sessionTxnState->checkIn(opCtx, OperationContextSession::CheckInReason::kYield);
         stateTransitionFuture.wait(opCtx);
         // Wait for any commit or abort oplog entry to be visible in the oplog. This will prevent a
         // new transaction from missing the transaction table update for the previous commit or
@@ -961,7 +1001,7 @@ void CheckoutSessionAndInvokeCommand::_checkOutSession() {
         auto storageInterface = repl::StorageInterface::get(opCtx);
         storageInterface->waitForAllEarlierOplogWritesToBeVisible(opCtx);
         // Check out the session again.
-        MongoDOperationContextSession::checkOut(opCtx);
+        _sessionTxnState->checkOut(opCtx);
     };
 
     auto apiParamsFromClient = APIParameters::get(opCtx);
@@ -980,6 +1020,8 @@ void CheckoutSessionAndInvokeCommand::_checkOutSession() {
         // transaction on that session.
         while (!beganOrContinuedTxn) {
             try {
+                auto opObserver = opCtx->getServiceContext()->getOpObserver();
+                opObserver->onTransactionStart(opCtx);
                 txnParticipant.beginOrContinue(
                     opCtx,
                     {*sessionOptions.getTxnNumber(), sessionOptions.getTxnRetryCounter()},
@@ -1119,8 +1161,8 @@ Future<void> CheckoutSessionAndInvokeCommand::_commitInvocation() {
         // succeeds.
         _stashTransaction(txnParticipant);
 
-        if (serverGlobalParams.clusterRole == ClusterRole::ShardServer ||
-            serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+        if (serverGlobalParams.clusterRole.has(ClusterRole::ShardServer) ||
+            serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
             auto txnResponseMetadata = txnParticipant.getResponseMetadata();
             auto bodyBuilder = replyBuilder->getBodyBuilder();
             txnResponseMetadata.serialize(&bodyBuilder);
@@ -1192,8 +1234,9 @@ void RunCommandImpl::_epilogue() {
         });
 
     behaviors.waitForLinearizableReadConcern(opCtx);
-    tenant_migration_access_blocker::checkIfLinearizableReadWasAllowedOrThrow(
-        opCtx, request.getDatabase());
+    const DatabaseName requestDbName =
+        DatabaseNameUtil::deserialize(request.getValidatedTenantId(), request.getDatabase());
+    tenant_migration_access_blocker::checkIfLinearizableReadWasAllowedOrThrow(opCtx, requestDbName);
 
     // Wait for data to satisfy the read concern level, if necessary.
     behaviors.waitForSpeculativeMajorityReadConcern(opCtx);
@@ -1225,6 +1268,8 @@ void RunCommandImpl::_epilogue() {
                                             _isInternalClient(),
                                             _ecd->getLastOpBeforeRun(),
                                             _ecd->getLastOpAfterRun());
+        appendAdditionalParticipants(
+            opCtx, &body, command->getName(), _ecd->getInvocation()->ns().ns());
     }
 
     auto commandBodyBob = replyBuilder->getBodyBuilder();
@@ -1316,8 +1361,8 @@ void RunCommandAndWaitForWriteConcern::_setup() {
                     "received command without explicit writeConcern on an internalClient connection {}"_format(
                         redact(request.body.toString())),
                     request.body.hasField(WriteConcernOptions::kWriteConcernField));
-            } else if (serverGlobalParams.clusterRole == ClusterRole::ShardServer ||
-                       serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+            } else if (serverGlobalParams.clusterRole.has(ClusterRole::ShardServer) ||
+                       serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
                 if (!request.body.hasField(WriteConcernOptions::kWriteConcernField)) {
                     // TODO: Disabled until after SERVER-44539, to avoid log spam.
                     // LOGV2(21959, "Missing writeConcern on {command}", "Missing "
@@ -1342,6 +1387,7 @@ void RunCommandAndWaitForWriteConcern::_setup() {
 }
 
 Future<void> RunCommandAndWaitForWriteConcern::_runCommandWithFailPoint() {
+    // TODO SERVER-69061 rename `failWithErrorCodeInRunCommand` and remove the following comment.
     // Despite the name, this failpoint only affects commands with write concerns.
     if (auto scoped = failWithErrorCodeInRunCommand.scoped(); MONGO_unlikely(scoped.isActive())) {
         const auto errorCode = scoped.getData()["errorCode"].numberInt();
@@ -1408,7 +1454,7 @@ void ExecCommandDatabase::_initiateCommand() {
                 str::stream() << "Command " << command->getName()
                               << " is not supported in multitenancy mode",
                 command->allowedWithSecurityToken());
-        _tokenAuthorizationSessionGuard.emplace(opCtx, request.validatedTenancyScope.get());
+        _tokenAuthorizationSessionGuard.emplace(opCtx, request.validatedTenancyScope.value());
     }
 
     if (isHello()) {
@@ -1462,17 +1508,19 @@ void ExecCommandDatabase::_initiateCommand() {
     _scopedMetrics.emplace(opCtx, dbname, collect);
 
     const auto allowTransactionsOnConfigDatabase =
-        (serverGlobalParams.clusterRole == ClusterRole::ConfigServer ||
-         serverGlobalParams.clusterRole == ClusterRole::ShardServer);
+        (serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer) ||
+         serverGlobalParams.clusterRole.has(ClusterRole::ShardServer));
+
+    const auto invocationNss = _invocation->ns();
 
     validateSessionOptions(
-        _sessionOptions, command->getName(), _invocation->ns(), allowTransactionsOnConfigDatabase);
+        _sessionOptions, command->getName(), invocationNss, allowTransactionsOnConfigDatabase);
 
     BSONElement cmdOptionMaxTimeMSField;
     BSONElement maxTimeMSOpOnlyField;
     BSONElement helpField;
 
-    StringMap<int> topLevelFields;
+    StringDataSet topLevelFields(8);
     for (auto&& element : request.body) {
         StringData fieldName = element.fieldNameStringData();
         if (fieldName == query_request_helper::cmdOptionMaxTimeMS) {
@@ -1495,7 +1543,7 @@ void ExecCommandDatabase::_initiateCommand() {
         uassert(ErrorCodes::FailedToParse,
                 str::stream() << "Parsed command object contains duplicate top level key: "
                               << fieldName,
-                topLevelFields[fieldName]++ == 0);
+                topLevelFields.insert(fieldName).second);
     }
 
     if (CommandHelpers::isHelpRequest(helpField)) {
@@ -1591,6 +1639,10 @@ void ExecCommandDatabase::_initiateCommand() {
 
     if (command->shouldAffectCommandCounter()) {
         globalOpCounters.gotCommand();
+        if (analyze_shard_key::supportsSamplingQueries(opCtx)) {
+            analyze_shard_key::QueryAnalysisSampler::get(opCtx).gotCommand(
+                request.getCommandName());
+        }
     }
 
     // Parse the 'maxTimeMS' command option, and use it to set a deadline for the operation on the
@@ -1671,16 +1723,15 @@ void ExecCommandDatabase::_initiateCommand() {
         // expect all versioned commands to be sent over 'system.buckets' namespace. But it is
         // possible that a stale mongos may send the request over a view namespace. In this case, we
         // initialize the 'OperationShardingState' with buckets namespace.
-        auto bucketNss = _invocation->ns().makeTimeseriesBucketsNamespace();
-        auto namespaceForSharding = CollectionCatalog::get(opCtx)
-                                        ->lookupCollectionByNamespaceForRead(opCtx, bucketNss)
-                                        .get()
-            ? bucketNss
-            : _invocation->ns();
-
-        boost::optional<ChunkVersion> shardVersion;
-        if (auto shardVersionElem = request.body[ChunkVersion::kShardVersionField]) {
-            shardVersion = ChunkVersion::parse(shardVersionElem);
+        auto bucketNss = invocationNss.makeTimeseriesBucketsNamespace();
+        // Hold reference to the catalog for collection lookup without locks to be safe.
+        auto catalog = CollectionCatalog::get(opCtx);
+        auto coll = catalog->lookupCollectionByNamespace(opCtx, bucketNss);
+        auto namespaceForSharding =
+            (coll && coll->getTimeseriesOptions()) ? bucketNss : invocationNss;
+        boost::optional<ShardVersion> shardVersion;
+        if (auto shardVersionElem = request.body[ShardVersion::kShardVersionField]) {
+            shardVersion = ShardVersion::parse(shardVersionElem);
         }
 
         boost::optional<DatabaseVersion> databaseVersion;
@@ -1754,21 +1805,14 @@ Future<void> ExecCommandDatabase::_commandExec() {
             auto opCtx = _execContext->getOpCtx();
 
             if (!opCtx->getClient()->isInDirectClient() &&
-                serverGlobalParams.clusterRole != ClusterRole::ConfigServer &&
-                !_refreshedDatabase) {
+                !serverGlobalParams.clusterRole.exclusivelyHasConfigRole() && !_refreshedDatabase) {
                 auto sce = s.extraInfo<StaleDbRoutingVersion>();
                 invariant(sce);
 
-                if (sce->getCriticalSectionSignal()) {
-                    // The shard is in a critical section, so we cannot retry locally
-                    OperationShardingState::waitForCriticalSectionToComplete(
-                        opCtx, *sce->getCriticalSectionSignal())
-                        .ignore();
-                    return s;
-                }
+                bool stableLocalVersion =
+                    !sce->getCriticalSectionSignal() && sce->getVersionWanted();
 
-                if (sce->getVersionWanted() &&
-                    sce->getVersionReceived() < sce->getVersionWanted()) {
+                if (stableLocalVersion && sce->getVersionReceived() < sce->getVersionWanted()) {
                     // The shard is recovered and the router is staler than the shard, so we cannot
                     // retry locally
                     return s;
@@ -1777,7 +1821,8 @@ Future<void> ExecCommandDatabase::_commandExec() {
                 const auto refreshed = _execContext->behaviors->refreshDatabase(opCtx, *sce);
                 if (refreshed) {
                     _refreshedDatabase = true;
-                    if (!opCtx->isContinuingMultiDocumentTransaction()) {
+                    if (!opCtx->isContinuingMultiDocumentTransaction() &&
+                        !sce->getCriticalSectionSignal()) {
                         _resetLockerStateAfterShardingUpdate(opCtx);
                         return _commandExec();
                     }
@@ -1791,37 +1836,42 @@ Future<void> ExecCommandDatabase::_commandExec() {
             ShardingStatistics::get(opCtx).countStaleConfigErrors.addAndFetch(1);
 
             if (!opCtx->getClient()->isInDirectClient() &&
-                serverGlobalParams.clusterRole != ClusterRole::ConfigServer &&
+                !serverGlobalParams.clusterRole.exclusivelyHasConfigRole() &&
                 !_refreshedCollection) {
                 if (auto sce = s.extraInfo<StaleConfigInfo>()) {
-                    if (sce->getCriticalSectionSignal()) {
-                        _execContext->behaviors->handleReshardingCriticalSectionMetrics(opCtx,
-                                                                                        *sce);
-                        // The shard is in a critical section, so we cannot retry locally
-                        OperationShardingState::waitForCriticalSectionToComplete(
-                            opCtx, *sce->getCriticalSectionSignal())
-                            .ignore();
-                        return s;
-                    }
+                    bool inCriticalSection = sce->getCriticalSectionSignal().has_value();
+                    bool stableLocalVersion = !inCriticalSection && sce->getVersionWanted();
 
-                    if (sce->getVersionWanted() &&
-                        ChunkVersion::isIgnoredVersion(sce->getVersionReceived())) {
+                    if (stableLocalVersion &&
+                        ShardVersion::isPlacementVersionIgnored(sce->getVersionReceived())) {
                         // Shard is recovered, but the router didn't sent a shard version, therefore
                         // we just need to tell the router how much it needs to advance to
                         // (getVersionWanted).
                         return s;
                     }
 
-                    if (sce->getVersionWanted() &&
-                        sce->getVersionReceived().isOlderThan(*sce->getVersionWanted())) {
+                    if (stableLocalVersion &&
+                        sce->getVersionReceived().placementVersion().isOlderThan(
+                            sce->getVersionWanted()->placementVersion())) {
                         // Shard is recovered and the router is staler than the shard
                         return s;
+                    }
+
+                    if (inCriticalSection) {
+                        _execContext->behaviors->handleReshardingCriticalSectionMetrics(opCtx,
+                                                                                        *sce);
                     }
 
                     const auto refreshed = _execContext->behaviors->refreshCollection(opCtx, *sce);
                     if (refreshed) {
                         _refreshedCollection = true;
-                        if (!opCtx->isContinuingMultiDocumentTransaction()) {
+
+                        // Can not rerun the command when executing a GetMore command as the cursor
+                        // is already lost.
+                        const auto isRunningGetMoreCmd =
+                            _execContext->getCommand()->getName() == "getMore";
+                        if (!opCtx->isContinuingMultiDocumentTransaction() && !inCriticalSection &&
+                            !isRunningGetMoreCmd) {
                             _resetLockerStateAfterShardingUpdate(opCtx);
                             return _commandExec();
                         }
@@ -1834,7 +1884,7 @@ Future<void> ExecCommandDatabase::_commandExec() {
         .onError<ErrorCodes::ShardCannotRefreshDueToLocksHeld>([this](Status s) -> Future<void> {
             // This exception can never happen on the config server. Config servers can't receive
             // SSV either, because they never have commands with shardVersion sent.
-            invariant(serverGlobalParams.clusterRole != ClusterRole::ConfigServer);
+            invariant(!serverGlobalParams.clusterRole.exclusivelyHasConfigRole());
 
             auto opCtx = _execContext->getOpCtx();
             if (!opCtx->getClient()->isInDirectClient() && !_refreshedCatalogCache) {
@@ -1848,7 +1898,12 @@ Future<void> ExecCommandDatabase::_commandExec() {
 
                 if (refreshed) {
                     _refreshedCatalogCache = true;
-                    if (!opCtx->isContinuingMultiDocumentTransaction()) {
+
+                    // Can not rerun the command when executing a GetMore command as the cursor is
+                    // already lost.
+                    const auto isRunningGetMoreCmd =
+                        _execContext->getCommand()->getName() == "getMore";
+                    if (!opCtx->isContinuingMultiDocumentTransaction() && !isRunningGetMoreCmd) {
                         _resetLockerStateAfterShardingUpdate(opCtx);
                         return _commandExec();
                     }
@@ -1886,6 +1941,8 @@ void ExecCommandDatabase::_handleFailure(Status status) {
                                         _isInternalClient(),
                                         getLastOpBeforeRun(),
                                         getLastOpAfterRun());
+    appendAdditionalParticipants(
+        opCtx, &_extraFieldsBuilder, command->getName(), _execContext->nsString().ns());
 
     BSONObjBuilder metadataBob;
     behaviors.appendReplyMetadata(opCtx, request, &metadataBob);
@@ -1937,12 +1994,13 @@ void curOpCommandSetup(OperationContext* opCtx, const OpMsgRequest& request) {
 
     // We construct a legacy $cmd namespace so we can fill in curOp using
     // the existing logic that existed for OP_QUERY commands
-    NamespaceString nss(request.getDatabase(), "$cmd");
+    NamespaceString nss(NamespaceString::makeCommandNamespace(
+        DatabaseNameUtil::deserialize(request.getValidatedTenantId(), request.getDatabase())));
 
     stdx::lock_guard<Client> lk(*opCtx->getClient());
+    curop->setNS_inlock(nss);
     curop->setOpDescription_inlock(request.body);
     curop->markCommand_inlock();
-    curop->setNS_inlock(nss.ns());
 }
 
 Future<void> parseCommand(std::shared_ptr<HandleRequest::ExecutionContext> execContext) try {
@@ -2063,6 +2121,7 @@ DbResponse makeCommandResponse(std::shared_ptr<HandleRequest::ExecutionContext> 
     }
 
     DbResponse dbResponse;
+    CommandHelpers::checkForInternalError(replyBuilder, execContext->isInternalClient());
 
     if (OpMsg::isFlagSet(message, OpMsg::kExhaustSupported)) {
         auto responseObj = replyBuilder->getBodyBuilder().asTempObj();
@@ -2073,7 +2132,20 @@ DbResponse makeCommandResponse(std::shared_ptr<HandleRequest::ExecutionContext> 
         }
     }
 
-    dbResponse.response = replyBuilder->done();
+    try {
+        dbResponse.response = replyBuilder->done();
+    } catch (const ExceptionFor<ErrorCodes::BSONObjectTooLarge>& ex) {
+        // Create a new reply builder as subsequently calling any methods on a builder after
+        // 'done()' results in undefined behavior.
+        auto errorReplyBuilder = execContext->getReplyBuilder();
+        BSONObjBuilder metadataBob;
+        BSONObjBuilder extraFieldsBuilder;
+        appendClusterAndOperationTime(
+            opCtx, &extraFieldsBuilder, &metadataBob, LogicalTime::kUninitialized);
+        generateErrorResponse(
+            opCtx, errorReplyBuilder, ex.toStatus(), metadataBob.obj(), extraFieldsBuilder.obj());
+        dbResponse.response = errorReplyBuilder->done();
+    }
     CurOp::get(opCtx)->debug().responseLength = dbResponse.response.header().dataLen();
 
     return dbResponse;
@@ -2129,9 +2201,6 @@ struct QueryOpRunner : SynchronousOpRunner {
     using SynchronousOpRunner::SynchronousOpRunner;
     DbResponse runSync() override {
         invariant(!executionContext->nsString().isCommand());
-
-        globalOpCounters.gotQueryDeprecated();
-        warnUnsupportedOp(executionContext->client(), networkOpToString(dbQuery));
         return makeErrorResponseToUnsupportedOpQuery("OP_QUERY is no longer supported");
     }
 };
@@ -2139,8 +2208,6 @@ struct QueryOpRunner : SynchronousOpRunner {
 struct GetMoreOpRunner : SynchronousOpRunner {
     using SynchronousOpRunner::SynchronousOpRunner;
     DbResponse runSync() override {
-        globalOpCounters.gotGetMoreDeprecated();
-        warnUnsupportedOp(executionContext->client(), networkOpToString(dbGetMore));
         return makeErrorResponseToUnsupportedOpQuery("OP_GET_MORE is no longer supported");
     }
 };
@@ -2160,7 +2227,6 @@ struct FireAndForgetOpRunner : SynchronousOpRunner {
 struct KillCursorsOpRunner : FireAndForgetOpRunner {
     using FireAndForgetOpRunner::FireAndForgetOpRunner;
     void runAndForget() override {
-        globalOpCounters.gotKillCursorsDeprecated();
         uasserted(5745703, "OP_KILL_CURSORS is no longer supported");
     }
 };
@@ -2168,9 +2234,6 @@ struct KillCursorsOpRunner : FireAndForgetOpRunner {
 struct InsertOpRunner : FireAndForgetOpRunner {
     using FireAndForgetOpRunner::FireAndForgetOpRunner;
     void runAndForget() override {
-        auto insertOp = InsertOp::parseLegacy(executionContext->getMessage());
-        const auto nDocs = insertOp.getDocuments().size();
-        globalOpCounters.gotInsertsDeprecated(nDocs);
         uasserted(5745702, "OP_INSERT is no longer supported");
     }
 };
@@ -2178,7 +2241,6 @@ struct InsertOpRunner : FireAndForgetOpRunner {
 struct UpdateOpRunner : FireAndForgetOpRunner {
     using FireAndForgetOpRunner::FireAndForgetOpRunner;
     void runAndForget() override {
-        globalOpCounters.gotUpdateDeprecated();
         uasserted(5745701, "OP_UPDATE is no longer supported");
     }
 };
@@ -2186,7 +2248,6 @@ struct UpdateOpRunner : FireAndForgetOpRunner {
 struct DeleteOpRunner : FireAndForgetOpRunner {
     using FireAndForgetOpRunner::FireAndForgetOpRunner;
     void runAndForget() override {
-        globalOpCounters.gotDeleteDeprecated();
         uasserted(5745700, "OP_DELETE is no longer supported");
     }
 };
@@ -2233,7 +2294,6 @@ std::unique_ptr<HandleRequest::OpRunner> HandleRequest::makeOpRunner() {
 }
 
 DbResponse FireAndForgetOpRunner::runSync() {
-    warnUnsupportedOp(executionContext->client(), networkOpToString(executionContext->op()));
     runAndForget();
     return {};
 }
@@ -2270,11 +2330,14 @@ void HandleRequest::completeOperation(DbResponse& response) {
 
     // Mark the op as complete, and log it if appropriate. Returns a boolean indicating whether
     // this op should be written to the profiler.
-    const bool shouldProfile = currentOp.completeAndLogOperation(opCtx,
-                                                                 MONGO_LOGV2_DEFAULT_COMPONENT,
-                                                                 response.response.size(),
-                                                                 executionContext->slowMsOverride,
-                                                                 executionContext->forceLog);
+    const bool shouldProfile = currentOp.completeAndLogOperation(
+        MONGO_LOGV2_DEFAULT_COMPONENT,
+        CollectionCatalog::get(opCtx)
+            ->getDatabaseProfileSettings(currentOp.getNSS().dbName())
+            .filter,
+        response.response.size(),
+        executionContext->slowMsOverride,
+        executionContext->forceLog);
 
     Top::get(opCtx->getServiceContext())
         .incrementGlobalLatencyStats(
@@ -2323,14 +2386,29 @@ BSONObj ServiceEntryPointCommon::getRedactedCopyForLogging(const Command* comman
     return bob.obj();
 }
 
-void onHandleRequestException(const Status& status) {
+void logHandleRequestFailure(const Status& status) {
     LOGV2_ERROR(4879802, "Failed to handle request", "error"_attr = redact(status));
 }
 
+void onHandleRequestException(const HandleRequest& hr, const Status& status) {
+    auto isMirrorOp = [&] {
+        const auto& obj = hr.executionContext->getRequest().body;
+        if (auto e = obj.getField("mirrored"); MONGO_unlikely(e.ok() && e.boolean()))
+            return true;
+        return false;
+    };
+
+    // TODO SERVER-70510 revert changes introduced by SERVER-60553 that suppresses errors occurred
+    // during handling of mirroring operations on recovering secondaries.
+    if (MONGO_unlikely(status == ErrorCodes::NotWritablePrimary && isMirrorOp()))
+        return;
+
+    logHandleRequestFailure(status);
+}
+
 Future<DbResponse> ServiceEntryPointCommon::handleRequest(
-    OperationContext* opCtx,
-    const Message& m,
-    std::unique_ptr<const Hooks> behaviors) noexcept try {
+    OperationContext* opCtx, const Message& m, std::unique_ptr<const Hooks> behaviors) noexcept
+    try {
     HandleRequest hr(opCtx, m, std::move(behaviors));
     hr.startOperation();
 
@@ -2338,7 +2416,7 @@ Future<DbResponse> ServiceEntryPointCommon::handleRequest(
     invariant(opRunner);
 
     return opRunner->run()
-        .then([hr = std::move(hr)](DbResponse response) mutable {
+        .then([&hr](DbResponse response) mutable {
             hr.completeOperation(response);
 
             auto opCtx = hr.executionContext->getOpCtx();
@@ -2353,10 +2431,10 @@ Future<DbResponse> ServiceEntryPointCommon::handleRequest(
 
             return response;
         })
-        .tapError([](Status status) { onHandleRequestException(status); });
+        .tapError([hr = std::move(hr)](Status status) { onHandleRequestException(hr, status); });
 } catch (const DBException& ex) {
     auto status = ex.toStatus();
-    onHandleRequestException(status);
+    logHandleRequestFailure(status);
     return status;
 }
 

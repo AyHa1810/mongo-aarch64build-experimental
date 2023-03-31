@@ -40,7 +40,13 @@ void validateWriteAllowed(OperationContext* opCtx) {
             "Cannot execute a write operation in read-only mode",
             !opCtx->readOnly());
 }
+
 }  // namespace
+
+RecordStore::RecordStore(boost::optional<UUID> uuid, StringData identName, bool isCapped)
+    : _ident(std::make_shared<Ident>(identName.toString())),
+      _uuid(uuid),
+      _cappedInsertNotifier(isCapped ? std::make_shared<CappedInsertNotifier>() : nullptr) {}
 
 void RecordStore::deleteRecord(OperationContext* opCtx, const RecordId& dl) {
     validateWriteAllowed(opCtx);
@@ -76,11 +82,31 @@ Status RecordStore::truncate(OperationContext* opCtx) {
     return doTruncate(opCtx);
 }
 
+Status RecordStore::rangeTruncate(OperationContext* opCtx,
+                                  const RecordId& minRecordId,
+                                  const RecordId& maxRecordId,
+                                  int64_t hintDataSizeDiff,
+                                  int64_t hintNumRecordsDiff) {
+    validateWriteAllowed(opCtx);
+    invariant(minRecordId <= maxRecordId, "Start position cannot be after end position");
+    return doRangeTruncate(opCtx, minRecordId, maxRecordId, hintDataSizeDiff, hintNumRecordsDiff);
+}
+
 void RecordStore::cappedTruncateAfter(OperationContext* opCtx,
                                       const RecordId& end,
-                                      bool inclusive) {
+                                      bool inclusive,
+                                      const AboutToDeleteRecordCallback& aboutToDelete) {
     validateWriteAllowed(opCtx);
-    doCappedTruncateAfter(opCtx, end, inclusive);
+    doCappedTruncateAfter(opCtx, end, inclusive, std::move(aboutToDelete));
+}
+
+bool RecordStore::haveCappedWaiters() const {
+    return _cappedInsertNotifier && _cappedInsertNotifier.use_count() > 1;
+}
+
+void RecordStore::notifyCappedWaitersIfNeeded() {
+    if (haveCappedWaiters())
+        _cappedInsertNotifier->notifyAll();
 }
 
 Status RecordStore::compact(OperationContext* opCtx) {
@@ -112,6 +138,37 @@ void RecordStore::waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCt
               !opCtx->lockState()->uninterruptibleLocksRequested());
 
     waitForAllEarlierOplogWritesToBeVisibleImpl(opCtx);
+}
+
+void CappedInsertNotifier::notifyAll() const {
+    stdx::lock_guard<Latch> lk(_mutex);
+    ++_version;
+    _notifier.notify_all();
+}
+
+uint64_t CappedInsertNotifier::getVersion() const {
+    stdx::lock_guard<Latch> lk(_mutex);
+    return _version;
+}
+
+void CappedInsertNotifier::waitUntil(uint64_t prevVersion, Date_t deadline) const {
+    stdx::unique_lock<Latch> lk(_mutex);
+    while (!_dead && prevVersion == _version) {
+        if (stdx::cv_status::timeout == _notifier.wait_until(lk, deadline.toSystemTimePoint())) {
+            return;
+        }
+    }
+}
+
+void CappedInsertNotifier::kill() {
+    stdx::lock_guard<Latch> lk(_mutex);
+    _dead = true;
+    _notifier.notify_all();
+}
+
+bool CappedInsertNotifier::isDead() {
+    stdx::lock_guard<Latch> lk(_mutex);
+    return _dead;
 }
 
 }  // namespace mongo

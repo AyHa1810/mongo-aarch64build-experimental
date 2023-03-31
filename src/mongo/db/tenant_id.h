@@ -46,14 +46,17 @@ namespace mongo {
  */
 class TenantId {
 public:
+    static const boost::optional<TenantId>& systemTenantId() {
+        static StaticImmortal<boost::optional<TenantId>> systemTenantId{};
+        return *systemTenantId;
+    }
+
     /**
-     * kSystemTenantId must be unique across all possible tenant IDs.
-     * Since the first four bytes of an OID are a unix epoch timestamp,
-     * we can simply select a value prior to the inception of MongoDB,
-     * and be guaranteed to never have a collision with a value
-     * produced by OID::gen().
+     * Parse a tenantId from a StringData. This method asserts if the tenantId is empty or not in an
+     * OID format.
+     * Returns a TenantId object from the parsed string.
      */
-    static const TenantId kSystemTenantId;
+    static TenantId parseFromString(StringData tenantId);
 
     explicit TenantId(const OID& oid) : _oid(oid) {}
 
@@ -89,7 +92,7 @@ public:
      */
     template <typename H>
     friend H AbslHashValue(H h, const TenantId& tenantId) {
-        return H::combine(std::move(h), tenantId.hash());
+        return H::combine(std::move(h), tenantId._oid);
     }
 
     /**

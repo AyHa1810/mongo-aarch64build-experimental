@@ -79,7 +79,7 @@ std::unique_ptr<MatchExpression> makePredicate(
 class LeafMatchExpression : public PathMatchExpression {
 public:
     LeafMatchExpression(MatchType matchType,
-                        StringData path,
+                        boost::optional<StringData> path,
                         clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : LeafMatchExpression(matchType,
                               path,
@@ -88,7 +88,7 @@ public:
                               std::move(annotation)) {}
 
     LeafMatchExpression(MatchType matchType,
-                        StringData path,
+                        boost::optional<StringData> path,
                         ElementPath::LeafArrayBehavior leafArrBehavior,
                         ElementPath::NonLeafArrayBehavior nonLeafArrBehavior,
                         clonable_ptr<ErrorAnnotation> annotation = nullptr)
@@ -150,7 +150,7 @@ public:
     }
 
     ComparisonMatchExpressionBase(MatchType type,
-                                  StringData path,
+                                  boost::optional<StringData> path,
                                   Value rhs,
                                   ElementPath::LeafArrayBehavior,
                                   ElementPath::NonLeafArrayBehavior,
@@ -161,7 +161,7 @@ public:
 
     virtual void debugString(StringBuilder& debug, int indentationLevel = 0) const;
 
-    BSONObj getSerializedRightHandSide() const final;
+    BSONObj getSerializedRightHandSide(SerializationOptions opts) const final;
 
     virtual bool equivalent(const MatchExpression* other) const;
 
@@ -187,7 +187,7 @@ public:
         return _collator;
     }
 
-    void setInputParamId(InputParamId paramId) {
+    void setInputParamId(boost::optional<InputParamId> paramId) {
         _inputParamId = paramId;
     }
 
@@ -212,7 +212,9 @@ protected:
 
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+        return [](std::unique_ptr<MatchExpression> expression) {
+            return expression;
+        };
     }
 
     boost::optional<InputParamId> _inputParamId;
@@ -247,7 +249,7 @@ public:
     }
 
     ComparisonMatchExpression(MatchType type,
-                              StringData path,
+                              boost::optional<StringData> path,
                               Value rhs,
                               clonable_ptr<ErrorAnnotation> annotation = nullptr,
                               const CollatorInterface* collator = nullptr);
@@ -261,12 +263,12 @@ class EqualityMatchExpression final : public ComparisonMatchExpression {
 public:
     static constexpr StringData kName = "$eq"_sd;
 
-    EqualityMatchExpression(StringData path,
+    EqualityMatchExpression(boost::optional<StringData> path,
                             Value rhs,
                             clonable_ptr<ErrorAnnotation> annotation = nullptr,
                             const CollatorInterface* collator = nullptr)
         : ComparisonMatchExpression(EQ, path, std::move(rhs), std::move(annotation), collator) {}
-    EqualityMatchExpression(StringData path,
+    EqualityMatchExpression(boost::optional<StringData> path,
                             const BSONElement& rhs,
                             clonable_ptr<ErrorAnnotation> annotation = nullptr,
                             const CollatorInterface* collator = nullptr)
@@ -276,7 +278,7 @@ public:
         return kName;
     }
 
-    std::unique_ptr<MatchExpression> shallowClone() const final {
+    std::unique_ptr<MatchExpression> clone() const final {
         std::unique_ptr<ComparisonMatchExpression> e =
             std::make_unique<EqualityMatchExpression>(path(), Value(getData()), _errorAnnotation);
         if (getTag()) {
@@ -302,11 +304,11 @@ class LTEMatchExpression final : public ComparisonMatchExpression {
 public:
     static constexpr StringData kName = "$lte"_sd;
 
-    LTEMatchExpression(StringData path,
+    LTEMatchExpression(boost::optional<StringData> path,
                        Value rhs,
                        clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : ComparisonMatchExpression(LTE, path, std::move(rhs), std::move(annotation)) {}
-    LTEMatchExpression(StringData path,
+    LTEMatchExpression(boost::optional<StringData> path,
                        const BSONElement& rhs,
                        clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : ComparisonMatchExpression(LTE, path, Value(rhs), std::move(annotation)) {}
@@ -315,7 +317,7 @@ public:
         return kName;
     }
 
-    std::unique_ptr<MatchExpression> shallowClone() const final {
+    std::unique_ptr<MatchExpression> clone() const final {
         std::unique_ptr<ComparisonMatchExpression> e =
             std::make_unique<LTEMatchExpression>(path(), _rhs, _errorAnnotation);
         if (getTag()) {
@@ -341,11 +343,11 @@ class LTMatchExpression final : public ComparisonMatchExpression {
 public:
     static constexpr StringData kName = "$lt"_sd;
 
-    LTMatchExpression(StringData path,
+    LTMatchExpression(boost::optional<StringData> path,
                       Value rhs,
                       clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : ComparisonMatchExpression(LT, path, std::move(rhs), std::move(annotation)) {}
-    LTMatchExpression(StringData path,
+    LTMatchExpression(boost::optional<StringData> path,
                       const BSONElement& rhs,
                       clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : ComparisonMatchExpression(LT, path, Value(rhs), std::move(annotation)) {}
@@ -354,7 +356,7 @@ public:
         return kName;
     }
 
-    std::unique_ptr<MatchExpression> shallowClone() const final {
+    std::unique_ptr<MatchExpression> clone() const final {
         std::unique_ptr<ComparisonMatchExpression> e =
             std::make_unique<LTMatchExpression>(path(), _rhs, _errorAnnotation);
         if (getTag()) {
@@ -384,12 +386,12 @@ class GTMatchExpression final : public ComparisonMatchExpression {
 public:
     static constexpr StringData kName = "$gt"_sd;
 
-    GTMatchExpression(StringData path,
+    GTMatchExpression(boost::optional<StringData> path,
                       Value rhs,
                       clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : ComparisonMatchExpression(GT, path, std::move(rhs), std::move(annotation)) {}
 
-    GTMatchExpression(StringData path,
+    GTMatchExpression(boost::optional<StringData> path,
                       const BSONElement& rhs,
                       clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : ComparisonMatchExpression(GT, path, Value(rhs), std::move(annotation)) {}
@@ -398,7 +400,7 @@ public:
         return kName;
     }
 
-    std::unique_ptr<MatchExpression> shallowClone() const final {
+    std::unique_ptr<MatchExpression> clone() const final {
         std::unique_ptr<ComparisonMatchExpression> e =
             std::make_unique<GTMatchExpression>(path(), _rhs, _errorAnnotation);
         if (getTag()) {
@@ -428,11 +430,11 @@ class GTEMatchExpression final : public ComparisonMatchExpression {
 public:
     static constexpr StringData kName = "$gte"_sd;
 
-    GTEMatchExpression(StringData path,
+    GTEMatchExpression(boost::optional<StringData> path,
                        Value rhs,
                        clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : ComparisonMatchExpression(GTE, path, std::move(rhs), std::move(annotation)) {}
-    GTEMatchExpression(StringData path,
+    GTEMatchExpression(boost::optional<StringData> path,
                        const BSONElement& rhs,
                        clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : ComparisonMatchExpression(GTE, path, Value(rhs), std::move(annotation)) {}
@@ -441,7 +443,7 @@ public:
         return kName;
     }
 
-    std::unique_ptr<MatchExpression> shallowClone() const final {
+    std::unique_ptr<MatchExpression> clone() const final {
         std::unique_ptr<ComparisonMatchExpression> e =
             std::make_unique<GTEMatchExpression>(path(), _rhs, _errorAnnotation);
         if (getTag()) {
@@ -470,22 +472,24 @@ public:
     static std::unique_ptr<pcre::Regex> makeRegex(const std::string& regex,
                                                   const std::string& flags);
 
-    RegexMatchExpression(StringData path, Value e, clonable_ptr<ErrorAnnotation> annotation)
+    RegexMatchExpression(boost::optional<StringData> path,
+                         Value e,
+                         clonable_ptr<ErrorAnnotation> annotation)
         : RegexMatchExpression(path, e.getRegex(), e.getRegexFlags(), std::move(annotation)) {}
 
-    RegexMatchExpression(StringData path,
+    RegexMatchExpression(boost::optional<StringData> path,
                          const BSONElement& e,
                          clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : RegexMatchExpression(path, Value(e), annotation) {}
 
-    RegexMatchExpression(StringData path,
+    RegexMatchExpression(boost::optional<StringData> path,
                          StringData regex,
                          StringData options,
                          clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
     ~RegexMatchExpression();
 
-    std::unique_ptr<MatchExpression> shallowClone() const final {
+    std::unique_ptr<MatchExpression> clone() const final {
         std::unique_ptr<RegexMatchExpression> e =
             std::make_unique<RegexMatchExpression>(path(), _regex, _flags, _errorAnnotation);
         if (getTag()) {
@@ -504,7 +508,7 @@ public:
 
     virtual void debugString(StringBuilder& debug, int indentationLevel) const;
 
-    BSONObj getSerializedRightHandSide() const final;
+    BSONObj getSerializedRightHandSide(SerializationOptions opts) const final;
 
     void serializeToBSONTypeRegex(BSONObjBuilder* out) const;
 
@@ -527,11 +531,11 @@ public:
         visitor->visit(this);
     }
 
-    void setSourceRegexInputParamId(InputParamId paramId) {
+    void setSourceRegexInputParamId(boost::optional<InputParamId> paramId) {
         _sourceRegexInputParamId = paramId;
     }
 
-    void setCompiledRegexInputParamId(InputParamId paramId) {
+    void setCompiledRegexInputParamId(boost::optional<InputParamId> paramId) {
         _compiledRegexInputParamId = paramId;
     }
 
@@ -545,7 +549,9 @@ public:
 
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+        return [](std::unique_ptr<MatchExpression> expression) {
+            return expression;
+        };
     }
 
     void _init();
@@ -560,12 +566,12 @@ private:
 
 class ModMatchExpression : public LeafMatchExpression {
 public:
-    ModMatchExpression(StringData path,
+    ModMatchExpression(boost::optional<StringData> path,
                        long long divisor,
                        long long remainder,
                        clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
-    std::unique_ptr<MatchExpression> shallowClone() const final {
+    std::unique_ptr<MatchExpression> clone() const final {
         std::unique_ptr<ModMatchExpression> m =
             std::make_unique<ModMatchExpression>(path(), _divisor, _remainder, _errorAnnotation);
         if (getTag()) {
@@ -584,7 +590,7 @@ public:
 
     virtual void debugString(StringBuilder& debug, int indentationLevel) const;
 
-    BSONObj getSerializedRightHandSide() const final;
+    BSONObj getSerializedRightHandSide(SerializationOptions opts) const final;
 
     virtual bool equivalent(const MatchExpression* other) const;
 
@@ -603,11 +609,11 @@ public:
         visitor->visit(this);
     }
 
-    void setDivisorInputParamId(InputParamId paramId) {
+    void setDivisorInputParamId(boost::optional<InputParamId> paramId) {
         _divisorInputParamId = paramId;
     }
 
-    void setRemainderInputParamId(InputParamId paramId) {
+    void setRemainderInputParamId(boost::optional<InputParamId> paramId) {
         _remainderInputParamId = paramId;
     }
 
@@ -621,7 +627,9 @@ public:
 
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+        return [](std::unique_ptr<MatchExpression> expression) {
+            return expression;
+        };
     }
 
     long long _divisor;
@@ -633,10 +641,10 @@ private:
 
 class ExistsMatchExpression : public LeafMatchExpression {
 public:
-    explicit ExistsMatchExpression(StringData path,
+    explicit ExistsMatchExpression(boost::optional<StringData> path,
                                    clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
-    virtual std::unique_ptr<MatchExpression> shallowClone() const {
+    virtual std::unique_ptr<MatchExpression> clone() const {
         std::unique_ptr<ExistsMatchExpression> e =
             std::make_unique<ExistsMatchExpression>(path(), _errorAnnotation);
         if (getTag()) {
@@ -649,7 +657,7 @@ public:
 
     virtual void debugString(StringBuilder& debug, int indentationLevel) const;
 
-    BSONObj getSerializedRightHandSide() const final;
+    BSONObj getSerializedRightHandSide(SerializationOptions opts) const final;
 
     virtual bool equivalent(const MatchExpression* other) const;
 
@@ -663,7 +671,9 @@ public:
 
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+        return [](std::unique_ptr<MatchExpression> expression) {
+            return expression;
+        };
     }
 };
 
@@ -672,15 +682,16 @@ private:
  */
 class InMatchExpression : public LeafMatchExpression {
 public:
-    explicit InMatchExpression(StringData path, clonable_ptr<ErrorAnnotation> annotation = nullptr);
+    explicit InMatchExpression(boost::optional<StringData> path,
+                               clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
-    std::unique_ptr<MatchExpression> shallowClone() const final;
+    std::unique_ptr<MatchExpression> clone() const final;
 
     bool matchesSingleElement(const BSONElement&, MatchDetails* details = nullptr) const final;
 
     virtual void debugString(StringBuilder& debug, int indentationLevel) const;
 
-    BSONObj getSerializedRightHandSide() const final;
+    BSONObj getSerializedRightHandSide(SerializationOptions opts) const final;
 
     virtual bool equivalent(const MatchExpression* other) const;
 
@@ -721,6 +732,18 @@ public:
         return _hasEmptyArray;
     }
 
+    bool hasEmptyObject() const {
+        return _hasEmptyObject;
+    }
+
+    bool hasNonEmptyArrayOrObject() const {
+        return _hasNonEmptyArrayOrObject;
+    }
+
+    bool hasNonScalarOrNonEmptyValues() const {
+        return hasNonEmptyArrayOrObject() || hasNull() || hasRegex();
+    }
+
     void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
         visitor->visit(this);
     }
@@ -729,7 +752,7 @@ public:
         visitor->visit(this);
     }
 
-    void setInputParamId(InputParamId paramId) {
+    void setInputParamId(boost::optional<InputParamId> paramId) {
         _inputParamId = paramId;
     }
 
@@ -745,6 +768,12 @@ private:
 
     // Whether or not '_equalities' has an empty array element in it.
     bool _hasEmptyArray = false;
+
+    // Whether or not '_equalities' has an empty object element in it.
+    bool _hasEmptyObject = false;
+
+    // Whether or not '_equalities' has a non-empty array or object element in it.
+    bool _hasNonEmptyArrayOrObject = false;
 
     // Collator used to construct '_eltCmp';
     const CollatorInterface* _collator = nullptr;
@@ -787,15 +816,15 @@ public:
      * bitmask.
      */
     explicit BitTestMatchExpression(MatchType type,
-                                    StringData path,
+                                    boost::optional<StringData> path,
                                     std::vector<uint32_t> bitPositions,
                                     clonable_ptr<ErrorAnnotation> annotation);
     explicit BitTestMatchExpression(MatchType type,
-                                    StringData path,
+                                    boost::optional<StringData> path,
                                     uint64_t bitMask,
                                     clonable_ptr<ErrorAnnotation> annotation);
     explicit BitTestMatchExpression(MatchType type,
-                                    StringData path,
+                                    boost::optional<StringData> path,
                                     const char* bitMaskBinary,
                                     uint32_t bitMaskLen,
                                     clonable_ptr<ErrorAnnotation> annotation);
@@ -805,7 +834,7 @@ public:
 
     virtual void debugString(StringBuilder& debug, int indentationLevel) const;
 
-    BSONObj getSerializedRightHandSide() const final;
+    BSONObj getSerializedRightHandSide(SerializationOptions opts) const final;
 
     virtual bool equivalent(const MatchExpression* other) const;
 
@@ -823,11 +852,11 @@ public:
 
     std::string name() const;
 
-    void setBitPositionsParamId(InputParamId paramId) {
+    void setBitPositionsParamId(boost::optional<InputParamId> paramId) {
         _bitPositionsParamId = paramId;
     }
 
-    void setBitMaskParamId(InputParamId paramId) {
+    void setBitMaskParamId(boost::optional<InputParamId> paramId) {
         _bitMaskParamId = paramId;
     }
 
@@ -841,7 +870,9 @@ public:
 
 private:
     ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+        return [](std::unique_ptr<MatchExpression> expression) {
+            return expression;
+        };
     }
 
     /**
@@ -880,24 +911,24 @@ private:
 
 class BitsAllSetMatchExpression : public BitTestMatchExpression {
 public:
-    BitsAllSetMatchExpression(StringData path,
+    BitsAllSetMatchExpression(boost::optional<StringData> path,
                               std::vector<uint32_t> bitPositions,
                               clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : BitTestMatchExpression(BITS_ALL_SET, path, bitPositions, std::move(annotation)) {}
 
-    BitsAllSetMatchExpression(StringData path,
+    BitsAllSetMatchExpression(boost::optional<StringData> path,
                               uint64_t bitMask,
                               clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : BitTestMatchExpression(BITS_ALL_SET, path, bitMask, std::move(annotation)) {}
 
-    BitsAllSetMatchExpression(StringData path,
+    BitsAllSetMatchExpression(boost::optional<StringData> path,
                               const char* bitMaskBinary,
                               uint32_t bitMaskLen,
                               clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : BitTestMatchExpression(
               BITS_ALL_SET, path, bitMaskBinary, bitMaskLen, std::move(annotation)) {}
 
-    std::unique_ptr<MatchExpression> shallowClone() const final {
+    std::unique_ptr<MatchExpression> clone() const final {
         std::unique_ptr<BitTestMatchExpression> bitTestMatchExpression =
             std::make_unique<BitsAllSetMatchExpression>(
                 path(), getBitPositions(), _errorAnnotation);
@@ -924,24 +955,24 @@ public:
 
 class BitsAllClearMatchExpression : public BitTestMatchExpression {
 public:
-    BitsAllClearMatchExpression(StringData path,
+    BitsAllClearMatchExpression(boost::optional<StringData> path,
                                 std::vector<uint32_t> bitPositions,
                                 clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : BitTestMatchExpression(BITS_ALL_CLEAR, path, bitPositions, std::move(annotation)) {}
 
-    BitsAllClearMatchExpression(StringData path,
+    BitsAllClearMatchExpression(boost::optional<StringData> path,
                                 uint64_t bitMask,
                                 clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : BitTestMatchExpression(BITS_ALL_CLEAR, path, bitMask, std::move(annotation)) {}
 
-    BitsAllClearMatchExpression(StringData path,
+    BitsAllClearMatchExpression(boost::optional<StringData> path,
                                 const char* bitMaskBinary,
                                 uint32_t bitMaskLen,
                                 clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : BitTestMatchExpression(
               BITS_ALL_CLEAR, path, bitMaskBinary, bitMaskLen, std::move(annotation)) {}
 
-    std::unique_ptr<MatchExpression> shallowClone() const final {
+    std::unique_ptr<MatchExpression> clone() const final {
         std::unique_ptr<BitTestMatchExpression> bitTestMatchExpression =
             std::make_unique<BitsAllClearMatchExpression>(
                 path(), getBitPositions(), _errorAnnotation);
@@ -968,24 +999,24 @@ public:
 
 class BitsAnySetMatchExpression : public BitTestMatchExpression {
 public:
-    BitsAnySetMatchExpression(StringData path,
+    BitsAnySetMatchExpression(boost::optional<StringData> path,
                               std::vector<uint32_t> bitPositions,
                               clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : BitTestMatchExpression(BITS_ANY_SET, path, bitPositions, std::move(annotation)) {}
 
-    BitsAnySetMatchExpression(StringData path,
+    BitsAnySetMatchExpression(boost::optional<StringData> path,
                               uint64_t bitMask,
                               clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : BitTestMatchExpression(BITS_ANY_SET, path, bitMask, std::move(annotation)) {}
 
-    BitsAnySetMatchExpression(StringData path,
+    BitsAnySetMatchExpression(boost::optional<StringData> path,
                               const char* bitMaskBinary,
                               uint32_t bitMaskLen,
                               clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : BitTestMatchExpression(
               BITS_ANY_SET, path, bitMaskBinary, bitMaskLen, std::move(annotation)) {}
 
-    std::unique_ptr<MatchExpression> shallowClone() const final {
+    std::unique_ptr<MatchExpression> clone() const final {
         std::unique_ptr<BitTestMatchExpression> bitTestMatchExpression =
             std::make_unique<BitsAnySetMatchExpression>(
                 path(), getBitPositions(), _errorAnnotation);
@@ -1012,24 +1043,24 @@ public:
 
 class BitsAnyClearMatchExpression : public BitTestMatchExpression {
 public:
-    BitsAnyClearMatchExpression(StringData path,
+    BitsAnyClearMatchExpression(boost::optional<StringData> path,
                                 std::vector<uint32_t> bitPositions,
                                 clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : BitTestMatchExpression(BITS_ANY_CLEAR, path, bitPositions, std::move(annotation)) {}
 
-    BitsAnyClearMatchExpression(StringData path,
+    BitsAnyClearMatchExpression(boost::optional<StringData> path,
                                 uint64_t bitMask,
                                 clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : BitTestMatchExpression(BITS_ANY_CLEAR, path, bitMask, std::move(annotation)) {}
 
-    BitsAnyClearMatchExpression(StringData path,
+    BitsAnyClearMatchExpression(boost::optional<StringData> path,
                                 const char* bitMaskBinary,
                                 uint32_t bitMaskLen,
                                 clonable_ptr<ErrorAnnotation> annotation = nullptr)
         : BitTestMatchExpression(
               BITS_ANY_CLEAR, path, bitMaskBinary, bitMaskLen, std::move(annotation)) {}
 
-    std::unique_ptr<MatchExpression> shallowClone() const final {
+    std::unique_ptr<MatchExpression> clone() const final {
         std::unique_ptr<BitTestMatchExpression> bitTestMatchExpression =
             std::make_unique<BitsAnyClearMatchExpression>(
                 path(), getBitPositions(), _errorAnnotation);
@@ -1053,69 +1084,4 @@ public:
         visitor->visit(this);
     }
 };
-
-/**
- * MatchExpression that represents a filter for a range of values. Similar semantics to the BETWEEN
- * SQL operator. Used for encoding a range query against an encrypted field.
- */
-class EncryptedBetweenMatchExpression final : public LeafMatchExpression {
-public:
-    static constexpr StringData kName = "$encryptedBetween"_sd;
-
-    EncryptedBetweenMatchExpression(StringData path,
-                                    BSONElement rhs,
-                                    clonable_ptr<ErrorAnnotation> annotation = nullptr)
-        : LeafMatchExpression(ENCRYPTED_BETWEEN, path, annotation) {
-        _backingBSON = BSON("" << rhs);
-    }
-
-
-    BSONElement rhs() const {
-        return _backingBSON.firstElement();
-    }
-
-    bool matchesSingleElement(const BSONElement& e, MatchDetails* details = nullptr) const final {
-        // TODO: SERVER-67627 Implement runtime tag generation for $encryptedBetween.
-        uasserted(6762800, "Not implemented");
-    }
-
-    BSONObj getSerializedRightHandSide() const final {
-        return BSON(kName << _backingBSON.firstElement());
-    }
-
-    std::unique_ptr<MatchExpression> shallowClone() const final {
-        std::unique_ptr<EncryptedBetweenMatchExpression> e =
-            std::make_unique<EncryptedBetweenMatchExpression>(path(), rhs(), _errorAnnotation);
-        if (getTag()) {
-            e->setTag(getTag()->clone());
-        }
-        return e;
-    }
-
-    virtual bool equivalent(const MatchExpression* other) const {
-        if (matchType() != other->matchType()) {
-            return false;
-        }
-        auto otherCast = static_cast<const EncryptedBetweenMatchExpression*>(other);
-        return path() == otherCast->path() && rhs().binaryEqual(otherCast->rhs());
-    };
-
-    void debugString(StringBuilder& debug, int indentationLevel) const;
-
-    void acceptVisitor(MatchExpressionMutableVisitor* visitor) final {
-        visitor->visit(this);
-    }
-
-    void acceptVisitor(MatchExpressionConstVisitor* visitor) const final {
-        visitor->visit(this);
-    }
-
-private:
-    BSONObj _backingBSON;
-
-    ExpressionOptimizerFunc getOptimizer() const final {
-        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
-    }
-};
-
 }  // namespace mongo

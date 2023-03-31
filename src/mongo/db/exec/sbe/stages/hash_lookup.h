@@ -102,6 +102,9 @@ public:
     std::vector<DebugPrinter::Block> debugPrint() const final;
     size_t estimateCompileTimeSize() const final;
 
+protected:
+    void saveChildrenState(bool relinquishCursor, bool disableSlotAccess) final;
+
 private:
     using HashTableType = std::unordered_map<value::MaterializedRow,  // NOLINT
                                              std::vector<size_t>,
@@ -181,7 +184,7 @@ private:
     const value::SlotVector _innerProjects;
     const value::SlotMap<std::unique_ptr<EExpression>> _innerAggs;
     const boost::optional<value::SlotId> _collatorSlot;
-    CollatorInterface* _collator;
+    CollatorInterface* _collator{nullptr};
 
     value::SlotAccessorMap _outAccessorMap;
     value::SlotAccessorMap _outInnerProjectAccessorMap;

@@ -204,10 +204,10 @@ class CreateFromQueryFixture : public mongo::unittest::Test {
 public:
     CreateFromQueryFixture()
         : _opCtx(_serviceContext.makeOperationContext()),
-          _driverOps(new UpdateDriver(
-              new ExpressionContext(_opCtx.get(), nullptr, NamespaceString("foo")))),
-          _driverRepl(new UpdateDriver(
-              new ExpressionContext(_opCtx.get(), nullptr, NamespaceString("foo")))) {
+          _driverOps(new UpdateDriver(new ExpressionContext(
+              _opCtx.get(), nullptr, NamespaceString::createNamespaceString_forTest("foo")))),
+          _driverRepl(new UpdateDriver(new ExpressionContext(
+              _opCtx.get(), nullptr, NamespaceString::createNamespaceString_forTest("foo")))) {
         _driverOps->parse(makeUpdateMod(fromjson("{$set:{'_':1}}")), _arrayFilters);
         _driverRepl->parse(makeUpdateMod(fromjson("{}")), _arrayFilters);
     }
@@ -575,7 +575,7 @@ public:
             auto parsedFilter = assertGet(MatchExpressionParser::parse(filter, expCtx));
             auto expr = assertGet(ExpressionWithPlaceholder::make(std::move(parsedFilter)));
             ASSERT(expr->getPlaceholder());
-            arrayFilters[expr->getPlaceholder().get()] = std::move(expr);
+            arrayFilters[expr->getPlaceholder().value()] = std::move(expr);
         }
 
         _driver->setFromOplogApplication(fromOplog);

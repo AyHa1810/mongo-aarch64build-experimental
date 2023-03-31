@@ -34,6 +34,31 @@
 
 namespace mongo {
 
+/**
+ * A ColumnStore index implementation for WiredTiger.
+ *
+ * Two documents in a RecordStore, for example:
+ *
+ * RID 1 : { _id: ObjectID(...), version: 2, author: { first: "Bob", last: "Adly" } }
+ * RID 2 : { _id: ObjectID(...), version: 3, author: { first: "Bob", last: "Adly" }, viewed: true }
+ *
+ * would look something like this in a ColumnStore:
+ *
+ * { _id\01, { vals: [ ObjectId("...") ] } }
+ * { _id\02, { vals: [ ObjectId("...") ] } }
+ * { author\01, { flags: [HAS_SUBPATHS] } }
+ * { author\02, { flags: [HAS_SUBPATHS] } }
+ * { author.first\01, { vals: [ "Bob" ] } }
+ * { author.first\02, { vals: [ "Bob" ] } }
+ * { author.last\01, { vals: [ "Adly" ] } }
+ * { author.last\02, { vals: [ "Adly" ] } }
+ * { version\01, { vals: [ 2 ] } }
+ * { version\02, { vals: [ 3 ] } }
+ * { viewed\02, { vals: [ true ] } }
+ * { \xFF1, { flags: [HAS_SUBPATHS] } }
+ * { \xFF2, { flags: [HAS_SUBPATHS] } }
+ *
+ */
 class WiredTigerColumnStore final : public ColumnStore {
 public:
     class WriteCursor;
@@ -42,7 +67,8 @@ public:
 
     static StatusWith<std::string> generateCreateString(const std::string& engineName,
                                                         const NamespaceString& collectionNamespace,
-                                                        const IndexDescriptor& desc);
+                                                        const IndexDescriptor& desc,
+                                                        bool isLogged);
 
     static Status create(OperationContext* opCtx,
                          const std::string& uri,
@@ -52,16 +78,16 @@ public:
                           const std::string& uri,
                           StringData ident,
                           const IndexDescriptor* desc,
-                          bool readOnly = false);
+                          bool isLogged);
     ~WiredTigerColumnStore() = default;
 
     //
     // CRUD
     //
     std::unique_ptr<ColumnStore::WriteCursor> newWriteCursor(OperationContext*) override;
-    void insert(OperationContext*, PathView, const RecordId&, CellView) override;
-    void remove(OperationContext*, PathView, const RecordId&) override;
-    void update(OperationContext*, PathView, const RecordId&, CellView) override;
+    void insert(OperationContext*, PathView, RowId, CellView) override;
+    void remove(OperationContext*, PathView, RowId) override;
+    void update(OperationContext*, PathView, RowId, CellView) override;
     std::unique_ptr<ColumnStore::Cursor> newCursor(OperationContext*) const override;
 
     std::unique_ptr<ColumnStore::BulkBuilder> makeBulkBuilder(OperationContext* opCtx) override;
@@ -70,9 +96,7 @@ public:
     // Whole ColumnStore ops
     //
     Status compact(OperationContext* opCtx) override;
-    void fullValidate(OperationContext* opCtx,
-                      int64_t* numKeysOut,
-                      IndexValidateResults* fullResults) const override;
+    IndexValidateResults validate(OperationContext* opCtx, bool full) const override;
 
     bool appendCustomStats(OperationContext* opCtx,
                            BSONObjBuilder* output,
@@ -82,9 +106,14 @@ public:
     long long getFreeStorageBytes(OperationContext* opCtx) const override;
 
     bool isEmpty(OperationContext* opCtx) override;
+    int64_t numEntries(OperationContext* opCtx) const override;
 
-    static std::string makeKey_ForTest(PathView path, const RecordId& id) {
+    static std::string makeKey_ForTest(PathView path, RowId id) {
         return makeKey(path, id);
+    }
+
+    const std::string& indexName() const {
+        return _indexName;
     }
 
 private:
@@ -92,16 +121,22 @@ private:
         return _uri;
     }
 
-    static std::string& makeKey(std::string& buffer, PathView, const RecordId&);
-    static std::string makeKey(PathView path, const RecordId& rid) {
+    static std::string makeKey(PathView path, RowId rid) {
         std::string out;
-        makeKey(out, path, rid);
+        makeKeyInBuffer(out, path, rid);
         return out;
     }
+
+    /**
+     * Sets 'buffer' to the column key (path/rid). Then returns a reference to the newly set
+     * 'buffer'.
+     */
+    static std::string& makeKeyInBuffer(std::string& buffer, PathView, RowId);
 
     std::string _uri;
     uint64_t _tableId;
     const IndexDescriptor* _desc;
     const std::string _indexName;
+    bool _isLogged;
 };
 }  // namespace mongo

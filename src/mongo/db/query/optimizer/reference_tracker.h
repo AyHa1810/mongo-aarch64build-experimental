@@ -29,9 +29,12 @@
 
 #pragma once
 
+#include "mongo/db/query/optimizer/cascades/memo_group_binder_interface.h"
 #include "mongo/db/query/optimizer/node.h"
 
+
 namespace mongo::optimizer {
+
 /**
  * Every Variable ABT conceptually references to a point in the ABT tree. The pointed tree is the
  * definition of the variable.
@@ -49,28 +52,15 @@ struct Definition {
     ABT::reference_type definition;
 };
 
-namespace cascades {
-class Memo;
-}
-
 struct CollectedInfo;
-using DefinitionsMap = opt::unordered_map<ProjectionName, Definition>;
-
-struct VariableCollectorResult {
-    // The Variables referenced by the subtree.
-    std::vector<std::reference_wrapper<const Variable>> _variables;
-    // The names of locally-defined Variables. These aren't propagated up the tree during normal
-    // variable resolution. Tracking these separately allows us to easily check, for example, which
-    // variables are referenced in but not defined by the subtree (i.e. variables which should be
-    // defined elsewhere in the ABT).
-    opt::unordered_set<std::string> _definedVars;
-};
+using DefinitionsMap = ProjectionNameMap<Definition>;
 
 /**
  * Helps enforce scoping and validity rules for definitions and Variable references.
  */
 class VariableEnvironment {
-    VariableEnvironment(std::unique_ptr<CollectedInfo> info, const cascades::Memo* memo);
+    VariableEnvironment(std::unique_ptr<CollectedInfo> info,
+                        const cascades::MemoGroupBinderInterface* memoInterface);
 
 public:
     /**
@@ -78,14 +68,19 @@ public:
      * does not change. More specifically, if a variable defining node is removed from the tree then
      * the environment becomes stale and has to be rebuilt.
      */
-    static VariableEnvironment build(const ABT& root, const cascades::Memo* memo = nullptr);
+    static VariableEnvironment build(
+        const ABT& root, const cascades::MemoGroupBinderInterface* memoInterface = nullptr);
     void rebuild(const ABT& root);
 
     /**
-     * Get information about Variables in the subtree rooted at 'n', including Variables referenced
-     * by the subtree and locally-defined Variables.
+     * Calls 'variableCallback' on each Variable and `variableDefinitionCallback` on each
+     * variable name defined via a Let or Lambda in the ABT.
      */
-    static VariableCollectorResult getVariables(const ABT& n);
+    static void walkVariables(
+        const ABT& n,
+        const std::function<void(const Variable&)>& variableCallback,
+        const std::function<void(const ProjectionName&)>& variableDefinitionCallback =
+            [](const ProjectionName&) {});
 
     ~VariableEnvironment();
 
@@ -118,10 +113,12 @@ public:
 
     bool hasFreeVariables() const;
 
+    ProjectionNameSet freeVariableNames() const;
+
     /**
      * Returns the number of places in the ABT where there is a free Variable with name 'variable'.
      */
-    size_t freeOccurences(const std::string& variable) const;
+    size_t freeOccurences(const ProjectionName& variable) const;
 
     /**
      * Returns whether 'var' is guaranteed to be the last access to the projection to which it
@@ -132,8 +129,9 @@ public:
 private:
     std::unique_ptr<CollectedInfo> _info;
 
-    // '_memo' is required to track references in an ABT containing MemoLogicalDelegatorNodes.
-    const cascades::Memo* _memo{nullptr};
+    // '_memoInterface' is required to track references in an ABT containing
+    // MemoLogicalDelegatorNodes.
+    const cascades::MemoGroupBinderInterface* _memoInterface{nullptr};
 };
 
 }  // namespace mongo::optimizer

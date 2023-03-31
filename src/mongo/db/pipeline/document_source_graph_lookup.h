@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/db/exec/document_value/value_comparator.h"
+#include "mongo/db/matcher/match_expression_dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_unwind.h"
 #include "mongo/db/pipeline/expression.h"
@@ -78,6 +79,13 @@ public:
         return _startWith.get();
     }
 
+    /*
+     * Returns a ref to '_startWith' that can be swapped out with a new expression.
+     */
+    boost::intrusive_ptr<Expression>& getMutableStartWithField() {
+        return _startWith;
+    }
+
     void setStartWithField(boost::intrusive_ptr<Expression> startWith) {
         _startWith.swap(startWith);
     }
@@ -90,9 +98,8 @@ public:
         _additionalFilter = additionalFilter ? additionalFilter->getOwned() : additionalFilter;
     };
 
-    void serializeToArray(
-        std::vector<Value>& array,
-        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    void serializeToArray(std::vector<Value>& array,
+                          SerializationOptions opts = SerializationOptions()) const final override;
 
     /**
      * Returns the 'as' path, and possibly the fields modified by an absorbed $unwind.
@@ -104,15 +111,26 @@ public:
     boost::optional<DistributedPlanLogic> distributedPlanLogic() final;
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final {
-        _startWith->addDependencies(deps);
+        expression::addDependencies(_startWith.get(), deps);
         return DepsTracker::State::SEE_NEXT;
     };
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {
+        expression::addVariableRefs(_startWith.get(), refs);
+        if (_additionalFilter) {
+            match_expression::addVariableRefs(
+                uassertStatusOK(MatchExpressionParser::parse(*_additionalFilter, _fromExpCtx))
+                    .get(),
+                refs);
+        }
+    }
     void addInvolvedCollections(stdx::unordered_set<NamespaceString>* collectionNames) const final;
 
     void detachFromOperationContext() final;
 
     void reattachToOperationContext(OperationContext* opCtx) final;
+
+    bool validateOperationContext(const OperationContext* opCtx) const final;
 
     static boost::intrusive_ptr<DocumentSourceGraphLookUp> create(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -155,9 +173,9 @@ private:
         boost::optional<long long> maxDepth,
         boost::optional<boost::intrusive_ptr<DocumentSourceUnwind>> unwindSrc);
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final {
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override {
         // Should not be called; use serializeToArray instead.
-        MONGO_UNREACHABLE;
+        MONGO_UNREACHABLE_TASSERT(7484306);
     }
 
     /**

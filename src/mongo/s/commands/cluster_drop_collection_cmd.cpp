@@ -80,11 +80,11 @@ public:
             auto nss = request().getNamespace();
             uassert(ErrorCodes::IllegalOperation,
                     "Cannot drop collection in 'config' database in sharded cluster",
-                    nss.db() != NamespaceString::kConfigDb);
+                    nss.dbName() != DatabaseName::kConfig);
 
             uassert(ErrorCodes::IllegalOperation,
                     "Cannot drop collection in 'admin' database in sharded cluster",
-                    nss.db() != NamespaceString::kAdminDb);
+                    nss.dbName() != DatabaseName::kAdmin);
 
             try {
                 // Invalidate the routing table cache entry for this collection so that we reload it
@@ -92,6 +92,7 @@ public:
                 // fails due to e.g. a NetworkError.
                 ON_BLOCK_EXIT([opCtx, nss] {
                     Grid::get(opCtx)->catalogCache()->invalidateCollectionEntry_LINEARIZABLE(nss);
+                    Grid::get(opCtx)->catalogCache()->invalidateIndexEntry_LINEARIZABLE(nss);
                 });
 
                 const auto dbInfo =
@@ -117,9 +118,9 @@ public:
                 auto resultObj = result.obj();
                 uassertStatusOK(getStatusFromCommandResult(resultObj));
                 // Ensure our reply conforms to the IDL-defined reply structure.
-                return DropReply::parse({"drop"}, resultObj);
+                return DropReply::parse(IDLParserContext{"drop"}, resultObj);
             } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
-                uassert(CollectionUUIDMismatchInfo(request().getDbName().toString(),
+                uassert(CollectionUUIDMismatchInfo(request().getDbName(),
                                                    *request().getCollectionUUID(),
                                                    request().getNamespace().coll().toString(),
                                                    boost::none),

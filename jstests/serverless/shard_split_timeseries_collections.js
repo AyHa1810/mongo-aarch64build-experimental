@@ -8,18 +8,13 @@
  *   requires_majority_read_concern,
  *   requires_persistence,
  *   serverless,
- *   requires_fcv_52,
- *   featureFlagShardSplit
+ *   requires_fcv_63
  * ]
  */
 
-(function() {
-"use strict";
+import {ShardSplitTest} from "jstests/serverless/libs/shard_split_test.js";
 
-load("jstests/libs/uuid_util.js");
-load("jstests/serverless/libs/basic_serverless_test.js");
-
-const test = new BasicServerlessTest({
+const test = new ShardSplitTest({
     recipientSetName: "recipientSet",
     recipientTagName: "recipientTag",
     quickGarbageCollection: true
@@ -28,8 +23,8 @@ test.addRecipientNodes();
 
 const donorPrimary = test.donor.getPrimary();
 
-const tenantId = "testTenantId";
-const tsDB = test.tenantDB(tenantId, "tsDB");
+const tenantId = ObjectId();
+const tsDB = test.tenantDB(tenantId.str, "tsDB");
 const donorTSDB = donorPrimary.getDB(tsDB);
 assert.commandWorked(donorTSDB.createCollection("tsColl", {timeseries: {timeField: "time"}}));
 assert.commandWorked(donorTSDB.runCommand(
@@ -41,4 +36,3 @@ assert.commandWorked(operation.commit());
 operation.forget();
 
 test.stop();
-})();

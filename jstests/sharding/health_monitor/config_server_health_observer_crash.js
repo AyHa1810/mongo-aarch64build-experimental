@@ -18,6 +18,7 @@ TestData.failIfUnterminatedProcesses = false;
 // the mongos in this test.
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
+TestData.skipCheckShardFilteringMetadata = true;
 
 const mongosParams = {
     setParameter: {
@@ -43,6 +44,7 @@ var st = new ShardingTest({
     shards: 1,
     mongos: [mongosParams, {}],
     other: {useBridge: true},
+    config: 3,
 });
 
 assert.commandWorked(st.s0.adminCommand(

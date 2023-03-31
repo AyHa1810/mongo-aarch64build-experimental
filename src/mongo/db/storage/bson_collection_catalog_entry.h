@@ -120,6 +120,7 @@ public:
         mutable Mutex multikeyMutex;
         mutable bool multikey = false;
         mutable MultikeyPaths multikeyPaths;
+        mutable AtomicWord<int32_t> concurrentWriters;
     };
 
     struct MetaData {
@@ -149,7 +150,7 @@ public:
          */
         bool eraseIndex(StringData name);
 
-        std::string ns;
+        NamespaceString nss;
         CollectionOptions options;
         // May include empty instances which represent indexes already dropped.
         std::vector<IndexMetaData> indexes;

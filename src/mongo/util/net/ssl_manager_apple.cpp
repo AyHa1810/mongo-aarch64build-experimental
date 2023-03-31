@@ -31,9 +31,9 @@
 #include "mongo/platform/basic.h"
 
 #include <boost/optional/optional.hpp>
+#include <cstdlib>
 #include <fstream>
 #include <memory>
-#include <stdlib.h>
 
 #include "mongo/base/checked_cast.h"
 #include "mongo/base/init.h"
@@ -41,6 +41,7 @@
 #include "mongo/base/status_with.h"
 #include "mongo/crypto/sha1_block.h"
 #include "mongo/crypto/sha256_block.h"
+#include "mongo/db/connection_health_metrics_parameter_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/random.h"
 #include "mongo/transport/ssl_connection_context.h"
@@ -1672,11 +1673,15 @@ Future<SSLPeerInfo> SSLManagerApple::parseAndValidatePeerCertificate(
         return swPeerSubjectName.getStatus();
     }
     const auto peerSubjectName = std::move(swPeerSubjectName.getValue());
-    LOGV2_DEBUG(23207,
-                2,
-                "Accepted TLS connection from peer: {peerSubjectName}",
-                "Accepted TLS connection from peer",
-                "peerSubjectName"_attr = peerSubjectName);
+    // The cipher will be presented as a number.
+    ::SSLCipherSuite cipher;
+    uassertOSStatusOK(::SSLGetNegotiatedCipher(ssl, &cipher));
+    if (!serverGlobalParams.quiet.load() && gEnableDetailedConnectionHealthMetricLogLines) {
+        LOGV2_INFO(6723803,
+                   "Accepted TLS connection from peer",
+                   "peerSubjectName"_attr = peerSubjectName,
+                   "cipher"_attr = cipher);
+    }
 
     // Server side.
     if (remoteHost.empty()) {
@@ -1889,8 +1894,6 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManager, ("EndStartupOptionHandling"))
     kMongoDBRolesOID = ::CFStringCreateWithCString(
         nullptr, mongodbRolesOID.identifier.c_str(), ::kCFStringEncodingUTF8);
 
-    // TODO SERVER-67419 This retry logic is a workaround; reconsider this approach after
-    // investigation.
     constexpr int kMaxRetries = 10;
     if (!isSSLServer || (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled)) {
         for (int i = 0; i < kMaxRetries; i++) {

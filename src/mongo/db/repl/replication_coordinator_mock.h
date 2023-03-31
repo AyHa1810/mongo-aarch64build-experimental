@@ -261,7 +261,9 @@ public:
 
     virtual Status doOptimizedReconfig(OperationContext* opCtx, GetNewConfigFn getNewConfig);
 
-    Status awaitConfigCommitment(OperationContext* opCtx, bool waitForOplogCommitment);
+    Status awaitConfigCommitment(OperationContext* opCtx,
+                                 bool waitForOplogCommitment,
+                                 long long term);
 
     virtual Status processReplSetInitiate(OperationContext* opCtx,
                                           const BSONObj& configObj,
@@ -391,8 +393,8 @@ public:
         const SplitHorizon::Parameters& horizonParams,
         boost::optional<TopologyVersion> clientTopologyVersion) override;
 
-    virtual StatusWith<OpTime> getLatestWriteOpTime(OperationContext* opCtx) const
-        noexcept override;
+    virtual StatusWith<OpTime> getLatestWriteOpTime(
+        OperationContext* opCtx) const noexcept override;
 
     virtual HostAndPort getCurrentPrimaryHostAndPort() const override;
 
@@ -420,6 +422,21 @@ public:
     };
 
     virtual WriteConcernTagChanges* getWriteConcernTagChanges() override;
+
+    virtual SplitPrepareSessionManager* getSplitPrepareSessionManager() override;
+
+    /**
+     * If this is true, the mock will update the "committed snapshot" everytime the "last applied"
+     * is updated. That behavior can be disabled for tests that need more control over what's
+     * majority committed.
+     */
+    void setUpdateCommittedSnapshot(bool val) {
+        _updateCommittedSnapshot = val;
+    }
+
+    bool isRetryableWrite(OperationContext* opCtx) const override {
+        return false;
+    }
 
 private:
     void _setMyLastAppliedOpTimeAndWallTime(WithLock lk,
@@ -450,6 +467,9 @@ private:
     bool _resetLastOpTimesCalled = false;
     bool _alwaysAllowWrites = false;
     bool _canAcceptNonLocalWrites = false;
+
+    SplitPrepareSessionManager _splitSessionManager;
+    bool _updateCommittedSnapshot = true;
 };
 
 }  // namespace repl

@@ -33,7 +33,6 @@
 #include <utility>
 
 #include "mongo/bson/util/builder.h"
-#include "mongo/client/client_deprecated.h"
 #include "mongo/client/connpool.h"
 #include "mongo/client/dbclient_cursor.h"
 #include "mongo/client/global_conn_pool.h"
@@ -478,25 +477,25 @@ void DBClientReplicaSet::logout(const string& dbname, BSONObj& info) {
 
 // ------------- simple functions -----------------
 
-void DBClientReplicaSet::insert(const string& ns,
+void DBClientReplicaSet::insert(const NamespaceString& nss,
                                 BSONObj obj,
                                 bool ordered,
                                 boost::optional<BSONObj> writeConcernObj) {
-    checkPrimary()->insert(ns, obj, ordered, writeConcernObj);
+    checkPrimary()->insert(nss, obj, ordered, writeConcernObj);
 }
 
-void DBClientReplicaSet::insert(const string& ns,
+void DBClientReplicaSet::insert(const NamespaceString& nss,
                                 const vector<BSONObj>& v,
                                 bool ordered,
                                 boost::optional<BSONObj> writeConcernObj) {
-    checkPrimary()->insert(ns, v, ordered, writeConcernObj);
+    checkPrimary()->insert(nss, v, ordered, writeConcernObj);
 }
 
-void DBClientReplicaSet::remove(const string& ns,
+void DBClientReplicaSet::remove(const NamespaceString& nss,
                                 const BSONObj& filter,
                                 bool removeMany,
                                 boost::optional<BSONObj> writeConcernObj) {
-    checkPrimary()->remove(ns, filter, removeMany, writeConcernObj);
+    checkPrimary()->remove(nss, filter, removeMany, writeConcernObj);
 }
 
 std::unique_ptr<DBClientCursor> DBClientReplicaSet::find(FindCommandRequest findRequest,

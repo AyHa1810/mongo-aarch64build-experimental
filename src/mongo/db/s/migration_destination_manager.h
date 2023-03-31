@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
 
 #include "mongo/base/string_data.h"
@@ -39,12 +40,15 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/replica_set_aware_service.h"
 #include "mongo/db/s/active_migrations_registry.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
+#include "mongo/db/s/migration_batch_fetcher.h"
 #include "mongo/db/s/migration_recipient_recovery_document_gen.h"
 #include "mongo/db/s/migration_session_id.h"
 #include "mongo/db/s/session_catalog_migration_destination.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/platform/mutex.h"
+#include "mongo/s/catalog_cache.h"
 #include "mongo/s/chunk_manager.h"
-#include "mongo/s/shard_id.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/cancellation.h"
@@ -116,7 +120,8 @@ public:
      * Returns a report on the active migration, if the migration is active. Otherwise return an
      * empty BSONObj.
      */
-    BSONObj getMigrationStatusReport();
+    BSONObj getMigrationStatusReport(
+        const CollectionShardingRuntime::ScopedSharedCollectionShardingRuntime& scopedCsrLock);
 
     /**
      * Returns OK if migration started successfully.
@@ -175,8 +180,13 @@ public:
     static IndexesAndIdIndex getCollectionIndexes(OperationContext* opCtx,
                                                   const NamespaceStringOrUUID& nssOrUUID,
                                                   const ShardId& fromShardId,
-                                                  const boost::optional<ChunkManager>& cm,
+                                                  const boost::optional<CollectionRoutingInfo>& cri,
                                                   boost::optional<Timestamp> afterClusterTime);
+
+
+    bool isParallelFetchingSupported() {
+        return _parallelFetchersSupported;
+    }
 
     /**
      * Gets the collection uuid and options from fromShardId. If given a chunk manager, will fetch
@@ -192,7 +202,6 @@ public:
         const ShardId& fromShardId,
         const boost::optional<ChunkManager>& cm,
         boost::optional<Timestamp> afterClusterTime);
-
 
     /**
      * Creates the collection on the shard and clones the indexes and options.
@@ -263,14 +272,22 @@ private:
      * ReplicaSetAwareService entry points.
      */
     void onStartup(OperationContext* opCtx) final {}
+    void onSetCurrentConfig(OperationContext* opCtx) final {}
     void onInitialDataAvailable(OperationContext* opCtx, bool isMajorityDataAvailable) final {}
     void onShutdown() final {}
     void onStepUpBegin(OperationContext* opCtx, long long term) final;
     void onStepUpComplete(OperationContext* opCtx, long long term) final {}
     void onStepDown() final;
     void onBecomeArbiter() final {}
+    inline std::string getServiceName() const override final {
+        return "MigrationDestinationManager";
+    }
 
-    // Mutex to guard all fields
+    // The number of session oplog entries recieved from the source shard. Not all oplog
+    // entries recieved from the source shard may be committed
+    AtomicWord<long long> _sessionOplogEntriesMigrated{0};
+
+    // Mutex to guard all fields below
     mutable Mutex _mutex = MONGO_MAKE_LATCH("MigrationDestinationManager::_mutex");
 
     // Migration session ID uniquely identifies the migration and indicates whether the prepare
@@ -283,8 +300,22 @@ private:
 
     stdx::thread _migrateThreadHandle;
 
+    long long _getNumCloned() {
+        return _migrationCloningProgress ? _migrationCloningProgress->getNumCloned() : 0;
+    }
+
+    long long _getNumBytesCloned() {
+        return _migrationCloningProgress ? _migrationCloningProgress->getNumBytes() : 0;
+    }
+
     boost::optional<UUID> _migrationId;
     boost::optional<UUID> _collectionUuid;
+
+    // State that is shared among all inserter threads.
+    std::shared_ptr<MigrationCloningProgressSharedState> _migrationCloningProgress;
+
+    bool _parallelFetchersSupported;
+
     LogicalSessionId _lsid;
     TxnNumber _txnNumber{kUninitializedTxnNumber};
     NamespaceString _nss;
@@ -304,8 +335,6 @@ private:
     // failure we can perform the appropriate cleanup.
     bool _chunkMarkedPending{false};
 
-    long long _numCloned{0};
-    long long _clonedBytes{0};
     long long _numCatchup{0};
     long long _numSteady{0};
 

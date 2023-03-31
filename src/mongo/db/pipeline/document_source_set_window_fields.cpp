@@ -139,8 +139,8 @@ WindowFunctionStatement WindowFunctionStatement::parse(BSONElement elem,
         window_function::Expression::parse(elem.embeddedObject(), sortBy, expCtx));
 }
 void WindowFunctionStatement::serialize(MutableDocument& outputFields,
-                                        boost::optional<ExplainOptions::Verbosity> explain) const {
-    outputFields[fieldName] = expr->serialize(explain);
+                                        SerializationOptions opts) const {
+    outputFields[opts.serializeFieldName(fieldName)] = expr->serialize(opts);
 }
 
 list<intrusive_ptr<DocumentSource>> document_source_set_window_fields::create(
@@ -239,7 +239,7 @@ list<intrusive_ptr<DocumentSource>> document_source_set_window_fields::create(
         combined.emplace_back(std::move(part));
     }
     if (sortBy) {
-        for (auto part : *sortBy) {
+        for (const auto& part : *sortBy) {
             combined.push_back(part);
         }
     }
@@ -283,32 +283,31 @@ intrusive_ptr<DocumentSource> DocumentSourceInternalSetWindowFields::optimize() 
     return this;
 }
 
-Value DocumentSourceInternalSetWindowFields::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceInternalSetWindowFields::serialize(SerializationOptions opts) const {
     MutableDocument spec;
     spec[SetWindowFieldsSpec::kPartitionByFieldName] =
-        _partitionBy ? (*_partitionBy)->serialize(false) : Value();
+        _partitionBy ? (*_partitionBy)->serialize(opts) : Value();
 
-    auto sortKeySerialization = explain
+    auto sortKeySerialization = opts.verbosity
         ? SortPattern::SortKeySerialization::kForExplain
         : SortPattern::SortKeySerialization::kForPipelineSerialization;
     spec[SetWindowFieldsSpec::kSortByFieldName] =
-        _sortBy ? Value(_sortBy->serialize(sortKeySerialization)) : Value();
+        _sortBy ? Value(_sortBy->serialize(sortKeySerialization, opts)) : Value();
 
     MutableDocument output;
     for (auto&& stmt : _outputFields) {
-        stmt.serialize(output, explain);
+        stmt.serialize(output, opts);
     }
     spec[SetWindowFieldsSpec::kOutputFieldName] = output.freezeToValue();
 
     MutableDocument out;
     out[getSourceName()] = Value(spec.freeze());
 
-    if (explain && *explain >= ExplainOptions::Verbosity::kExecStats) {
+    if (opts.verbosity && *opts.verbosity >= ExplainOptions::Verbosity::kExecStats) {
         MutableDocument md;
 
         for (auto&& [fieldName, function] : _executableOutputs) {
-            md[fieldName] =
+            md[opts.serializeFieldName(fieldName)] =
                 Value(static_cast<long long>(_memoryTracker[fieldName].maxMemoryBytes()));
         }
 
@@ -458,8 +457,12 @@ DocumentSource::GetNextResult DocumentSourceInternalSetWindowFields::doGetNext()
         return DocumentSource::GetNextResult::makeEOF();
 
     auto curDoc = _iterator.current();
-    // The only way we hit this case is if there are no documents, since otherwise _eof will be set.
     if (!curDoc) {
+        if (_iterator.isPaused()) {
+            return DocumentSource::GetNextResult::makePauseExecution();
+        }
+        // The only way we hit this case is if there are no documents, since otherwise _eof will be
+        // set.
         _eof = true;
         return DocumentSource::GetNextResult::makeEOF();
     }
@@ -479,14 +482,11 @@ DocumentSource::GetNextResult DocumentSourceInternalSetWindowFields::doGetNext()
             throw;
         }
 
-        if (_memoryTracker.currentMemoryBytes() >=
-                static_cast<long long>(_memoryTracker._maxAllowedMemoryUsageBytes) &&
-            _memoryTracker._allowDiskUse) {
+        if (!_memoryTracker.withinMemoryLimit() && _memoryTracker._allowDiskUse) {
             // Attempt to spill where possible.
             _iterator.spillToDisk();
         }
-        if (_memoryTracker.currentMemoryBytes() >
-            static_cast<long long>(_memoryTracker._maxAllowedMemoryUsageBytes)) {
+        if (!_memoryTracker.withinMemoryLimit()) {
             _iterator.finalize();
             uasserted(5414201,
                       str::stream()

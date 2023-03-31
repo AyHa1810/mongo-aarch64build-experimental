@@ -29,12 +29,11 @@
 
 
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/catalog/catalog_helper.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/s/database_sharding_state.h"
-#include "mongo/db/s/dist_lock_manager.h"
+#include "mongo/db/s/ddl_lock_manager.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/timeseries/catalog_helper.h"
 #include "mongo/db/timeseries/timeseries_commands_conversion_helper.h"
@@ -45,7 +44,6 @@
 #include "mongo/s/stale_shard_version_helpers.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
-
 
 namespace mongo {
 namespace {
@@ -153,14 +151,16 @@ ShardsvrDropIndexesCommand::Invocation::Response ShardsvrDropIndexesCommand::Inv
                 return timeoutMillisecs;
             }
         }
-        return DistLockManager::kDefaultLockTimeout;
+        return DDLLockManager::kDefaultLockTimeout;
     }();
 
-    auto distLockManager = DistLockManager::get(opCtx);
-    auto dbLocalLock = distLockManager->lockDirectLocally(opCtx, ns().db(), lockTimeout);
+    static constexpr StringData lockReason{"dropIndexes"_sd};
+
+    auto ddlLockManager = DDLLockManager::get(opCtx);
+    auto dbDDLLock = ddlLockManager->lock(opCtx, ns().db(), lockReason, lockTimeout);
 
     // Check under the dbLock if this is still the primary shard for the database
-    catalog_helper::assertIsPrimaryShardForDb(opCtx, ns().db());
+    DatabaseShardingState::assertIsPrimaryShardForDb(opCtx, ns().db());
 
     auto resolvedNs = ns();
     auto dropIdxBSON = dropIdxCmd.toBSON({});
@@ -175,14 +175,14 @@ ShardsvrDropIndexesCommand::Invocation::Response ShardsvrDropIndexesCommand::Inv
         resolvedNs = ns().makeTimeseriesBucketsNamespace();
     }
 
-    auto nsLocalLock = distLockManager->lockDirectLocally(opCtx, resolvedNs.ns(), lockTimeout);
+    auto collDDLLock = ddlLockManager->lock(opCtx, resolvedNs.ns(), lockReason, lockTimeout);
 
     StaleConfigRetryState retryState;
     return shardVersionRetry(
         opCtx, Grid::get(opCtx)->catalogCache(), resolvedNs, "dropIndexes", [&] {
             // If the collection is sharded, we target only the primary shard and the shards that
             // own chunks for the collection.
-            const auto routingInfo = uassertStatusOK(
+            const auto cri = uassertStatusOK(
                 Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, resolvedNs));
 
             auto cmdToBeSent = CommandHelpers::filterCommandRequestForPassthrough(
@@ -193,7 +193,7 @@ ShardsvrDropIndexesCommand::Invocation::Response ShardsvrDropIndexesCommand::Inv
                     opCtx,
                     resolvedNs.db(),
                     resolvedNs,
-                    routingInfo,
+                    cri,
                     retryState.shardsWithSuccessResponses,
                     applyReadWriteConcern(
                         opCtx,

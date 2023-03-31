@@ -1,6 +1,5 @@
 /**
- * Tests that forgetShardSplit command doesn't hang if failover occurs immediately after the
- * state doc for the split has been removed.
+ * Tests that forgetShardSplit command doesn't hang if failover occurs while it is being processed.
  *
  * @tags: [
  *   incompatible_with_eft,
@@ -9,27 +8,22 @@
  *   requires_majority_read_concern,
  *   requires_persistence,
  *   serverless,
- *   requires_fcv_52,
- *   featureFlagShardSplit
+ *   requires_fcv_63
  * ]
  */
 
-(function() {
-"use strict";
+import {ShardSplitTest} from "jstests/serverless/libs/shard_split_test.js";
 
-load("jstests/libs/parallelTester.js");
 load("jstests/libs/fail_point_util.js");
-load("jstests/libs/uuid_util.js");
-load("jstests/serverless/libs/basic_serverless_test.js");
 
-const test = new BasicServerlessTest({
+const test = new ShardSplitTest({
     recipientTagName: "recipientTag",
     recipientSetName: "recipientSet",
     quickGarbageCollection: true
 });
 test.addRecipientNodes();
 
-const tenantIds = ["testTenantId"];
+const tenantIds = [ObjectId() /*tenantA*/];
 
 let donorPrimary = test.donor.getPrimary();
 
@@ -43,9 +37,8 @@ test.removeAndStopRecipientNodes();
 
 const forgetMigrationThread = operation.forgetAsync();
 
+// Wait until `forgetShardSplit` has been received to trigger the stepdown.
 fp.wait();
-
-test.waitForGarbageCollection(operation.migrationId, tenantIds);
 
 // Force a stepdown on the primary.
 assert.commandWorked(
@@ -61,4 +54,3 @@ assert.commandFailedWithCode(forgetMigrationThread.returnData(),
                              ErrorCodes.InterruptedDueToReplStateChange);
 
 test.stop();
-})();

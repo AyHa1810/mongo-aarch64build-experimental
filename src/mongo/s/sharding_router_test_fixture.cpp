@@ -259,7 +259,7 @@ void ShardingTestFixture::expectGetShards(const std::vector<ShardType>& shards) 
 
         ASSERT_BSONOBJ_EQ(query->getFilter(), BSONObj());
         ASSERT_BSONOBJ_EQ(query->getSort(), BSONObj());
-        ASSERT_FALSE(query->getLimit().is_initialized());
+        ASSERT_FALSE(query->getLimit().has_value());
 
         checkReadConcern(request.cmdObj,
                          VectorClock::kInitialComponentTime.asTimestamp(),
@@ -309,7 +309,7 @@ void ShardingTestFixture::expectUpdateCollection(const HostAndPort& expectedHost
         ASSERT_EQUALS(expectedHost, request.target);
         ASSERT_BSONOBJ_EQ(BSON(rpc::kReplSetMetadataFieldName << 1),
                           rpc::TrackingMetadata::removeTrackingData(request.metadata));
-        ASSERT_EQUALS(NamespaceString::kConfigDb, request.dbname);
+        ASSERT_EQUALS(DatabaseName::kConfig.db(), request.dbname);
 
         const auto opMsgRequest = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
         const auto updateOp = UpdateOp::parse(opMsgRequest);
@@ -413,7 +413,7 @@ void ShardingTestFixture::checkReadConcern(const BSONObj& cmdObj,
 }
 
 std::unique_ptr<ShardingCatalogClient> ShardingTestFixture::makeShardingCatalogClient() {
-    return std::make_unique<ShardingCatalogClientImpl>();
+    return std::make_unique<ShardingCatalogClientImpl>(nullptr /* overrideConfigShard */);
 }
 
 }  // namespace mongo

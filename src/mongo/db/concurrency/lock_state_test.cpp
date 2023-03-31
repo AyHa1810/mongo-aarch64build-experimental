@@ -37,6 +37,7 @@
 #include "mongo/config.h"
 #include "mongo/db/concurrency/lock_manager_test_help.h"
 #include "mongo/db/concurrency/locker.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer_mock.h"
@@ -55,7 +56,9 @@ class LockerImplTest : public ServiceContextTest {};
 TEST_F(LockerImplTest, LockNoConflict) {
     auto opCtx = makeOperationContext();
 
-    const ResourceId resId(RESOURCE_COLLECTION, "TestDB.collection"_sd);
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl locker(opCtx->getServiceContext());
     locker.lockGlobal(opCtx.get(), MODE_IX);
@@ -75,7 +78,9 @@ TEST_F(LockerImplTest, LockNoConflict) {
 TEST_F(LockerImplTest, ReLockNoConflict) {
     auto opCtx = makeOperationContext();
 
-    const ResourceId resId(RESOURCE_COLLECTION, "TestDB.collection"_sd);
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl locker(opCtx->getServiceContext());
     locker.lockGlobal(opCtx.get(), MODE_IX);
@@ -95,7 +100,9 @@ TEST_F(LockerImplTest, ReLockNoConflict) {
 TEST_F(LockerImplTest, ConflictWithTimeout) {
     auto opCtx = makeOperationContext();
 
-    const ResourceId resId(RESOURCE_COLLECTION, "TestDB.collection"_sd);
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl locker1(opCtx->getServiceContext());
     locker1.lockGlobal(opCtx.get(), MODE_IX);
@@ -119,7 +126,9 @@ TEST_F(LockerImplTest, ConflictWithTimeout) {
 TEST_F(LockerImplTest, ConflictUpgradeWithTimeout) {
     auto opCtx = makeOperationContext();
 
-    const ResourceId resId(RESOURCE_COLLECTION, "TestDB.collection"_sd);
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl locker1(opCtx->getServiceContext());
     locker1.lockGlobal(opCtx.get(), MODE_IS);
@@ -140,7 +149,7 @@ TEST_F(LockerImplTest, ConflictUpgradeWithTimeout) {
 
 TEST_F(LockerImplTest, FailPointInLockFailsGlobalNonIntentLocksIfTheyCannotBeImmediatelyGranted) {
     transport::TransportLayerMock transportLayer;
-    transport::SessionHandle session = transportLayer.createSession();
+    std::shared_ptr<transport::Session> session = transportLayer.createSession();
 
     auto newClient = getServiceContext()->makeClient("userClient", session);
     AlternativeClientRegion acr(newClient);
@@ -168,14 +177,16 @@ TEST_F(LockerImplTest, FailPointInLockFailsGlobalNonIntentLocksIfTheyCannotBeImm
 
 TEST_F(LockerImplTest, FailPointInLockFailsNonIntentLocksIfTheyCannotBeImmediatelyGranted) {
     transport::TransportLayerMock transportLayer;
-    transport::SessionHandle session = transportLayer.createSession();
+    std::shared_ptr<transport::Session> session = transportLayer.createSession();
 
     auto newClient = getServiceContext()->makeClient("userClient", session);
     AlternativeClientRegion acr(newClient);
     auto newOpCtx = cc().makeOperationContext();
 
     // Granted MODE_X lock, fail incoming MODE_S and MODE_X.
-    const ResourceId resId(RESOURCE_COLLECTION, "TestDB.collection"_sd);
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl locker1(newOpCtx->getServiceContext());
     locker1.lockGlobal(newOpCtx.get(), MODE_IX);
@@ -252,7 +263,7 @@ TEST_F(LockerImplTest, saveAndRestoreGlobal) {
     ASSERT_EQUALS(MODE_IX, lockInfo.globalMode);
 
     // Restore the lock(s) we had.
-    locker.restoreLockState(lockInfo);
+    locker.restoreLockState(opCtx.get(), lockInfo);
 
     ASSERT(locker.isLocked());
     ASSERT(locker.unlockGlobal());
@@ -268,7 +279,7 @@ TEST_F(LockerImplTest, saveAndRestoreRSTL) {
 
     LockerImpl locker(opCtx->getServiceContext());
 
-    const ResourceId resIdDatabase(RESOURCE_DATABASE, "TestDB"_sd);
+    const ResourceId resIdDatabase(RESOURCE_DATABASE, DatabaseName(boost::none, "TestDB"));
 
     // Acquire locks.
     locker.lock(resourceIdReplicationStateTransitionLock, MODE_IX);
@@ -286,7 +297,7 @@ TEST_F(LockerImplTest, saveAndRestoreRSTL) {
     ASSERT_EQUALS(MODE_NONE, locker.getLockMode(resIdDatabase));
 
     // Restore the lock(s) we had.
-    locker.restoreLockState(lockInfo);
+    locker.restoreLockState(opCtx.get(), lockInfo);
 
     // Check locks are re-locked.
     ASSERT(locker.isLocked());
@@ -335,8 +346,10 @@ TEST_F(LockerImplTest, saveAndRestoreDBAndCollection) {
 
     LockerImpl locker(opCtx->getServiceContext());
 
-    const ResourceId resIdDatabase(RESOURCE_DATABASE, "TestDB"_sd);
-    const ResourceId resIdCollection(RESOURCE_COLLECTION, "TestDB.collection"_sd);
+    const ResourceId resIdDatabase(RESOURCE_DATABASE, DatabaseName(boost::none, "TestDB"));
+    const ResourceId resIdCollection(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     // Lock some stuff.
     locker.lockGlobal(opCtx.get(), MODE_IX);
@@ -349,7 +362,7 @@ TEST_F(LockerImplTest, saveAndRestoreDBAndCollection) {
     ASSERT_EQUALS(MODE_NONE, locker.getLockMode(resIdCollection));
 
     // Restore lock state.
-    locker.restoreLockState(lockInfo);
+    locker.restoreLockState(opCtx.get(), lockInfo);
 
     // Make sure things were re-locked.
     ASSERT_EQUALS(MODE_IX, locker.getLockMode(resIdDatabase));
@@ -365,8 +378,10 @@ TEST_F(LockerImplTest, releaseWriteUnitOfWork) {
 
     LockerImpl locker(opCtx->getServiceContext());
 
-    const ResourceId resIdDatabase(RESOURCE_DATABASE, "TestDB"_sd);
-    const ResourceId resIdCollection(RESOURCE_COLLECTION, "TestDB.collection"_sd);
+    const ResourceId resIdDatabase(RESOURCE_DATABASE, DatabaseName(boost::none, "TestDB"));
+    const ResourceId resIdCollection(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     locker.beginWriteUnitOfWork();
     // Lock some stuff.
@@ -395,8 +410,10 @@ TEST_F(LockerImplTest, restoreWriteUnitOfWork) {
 
     LockerImpl locker(opCtx->getServiceContext());
 
-    const ResourceId resIdDatabase(RESOURCE_DATABASE, "TestDB"_sd);
-    const ResourceId resIdCollection(RESOURCE_COLLECTION, "TestDB.collection"_sd);
+    const ResourceId resIdDatabase(RESOURCE_DATABASE, DatabaseName(boost::none, "TestDB"));
+    const ResourceId resIdCollection(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     locker.beginWriteUnitOfWork();
     // Lock some stuff.
@@ -416,7 +433,7 @@ TEST_F(LockerImplTest, restoreWriteUnitOfWork) {
     ASSERT_FALSE(locker.isLocked());
 
     // Restore lock state.
-    locker.restoreWriteUnitOfWorkAndLock(nullptr, lockInfo);
+    locker.restoreWriteUnitOfWorkAndLock(opCtx.get(), lockInfo);
 
     // Make sure things were re-locked.
     ASSERT_EQUALS(MODE_IX, locker.getLockMode(resIdDatabase));
@@ -437,9 +454,13 @@ TEST_F(LockerImplTest, releaseAndRestoreWriteUnitOfWorkWithoutUnlock) {
 
     LockerImpl locker(opCtx->getServiceContext());
 
-    const ResourceId resIdDatabase(RESOURCE_DATABASE, "TestDB"_sd);
-    const ResourceId resIdCollection(RESOURCE_COLLECTION, "TestDB.collection"_sd);
-    const ResourceId resIdCollection2(RESOURCE_COLLECTION, "TestDB.collection2"_sd);
+    const ResourceId resIdDatabase(RESOURCE_DATABASE, DatabaseName(boost::none, "TestDB"));
+    const ResourceId resIdCollection(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
+    const ResourceId resIdCollection2(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection2"));
 
     locker.beginWriteUnitOfWork();
     // Lock some stuff.
@@ -553,8 +574,10 @@ TEST_F(LockerImplTest, releaseAndRestoreReadOnlyWriteUnitOfWork) {
 
     LockerImpl locker(opCtx->getServiceContext());
 
-    const ResourceId resIdDatabase(RESOURCE_DATABASE, "TestDB"_sd);
-    const ResourceId resIdCollection(RESOURCE_COLLECTION, "TestDB.collection"_sd);
+    const ResourceId resIdDatabase(RESOURCE_DATABASE, DatabaseName(boost::none, "TestDB"));
+    const ResourceId resIdCollection(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     // Snapshot transactions delay shared locks as well.
     locker.setSharedLocksShouldTwoPhaseLock(true);
@@ -578,7 +601,7 @@ TEST_F(LockerImplTest, releaseAndRestoreReadOnlyWriteUnitOfWork) {
     ASSERT_FALSE(locker.isLocked());
 
     // Restore lock state.
-    locker.restoreWriteUnitOfWorkAndLock(nullptr, lockInfo);
+    locker.restoreWriteUnitOfWorkAndLock(opCtx.get(), lockInfo);
 
     ASSERT_EQUALS(MODE_IS, locker.getLockMode(resIdDatabase));
     ASSERT_EQUALS(MODE_IS, locker.getLockMode(resIdCollection));
@@ -620,8 +643,10 @@ TEST_F(LockerImplTest, releaseAndRestoreWriteUnitOfWorkWithRecursiveLocks) {
 
     LockerImpl locker(opCtx->getServiceContext());
 
-    const ResourceId resIdDatabase(RESOURCE_DATABASE, "TestDB"_sd);
-    const ResourceId resIdCollection(RESOURCE_COLLECTION, "TestDB.collection"_sd);
+    const ResourceId resIdDatabase(RESOURCE_DATABASE, DatabaseName(boost::none, "TestDB"));
+    const ResourceId resIdCollection(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     locker.beginWriteUnitOfWork();
     // Lock some stuff.
@@ -677,7 +702,7 @@ TEST_F(LockerImplTest, releaseAndRestoreWriteUnitOfWorkWithRecursiveLocks) {
     ASSERT_FALSE(locker.isLocked());
 
     // Restore lock state.
-    locker.restoreWriteUnitOfWorkAndLock(nullptr, lockInfo);
+    locker.restoreWriteUnitOfWorkAndLock(opCtx.get(), lockInfo);
 
     // Make sure things were re-locked in the correct mode.
     ASSERT_EQUALS(MODE_IX, locker.getLockMode(resIdDatabase));
@@ -701,7 +726,7 @@ TEST_F(LockerImplTest, releaseAndRestoreWriteUnitOfWorkWithRecursiveLocks) {
 TEST_F(LockerImplTest, DefaultLocker) {
     auto opCtx = makeOperationContext();
 
-    const ResourceId resId(RESOURCE_DATABASE, "TestDB"_sd);
+    const ResourceId resId(RESOURCE_DATABASE, DatabaseName(boost::none, "TestDB"));
 
     LockerImpl locker(opCtx->getServiceContext());
     locker.lockGlobal(opCtx.get(), MODE_IX);
@@ -725,10 +750,14 @@ TEST_F(LockerImplTest, SharedLocksShouldTwoPhaseLockIsTrue) {
 
     auto opCtx = makeOperationContext();
 
-    const ResourceId resId1(RESOURCE_DATABASE, "TestDB1"_sd);
-    const ResourceId resId2(RESOURCE_DATABASE, "TestDB2"_sd);
-    const ResourceId resId3(RESOURCE_COLLECTION, "TestDB.collection3"_sd);
-    const ResourceId resId4(RESOURCE_COLLECTION, "TestDB.collection4"_sd);
+    const ResourceId resId1(RESOURCE_DATABASE, DatabaseName(boost::none, "TestDB1"));
+    const ResourceId resId2(RESOURCE_DATABASE, DatabaseName(boost::none, "TestDB2"));
+    const ResourceId resId3(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection3"));
+    const ResourceId resId4(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection4"));
 
     LockerImpl locker(opCtx->getServiceContext());
     locker.setSharedLocksShouldTwoPhaseLock(true);
@@ -781,10 +810,14 @@ TEST_F(LockerImplTest, ModeIXAndXLockParticipatesInTwoPhaseLocking) {
 
     auto opCtx = makeOperationContext();
 
-    const ResourceId resId1(RESOURCE_DATABASE, "TestDB1"_sd);
-    const ResourceId resId2(RESOURCE_DATABASE, "TestDB2"_sd);
-    const ResourceId resId3(RESOURCE_COLLECTION, "TestDB.collection3"_sd);
-    const ResourceId resId4(RESOURCE_COLLECTION, "TestDB.collection4"_sd);
+    const ResourceId resId1(RESOURCE_DATABASE, DatabaseName(boost::none, "TestDB1"));
+    const ResourceId resId2(RESOURCE_DATABASE, DatabaseName(boost::none, "TestDB2"));
+    const ResourceId resId3(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection3"));
+    const ResourceId resId4(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection4"));
 
     LockerImpl locker(opCtx->getServiceContext());
 
@@ -926,8 +959,8 @@ TEST_F(LockerImplTest, RSTLTwoPhaseLockingBehaviorModeIS) {
 TEST_F(LockerImplTest, OverrideLockRequestTimeout) {
     auto opCtx = makeOperationContext();
 
-    const ResourceId resIdFirstDB(RESOURCE_DATABASE, "FirstDB"_sd);
-    const ResourceId resIdSecondDB(RESOURCE_DATABASE, "SecondDB"_sd);
+    const ResourceId resIdFirstDB(RESOURCE_DATABASE, DatabaseName(boost::none, "FirstDB"));
+    const ResourceId resIdSecondDB(RESOURCE_DATABASE, DatabaseName(boost::none, "SecondDB"));
 
     LockerImpl locker1(opCtx->getServiceContext());
     LockerImpl locker2(opCtx->getServiceContext());
@@ -963,8 +996,8 @@ TEST_F(LockerImplTest, OverrideLockRequestTimeout) {
 TEST_F(LockerImplTest, DoNotWaitForLockAcquisition) {
     auto opCtx = makeOperationContext();
 
-    const ResourceId resIdFirstDB(RESOURCE_DATABASE, "FirstDB"_sd);
-    const ResourceId resIdSecondDB(RESOURCE_DATABASE, "SecondDB"_sd);
+    const ResourceId resIdFirstDB(RESOURCE_DATABASE, DatabaseName(boost::none, "FirstDB"));
+    const ResourceId resIdSecondDB(RESOURCE_DATABASE, DatabaseName(boost::none, "SecondDB"));
 
     LockerImpl locker1(opCtx->getServiceContext());
     LockerImpl locker2(opCtx->getServiceContext());
@@ -1018,8 +1051,10 @@ bool lockerInfoContainsLock(const Locker::LockerInfo& lockerInfo,
 TEST_F(LockerImplTest, GetLockerInfoShouldReportHeldLocks) {
     auto opCtx = makeOperationContext();
 
-    const ResourceId dbId(RESOURCE_DATABASE, "TestDB"_sd);
-    const ResourceId collectionId(RESOURCE_COLLECTION, "TestDB.collection"_sd);
+    const ResourceId dbId(RESOURCE_DATABASE, DatabaseName(boost::none, "TestDB"));
+    const ResourceId collectionId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     // Take an exclusive lock on the collection.
     LockerImpl locker(opCtx->getServiceContext());
@@ -1044,8 +1079,10 @@ TEST_F(LockerImplTest, GetLockerInfoShouldReportHeldLocks) {
 TEST_F(LockerImplTest, GetLockerInfoShouldReportPendingLocks) {
     auto opCtx = makeOperationContext();
 
-    const ResourceId dbId(RESOURCE_DATABASE, "TestDB"_sd);
-    const ResourceId collectionId(RESOURCE_COLLECTION, "TestDB.collection"_sd);
+    const ResourceId dbId(RESOURCE_DATABASE, DatabaseName(boost::none, "TestDB"));
+    const ResourceId collectionId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     // Take an exclusive lock on the collection.
     LockerImpl successfulLocker(opCtx->getServiceContext());
@@ -1087,10 +1124,58 @@ TEST_F(LockerImplTest, GetLockerInfoShouldReportPendingLocks) {
     ASSERT(conflictingLocker.unlockGlobal());
 }
 
+TEST_F(LockerImplTest, GetLockerInfoShouldSubtractBase) {
+    auto opCtx = makeOperationContext();
+    auto locker = opCtx->lockState();
+    const ResourceId dbId(RESOURCE_DATABASE, DatabaseName(boost::none, "SubtractTestDB"));
+
+    auto numAcquisitions = [&](boost::optional<SingleThreadedLockStats> baseStats) {
+        Locker::LockerInfo info;
+        locker->getLockerInfo(&info, baseStats);
+        return info.stats.get(dbId, MODE_IX).numAcquisitions;
+    };
+    auto getBaseStats = [&] {
+        return CurOp::get(opCtx.get())->getLockStatsBase();
+    };
+
+    locker->lockGlobal(opCtx.get(), MODE_IX);
+
+    // Obtain a lock before any other ops have been pushed to the stack.
+    locker->lock(dbId, MODE_IX);
+    locker->unlock(dbId);
+
+    ASSERT_EQUALS(numAcquisitions(getBaseStats()), 1) << "The acquisition should be reported";
+
+    // Push another op to the stack and obtain a lock.
+    CurOp superOp;
+    superOp.push(opCtx.get());
+    locker->lock(dbId, MODE_IX);
+    locker->unlock(dbId);
+
+    ASSERT_EQUALS(numAcquisitions(getBaseStats()), 1)
+        << "Only superOp's acquisition should be reported";
+
+    // Then push another op to the stack and obtain another lock.
+    CurOp subOp;
+    subOp.push(opCtx.get());
+    locker->lock(dbId, MODE_IX);
+    locker->unlock(dbId);
+
+    ASSERT_EQUALS(numAcquisitions(getBaseStats()), 1)
+        << "Only the latest acquisition should be reported";
+
+    ASSERT_EQUALS(numAcquisitions({}), 3)
+        << "All acquisitions should be reported when no base is subtracted out.";
+
+    ASSERT(locker->unlockGlobal());
+}
+
 TEST_F(LockerImplTest, ReaquireLockPendingUnlock) {
     auto opCtx = makeOperationContext();
 
-    const ResourceId resId(RESOURCE_COLLECTION, "TestDB.collection"_sd);
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl locker(opCtx->getServiceContext());
     locker.lockGlobal(opCtx.get(), MODE_IS);
@@ -1120,7 +1205,9 @@ TEST_F(LockerImplTest, ReaquireLockPendingUnlock) {
 TEST_F(LockerImplTest, AcquireLockPendingUnlockWithCoveredMode) {
     auto opCtx = makeOperationContext();
 
-    const ResourceId resId(RESOURCE_COLLECTION, "TestDB.collection"_sd);
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl locker(opCtx->getServiceContext());
     locker.lockGlobal(opCtx.get(), MODE_IS);
@@ -1150,7 +1237,9 @@ TEST_F(LockerImplTest, AcquireLockPendingUnlockWithCoveredMode) {
 TEST_F(LockerImplTest, ConvertLockPendingUnlock) {
     auto opCtx = makeOperationContext();
 
-    const ResourceId resId(RESOURCE_COLLECTION, "TestDB.collection"_sd);
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl locker(opCtx->getServiceContext());
     locker.lockGlobal(opCtx.get(), MODE_IS);
@@ -1184,7 +1273,9 @@ TEST_F(LockerImplTest, ConvertLockPendingUnlock) {
 TEST_F(LockerImplTest, ConvertLockPendingUnlockAndUnlock) {
     auto opCtx = makeOperationContext();
 
-    const ResourceId resId(RESOURCE_COLLECTION, "TestDB.collection"_sd);
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl locker(opCtx->getServiceContext());
     locker.lockGlobal(opCtx.get(), MODE_IS);
@@ -1224,29 +1315,30 @@ TEST_F(LockerImplTest, ConvertLockPendingUnlockAndUnlock) {
     locker.unlockGlobal();
 }
 
-TEST_F(LockerImplTest, SkipTicketAcquisitionForLockRAIIType) {
+TEST_F(LockerImplTest, SetTicketAcquisitionForLockRAIIType) {
     auto opCtx = makeOperationContext();
 
     // By default, ticket acquisition is required.
-    ASSERT_TRUE(opCtx->lockState()->shouldAcquireTicket());
+    ASSERT_TRUE(opCtx->lockState()->shouldWaitForTicket());
 
     {
-        SkipTicketAcquisitionForLock skipTicketAcquisition(opCtx.get());
-        ASSERT_FALSE(opCtx->lockState()->shouldAcquireTicket());
+        ScopedAdmissionPriorityForLock setTicketAquisition(opCtx->lockState(),
+                                                           AdmissionContext::Priority::kImmediate);
+        ASSERT_FALSE(opCtx->lockState()->shouldWaitForTicket());
     }
 
-    ASSERT_TRUE(opCtx->lockState()->shouldAcquireTicket());
+    ASSERT_TRUE(opCtx->lockState()->shouldWaitForTicket());
 
-    // If ticket acquisitions are disabled on the lock state, the RAII type has no effect.
-    opCtx->lockState()->skipAcquireTicket();
-    ASSERT_FALSE(opCtx->lockState()->shouldAcquireTicket());
+    opCtx->lockState()->setAdmissionPriority(AdmissionContext::Priority::kImmediate);
+    ASSERT_FALSE(opCtx->lockState()->shouldWaitForTicket());
 
     {
-        SkipTicketAcquisitionForLock skipTicketAcquisition(opCtx.get());
-        ASSERT_FALSE(opCtx->lockState()->shouldAcquireTicket());
+        ScopedAdmissionPriorityForLock setTicketAquisition(opCtx->lockState(),
+                                                           AdmissionContext::Priority::kImmediate);
+        ASSERT_FALSE(opCtx->lockState()->shouldWaitForTicket());
     }
 
-    ASSERT_FALSE(opCtx->lockState()->shouldAcquireTicket());
+    ASSERT_FALSE(opCtx->lockState()->shouldWaitForTicket());
 }
 
 // This test exercises the lock dumping code in ~LockerImpl in case locks are held on destruction.
@@ -1255,7 +1347,9 @@ DEATH_TEST_F(LockerImplTest,
              "Operation ending while holding locks.") {
     auto opCtx = makeOperationContext();
 
-    const ResourceId resId(RESOURCE_COLLECTION, "TestDB.collection"_sd);
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl locker(opCtx->getServiceContext());
     locker.lockGlobal(opCtx.get(), MODE_IX);

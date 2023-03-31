@@ -30,6 +30,7 @@
 #include "mongo/s/stale_exception.h"
 
 #include "mongo/base/init.h"
+#include "mongo/s/shard_version.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -43,9 +44,9 @@ MONGO_INIT_REGISTER_ERROR_EXTRA_INFO(StaleDbRoutingVersion);
 
 void StaleConfigInfo::serialize(BSONObjBuilder* bob) const {
     bob->append("ns", _nss.ns());
-    _received.serializeToBSON("vReceived", bob);
+    _received.serialize("vReceived", bob);
     if (_wanted)
-        _wanted->serializeToBSON("vWanted", bob);
+        _wanted->serialize("vWanted", bob);
 
     invariant(_shardId != "");
     bob->append("shardId", _shardId.toString());
@@ -55,15 +56,15 @@ std::shared_ptr<const ErrorExtraInfo> StaleConfigInfo::parse(const BSONObj& obj)
     auto shardId = obj["shardId"].String();
     uassert(ErrorCodes::NoSuchKey, "The shardId field is missing", !shardId.empty());
 
-    return std::make_shared<StaleConfigInfo>(NamespaceString(obj["ns"].String()),
-                                             ChunkVersion::parse(obj["vReceived"]),
-                                             [&] {
-                                                 if (auto vWantedElem = obj["vWanted"])
-                                                     return boost::make_optional(
-                                                         ChunkVersion::parse(vWantedElem));
-                                                 return boost::optional<ChunkVersion>();
-                                             }(),
-                                             ShardId(std::move(shardId)));
+    return std::make_shared<StaleConfigInfo>(
+        NamespaceString(obj["ns"].String()),
+        ShardVersion::parse(obj["vReceived"]),
+        [&] {
+            if (auto vWantedElem = obj["vWanted"])
+                return boost::make_optional(ShardVersion::parse(vWantedElem));
+            return boost::optional<ShardVersion>();
+        }(),
+        ShardId(std::move(shardId)));
 }
 
 void StaleEpochInfo::serialize(BSONObjBuilder* bob) const {

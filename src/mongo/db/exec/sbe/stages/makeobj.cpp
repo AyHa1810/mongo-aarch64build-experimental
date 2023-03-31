@@ -194,9 +194,9 @@ void MakeObjStageBase<MakeObjOutputType::object>::produceObject() {
                     : approximatedNumFieldsInRoot + projectedFieldsSize;
                 obj->reserve(numOutputFields);
                 // Skip document length.
-                be += 4;
-                while (*be != 0) {
-                    auto sv = bson::fieldNameView(be);
+                be += sizeof(int32_t);
+                while (be != end - 1) {
+                    auto sv = bson::fieldNameAndLength(be);
                     auto key = StringMapHasher{}.hashed_key(StringData(sv));
 
                     if (!isFieldProjectedOrRestricted(key)) {
@@ -276,10 +276,12 @@ void MakeObjStageBase<MakeObjOutputType::bsonObject>::produceObject() {
         if (tag == value::TypeTags::bsonObject) {
             if (!(nFieldsNeededIfInclusion == 0 && _fieldBehavior == FieldBehavior::keep)) {
                 auto be = value::bitcastTo<const char*>(val);
+                const auto end = be + ConstDataView(be).read<LittleEndian<uint32_t>>();
+
                 // Skip document length.
-                be += 4;
-                while (*be != 0) {
-                    auto sv = bson::fieldNameView(be);
+                be += sizeof(int32_t);
+                while (be != end - 1) {
+                    auto sv = bson::fieldNameAndLength(be);
                     auto key = StringMapHasher{}.hashed_key(StringData(sv));
 
                     auto nextBe = bson::advance(be, sv.size());
@@ -447,11 +449,11 @@ size_t MakeObjStageBase<O>::estimateCompileTimeSize() const {
 
 template <MakeObjOutputType O>
 void MakeObjStageBase<O>::doSaveState(bool relinquishCursor) {
-    if (!slotsAccessible() || !relinquishCursor) {
+    if (!relinquishCursor) {
         return;
     }
 
-    prepareForYielding(_obj);
+    prepareForYielding(_obj, slotsAccessible());
 }
 
 // Explicit template instantiations.

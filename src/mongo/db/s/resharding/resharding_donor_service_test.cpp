@@ -30,7 +30,6 @@
 
 #include "mongo/platform/basic.h"
 
-#include <boost/optional/optional_io.hpp>
 #include <utility>
 
 #include "mongo/db/dbdirectclient.h"
@@ -45,12 +44,12 @@
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/s/operation_sharding_state.h"
-#include "mongo/db/s/recoverable_critical_section_service.h"
 #include "mongo/db/s/resharding/resharding_change_event_o2_field_gen.h"
 #include "mongo/db/s/resharding/resharding_data_copy_util.h"
 #include "mongo/db/s/resharding/resharding_donor_service.h"
 #include "mongo/db/s/resharding/resharding_service_test_helpers.h"
 #include "mongo/db/s/resharding/resharding_util.h"
+#include "mongo/db/s/sharding_recovery_service.h"
 #include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
@@ -66,7 +65,8 @@ namespace {
 using DonorStateTransitionController =
     resharding_service_test_helpers::StateTransitionController<DonorStateEnum>;
 using OpObserverForTest =
-    resharding_service_test_helpers::OpObserverForTest<DonorStateEnum, ReshardingDonorDocument>;
+    resharding_service_test_helpers::StateTransitionControllerOpObserver<DonorStateEnum,
+                                                                         ReshardingDonorDocument>;
 using PauseDuringStateTransitions =
     resharding_service_test_helpers::PauseDuringStateTransitions<DonorStateEnum>;
 
@@ -91,17 +91,6 @@ public:
                                 const NamespaceString& tempReshardingNss) override {}
 };
 
-class DonorOpObserverForTest : public OpObserverForTest {
-public:
-    DonorOpObserverForTest(std::shared_ptr<DonorStateTransitionController> controller)
-        : OpObserverForTest(std::move(controller),
-                            NamespaceString::kDonorReshardingOperationsNamespace) {}
-
-    DonorStateEnum getState(const ReshardingDonorDocument& donorDoc) override {
-        return donorDoc.getMutableState().getState();
-    }
-};
-
 class ReshardingDonorServiceForTest : public ReshardingDonorService {
 public:
     explicit ReshardingDonorServiceForTest(ServiceContext* serviceContext)
@@ -110,7 +99,8 @@ public:
     std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(BSONObj initialState) override {
         return std::make_shared<DonorStateMachine>(
             this,
-            ReshardingDonorDocument::parse({"ReshardingDonorServiceForTest"}, initialState),
+            ReshardingDonorDocument::parse(IDLParserContext{"ReshardingDonorServiceForTest"},
+                                           initialState),
             std::make_unique<ExternalStateForTest>(),
             _serviceContext);
     }
@@ -137,7 +127,12 @@ public:
         repl::StorageInterface::set(serviceContext, std::move(storageMock));
 
         _controller = std::make_shared<DonorStateTransitionController>();
-        _opObserverRegistry->addObserver(std::make_unique<DonorOpObserverForTest>(_controller));
+        _opObserverRegistry->addObserver(std::make_unique<OpObserverForTest>(
+            _controller,
+            NamespaceString::kDonorReshardingOperationsNamespace,
+            [](const ReshardingDonorDocument& donorDoc) {
+                return donorDoc.getMutableState().getState();
+            }));
     }
 
     DonorStateTransitionController* controller() {
@@ -755,7 +750,7 @@ TEST_F(ReshardingDonorServiceTest, RestoreMetricsOnKBlockingWrites) {
 
     // This acquires the critical section required by resharding donor machine when it is in
     // kBlockingWrites.
-    RecoverableCriticalSectionService::get(opCtx.get())
+    ShardingRecoveryService::get(opCtx.get())
         ->acquireRecoverableCriticalSectionBlockWrites(opCtx.get(),
                                                        doc.getSourceNss(),
                                                        BSON("command"
@@ -772,7 +767,7 @@ TEST_F(ReshardingDonorServiceTest, RestoreMetricsOnKBlockingWrites) {
         donor
             ->reportForCurrentOp(MongoProcessInterface::CurrentOpConnectionsMode::kExcludeIdle,
                                  MongoProcessInterface::CurrentOpSessionsMode::kExcludeIdle)
-            .get();
+            .value();
     ASSERT_EQ(currOp.getStringField("donorState"),
               DonorState_serializer(DonorStateEnum::kBlockingWrites));
     ASSERT_GTE(currOp.getField("totalOperationTimeElapsedSecs").Long(), opTimeDurationSecs);

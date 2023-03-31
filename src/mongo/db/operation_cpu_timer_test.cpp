@@ -53,19 +53,32 @@ public:
         return getGlobalServiceContext()->makeClient("AlternativeClient");
     }
 
-    auto getTimer() const {
-        return OperationCPUTimer::get(_opCtx.get());
+    OperationCPUTimers* getTimers() const {
+        return OperationCPUTimers::get(_opCtx.get());
+    }
+
+    std::unique_ptr<OperationCPUTimer> makeTimer() const {
+        return getTimers()->makeTimer();
     }
 
     void setUp() {
         _opCtx = getGlobalServiceContext()->makeOperationContext(Client::getCurrent());
     }
 
-    void busyWait(Microseconds delay) const {
-        auto start = stdx::chrono::steady_clock::now();
-        auto end = start + stdx::chrono::microseconds{durationCount<Microseconds>(delay)};
-        while (stdx::chrono::steady_clock::now() <= end) {
+    void busyWait(Nanoseconds delay) const {
+        AtomicWord<bool> mayJoin{false};
+        stdx::thread blocker([&] {
+            sleepFor(delay);
+            mayJoin.store(true);
+        });
+        while (!mayJoin.load()) {
+            // Busy wait for the blocker thread.
         }
+        blocker.join();
+    }
+
+    void resetOpCtx() {
+        _opCtx.reset();
     }
 
 private:
@@ -75,7 +88,7 @@ private:
 #if defined(__linux__)
 
 TEST_F(OperationCPUTimerTest, TestTimer) {
-    auto timer = getTimer();
+    auto timer = makeTimer();
 
     timer->start();
     busyWait(Microseconds(1));  // A small delay to make sure the timer advances.
@@ -89,13 +102,13 @@ TEST_F(OperationCPUTimerTest, TestTimer) {
 }
 
 TEST_F(OperationCPUTimerTest, TestReset) {
-    auto timer = getTimer();
+    auto timer = makeTimer();
 
     timer->start();
-    busyWait(Microseconds(1));  // Introducing some delay for the timer to measure.
+    busyWait(Milliseconds(1));  // Introducing some delay for the timer to measure.
     timer->stop();
     auto elapsedAfterStop = timer->getElapsed();
-    ASSERT_GTE(elapsedAfterStop, Microseconds(1));
+    ASSERT_GTE(elapsedAfterStop, Milliseconds(1));
 
     timer->start();
     auto elapsedAfterReset = timer->getElapsed();
@@ -109,13 +122,16 @@ TEST_F(OperationCPUTimerTest, TestTimerDetachAndAttachHandlers) {
         {
             FailPointEnableBlock fpDetach("hangCPUTimerAfterOnThreadDetach");
             failPointsReady.countDownAndWait();
-            fpDetach->waitForTimesEntered(1);
+            fpDetach->waitForTimesEntered(fpDetach.initialTimesEntered() + 1);
         }
-        fpAttach->waitForTimesEntered(1);
+        fpAttach->waitForTimesEntered(fpAttach.initialTimesEntered() + 1);
     });
 
-    auto timer = getTimer();
-    timer->start();
+    auto timer1 = makeTimer();
+    timer1->start();
+
+    auto timer2 = makeTimer();
+    timer2->start();
 
     failPointsReady.countDownAndWait();
     {
@@ -123,90 +139,103 @@ TEST_F(OperationCPUTimerTest, TestTimerDetachAndAttachHandlers) {
         AlternativeClientRegion acr(client);
     }
 
-    timer->stop();
+    busyWait(Microseconds(1));  // A small delay to make sure the timers advance.
+
+    timer1->stop();
+    timer2->stop();
     observer.join();
+
+    ASSERT_GT(timer1->getElapsed(), Nanoseconds(0));
+    ASSERT_GT(timer2->getElapsed(), Nanoseconds(0));
 }
 
-TEST_F(OperationCPUTimerTest, TestTimerElapsedAfterMultipleDetachAttach) {
+TEST_F(OperationCPUTimerTest, MultipleTimers) {
+    auto timer1 = makeTimer();
+    timer1->start();
 
-    auto checkTimerAccumulatesElapsedTime = [&]() {
-        auto timer = getTimer();
-        timer->start();
-        busyWait(Microseconds(100));  // Elapse 100 us.
-        timer->onThreadDetach();
+    {
+        auto timer2 = makeTimer();
+        timer2->start();
 
-        busyWait(Microseconds(100));
+        busyWait(Microseconds(1));  // A small delay to make sure the timers advance.
+        ASSERT_GT(timer1->getElapsed(), Nanoseconds(0));
+        ASSERT_GT(timer2->getElapsed(), Nanoseconds(0));
 
-        timer->onThreadAttach();
-        busyWait(Microseconds(10));  // Elapse 10 us.
-        timer->onThreadDetach();
-
-        busyWait(Microseconds(100));
-
-        timer->onThreadAttach();
-        busyWait(Microseconds(10));  // Elapse 10 us.
-        timer->stop();
-
-        return timer->getElapsed();
-    };
-
-    // PosixTimer relies on clock_gettime, which might give bad results if the thread is migrated to
-    // another CPU when using a GLIBC < 2.4. Additionally, even on systems with GLIBC >= 2.4
-    // reported time can occasionally be incorrect due to precision issues. E.g. 119999000 ns < 120
-    // ms.
-
-    // We try to work around this issue by executing the test multiple times and establishing a
-    // threshold failure rate. This does not guarantee that the test will not fail, but should
-    // reduce the amount of noise.
-
-    const auto kRepeats = 1000;
-    const auto kMaxFailureRate = 0.1;
-    const auto kMaxFailures = kMaxFailureRate * kRepeats;
-    auto nFailures = 0;
-    auto nRetries = 0;
-    while (nRetries++ < kRepeats) {
-        auto testResult = checkTimerAccumulatesElapsedTime();
-        // Total elapsed while attached should be GTE 120 us.
-        if (testResult < Microseconds(120)) {
-            ++nFailures;
-        }
-        // Verifies we do not compute detached time.
-        ASSERT_LT(testResult, Microseconds(200));
+        ASSERT_EQ(2, getTimers()->count());
     }
-    ASSERT_LTE(nFailures, kMaxFailures);
+
+    ASSERT_EQ(1, getTimers()->count());
+
+    timer1->stop();
+
+    auto elapsedAfterStop = timer1->getElapsed();
+    busyWait(Milliseconds(10));  // A small delay to make sure the timer could advance.
+    auto elapsedAfterSleep = timer1->getElapsed();
+    ASSERT_EQ(elapsedAfterSleep, elapsedAfterStop);
 }
 
-DEATH_TEST_F(OperationCPUTimerTest,
-             AccessTimerForDetachedOperation,
-             "Operation not attached to the current thread") {
-    auto client = Client::releaseCurrent();
-    getTimer();
+TEST_F(OperationCPUTimerTest, MultipleTimersOutOfOrder) {
+    auto timer1 = makeTimer();
+    timer1->start();
+
+    auto timer2 = makeTimer();
+    timer2->start();
+
+    busyWait(Microseconds(1));  // A small delay to make sure the timers advance.
+    ASSERT_GT(timer1->getElapsed(), Nanoseconds(0));
+    ASSERT_GT(timer2->getElapsed(), Nanoseconds(0));
+
+    // Note that there should be no restriction against stopping the first timer first.
+    timer1->stop();
+
+    auto elapsedAfterStop = timer1->getElapsed();
+    busyWait(Milliseconds(10));  // A small delay to make sure the timer could advance.
+    auto elapsedAfterSleep = timer1->getElapsed();
+    ASSERT_EQ(elapsedAfterSleep, elapsedAfterStop);
+
+    timer2->stop();
+    ASSERT_GT(timer2->getElapsed(), elapsedAfterStop);
+    elapsedAfterStop = timer2->getElapsed();
+    busyWait(Milliseconds(10));  // A small delay to make sure the timer could advance.
+    elapsedAfterSleep = timer2->getElapsed();
+    ASSERT_EQ(elapsedAfterSleep, elapsedAfterStop);
+
+    ASSERT_EQ(2, getTimers()->count());
+}
+
+TEST_F(OperationCPUTimerTest, TestOpCtxDestruction) {
+    auto timer = makeTimer();
+    timer->start();
+    resetOpCtx();
+    timer->stop();
 }
 
 DEATH_TEST_F(OperationCPUTimerTest, StopTimerBeforeStart, "Timer is not running") {
-    getTimer()->stop();
+    auto timer = makeTimer();
+    timer->stop();
 }
 
 DEATH_TEST_F(OperationCPUTimerTest, StartTimerMultipleTimes, "Timer has already started") {
-    getTimer()->start();
-    getTimer()->start();
+    auto timer = makeTimer();
+    timer->start();
+    timer->start();
 }
 
 DEATH_TEST_F(OperationCPUTimerTest, OnAttachForAttachedTimer, "Timer has already been attached") {
-    auto timer = getTimer();
+    auto timer = makeTimer();
     timer->start();
     timer->onThreadAttach();
 }
 
 DEATH_TEST_F(OperationCPUTimerTest, OnDetachForDetachedTimer, "Timer is not attached") {
-    auto timer = getTimer();
+    auto timer = makeTimer();
     timer->start();
     auto client = Client::releaseCurrent();
     timer->onThreadDetach();
 }
 
 DEATH_TEST_F(OperationCPUTimerTest, GetElapsedForPausedTimer, "Not attached to current thread") {
-    auto timer = getTimer();
+    auto timer = makeTimer();
     timer->start();
     auto client = Client::releaseCurrent();
     timer->getElapsed();
@@ -225,7 +254,7 @@ TEST_F(OperationCPUTimerTest, TimerPausesOnBlockingSleep) {
     const auto kMaxFailureRate = 0.1;
     const auto kMaxFailures = kMaxFailureRate * kRepeats;
 
-    auto timer = getTimer();
+    auto timer = makeTimer();
 
     auto checkTimer = [&] {
         auto elapsed = timer->getElapsed();
@@ -262,7 +291,7 @@ TEST_F(OperationCPUTimerTest, TimerPausesOnBlockingSleep) {
 #else
 
 TEST_F(OperationCPUTimerTest, TimerNotSetIfNotSupported) {
-    auto timer = getTimer();
+    auto timer = getTimers();
     ASSERT(timer == nullptr);
 }
 

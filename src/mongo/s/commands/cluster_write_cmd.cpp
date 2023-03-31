@@ -42,11 +42,11 @@
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/chunk_manager_targeter.h"
 #include "mongo/s/client/num_hosts_targeted_metrics.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/cluster_write.h"
+#include "mongo/s/collection_routing_info_targeter.h"
 #include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/commands/document_shard_key_update_util.h"
 #include "mongo/s/grid.h"
@@ -62,6 +62,8 @@
 
 namespace mongo {
 namespace {
+
+using QuerySamplingOptions = OperationContext::QuerySamplingOptions;
 
 MONGO_FAIL_POINT_DEFINE(hangAfterThrowWouldChangeOwningShardRetryableWrite);
 
@@ -144,7 +146,7 @@ boost::optional<WouldChangeOwningShardInfo> getWouldChangeOwningShardErrorInfo(
     }
 }
 
-void handleWouldChangeOwningShardErrorRetryableWrite(OperationContext* opCtx,
+void handleWouldChangeOwningShardErrorNonTransaction(OperationContext* opCtx,
                                                      BatchedCommandRequest* request,
                                                      BatchedCommandResponse* response) {
     // Strip write concern because this command will be sent as part of a
@@ -178,7 +180,7 @@ void handleWouldChangeOwningShardErrorRetryableWrite(OperationContext* opCtx,
 
     auto swCommitResult = txn.runNoThrow(
         opCtx, [sharedBlock](const txn_api::TransactionClient& txnClient, ExecutorPtr txnExec) {
-            return txnClient.runCommand(sharedBlock->nss.db(), sharedBlock->cmdObj)
+            return txnClient.runCommand(sharedBlock->nss.dbName(), sharedBlock->cmdObj)
                 .thenRunOn(txnExec)
                 .then([sharedBlock](auto res) {
                     uassertStatusOK(getStatusFromWriteCommandReply(res));
@@ -270,17 +272,36 @@ UpdateShardKeyResult handleWouldChangeOwningShardErrorTransaction(
     return UpdateShardKeyResult{sharedBlock->updatedShardKey, std::move(upsertedId)};
 }
 
-/**
- * Changes the shard key for the document if the response object contains a WouldChangeOwningShard
- * error. If the original command was sent as a retryable write, starts a transaction on the same
- * session and txnNum, deletes the original document, inserts the new one, and commits the
- * transaction. If the original command is part of a transaction, deletes the original document and
- * inserts the new one. Returns whether or not we actually complete the delete and insert.
- */
-bool handleWouldChangeOwningShardError(OperationContext* opCtx,
-                                       BatchedCommandRequest* request,
-                                       BatchedCommandResponse* response,
-                                       BatchWriteExecStats stats) {
+void updateHostsTargetedMetrics(OperationContext* opCtx,
+                                BatchedCommandRequest::BatchType batchType,
+                                int nShardsOwningChunks,
+                                int nShardsTargeted) {
+    NumHostsTargetedMetrics::QueryType writeType;
+    switch (batchType) {
+        case BatchedCommandRequest::BatchType_Insert:
+            writeType = NumHostsTargetedMetrics::QueryType::kInsertCmd;
+            break;
+        case BatchedCommandRequest::BatchType_Update:
+            writeType = NumHostsTargetedMetrics::QueryType::kUpdateCmd;
+            break;
+        case BatchedCommandRequest::BatchType_Delete:
+            writeType = NumHostsTargetedMetrics::QueryType::kDeleteCmd;
+            break;
+
+            MONGO_UNREACHABLE;
+    }
+
+    auto targetType = NumHostsTargetedMetrics::get(opCtx).parseTargetType(
+        opCtx, nShardsTargeted, nShardsOwningChunks);
+    NumHostsTargetedMetrics::get(opCtx).addNumHostsTargeted(writeType, targetType);
+}
+
+}  // namespace
+
+bool ClusterWriteCmd::handleWouldChangeOwningShardError(OperationContext* opCtx,
+                                                        BatchedCommandRequest* request,
+                                                        BatchedCommandResponse* response,
+                                                        BatchWriteExecStats stats) {
     auto txnRouter = TransactionRouter::get(opCtx);
     bool isRetryableWrite = opCtx->getTxnNumber() && !txnRouter;
 
@@ -294,21 +315,36 @@ bool handleWouldChangeOwningShardError(OperationContext* opCtx,
 
     if (feature_flags::gFeatureFlagUpdateDocumentShardKeyUsingTransactionApi.isEnabled(
             serverGlobalParams.featureCompatibility)) {
-        if (isRetryableWrite) {
-            if (MONGO_unlikely(hangAfterThrowWouldChangeOwningShardRetryableWrite.shouldFail())) {
-                LOGV2(5918603, "Hit hangAfterThrowWouldChangeOwningShardRetryableWrite failpoint");
-                hangAfterThrowWouldChangeOwningShardRetryableWrite.pauseWhileSet(opCtx);
-            }
-
-            handleWouldChangeOwningShardErrorRetryableWrite(opCtx, request, response);
-        } else {
+        if (txnRouter) {
             auto updateResult = handleWouldChangeOwningShardErrorTransaction(
                 opCtx, request, response, *wouldChangeOwningShardErrorInfo);
             updatedShardKey = updateResult.updatedShardKey;
             upsertedId = std::move(updateResult.upsertedId);
+        } else {
+            // Updating a document's shard key such that its owning shard changes must be run in a
+            // transaction. If this update is not already in a transaction, complete the update
+            // using an internal transaction.
+            if (isRetryableWrite) {
+                if (MONGO_unlikely(
+                        hangAfterThrowWouldChangeOwningShardRetryableWrite.shouldFail())) {
+                    LOGV2(5918603,
+                          "Hit hangAfterThrowWouldChangeOwningShardRetryableWrite failpoint");
+                    hangAfterThrowWouldChangeOwningShardRetryableWrite.pauseWhileSet(opCtx);
+                }
+            }
+            handleWouldChangeOwningShardErrorNonTransaction(opCtx, request, response);
         }
     } else {
         // TODO SERVER-67429: Delete this branch.
+        if (!txnRouter && !isRetryableWrite) {
+            response->getErrDetails().back().setStatus(Status(
+                ErrorCodes::IllegalOperation,
+                "Must run update to document shard key in a transaction or as a retryable write."));
+            return false;
+        }
+
+        opCtx->setQuerySamplingOptions(QuerySamplingOptions::kOptOut);
+
         if (isRetryableWrite) {
             if (MONGO_unlikely(hangAfterThrowWouldChangeOwningShardRetryableWrite.shouldFail())) {
                 LOGV2(22759, "Hit hangAfterThrowWouldChangeOwningShardRetryableWrite failpoint");
@@ -410,7 +446,7 @@ bool handleWouldChangeOwningShardError(OperationContext* opCtx,
         if (upsertedId) {
             auto upsertDetail = std::make_unique<BatchedUpsertDetail>();
             upsertDetail->setIndex(0);
-            upsertDetail->setUpsertedID(upsertedId.get());
+            upsertDetail->setUpsertedID(upsertedId.value());
             response->addToUpsertDetails(upsertDetail.release());
         } else {
             response->setNModified(response->getNModified() + 1);
@@ -420,32 +456,6 @@ bool handleWouldChangeOwningShardError(OperationContext* opCtx,
     return updatedShardKey;
 }
 
-void updateHostsTargetedMetrics(OperationContext* opCtx,
-                                BatchedCommandRequest::BatchType batchType,
-                                int nShardsOwningChunks,
-                                int nShardsTargeted) {
-    NumHostsTargetedMetrics::QueryType writeType;
-    switch (batchType) {
-        case BatchedCommandRequest::BatchType_Insert:
-            writeType = NumHostsTargetedMetrics::QueryType::kInsertCmd;
-            break;
-        case BatchedCommandRequest::BatchType_Update:
-            writeType = NumHostsTargetedMetrics::QueryType::kUpdateCmd;
-            break;
-        case BatchedCommandRequest::BatchType_Delete:
-            writeType = NumHostsTargetedMetrics::QueryType::kDeleteCmd;
-            break;
-
-            MONGO_UNREACHABLE;
-    }
-
-    auto targetType = NumHostsTargetedMetrics::get(opCtx).parseTargetType(
-        opCtx, nShardsTargeted, nShardsOwningChunks);
-    NumHostsTargetedMetrics::get(opCtx).addNumHostsTargeted(writeType, targetType);
-}
-
-}  // namespace
-
 void ClusterWriteCmd::_commandOpWrite(OperationContext* opCtx,
                                       const NamespaceString& nss,
                                       const BSONObj& command,
@@ -454,7 +464,7 @@ void ClusterWriteCmd::_commandOpWrite(OperationContext* opCtx,
     auto endpoints = [&] {
         // Note that this implementation will not handle targeting retries and does not
         // completely emulate write behavior
-        ChunkManagerTargeter targeter(opCtx, nss);
+        CollectionRoutingInfoTargeter targeter(opCtx, nss);
 
         if (targetingBatchItem.getOpType() == BatchedCommandRequest::BatchType_Insert) {
             return std::vector{targeter.targetInsert(opCtx, targetingBatchItem.getDocument())};
@@ -486,7 +496,7 @@ void ClusterWriteCmd::_commandOpWrite(OperationContext* opCtx,
     MultiStatementTransactionRequestsSender ars(
         opCtx,
         Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
-        nss.db(),
+        nss.dbName(),
         requests,
         readPref,
         Shard::RetryPolicy::kNoRetry);
@@ -512,13 +522,7 @@ bool ClusterWriteCmd::InvocationBase::runImpl(OperationContext* opCtx,
     // The batched request will only have WC if it was supplied by the client. Otherwise, the
     // batched request should use the WC from the opCtx.
     if (!batchedRequest.hasWriteConcern()) {
-        if (opCtx->getWriteConcern().usedDefaultConstructedWC) {
-            // Pass writeConcern: {}, rather than {w: 1, wtimeout: 0}, so as to not override the
-            // configsvr w:majority upconvert.
-            batchedRequest.setWriteConcern(BSONObj());
-        } else {
-            batchedRequest.setWriteConcern(opCtx->getWriteConcern().toBSON());
-        }
+        batchedRequest.setWriteConcern(opCtx->getWriteConcern().toBSON());
     }
 
     // Write ops are never allowed to have writeConcern inside transactions. Normally
@@ -557,22 +561,17 @@ bool ClusterWriteCmd::InvocationBase::runImpl(OperationContext* opCtx,
 
     // TODO: increase opcounters by more than one
     auto& debug = CurOp::get(opCtx)->debug();
-    auto catalogCache = Grid::get(opCtx)->catalogCache();
     switch (_batchedRequest.getBatchType()) {
         case BatchedCommandRequest::BatchType_Insert:
             for (size_t i = 0; i < numAttempts; ++i) {
                 globalOpCounters.gotInsert();
             }
-            catalogCache->checkAndRecordOperationBlockedByRefresh(opCtx,
-                                                                  mongo::LogicalOp::opInsert);
             debug.additiveMetrics.ninserted = response.getN();
             break;
         case BatchedCommandRequest::BatchType_Update:
             for (size_t i = 0; i < numAttempts; ++i) {
                 globalOpCounters.gotUpdate();
             }
-            catalogCache->checkAndRecordOperationBlockedByRefresh(opCtx,
-                                                                  mongo::LogicalOp::opUpdate);
 
             // The response.getN() count is the sum of documents matched and upserted.
             if (response.isUpsertDetailsSet()) {
@@ -605,8 +604,6 @@ bool ClusterWriteCmd::InvocationBase::runImpl(OperationContext* opCtx,
             for (size_t i = 0; i < numAttempts; ++i) {
                 globalOpCounters.gotDelete();
             }
-            catalogCache->checkAndRecordOperationBlockedByRefresh(opCtx,
-                                                                  mongo::LogicalOp::opDelete);
             debug.additiveMetrics.ndeleted = response.getN();
             break;
     }
@@ -615,10 +612,10 @@ bool ClusterWriteCmd::InvocationBase::runImpl(OperationContext* opCtx,
     CurOp::get(opCtx)->debug().nShards =
         stats.getTargetedShards().size() + (updatedShardKey ? 1 : 0);
 
-    if (stats.getNumShardsOwningChunks().is_initialized())
+    if (stats.getNumShardsOwningChunks().has_value())
         updateHostsTargetedMetrics(opCtx,
                                    _batchedRequest.getBatchType(),
-                                   stats.getNumShardsOwningChunks().get(),
+                                   stats.getNumShardsOwningChunks().value(),
                                    stats.getTargetedShards().size() + (updatedShardKey ? 1 : 0));
 
     if (auto txnRouter = TransactionRouter::get(opCtx)) {
@@ -645,6 +642,8 @@ void ClusterWriteCmd::InvocationBase::run(OperationContext* opCtx,
 void ClusterWriteCmd::InvocationBase::explain(OperationContext* opCtx,
                                               ExplainOptions::Verbosity verbosity,
                                               rpc::ReplyBuilderInterface* result) {
+    preExplainImplHook(opCtx);
+
     uassert(ErrorCodes::InvalidLength,
             "explained write batches must be of size 1",
             _batchedRequest.sizeWriteOps() == 1U);

@@ -30,9 +30,9 @@
 
 #include "mongo/db/storage/durable_catalog_impl.h"
 
+#include <cstdlib>
 #include <fmt/format.h>
 #include <memory>
-#include <stdlib.h>
 
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/bson/util/builder.h"
@@ -147,8 +147,8 @@ public:
     AddIdentChange(DurableCatalogImpl* catalog, RecordId catalogId)
         : _catalog(catalog), _catalogId(std::move(catalogId)) {}
 
-    virtual void commit(boost::optional<Timestamp>) {}
-    virtual void rollback() {
+    virtual void commit(OperationContext* opCtx, boost::optional<Timestamp>) {}
+    virtual void rollback(OperationContext* opCtx) {
         stdx::lock_guard<Latch> lk(_catalog->_catalogIdToEntryMapLock);
         _catalog->_catalogIdToEntryMap.erase(_catalogId);
     }
@@ -210,7 +210,7 @@ std::string DurableCatalogImpl::getFilesystemPathForDb(const std::string& dbName
     }
 }
 
-std::string DurableCatalogImpl::_newUniqueIdent(NamespaceString nss, const char* kind) {
+std::string DurableCatalogImpl::generateUniqueIdent(NamespaceString nss, const char* kind) {
     // If this changes to not put _rand at the end, _hasEntryCollidingWithRand will need fixing.
     stdx::lock_guard<Latch> lk(_randLock);
     StringBuilder buf;
@@ -236,8 +236,9 @@ void DurableCatalogImpl::init(OperationContext* opCtx) {
 
         // No rollback since this is just loading already committed data.
         auto ident = obj["ident"].String();
-        auto ns = obj["ns"].String();
-        _catalogIdToEntryMap[record->id] = Entry(record->id, ident, NamespaceString(ns));
+        auto nss =
+            NamespaceString::parseFromStringExpectTenantIdInMultitenancyMode(obj["ns"].String());
+        _catalogIdToEntryMap[record->id] = EntryIdentifier(record->id, ident, nss);
     }
 
     // In the unlikely event that we have used this _rand before generate a new one.
@@ -247,9 +248,9 @@ void DurableCatalogImpl::init(OperationContext* opCtx) {
     }
 }
 
-std::vector<DurableCatalog::Entry> DurableCatalogImpl::getAllCatalogEntries(
+std::vector<DurableCatalog::EntryIdentifier> DurableCatalogImpl::getAllCatalogEntries(
     OperationContext* opCtx) const {
-    std::vector<DurableCatalog::Entry> ret;
+    std::vector<DurableCatalog::EntryIdentifier> ret;
 
     auto cursor = _rs->getCursor(opCtx);
     while (auto record = cursor->next()) {
@@ -259,35 +260,84 @@ std::vector<DurableCatalog::Entry> DurableCatalogImpl::getAllCatalogEntries(
             continue;
         }
         auto ident = obj["ident"].String();
-        auto ns = obj["ns"].String();
+        auto nss =
+            NamespaceString::parseFromStringExpectTenantIdInMultitenancyMode(obj["ns"].String());
 
-        ret.emplace_back(record->id, ident, NamespaceString(ns));
+        ret.emplace_back(record->id, ident, nss);
     }
 
     return ret;
 }
 
-DurableCatalog::Entry DurableCatalogImpl::getEntry(const RecordId& catalogId) const {
+boost::optional<DurableCatalogEntry> DurableCatalogImpl::scanForCatalogEntryByNss(
+    OperationContext* opCtx, const NamespaceString& nss) const {
+    auto cursor = _rs->getCursor(opCtx);
+    while (auto record = cursor->next()) {
+        BSONObj obj = record->data.releaseToBson();
+
+        if (isFeatureDocument(obj)) {
+            // Skip over the version document because it doesn't correspond to a collection.
+            continue;
+        }
+
+        auto entryNss =
+            NamespaceString::parseFromStringExpectTenantIdInMultitenancyMode(obj["ns"].String());
+        if (entryNss == nss) {
+            BSONElement idxIdent = obj["idxIdent"];
+            return DurableCatalogEntry{record->id,
+                                       obj["ident"].String(),
+                                       idxIdent.eoo() ? BSONObj() : idxIdent.Obj().getOwned(),
+                                       _parseMetaData(obj["md"])};
+        }
+    }
+
+    return boost::none;
+}
+
+boost::optional<DurableCatalogEntry> DurableCatalogImpl::scanForCatalogEntryByUUID(
+    OperationContext* opCtx, const UUID& uuid) const {
+    auto cursor = _rs->getCursor(opCtx);
+    while (auto record = cursor->next()) {
+        BSONObj obj = record->data.releaseToBson();
+
+        if (isFeatureDocument(obj)) {
+            // Skip over the version document because it doesn't correspond to a collection.
+            continue;
+        }
+
+        std::shared_ptr<BSONCollectionCatalogEntry::MetaData> md = _parseMetaData(obj["md"]);
+        if (md->options.uuid == uuid) {
+            BSONElement idxIdent = obj["idxIdent"];
+            return DurableCatalogEntry{record->id,
+                                       obj["ident"].String(),
+                                       idxIdent.eoo() ? BSONObj() : idxIdent.Obj().getOwned(),
+                                       md};
+        }
+    }
+
+    return boost::none;
+}
+
+DurableCatalog::EntryIdentifier DurableCatalogImpl::getEntry(const RecordId& catalogId) const {
     stdx::lock_guard<Latch> lk(_catalogIdToEntryMapLock);
     auto it = _catalogIdToEntryMap.find(catalogId);
     invariant(it != _catalogIdToEntryMap.end());
     return it->second;
 }
 
-StatusWith<DurableCatalog::Entry> DurableCatalogImpl::_addEntry(OperationContext* opCtx,
-                                                                NamespaceString nss,
-                                                                const CollectionOptions& options) {
+StatusWith<DurableCatalog::EntryIdentifier> DurableCatalogImpl::_addEntry(
+    OperationContext* opCtx, NamespaceString nss, const CollectionOptions& options) {
     invariant(opCtx->lockState()->isDbLockedForMode(nss.dbName(), MODE_IX));
 
-    auto ident = _newUniqueIdent(nss, "collection");
+    auto ident = generateUniqueIdent(nss, "collection");
 
     BSONObj obj;
     {
         BSONObjBuilder b;
-        b.append("ns", nss.ns());
+        b.append("ns", nss.toStringWithTenantId());
         b.append("ident", ident);
         BSONCollectionCatalogEntry::MetaData md;
-        md.ns = nss.ns();
+        md.nss = nss;
         md.options = options;
 
         if (options.timeseries) {
@@ -316,9 +366,8 @@ StatusWith<DurableCatalog::Entry> DurableCatalogImpl::_addEntry(OperationContext
     return {{res.getValue(), ident, nss}};
 }
 
-StatusWith<DurableCatalog::Entry> DurableCatalogImpl::_importEntry(OperationContext* opCtx,
-                                                                   NamespaceString nss,
-                                                                   const BSONObj& metadata) {
+StatusWith<DurableCatalog::EntryIdentifier> DurableCatalogImpl::_importEntry(
+    OperationContext* opCtx, NamespaceString nss, const BSONObj& metadata) {
     invariant(opCtx->lockState()->isDbLockedForMode(nss.dbName(), MODE_IX));
 
     auto ident = metadata["ident"].String();
@@ -378,12 +427,30 @@ BSONObj DurableCatalogImpl::_findEntry(OperationContext* opCtx, const RecordId& 
     return data.releaseToBson().getOwned();
 }
 
+boost::optional<DurableCatalogEntry> DurableCatalogImpl::getParsedCatalogEntry(
+    OperationContext* opCtx, const RecordId& catalogId) const {
+    BSONObj obj = _findEntry(opCtx, catalogId);
+    if (obj.isEmpty()) {
+        return boost::none;
+    }
+
+    BSONElement idxIdent = obj["idxIdent"];
+    return DurableCatalogEntry{catalogId,
+                               obj["ident"].String(),
+                               idxIdent.eoo() ? BSONObj() : idxIdent.Obj().getOwned(),
+                               _parseMetaData(obj["md"])};
+}
+
 std::shared_ptr<BSONCollectionCatalogEntry::MetaData> DurableCatalogImpl::getMetaData(
     OperationContext* opCtx, const RecordId& catalogId) const {
     BSONObj obj = _findEntry(opCtx, catalogId);
     LOGV2_DEBUG(22209, 3, " fetched CCE metadata: {obj}", "obj"_attr = obj);
+    return _parseMetaData(obj["md"]);
+}
+
+std::shared_ptr<BSONCollectionCatalogEntry::MetaData> DurableCatalogImpl::_parseMetaData(
+    const BSONElement& mdElement) const {
     std::shared_ptr<BSONCollectionCatalogEntry::MetaData> md;
-    const BSONElement mdElement = obj["md"];
     if (mdElement.isABSONObj()) {
         LOGV2_DEBUG(22210, 3, "returning metadata: {mdElement}", "mdElement"_attr = mdElement);
         md = std::make_shared<BSONCollectionCatalogEntry::MetaData>();
@@ -395,7 +462,7 @@ std::shared_ptr<BSONCollectionCatalogEntry::MetaData> DurableCatalogImpl::getMet
 void DurableCatalogImpl::putMetaData(OperationContext* opCtx,
                                      const RecordId& catalogId,
                                      BSONCollectionCatalogEntry::MetaData& md) {
-    NamespaceString nss(md.ns);
+    NamespaceString nss(md.nss);
     BSONObj obj = _findEntry(opCtx, catalogId);
 
     {
@@ -426,7 +493,7 @@ void DurableCatalogImpl::putMetaData(OperationContext* opCtx,
                 continue;
             }
             // missing, create new
-            newIdentMap.append(name, _newUniqueIdent(nss, "index"));
+            newIdentMap.append(name, generateUniqueIdent(nss, "index"));
         }
         b.append("idxIdent", newIdentMap.obj());
 
@@ -448,7 +515,7 @@ Status DurableCatalogImpl::_replaceEntry(OperationContext* opCtx,
     {
         BSONObjBuilder b;
 
-        b.append("ns", toNss.ns());
+        b.append("ns", toNss.toStringWithTenantId());
         b.append("md", md.toBSON());
 
         b.appendElementsUnique(old);
@@ -464,7 +531,7 @@ Status DurableCatalogImpl::_replaceEntry(OperationContext* opCtx,
 
     NamespaceString fromName = it->second.nss;
     it->second.nss = toNss;
-    opCtx->recoveryUnit()->onRollback([this, catalogId, fromName]() {
+    opCtx->recoveryUnit()->onRollback([this, catalogId, fromName](OperationContext*) {
         stdx::lock_guard<Latch> lk(_catalogIdToEntryMapLock);
         const auto it = _catalogIdToEntryMap.find(catalogId);
         invariant(it != _catalogIdToEntryMap.end());
@@ -481,7 +548,7 @@ Status DurableCatalogImpl::_removeEntry(OperationContext* opCtx, const RecordId&
         return Status(ErrorCodes::NamespaceNotFound, "collection not found");
     }
 
-    opCtx->recoveryUnit()->onRollback([this, catalogId, entry = it->second]() {
+    opCtx->recoveryUnit()->onRollback([this, catalogId, entry = it->second](OperationContext*) {
         stdx::lock_guard<Latch> lk(_catalogIdToEntryMapLock);
         _catalogIdToEntryMap[catalogId] = entry;
     });
@@ -549,8 +616,8 @@ bool DurableCatalogImpl::isCollectionIdent(StringData ident) const {
         ident.find("collection/") != std::string::npos;
 }
 
-StatusWith<std::string> DurableCatalogImpl::newOrphanedIdent(OperationContext* opCtx,
-                                                             std::string ident) {
+StatusWith<std::string> DurableCatalogImpl::newOrphanedIdent(
+    OperationContext* opCtx, std::string ident, const CollectionOptions& optionsWithUUID) {
     // The collection will be named local.orphan.xxxxx.
     std::string identNs = ident;
     std::replace(identNs.begin(), identNs.end(), '-', '_');
@@ -558,16 +625,13 @@ StatusWith<std::string> DurableCatalogImpl::newOrphanedIdent(OperationContext* o
     NamespaceString nss(NamespaceString(NamespaceString::kOrphanCollectionDb,
                                         NamespaceString::kOrphanCollectionPrefix + identNs));
 
-    // Generate a new UUID for the orphaned collection.
-    CollectionOptions optionsWithUUID;
-    optionsWithUUID.uuid.emplace(UUID::gen());
     BSONObj obj;
     {
         BSONObjBuilder b;
-        b.append("ns", nss.ns());
+        b.append("ns", nss.toStringWithTenantId());
         b.append("ident", ident);
         BSONCollectionCatalogEntry::MetaData md;
-        md.ns = nss.ns();
+        md.nss = nss;
         // Default options with newly generated UUID.
         md.options = optionsWithUUID;
         b.append("md", md.toBSON());
@@ -579,7 +643,7 @@ StatusWith<std::string> DurableCatalogImpl::newOrphanedIdent(OperationContext* o
 
     stdx::lock_guard<Latch> lk(_catalogIdToEntryMapLock);
     invariant(_catalogIdToEntryMap.find(res.getValue()) == _catalogIdToEntryMap.end());
-    _catalogIdToEntryMap[res.getValue()] = Entry(res.getValue(), ident, nss);
+    _catalogIdToEntryMap[res.getValue()] = EntryIdentifier(res.getValue(), ident, nss);
     opCtx->recoveryUnit()->registerChange(std::make_unique<AddIdentChange>(this, res.getValue()));
 
     LOGV2_DEBUG(22213,
@@ -587,7 +651,7 @@ StatusWith<std::string> DurableCatalogImpl::newOrphanedIdent(OperationContext* o
                 "stored meta data for orphaned collection {namespace} @ {res_getValue}",
                 logAttrs(nss),
                 "res_getValue"_attr = res.getValue());
-    return {nss.ns()};
+    return {nss.toStringWithTenantId()};
 }
 
 StatusWith<std::pair<RecordId, std::unique_ptr<RecordStore>>> DurableCatalogImpl::createCollection(
@@ -599,13 +663,14 @@ StatusWith<std::pair<RecordId, std::unique_ptr<RecordStore>>> DurableCatalogImpl
     invariant(nss.coll().size() > 0);
 
     if (CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss)) {
-        throwWriteConflictException();
+        throwWriteConflictException(str::stream()
+                                    << "Namespace '" << nss.ns() << "' is already in use.");
     }
 
-    StatusWith<Entry> swEntry = _addEntry(opCtx, nss, options);
+    StatusWith<EntryIdentifier> swEntry = _addEntry(opCtx, nss, options);
     if (!swEntry.isOK())
         return swEntry.getStatus();
-    Entry& entry = swEntry.getValue();
+    EntryIdentifier& entry = swEntry.getValue();
 
     const auto keyFormat = [&] {
         // Clustered collections require KeyFormat::String, but the opposite is not necessarily
@@ -622,7 +687,7 @@ StatusWith<std::pair<RecordId, std::unique_ptr<RecordStore>>> DurableCatalogImpl
         return status;
 
     auto ru = opCtx->recoveryUnit();
-    opCtx->recoveryUnit()->onRollback([ru, catalog = this, ident = entry.ident]() {
+    opCtx->recoveryUnit()->onRollback([ru, catalog = this, ident = entry.ident](OperationContext*) {
         // Intentionally ignoring failure
         catalog->_engine->getEngine()->dropIdent(ru, ident).ignore();
     });
@@ -645,11 +710,12 @@ Status DurableCatalogImpl::createIndex(OperationContext* opCtx,
         ? kvEngine->createColumnStore(opCtx, nss, collOptions, ident, spec)
         : kvEngine->createSortedDataInterface(opCtx, nss, collOptions, ident, spec);
     if (status.isOK()) {
-        opCtx->recoveryUnit()->onRollback([this, ident, recoveryUnit = opCtx->recoveryUnit()]() {
-            // Intentionally ignoring failure.
-            auto kvEngine = _engine->getEngine();
-            kvEngine->dropIdent(recoveryUnit, ident).ignore();
-        });
+        opCtx->recoveryUnit()->onRollback(
+            [this, ident, recoveryUnit = opCtx->recoveryUnit()](OperationContext*) {
+                // Intentionally ignoring failure.
+                auto kvEngine = _engine->getEngine();
+                kvEngine->dropIdent(recoveryUnit, ident).ignore();
+            });
     }
     return status;
 }
@@ -717,18 +783,19 @@ StatusWith<DurableCatalog::ImportResult> DurableCatalogImpl::importCollection(
         };
 
         stdx::lock_guard<Latch> lk(_randLock);
-        while (_hasEntryCollidingWithRand(lk) || identsToImportConflict(lk)) {
+        while (!importOptions.skipIdentCollisionCheck &&
+               (_hasEntryCollidingWithRand(lk) || identsToImportConflict(lk))) {
             _rand = _newRand();
         }
     }
 
-    StatusWith<Entry> swEntry = _importEntry(opCtx, nss, catalogEntry);
+    StatusWith<EntryIdentifier> swEntry = _importEntry(opCtx, nss, catalogEntry);
     if (!swEntry.isOK())
         return swEntry.getStatus();
-    Entry& entry = swEntry.getValue();
+    EntryIdentifier& entry = swEntry.getValue();
 
     opCtx->recoveryUnit()->onRollback(
-        [opCtx, catalog = this, ident = entry.ident, indexIdents = indexIdents]() {
+        [catalog = this, ident = entry.ident, indexIdents = indexIdents](OperationContext* opCtx) {
             catalog->_engine->getEngine()->dropIdentForImport(opCtx, ident);
             for (const auto& indexIdent : indexIdents) {
                 catalog->_engine->getEngine()->dropIdentForImport(opCtx, indexIdent);
@@ -751,7 +818,7 @@ StatusWith<DurableCatalog::ImportResult> DurableCatalogImpl::importCollection(
     auto rs = _engine->getEngine()->getRecordStore(opCtx, nss, entry.ident, md.options);
     invariant(rs);
 
-    return DurableCatalog::ImportResult(entry.catalogId, std::move(rs), md.options.uuid.get());
+    return DurableCatalog::ImportResult(entry.catalogId, std::move(rs), md.options.uuid.value());
 }
 
 Status DurableCatalogImpl::renameCollection(OperationContext* opCtx,
@@ -762,7 +829,7 @@ Status DurableCatalogImpl::renameCollection(OperationContext* opCtx,
 }
 
 Status DurableCatalogImpl::dropCollection(OperationContext* opCtx, const RecordId& catalogId) {
-    Entry entry;
+    EntryIdentifier entry;
     {
         stdx::lock_guard<Latch> lk(_catalogIdToEntryMapLock);
         entry = _catalogIdToEntryMap[catalogId];
@@ -819,6 +886,21 @@ int DurableCatalogImpl::getTotalIndexCount(OperationContext* opCtx,
         return 0;
 
     return md->getTotalIndexCount();
+}
+
+void DurableCatalogImpl::getReadyIndexes(OperationContext* opCtx,
+                                         RecordId catalogId,
+                                         StringSet* names) const {
+    auto md = getMetaData(opCtx, catalogId);
+
+    if (!md) {
+        return;
+    }
+
+    for (const auto& index : md->indexes) {
+        if (index.ready)
+            names->insert(index.spec["name"].String());
+    }
 }
 
 bool DurableCatalogImpl::isIndexPresent(OperationContext* opCtx,

@@ -76,7 +76,7 @@ public:
             const auto& dbName = request().getDbName();
 
             try {
-                uassertStatusOK(dropDatabase(opCtx, dbName.toString()));
+                uassertStatusOK(dropDatabase(opCtx, dbName));
             } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
                 LOGV2_DEBUG(5281101,
                             1,
@@ -88,7 +88,7 @@ public:
 
     private:
         NamespaceString ns() const override {
-            return {request().getDbName(), ""};
+            return NamespaceString(request().getDbName());
         }
 
         bool supportsWriteConcern() const override {
@@ -103,7 +103,7 @@ public:
                                                            ActionType::internal));
         }
     };
-} sharsvrdDropCollectionParticipantCommand;
+} shardsvrDropDatabaseParticipantCommand;
 
 }  // namespace
 }  // namespace mongo

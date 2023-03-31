@@ -65,26 +65,28 @@ public:
         return true;
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
-                ActionType::getShardVersion)) {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(
+                     ResourcePattern::forExactNamespace(parseNs(dbName, cmdObj)),
+                     ActionType::getShardVersion)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
         return Status::OK();
     }
 
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return CommandHelpers::parseNsFullyQualified(cmdObj);
+    NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) const override {
+        return NamespaceStringUtil::parseNamespaceFromRequest(
+            dbName.tenantId(), CommandHelpers::parseNsFullyQualified(cmdObj));
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        const NamespaceString nss(parseNs(dbname, cmdObj));
+        const NamespaceString nss(parseNs(dbName, cmdObj));
 
         uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
 
@@ -92,10 +94,15 @@ public:
             "configServer",
             Grid::get(opCtx)->shardRegistry()->getConfigServerConnectionString().toString());
 
-        AutoGetCollection autoColl(opCtx, nss, MODE_IS, AutoGetCollectionViewMode::kViewsPermitted);
-        auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
+        AutoGetCollection autoColl(
+            opCtx,
+            nss,
+            MODE_IS,
+            AutoGetCollection::Options{}.viewMode(auto_get_collection::ViewMode::kViewsPermitted));
+        const auto scopedCsr =
+            CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(opCtx, nss);
 
-        const auto optMetadata = csr->getCurrentMetadataIfKnown();
+        auto optMetadata = scopedCsr->getCurrentMetadataIfKnown();
         if (!optMetadata) {
             result.append("global", "UNKNOWN");
 
@@ -104,23 +111,25 @@ public:
             }
         } else {
             const auto& metadata = *optMetadata;
-            result.appendTimestamp("global", metadata.getShardVersion().toLong());
+            result.appendTimestamp("global", metadata.getShardPlacementVersion().toLong());
 
             if (cmdObj["fullMetadata"].trueValue()) {
                 BSONObjBuilder metadataBuilder(result.subobjStart("metadata"));
                 if (metadata.isSharded()) {
                     metadataBuilder.appendTimestamp("collVersion",
-                                                    metadata.getCollVersion().toLong());
-                    metadataBuilder.append("collVersionEpoch", metadata.getCollVersion().epoch());
+                                                    metadata.getCollPlacementVersion().toLong());
+                    metadataBuilder.append("collVersionEpoch",
+                                           metadata.getCollPlacementVersion().epoch());
                     metadataBuilder.append("collVersionTimestamp",
-                                           metadata.getCollVersion().getTimestamp());
+                                           metadata.getCollPlacementVersion().getTimestamp());
 
-                    metadataBuilder.appendTimestamp("shardVersion",
-                                                    metadata.getShardVersionForLogging().toLong());
+                    metadataBuilder.appendTimestamp(
+                        "shardVersion", metadata.getShardPlacementVersionForLogging().toLong());
                     metadataBuilder.append("shardVersionEpoch",
-                                           metadata.getShardVersionForLogging().epoch());
-                    metadataBuilder.append("shardVersionTimestamp",
-                                           metadata.getShardVersionForLogging().getTimestamp());
+                                           metadata.getShardPlacementVersionForLogging().epoch());
+                    metadataBuilder.append(
+                        "shardVersionTimestamp",
+                        metadata.getShardPlacementVersionForLogging().getTimestamp());
 
                     metadataBuilder.append("keyPattern", metadata.getShardKeyPattern().toBSON());
 
@@ -129,6 +138,28 @@ public:
                     chunksArr.doneFast();
                 }
                 metadataBuilder.doneFast();
+            }
+        }
+
+        if (scopedCsr->getCollectionIndexes(opCtx)) {
+            result.append("indexVersion", scopedCsr->getCollectionIndexes(opCtx)->indexVersion());
+
+            if (cmdObj["fullMetadata"].trueValue()) {
+                BSONArrayBuilder indexesArrBuilder;
+                bool exceedsSizeLimit = false;
+                scopedCsr->getIndexes(opCtx)->forEachIndex([&](const auto& index) {
+                    BSONObjBuilder indexB(index.toBSON());
+                    if (result.len() + indexesArrBuilder.len() + indexB.len() >
+                        BSONObjMaxUserSize) {
+                        exceedsSizeLimit = true;
+                    } else {
+                        indexesArrBuilder.append(indexB.done());
+                    }
+
+                    return !exceedsSizeLimit;
+                });
+
+                result.append("indexes", indexesArrBuilder.arr());
             }
         }
 

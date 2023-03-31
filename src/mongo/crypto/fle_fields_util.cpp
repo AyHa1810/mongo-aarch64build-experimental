@@ -27,22 +27,134 @@
  *    it in the license file.
  */
 
-#include "fle_fields_util.h"
+#include "mongo/crypto/fle_fields_util.h"
+
 #include "mongo/bson/bsonelement.h"
-#include "mongo/bson/bsontypes.h"
 #include "mongo/crypto/fle_field_schema_gen.h"
-#include "mongo/idl/basic_types.h"
+#include "mongo/db/basic_types_gen.h"
+#include "mongo/db/exec/document_value/value.h"
+#include <limits>
 
 namespace mongo {
 void validateIDLFLE2EncryptionPlaceholder(const FLE2EncryptionPlaceholder* placeholder) {
     if (placeholder->getAlgorithm() == Fle2AlgorithmInt::kRange) {
-        auto val = placeholder->getValue().getElement();
-        uassert(6720200, "Range placeholder must be an array.", val.isABSONObj());
-        auto obj = val.Obj();
-        uassert(6720201, "Range placeholder must be an array.", obj.couldBeArray());
-        uassert(6720202,
-                "Range placeholder must hold an array with a min and max value.",
-                obj.nFields() == 2);
+        if (placeholder->getType() == Fle2PlaceholderType::kFind) {
+            auto val = placeholder->getValue().getElement();
+            uassert(6720200, "Range Find placeholder value must be an object.", val.isABSONObj());
+            auto obj = val.Obj();
+            FLE2RangeFindSpec::parse(IDLParserContext("v"), obj);
+            uassert(6832501,
+                    "Sparsity must be defined for range placeholders.",
+                    placeholder->getSparsity());
+        } else if (placeholder->getType() == Fle2PlaceholderType::kInsert) {
+            auto val = placeholder->getValue().getElement();
+            uassert(6775321, "Range Insert placeholder value must be an object.", val.isABSONObj());
+            auto obj = val.Obj();
+            FLE2RangeInsertSpec::parse(IDLParserContext("v"), obj);
+            uassert(6775322,
+                    "Sparsity must be defined for range placeholders.",
+                    placeholder->getSparsity());
+        }
+    } else {
+        uassert(6832500,
+                "Hypergraph sparsity can only be set for range placeholders.",
+                !placeholder->getSparsity());
     }
+}
+
+bool isInfinite(ImplicitValue val) {
+    constexpr auto inf = std::numeric_limits<double>::infinity();
+    if (val.getType() != BSONType::NumberDouble) {
+        return false;
+    }
+    auto num = val.getDouble();
+    return num == inf || num == -inf;
+}
+namespace {
+bool isWithinInt(int64_t num) {
+    return num <= std::numeric_limits<int32_t>::max() && num >= std::numeric_limits<int32_t>::min();
+}
+}  // namespace
+
+void validateQueryBounds(BSONType indexType, ImplicitValue lb, ImplicitValue ub) {
+    // Bounds of any type might have an infinite endpoint because open-ended bounds are represented
+    // with the undefined endpoint as infinity or -infinity.
+    switch (indexType) {
+        case NumberInt:
+            uassert(
+                6901306,
+                "If the index type is NumberInt, then lower bound for query must be an int or be a "
+                "long that is within the range of int.",
+                isInfinite(lb) || lb.getType() == BSONType::NumberInt ||
+                    (lb.getType() == BSONType::NumberLong && isWithinInt(lb.getLong())));
+            uassert(
+                6901307,
+                "If the index type is NumberInt, then upper bound for query must be an int or be a "
+                "long that is within the range of int.",
+                isInfinite(ub) || ub.getType() == BSONType::NumberInt ||
+                    (ub.getType() == BSONType::NumberLong && isWithinInt(ub.getLong())));
+            break;
+        case NumberLong:
+            uassert(
+                6901308,
+                "Lower bound for query over NumberLong must be either a NumberLong or NumberInt.",
+                isInfinite(lb) || lb.getType() == BSONType::NumberLong ||
+                    lb.getType() == BSONType::NumberInt);
+            uassert(
+                6901309,
+                "Upper bound for query over NumberLong must be either a NumberLong or NumberInt.",
+                isInfinite(ub) || ub.getType() == BSONType::NumberLong ||
+                    ub.getType() == BSONType::NumberInt);
+            break;
+        case Date:
+            uassert(6901310,
+                    "Lower bound for query over Date must be a Date.",
+                    isInfinite(lb) || lb.getType() == BSONType::Date);
+            uassert(6901311,
+                    "Upper bound for query over Date must be a Date.",
+                    isInfinite(ub) || ub.getType() == BSONType::Date);
+            break;
+        case NumberDouble:
+            uassert(6901312,
+                    "Lower bound for query over NumberDouble must be a NumberDouble.",
+                    lb.getType() == BSONType::NumberDouble);
+            uassert(6901313,
+                    "Upper bound for query over NumberDouble must be a NumberDouble.",
+                    ub.getType() == BSONType::NumberDouble);
+            break;
+        case NumberDecimal:
+            uassert(6901314,
+                    "Lower bound for query over NumberDecimal must be a NumberDecimal.",
+                    isInfinite(lb) || lb.getType() == BSONType::NumberDecimal);
+            uassert(6901315,
+                    "Upper bound for query over NumberDecimal must be a NumberDecimal.",
+                    isInfinite(ub) || ub.getType() == BSONType::NumberDecimal);
+            break;
+        default:
+            uasserted(6901305,
+                      str::stream() << "Index type must be a numeric or date, not: " << indexType);
+    }
+}
+
+void validateIDLFLE2RangeFindSpec(const FLE2RangeFindSpec* placeholder) {
+    if (!placeholder->getEdgesInfo()) {
+        return;
+    }
+
+    auto& edgesInfo = placeholder->getEdgesInfo().get();
+
+    auto min = edgesInfo.getIndexMin().getElement();
+    auto max = edgesInfo.getIndexMax().getElement();
+    uassert(6901304, "Range min and range max must be the same type.", min.type() == max.type());
+
+    if (edgesInfo.getPrecision().has_value()) {
+        uassert(6967102,
+                "Precision can only be set if type is floating point",
+                min.type() == BSONType::NumberDecimal || min.type() == BSONType::NumberDouble);
+    }
+
+    auto lb = edgesInfo.getLowerBound().getElement();
+    auto ub = edgesInfo.getUpperBound().getElement();
+    validateQueryBounds(min.type(), lb, ub);
 }
 }  // namespace mongo

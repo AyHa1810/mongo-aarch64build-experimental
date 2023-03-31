@@ -68,11 +68,12 @@ public:
             const auto nss = ns();
             const auto& req = request();
 
-            // TODO SERVER-64926 do not assume min always present
-            uassert(ErrorCodes::InvalidOptions, "Missing required parameter 'min'", req.getMin());
+            uassert(ErrorCodes::InvalidOptions,
+                    "Missing required parameter 'min' or 'max'",
+                    req.getMin() || req.getMax());
 
             ConfigsvrMoveRange configsvrRequest(nss);
-            configsvrRequest.setDbName(NamespaceString::kAdminDb);
+            configsvrRequest.setDbName(DatabaseName::kAdmin);
             configsvrRequest.setMoveRangeRequestBase(req.getMoveRangeRequestBase());
             configsvrRequest.setForceJumbo(request().getForceJumbo() ? ForceJumbo::kForceManual
                                                                      : ForceJumbo::kDoNotForce);
@@ -81,7 +82,7 @@ public:
             const auto commandResponse = uassertStatusOK(configShard->runCommand(
                 opCtx,
                 ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                NamespaceString::kAdminDb.toString(),
+                DatabaseName::kAdmin.toString(),
                 configsvrRequest.toBSON(BSON(WriteConcernOptions::kWriteConcernField
                                              << opCtx->getWriteConcern().toBSON())),
                 Shard::RetryPolicy::kIdempotent));

@@ -51,8 +51,8 @@ UUID retrieveReshardingUUID(OperationContext* opCtx, const NamespaceString& ns) 
     repl::ReadConcernArgs::get(opCtx) =
         repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
 
-    const auto catalogClient = Grid::get(opCtx)->catalogClient();
-    const auto collEntry = catalogClient->getCollection(opCtx, ns);
+    const auto collEntry =
+        ShardingCatalogManager::get(opCtx)->localCatalogClient()->getCollection(opCtx, ns);
 
     uassert(ErrorCodes::NoSuchReshardCollection,
             "Could not find resharding-related metadata that matches the given namespace",
@@ -78,10 +78,10 @@ void assertExistsReshardingDocument(OperationContext* opCtx, UUID reshardingUUID
 }
 
 auto assertGetReshardingMachine(OperationContext* opCtx, UUID reshardingUUID) {
-    auto machine = resharding::tryGetReshardingStateMachine<
-        ReshardingCoordinatorService,
-        ReshardingCoordinatorService::ReshardingCoordinator,
-        ReshardingCoordinatorDocument>(opCtx, reshardingUUID);
+    auto machine = resharding::tryGetReshardingStateMachine<ReshardingCoordinatorService,
+                                                            ReshardingCoordinator,
+                                                            ReshardingCoordinatorDocument>(
+        opCtx, reshardingUUID);
 
     uassert(ErrorCodes::NoSuchReshardCollection,
             "Could not find in-progress resharding operation to abort",
@@ -108,7 +108,7 @@ public:
 
             uassert(ErrorCodes::IllegalOperation,
                     "_configsvrAbortReshardCollection can only be run on config servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
 
@@ -116,7 +116,7 @@ public:
 
             LOGV2(5403501,
                   "Aborting resharding operation",
-                  "namespace"_attr = ns(),
+                  logAttrs(ns()),
                   "reshardingUUID"_attr = reshardingUUID);
 
             assertExistsReshardingDocument(opCtx, reshardingUUID);

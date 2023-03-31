@@ -35,6 +35,7 @@
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/pipeline/stage_constraints.h"
+#include "mongo/db/stats/counters.h"
 
 namespace mongo {
 
@@ -63,6 +64,11 @@ public:
     DocumentSourceUnionWith(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                             std::unique_ptr<Pipeline, PipelineDeleter> pipeline)
         : DocumentSource(kStageName, expCtx), _pipeline(std::move(pipeline)) {
+        if (!_pipeline->getContext()->ns.isOnInternalDb()) {
+            globalOpCounters.gotNestedAggregate();
+        }
+        _pipeline->getContext()->inUnionWith = true;
+
         // If this pipeline is being run as part of explain, then cache a copy to use later during
         // serialization.
         if (expCtx->explain >= ExplainOptions::Verbosity::kExecStats) {
@@ -72,9 +78,9 @@ public:
 
     DocumentSourceUnionWith(const DocumentSourceUnionWith& original,
                             const boost::intrusive_ptr<ExpressionContext>& newExpCtx)
-        : DocumentSource(kStageName,
-                         newExpCtx ? newExpCtx : original.pExpCtx->copyWith(original.pExpCtx->ns)),
-          _pipeline(original._pipeline->clone()) {}
+        : DocumentSource(kStageName, newExpCtx), _pipeline(original._pipeline->clone()) {
+        _pipeline->getContext()->inUnionWith = true;
+    }
 
     ~DocumentSourceUnionWith();
 
@@ -119,6 +125,8 @@ public:
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final;
+
     boost::optional<DistributedPlanLogic> distributedPlanLogic() final {
         // {shardsStage, mergingStage, sortPattern}
         return DistributedPlanLogic{nullptr, this, boost::none};
@@ -129,6 +137,8 @@ public:
     void detachFromOperationContext() final;
 
     void reattachToOperationContext(OperationContext* opCtx) final;
+
+    bool validateOperationContext(const OperationContext* opCtx) const final;
 
     bool usedDisk() final;
 
@@ -180,7 +190,7 @@ private:
         kFinished
     };
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
 
     void addViewDefinition(NamespaceString nss, std::vector<BSONObj> viewPipeline);
 

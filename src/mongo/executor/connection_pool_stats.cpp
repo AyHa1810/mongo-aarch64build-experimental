@@ -48,26 +48,35 @@ constexpr auto kAcquisitionWaitTimesKey = "acquisitionWaitTimes"_sd;
 
 ConnectionStatsPer::ConnectionStatsPer(size_t nInUse,
                                        size_t nAvailable,
+                                       size_t nLeased,
                                        size_t nCreated,
                                        size_t nRefreshing,
                                        size_t nRefreshed,
-                                       size_t nWasNeverUsed)
+                                       size_t nWasNeverUsed,
+                                       size_t nWasUsedOnce,
+                                       Milliseconds nConnUsageTime)
     : inUse(nInUse),
       available(nAvailable),
+      leased(nLeased),
       created(nCreated),
       refreshing(nRefreshing),
       refreshed(nRefreshed),
-      wasNeverUsed(nWasNeverUsed) {}
+      wasNeverUsed(nWasNeverUsed),
+      wasUsedOnce(nWasUsedOnce),
+      connUsageTime(nConnUsageTime) {}
 
 ConnectionStatsPer::ConnectionStatsPer() = default;
 
 ConnectionStatsPer& ConnectionStatsPer::operator+=(const ConnectionStatsPer& other) {
     inUse += other.inUse;
     available += other.available;
+    leased += other.leased;
     created += other.created;
     refreshing += other.refreshing;
     refreshed += other.refreshed;
     wasNeverUsed += other.wasNeverUsed;
+    wasUsedOnce += other.wasUsedOnce;
+    connUsageTime += other.connUsageTime;
     acquisitionWaitTimes += other.acquisitionWaitTimes;
 
     return *this;
@@ -92,10 +101,13 @@ void ConnectionPoolStats::updateStatsForHost(std::string pool,
     // Update total connection stats.
     totalInUse += newStats.inUse;
     totalAvailable += newStats.available;
+    totalLeased += newStats.leased;
     totalCreated += newStats.created;
     totalRefreshing += newStats.refreshing;
     totalRefreshed += newStats.refreshed;
     totalWasNeverUsed += newStats.wasNeverUsed;
+    totalWasUsedOnce += newStats.wasUsedOnce;
+    totalConnUsageTime += newStats.connUsageTime;
     acquisitionWaitTimes += newStats.acquisitionWaitTimes;
 }
 
@@ -104,20 +116,32 @@ void ConnectionPoolStats::appendToBSON(mongo::BSONObjBuilder& result, bool forFT
 
     result.appendNumber("totalInUse", static_cast<long long>(totalInUse));
     result.appendNumber("totalAvailable", static_cast<long long>(totalAvailable));
+    result.appendNumber("totalLeased", static_cast<long long>(totalLeased));
     result.appendNumber("totalCreated", static_cast<long long>(totalCreated));
     result.appendNumber("totalRefreshing", static_cast<long long>(totalRefreshing));
     result.appendNumber("totalRefreshed", static_cast<long long>(totalRefreshed));
-    if (isCCHMEnabled)
+    if (isCCHMEnabled) {
         result.appendNumber("totalWasNeverUsed", static_cast<long long>(totalWasNeverUsed));
-
+        if (forFTDC) {
+            result.appendNumber("totalWasUsedOnce", static_cast<long long>(totalWasUsedOnce));
+            result.appendNumber("totalConnUsageTimeMillis",
+                                durationCount<Milliseconds>(totalConnUsageTime));
+        }
+    }
 
     if (forFTDC) {
-        BSONObjBuilder poolBuilder(result.subobjStart("connectionsInUsePerPool"));
+        BSONObjBuilder poolBuilder(result.subobjStart("pools"));
         for (const auto& [pool, stats] : statsByPool) {
             BSONObjBuilder poolInfo(poolBuilder.subobjStart(pool));
             poolInfo.appendNumber("poolInUse", static_cast<long long>(stats.inUse));
+            if (isCCHMEnabled) {
+                poolInfo.appendNumber("poolWasUsedOnce", static_cast<long long>(stats.wasUsedOnce));
+                poolInfo.appendNumber("poolConnUsageTimeMillis",
+                                      durationCount<Milliseconds>(stats.connUsageTime));
+            }
             for (const auto& [host, stats] : stats.statsByHost) {
-                poolInfo.appendNumber(host.toString(), static_cast<long long>(stats.inUse));
+                BSONObjBuilder hostInfo(poolInfo.subobjStart(host.toString()));
+                poolInfo.appendNumber("inUse", static_cast<long long>(stats.inUse));
             }
         }
 
@@ -137,6 +161,7 @@ void ConnectionPoolStats::appendToBSON(mongo::BSONObjBuilder& result, bool forFT
             BSONObjBuilder poolInfo(poolBuilder.subobjStart(pool));
             poolInfo.appendNumber("poolInUse", static_cast<long long>(stats.inUse));
             poolInfo.appendNumber("poolAvailable", static_cast<long long>(stats.available));
+            poolInfo.appendNumber("poolLeased", static_cast<long long>(stats.leased));
             poolInfo.appendNumber("poolCreated", static_cast<long long>(stats.created));
             poolInfo.appendNumber("poolRefreshing", static_cast<long long>(stats.refreshing));
             poolInfo.appendNumber("poolRefreshed", static_cast<long long>(stats.refreshed));
@@ -150,6 +175,7 @@ void ConnectionPoolStats::appendToBSON(mongo::BSONObjBuilder& result, bool forFT
                 BSONObjBuilder hostInfo(poolInfo.subobjStart(host.toString()));
                 hostInfo.appendNumber("inUse", static_cast<long long>(stats.inUse));
                 hostInfo.appendNumber("available", static_cast<long long>(stats.available));
+                hostInfo.appendNumber("leased", static_cast<long long>(stats.leased));
                 hostInfo.appendNumber("created", static_cast<long long>(stats.created));
                 hostInfo.appendNumber("refreshing", static_cast<long long>(stats.refreshing));
                 hostInfo.appendNumber("refreshed", static_cast<long long>(stats.refreshed));
@@ -169,6 +195,7 @@ void ConnectionPoolStats::appendToBSON(mongo::BSONObjBuilder& result, bool forFT
             BSONObjBuilder hostInfo(hostBuilder.subobjStart(host.toString()));
             hostInfo.appendNumber("inUse", static_cast<long long>(stats.inUse));
             hostInfo.appendNumber("available", static_cast<long long>(stats.available));
+            hostInfo.appendNumber("leased", static_cast<long long>(stats.leased));
             hostInfo.appendNumber("created", static_cast<long long>(stats.created));
             hostInfo.appendNumber("refreshing", static_cast<long long>(stats.refreshing));
             hostInfo.appendNumber("refreshed", static_cast<long long>(stats.refreshed));

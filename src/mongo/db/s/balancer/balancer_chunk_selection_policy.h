@@ -34,11 +34,9 @@
 
 #include "mongo/db/s/balancer/balancer_policy.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/chunk_version.h"
 
 namespace mongo {
 
-class ChunkType;
 class NamespaceString;
 class OperationContext;
 template <typename T>
@@ -74,7 +72,11 @@ public:
      * Potentially blocking method, which gives out a set of chunks to be moved.
      */
     virtual StatusWith<MigrateInfoVector> selectChunksToMove(
-        OperationContext* opCtx, stdx::unordered_set<ShardId>* unavailableShards) = 0;
+        OperationContext* opCtx,
+        const std::vector<ClusterStatistics::ShardStatistics>& shardStats,
+        stdx::unordered_set<ShardId>* availableShards,
+        stdx::unordered_set<NamespaceString>* imbalancedCollectionsCachePtr) = 0;
+
 
     /**
      * Given a valid namespace returns all the Migrations the balancer would need to perform

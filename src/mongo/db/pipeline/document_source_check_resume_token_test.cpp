@@ -206,10 +206,6 @@ protected:
         if (!_collScan) {
             _collScan = std::make_unique<CollectionScan>(
                 pExpCtx.get(), _collectionPtr, _params, &_ws, _filter.get());
-            // The first call to doWork will create the cursor and return NEED_TIME. But it won't
-            // actually scan any of the documents that are present in the mock cursor queue.
-            ASSERT_EQ(_collScan->doWork(nullptr), PlanStage::NEED_TIME);
-            ASSERT_EQ(_getNumDocsTested(), 0);
         }
         while (true) {
             // If the next result is a pause, return it and don't collscan.
@@ -228,6 +224,7 @@ protected:
                     // entry into the oplog. This is like a stripped-down DSCSTransform stage.
                     MutableDocument mutableDoc{_ws.get(id)->doc.value()};
                     mutableDoc["_id"] = nextResult.getDocument()["_id"];
+                    mutableDoc.metadata().setSortKey(nextResult.getDocument()["_id"], true);
                     return mutableDoc.freeze();
                 }
                 case PlanStage::NEED_TIME:
@@ -483,8 +480,12 @@ TEST_F(CheckResumeTokenTest, ShouldFailIfTokenHasWrongNamespace) {
     Timestamp resumeTimestamp(100, 1);
 
     auto resumeTokenUUID = UUID::gen();
-    auto checkResumeToken = createDSEnsureResumeTokenPresent(resumeTimestamp, "1", resumeTokenUUID);
     auto otherUUID = UUID::gen();
+    ASSERT_NE(resumeTokenUUID, otherUUID);
+    if (resumeTokenUUID > otherUUID) {
+        std::swap(resumeTokenUUID, otherUUID);
+    }
+    auto checkResumeToken = createDSEnsureResumeTokenPresent(resumeTimestamp, "1", resumeTokenUUID);
     addOplogEntryOnTestNS(resumeTimestamp, "1", otherUUID);
     ASSERT_THROWS_CODE(
         checkResumeToken->getNext(), AssertionException, ErrorCodes::ChangeStreamFatalError);

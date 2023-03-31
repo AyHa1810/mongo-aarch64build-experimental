@@ -38,18 +38,19 @@
 namespace mongo {
 
 /**
- * Acquires the config db lock in IX mode and the collection lock for config.rangeDeletions in X
- * mode.
+ * Scoped lock to synchronize with the execution of range deletions.
+ * The range-deleter acquires a scoped lock in IX mode while orphans are being deleted.
+ * Acquiring the scoped lock in MODE_X ensures that no orphan counter in `config.rangeDeletions`
+ * entries is going to be updated concurrently.
  */
 class ScopedRangeDeleterLock {
 public:
-    ScopedRangeDeleterLock(OperationContext* opCtx);
-    ScopedRangeDeleterLock(OperationContext* opCtx, const UUID& collectionUuid);
+    ScopedRangeDeleterLock(OperationContext* opCtx, LockMode mode)
+        : _resourceLock(opCtx, _mutex.getRid(), mode) {}
 
 private:
-    Lock::DBLock _configLock;
-    Lock::CollectionLock _rangeDeletionLock;
-    boost::optional<Lock::ResourceLock> _collectionUuidLock;
+    const Lock::ResourceLock _resourceLock;
+    static inline const Lock::ResourceMutex _mutex{"ScopedRangeDeleterLock"};
 };
 
 /**
@@ -102,6 +103,7 @@ public:
                                                    const UUID& collectionUUID) const;
 
 private:
+    void onSetCurrentConfig(OperationContext* opCtx) override final {}
     void onInitialDataAvailable(OperationContext* opCtx,
                                 bool isMajorityDataAvailable) override final {}
     void onStepUpBegin(OperationContext* opCtx, long long term) override final {}
@@ -111,6 +113,9 @@ private:
     void onStartup(OperationContext* opCtx) override final;
     void onStepUpComplete(OperationContext* opCtx, long long term) override final;
     void onStepDown() override final;
+    inline std::string getServiceName() const override final {
+        return "BalancerStatsRegistry";
+    }
 
     void _loadOrphansCount(OperationContext* opCtx);
     bool _isInitialized() const {

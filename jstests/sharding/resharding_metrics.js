@@ -19,7 +19,6 @@ function getCurrentOpSection(mongo, role) {
         jsTest.log(tojson(report));
         return false;
     }, `: was unable to find resharding ${role} service in currentOp output from ${mongo.host}`);
-
     return curOpSection;
 }
 
@@ -55,10 +54,6 @@ for (let [_, shardReplSet] of Object.entries(topology.shards)) {
 allNodes.push(topology.configsvr.primary);
 allNodes.forEach((hostName) => {
     const status = new Mongo(hostName).getDB('admin').serverStatus({});
-    if (hostName == topology.configsvr.primary) {
-        assert(!status.hasOwnProperty('shardingStatistics'));
-        return;
-    }
     const shardingStats = status.shardingStatistics;
     assert(!shardingStats.hasOwnProperty('resharding'));
 });
@@ -95,8 +90,6 @@ reshardingTest.withReshardingInBackground(
             assert(curOpSection.hasOwnProperty('recipientState'), tojson(curOpSection));
             assert(curOpSection.hasOwnProperty('documentsCopied'), tojson(curOpSection));
             assert(curOpSection.hasOwnProperty('oplogEntriesApplied'), tojson(curOpSection));
-            assert(curOpSection.hasOwnProperty('remainingOperationTimeEstimatedSecs'),
-                   tojson(curOpSection));
         });
 
         const curOpSection =
@@ -112,7 +105,6 @@ allNodes.forEach((hostName) => {
     let debugStr = () => {
         return 'server: ' + tojson(hostName) + ', serverStatusSection: ' + tojson(serverStatus);
     };
-
     assert(serverStatus.hasOwnProperty('countSucceeded'), debugStr());
     assert(serverStatus.hasOwnProperty('countFailed'), debugStr());
 

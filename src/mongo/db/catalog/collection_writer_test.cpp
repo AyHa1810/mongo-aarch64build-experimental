@@ -55,22 +55,24 @@ public:
 protected:
     void setUp() override {
         CatalogTestFixture::setUp();
+        Lock::GlobalWrite lk(operationContext());
 
         std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(kNss);
         CollectionCatalog::write(getServiceContext(), [&](CollectionCatalog& catalog) {
-            catalog.registerCollection(operationContext(), UUID::gen(), std::move(collection));
+            auto uuid = collection->uuid();
+            catalog.registerCollection(
+                operationContext(), uuid, std::move(collection), /*ts=*/boost::none);
         });
     }
 
     CollectionPtr lookupCollectionFromCatalog() {
-        return CollectionCatalog::get(operationContext())
-            ->lookupCollectionByNamespace(operationContext(), kNss);
+        return CollectionPtr(CollectionCatalog::get(operationContext())
+                                 ->lookupCollectionByNamespace(operationContext(), kNss));
     }
 
     const Collection* lookupCollectionFromCatalogForRead() {
         return CollectionCatalog::get(operationContext())
-            ->lookupCollectionByNamespaceForRead(operationContext(), kNss)
-            .get();
+            ->lookupCollectionByNamespace(operationContext(), kNss);
     }
 
     void verifyCollectionInCatalogUsingDifferentClient(const Collection* expected) {
@@ -79,16 +81,17 @@ protected:
             auto opCtx = client->makeOperationContext();
             ASSERT_EQ(expected,
                       CollectionCatalog::get(opCtx.get())
-                          ->lookupCollectionByNamespace(opCtx.get(), kNss)
-                          .get());
+                          ->lookupCollectionByNamespace(opCtx.get(), kNss));
         });
         t.join();
     }
 
-    const NamespaceString kNss{"testdb", "testcol"};
+    const NamespaceString kNss =
+        NamespaceString::createNamespaceString_forTest("testdb", "testcol");
 };
 
 TEST_F(CollectionWriterTest, Commit) {
+    AutoGetCollection lock(operationContext(), kNss, MODE_X);
     CollectionWriter writer(operationContext(), kNss);
 
     const Collection* before = lookupCollectionFromCatalog().get();
@@ -99,7 +102,6 @@ TEST_F(CollectionWriterTest, Commit) {
     ASSERT_EQ(lookupCollectionFromCatalog().get(), lookupCollectionFromCatalogForRead());
 
     {
-        AutoGetCollection lock(operationContext(), kNss, MODE_X);
         WriteUnitOfWork wuow(operationContext());
         auto writable = writer.getWritableCollection(operationContext());
 
@@ -126,7 +128,6 @@ TEST_F(CollectionWriterTest, Commit) {
     before = lookupCollectionFromCatalog().get();
 
     {
-        AutoGetCollection lock(operationContext(), kNss, MODE_X);
         WriteUnitOfWork wuow(operationContext());
         auto writable = writer.getWritableCollection(operationContext());
 
@@ -143,6 +144,7 @@ TEST_F(CollectionWriterTest, Commit) {
 }
 
 TEST_F(CollectionWriterTest, Rollback) {
+    AutoGetCollection lock(operationContext(), kNss, MODE_X);
     CollectionWriter writer(operationContext(), kNss);
 
     const Collection* before = lookupCollectionFromCatalog().get();
@@ -151,7 +153,6 @@ TEST_F(CollectionWriterTest, Rollback) {
     ASSERT_EQ(lookupCollectionFromCatalog().get(), lookupCollectionFromCatalogForRead());
 
     {
-        AutoGetCollection lock(operationContext(), kNss, MODE_X);
         WriteUnitOfWork wuow(operationContext());
         auto writable = writer.getWritableCollection(operationContext());
 
@@ -190,17 +191,16 @@ TEST_F(CollectionWriterTest, CommitAfterDestroy) {
 }
 
 TEST_F(CollectionWriterTest, CatalogWrite) {
-    auto catalog = CollectionCatalog::get(getServiceContext());
+    auto catalog = CollectionCatalog::latest(getServiceContext());
     CollectionCatalog::write(
         getServiceContext(), [this, &catalog](CollectionCatalog& writableCatalog) {
             // We should see a different catalog instance than a reader would
             ASSERT_NE(&writableCatalog, catalog.get());
             // However, it should be a shallow copy. The collection instance should be the same
-            ASSERT_EQ(
-                writableCatalog.lookupCollectionByNamespaceForRead(operationContext(), kNss).get(),
-                catalog->lookupCollectionByNamespaceForRead(operationContext(), kNss).get());
+            ASSERT_EQ(writableCatalog.lookupCollectionByNamespace(operationContext(), kNss),
+                      catalog->lookupCollectionByNamespace(operationContext(), kNss));
         });
-    auto after = CollectionCatalog::get(getServiceContext());
+    auto after = CollectionCatalog::latest(getServiceContext());
     ASSERT_NE(&catalog, &after);
 }
 
@@ -249,13 +249,16 @@ public:
 
     void setUp() override {
         CatalogTestFixture::setUp();
+        Lock::GlobalWrite lk(operationContext());
 
         CollectionCatalog::write(getServiceContext(), [&](CollectionCatalog& catalog) {
             for (size_t i = 0; i < NumCollections; ++i) {
-                catalog.registerCollection(operationContext(),
-                                           UUID::gen(),
-                                           std::make_shared<CollectionMock>(
-                                               NamespaceString("many", fmt::format("coll{}", i))));
+                catalog.registerCollection(
+                    operationContext(),
+                    UUID::gen(),
+                    std::make_shared<CollectionMock>(NamespaceString::createNamespaceString_forTest(
+                        "many", fmt::format("coll{}", i))),
+                    /*ts=*/boost::none);
             }
         });
     }

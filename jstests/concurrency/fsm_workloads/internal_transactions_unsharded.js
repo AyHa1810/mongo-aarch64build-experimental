@@ -11,7 +11,7 @@
  * @tags: [
  *  requires_fcv_60,
  *  uses_transactions,
- *  assumes_unsharded_collection
+ *  assumes_unsharded_collection,
  * ]
  */
 load('jstests/concurrency/fsm_libs/extend_workload.js');
@@ -70,10 +70,6 @@ var $config = extendWorkload($config, function($config, $super) {
         [$config.data.executionContextTypes.kClientRetryableWrite]: false,
         [$config.data.executionContextTypes.kClientTransaction]: false,
     };
-
-    // This workload sets the 'storeFindAndModifyImagesInSideCollection' parameter to a random bool
-    // during setup() and restores the original value during teardown().
-    $config.data.originalStoreFindAndModifyImagesInSideCollection = {};
 
     // The reap threshold is overriden to get coverage for when it schedules reaps during an active
     // workload.
@@ -201,8 +197,11 @@ var $config = extendWorkload($config, function($config, $super) {
     $config.data.isAcceptableAggregateCmdError = function isAcceptableAggregateCmdError(res) {
         // The aggregate command is expected to involve running getMore commands which are not
         // retryable after network errors.
-        return TestData.runningWithShardStepdowns && res &&
-            (res.code == ErrorCodes.QueryPlanKilled);
+        // The linearizable read has a 15s timeout, then a LinearizableReadConcernError will be
+        // thrown, so we retry on this error in test
+        return res &&
+            (res.code == ErrorCodes.LinearizableReadConcernError ||
+             (TestData.runningWithShardStepdowns && res.code == ErrorCodes.QueryPlanKilled));
     };
 
     $config.data.getRandomDocument = function getRandomDocument(db, collName) {
@@ -500,30 +499,6 @@ var $config = extendWorkload($config, function($config, $super) {
         });
     };
 
-    $config.data.overrideStoreFindAndModifyImagesInSideCollection =
-        function overrideStoreFindAndModifyImagesInSideCollection(cluster) {
-        // Store the findAndModify images in the oplog half of the time.
-        const enableFindAndModifyImageCollection = this.generateRandomBool();
-        cluster.executeOnMongodNodes((db) => {
-            const res = assert.commandWorked(db.adminCommand({
-                setParameter: 1,
-                storeFindAndModifyImagesInSideCollection: enableFindAndModifyImageCollection
-            }));
-            this.originalStoreFindAndModifyImagesInSideCollection[db.getMongo().host] = res.was;
-        });
-    };
-
-    $config.data.restoreStoreFindAndModifyImagesInSideCollection =
-        function restoreStoreFindAndModifyImagesInSideCollection(cluster) {
-        cluster.executeOnMongodNodes((db) => {
-            assert.commandWorked(db.adminCommand({
-                setParameter: 1,
-                storeFindAndModifyImagesInSideCollection:
-                    this.originalStoreFindAndModifyImagesInSideCollection[db.getMongo().host]
-            }));
-        });
-    };
-
     $config.data.overrideTransactionLifetimeLimit = function overrideTransactionLifetimeLimit(
         cluster) {
         cluster.executeOnMongodNodes((db) => {
@@ -562,7 +537,6 @@ var $config = extendWorkload($config, function($config, $super) {
             }
         }
         this.overrideInternalTransactionsReapThreshold(cluster);
-        this.overrideStoreFindAndModifyImagesInSideCollection(cluster);
         if (this.lowerTransactionLifetimeLimitSeconds) {
             this.overrideTransactionLifetimeLimit(cluster);
         }
@@ -570,7 +544,6 @@ var $config = extendWorkload($config, function($config, $super) {
 
     $config.teardown = function teardown(db, collName, cluster) {
         this.restoreInternalTransactionsReapThreshold(cluster);
-        this.restoreStoreFindAndModifyImagesInSideCollection(cluster);
         if (this.lowerTransactionLifetimeLimitSeconds) {
             this.restoreTransactionLifetimeLimit(cluster);
         }

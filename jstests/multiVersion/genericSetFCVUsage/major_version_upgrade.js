@@ -8,7 +8,7 @@
  * - Insert a document into the new collection.
  * - Create an index on the new collection.
  *
- * @tags: [disabled_for_fcv_6_1_upgrade, requires_v4_0]
+ * @tags: [requires_v4_0]
  */
 
 (function() {
@@ -31,10 +31,10 @@ const defaultOptions = {
 // This lists all supported releases and needs to be kept up to date as versions are added and
 // dropped.
 const versions = [
-    {binVersion: '4.0', featureCompatibilityVersion: '4.0', testCollection: 'four_zero'},
     {binVersion: '4.2', featureCompatibilityVersion: '4.2', testCollection: 'four_two'},
     {binVersion: '4.4', featureCompatibilityVersion: '4.4', testCollection: 'four_four'},
     {binVersion: '5.0', featureCompatibilityVersion: '5.0', testCollection: 'five_zero'},
+    {binVersion: '6.0', featureCompatibilityVersion: '6.0', testCollection: 'six_zero'},
     {binVersion: 'last-lts', testCollection: 'last_lts'},
     {binVersion: 'last-continuous', testCollection: 'last_continuous'},
     {binVersion: 'latest', featureCompatibilityVersion: latestFCV, testCollection: 'latest'},

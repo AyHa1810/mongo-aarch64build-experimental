@@ -31,7 +31,6 @@
 
 #include <map>
 
-#include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/platform/atomic_word.h"
@@ -74,23 +73,12 @@ public:
         _checkWrap(&OpCounters::_command, 1);
     }
 
-    void gotInsertsDeprecated(int n) {
-        _checkWrap(&OpCounters::_insertDeprecated, n);
-    }
     void gotQueryDeprecated() {
         _checkWrap(&OpCounters::_queryDeprecated, 1);
     }
-    void gotUpdateDeprecated() {
-        _checkWrap(&OpCounters::_updateDeprecated, 1);
-    }
-    void gotDeleteDeprecated() {
-        _checkWrap(&OpCounters::_deleteDeprecated, 1);
-    }
-    void gotGetMoreDeprecated() {
-        _checkWrap(&OpCounters::_getmoreDeprecated, 1);
-    }
-    void gotKillCursorsDeprecated() {
-        _checkWrap(&OpCounters::_killcursorsDeprecated, 1);
+
+    void gotNestedAggregate() {
+        _checkWrap(&OpCounters::_nestedAggregate, 1);
     }
 
     BSONObj getObj() const;
@@ -132,6 +120,9 @@ public:
     const AtomicWord<long long>* getCommand() const {
         return &*_command;
     }
+    const AtomicWord<long long>* getNestedAggregate() const {
+        return &*_nestedAggregate;
+    }
     const AtomicWord<long long>* getInsertOnExistingDoc() const {
         return &*_insertOnExistingDoc;
     }
@@ -148,7 +139,15 @@ public:
         return &*_acceptableErrorInCommand;
     }
 
+    // Reset all counters. To used for testing purposes only.
+    void resetForTest() {
+        _reset();
+    }
+
 private:
+    // Reset all counters.
+    void _reset();
+
     // Increment member `counter` by `n`, resetting all counters if it was > 2^60.
     void _checkWrap(CacheExclusive<AtomicWord<long long>> OpCounters::*counter, int n);
 
@@ -158,6 +157,7 @@ private:
     CacheExclusive<AtomicWord<long long>> _delete;
     CacheExclusive<AtomicWord<long long>> _getmore;
     CacheExclusive<AtomicWord<long long>> _command;
+    CacheExclusive<AtomicWord<long long>> _nestedAggregate;
 
     CacheExclusive<AtomicWord<long long>> _insertOnExistingDoc;
     CacheExclusive<AtomicWord<long long>> _updateOnMissingDoc;
@@ -165,13 +165,8 @@ private:
     CacheExclusive<AtomicWord<long long>> _deleteFromMissingNamespace;
     CacheExclusive<AtomicWord<long long>> _acceptableErrorInCommand;
 
-    // Counters for deprecated opcodes.
-    CacheExclusive<AtomicWord<long long>> _insertDeprecated;
+    // Counter for the deprecated OP_QUERY opcode.
     CacheExclusive<AtomicWord<long long>> _queryDeprecated;
-    CacheExclusive<AtomicWord<long long>> _updateDeprecated;
-    CacheExclusive<AtomicWord<long long>> _deleteDeprecated;
-    CacheExclusive<AtomicWord<long long>> _getmoreDeprecated;
-    CacheExclusive<AtomicWord<long long>> _killcursorsDeprecated;
 };
 
 extern OpCounters globalOpCounters;
@@ -268,6 +263,8 @@ public:
 
     void incSaslSupportedMechanismsReceived();
 
+    void incAuthenticationCumulativeTime(long long micros);
+
     void append(BSONObjBuilder*);
 
     void initializeMechanismMap(const std::vector<std::string>&);
@@ -290,7 +287,7 @@ private:
     using MechanismMap = std::map<std::string, MechanismData>;
 
     AtomicWord<long long> _saslSupportedMechanismsReceived;
-
+    AtomicWord<long long> _authenticationCumulativeMicros;
     // Mechanism maps are initialized at startup to contain all
     // mechanisms known to authenticationMechanisms setParam.
     // After that they are kept to a fixed size.
@@ -328,79 +325,132 @@ public:
 
 extern DotsAndDollarsFieldsCounters dotsAndDollarsFieldsCounters;
 
-class QueryEngineCounters {
+class QueryFrameworkCounters {
 public:
-    QueryEngineCounters() = default;
+    QueryFrameworkCounters() = default;
 
     void incrementQueryEngineCounters(CurOp* curop) {
         auto& debug = curop->debug();
         const BSONObj& cmdObj = curop->opDescription();
         auto cmdName = cmdObj.firstElementFieldNameStringData();
-        if (cmdName == "find" && debug.classicEngineUsed) {
-            if (debug.classicEngineUsed.get()) {
-                classicFindQueryCounter.increment();
-            } else {
-                sbeFindQueryCounter.increment();
+
+        if (cmdName == "find") {
+            switch (debug.queryFramework) {
+                case PlanExecutor::QueryFramework::kClassicOnly:
+                    classicFindQueryCounter.increment();
+                    break;
+                case PlanExecutor::QueryFramework::kSBEOnly:
+                    sbeFindQueryCounter.increment();
+                    break;
+                case PlanExecutor::QueryFramework::kCQF:
+                    cqfFindQueryCounter.increment();
+                    break;
+                default:
+                    break;
             }
-        } else if (cmdName == "aggregate" && debug.classicEngineUsed && debug.documentSourceUsed) {
-            if (debug.classicEngineUsed.get()) {
-                if (debug.documentSourceUsed.get()) {
-                    classicHybridAggregationCounter.increment();
-                } else {
+        } else if (cmdName == "aggregate") {
+            switch (debug.queryFramework) {
+                case PlanExecutor::QueryFramework::kClassicOnly:
                     classicOnlyAggregationCounter.increment();
-                }
-            } else {
-                if (debug.documentSourceUsed.get()) {
-                    sbeHybridAggregationCounter.increment();
-                } else {
+                    break;
+                case PlanExecutor::QueryFramework::kClassicHybrid:
+                    classicHybridAggregationCounter.increment();
+                    break;
+                case PlanExecutor::QueryFramework::kSBEOnly:
                     sbeOnlyAggregationCounter.increment();
-                }
+                    break;
+                case PlanExecutor::QueryFramework::kSBEHybrid:
+                    sbeHybridAggregationCounter.increment();
+                    break;
+                case PlanExecutor::QueryFramework::kCQF:
+                    cqfAggregationQueryCounter.increment();
+                    break;
+                case PlanExecutor::QueryFramework::kUnknown:
+                    break;
             }
         }
     }
 
-    // Query counters that record whether a find query was fully or partially executed in SBE, or
-    // fully executed using the classic engine. One or the other will always be incremented during a
-    // query.
-    CounterMetric sbeFindQueryCounter{"query.queryExecutionEngine.find.sbe"};
-    CounterMetric classicFindQueryCounter{"query.queryExecutionEngine.find.classic"};
+    // Query counters that record whether a find query was fully or partially executed in SBE, fully
+    // executed using the classic engine, or fully executed using the common query framework (CQF).
+    // One of these will always be incremented during a query.
+    CounterMetric sbeFindQueryCounter{"query.queryFramework.find.sbe"};
+    CounterMetric classicFindQueryCounter{"query.queryFramework.find.classic"};
+    CounterMetric cqfFindQueryCounter{"query.queryFramework.find.cqf"};
 
     // Aggregation query counters that record whether an aggregation was fully or partially executed
-    // in DocumentSource (an sbe/classic hybrid plan), or fully pushed down to the sbe/classic
-    // layer. Only incremented during aggregations.
-    CounterMetric sbeOnlyAggregationCounter{"query.queryExecutionEngine.aggregate.sbeOnly"};
-    CounterMetric classicOnlyAggregationCounter{"query.queryExecutionEngine.aggregate.classicOnly"};
-    CounterMetric sbeHybridAggregationCounter{"query.queryExecutionEngine.aggregate.sbeHybrid"};
-    CounterMetric classicHybridAggregationCounter{
-        "query.queryExecutionEngine.aggregate.classicHybrid"};
+    // in DocumentSource (an sbe/classic hybrid plan), fully pushed down to the sbe/classic layer,
+    // or executed using CQF. These are only incremented during aggregations.
+    CounterMetric sbeOnlyAggregationCounter{"query.queryFramework.aggregate.sbeOnly"};
+    CounterMetric classicOnlyAggregationCounter{"query.queryFramework.aggregate.classicOnly"};
+    CounterMetric sbeHybridAggregationCounter{"query.queryFramework.aggregate.sbeHybrid"};
+    CounterMetric classicHybridAggregationCounter{"query.queryFramework.aggregate.classicHybrid"};
+    CounterMetric cqfAggregationQueryCounter{"query.queryFramework.aggregate.cqf"};
 };
-extern QueryEngineCounters queryEngineCounters;
+extern QueryFrameworkCounters queryFrameworkCounters;
 
 class LookupPushdownCounters {
 public:
     LookupPushdownCounters() = default;
 
     void incrementLookupCounters(OpDebug& debug) {
-        if (debug.pipelineUsesLookup) {
-            totalLookup.increment();
-        }
         nestedLoopJoin.increment(debug.nestedLoopJoin);
         indexedLoopJoin.increment(debug.indexedLoopJoin);
         hashLookup.increment(debug.hashLookup);
         hashLookupSpillToDisk.increment(debug.hashLookupSpillToDisk);
     }
 
-    // Counter tracking pipelines that have a lookup stage regardless of the engine used.
-    CounterMetric totalLookup{"query.lookup.pipelineTotalCount"};
     // Counters for lookup join strategies.
-    CounterMetric nestedLoopJoin{"query.lookup.slotBasedExecutionCounters.nestedLoopJoin"};
-    CounterMetric indexedLoopJoin{"query.lookup.slotBasedExecutionCounters.indexedLoopJoin"};
-    CounterMetric hashLookup{"query.lookup.slotBasedExecutionCounters.hashLookup"};
+    CounterMetric nestedLoopJoin{"query.lookup.nestedLoopJoin"};
+    CounterMetric indexedLoopJoin{"query.lookup.indexedLoopJoin"};
+    CounterMetric hashLookup{"query.lookup.hashLookup"};
     // Counter tracking hashLookup spills in lookup stages that get pushed down.
-    CounterMetric hashLookupSpillToDisk{
-        "query.lookup.slotBasedExecutionCounters.hashLookupSpillToDisk"};
+    CounterMetric hashLookupSpillToDisk{"query.lookup.hashLookupSpillToDisk"};
 };
 extern LookupPushdownCounters lookupPushdownCounters;
+
+class SortCounters {
+public:
+    SortCounters() = default;
+
+    void incrementSortCounters(const OpDebug& debug) {
+        sortSpillsCounter.increment(debug.sortSpills);
+        sortTotalBytesCounter.increment(debug.sortTotalDataSizeBytes);
+        sortTotalKeysCounter.increment(debug.keysSorted);
+    }
+
+    // Counters tracking sort stats across all engines
+    // The total number of spills to disk from sort stages
+    CounterMetric sortSpillsCounter{"query.sort.spillToDisk"};
+    // The number of keys that we've sorted.
+    CounterMetric sortTotalKeysCounter{"query.sort.totalKeysSorted"};
+    // The amount of data we've sorted in bytes
+    CounterMetric sortTotalBytesCounter{"query.sort.totalBytesSorted"};
+};
+extern SortCounters sortCounters;
+
+class GroupCounters {
+public:
+    GroupCounters() = default;
+
+    void incrementGroupCounters(uint64_t spills,
+                                uint64_t spilledDataStorageSize,
+                                uint64_t spilledRecords) {
+        groupSpills.increment(spills);
+        groupSpilledDataStorageSize.increment(spilledDataStorageSize);
+        groupSpilledRecords.increment(spilledRecords);
+    }
+
+    // Counters tracking group stats across all execution engines.
+    CounterMetric groupSpills{
+        "query.group.spills"};  // The total number of spills to disk from group stages.
+    CounterMetric groupSpilledDataStorageSize{
+        "query.group.spilledDataStorageSize"};  // The size of the file or RecordStore spilled to
+                                                // disk.
+    CounterMetric groupSpilledRecords{
+        "query.group.spilledRecords"};  // The number of records spilled to disk.
+};
+extern GroupCounters groupCounters;
 
 /**
  * Generic class for counters of expressions inside various MQL statements.
@@ -434,6 +484,49 @@ private:
     StringMap<std::unique_ptr<ExprCounter>> operatorCountersExprMap = {};
 };
 
+class ValidatorCounters {
+public:
+    ValidatorCounters() {
+        _validatorCounterMap["create"] = std::make_unique<ValidatorCounter>("create");
+        _validatorCounterMap["collMod"] = std::make_unique<ValidatorCounter>("collMod");
+    }
+
+    void incrementCounters(const StringData cmdName,
+                           const BSONObj& validator,
+                           bool parsingSucceeded) {
+        if (!validator.isEmpty()) {
+            auto validatorCounter = _validatorCounterMap.find(cmdName);
+            tassert(7139200,
+                    str::stream() << "The validator counters are not support for the command: "
+                                  << cmdName,
+                    validatorCounter != _validatorCounterMap.end());
+            validatorCounter->second->totalCounter.increment();
+
+            if (!parsingSucceeded) {
+                validatorCounter->second->failedCounter.increment();
+            }
+            if (validator.hasField("$jsonSchema")) {
+                validatorCounter->second->jsonSchemaCounter.increment();
+            }
+        }
+    }
+
+private:
+    struct ValidatorCounter {
+        ValidatorCounter(const StringData name)
+            : totalCounter{"commands." + name + ".validator.total"},
+              failedCounter{"commands." + name + ".validator.failed"},
+              jsonSchemaCounter{"commands." + name + ".validator.jsonSchema"} {}
+        CounterMetric totalCounter;
+        CounterMetric failedCounter;
+        CounterMetric jsonSchemaCounter;
+    };
+
+    StringMap<std::unique_ptr<ValidatorCounter>> _validatorCounterMap = {};
+};
+
+extern ValidatorCounters validatorCounters;
+
 // Global counters for expressions inside aggregation pipelines.
 extern OperatorCounters operatorCountersAggExpressions;
 // Global counters for match expressions.
@@ -442,5 +535,10 @@ extern OperatorCounters operatorCountersMatchExpressions;
 extern OperatorCounters operatorCountersGroupAccumulatorExpressions;
 // Global counters for accumulator expressions apply to $setWindowFields.
 extern OperatorCounters operatorCountersWindowAccumulatorExpressions;
+
+// Track the number of {multi:true} updates.
+extern CounterMetric updateManyCount;
+// Track the number of deleteMany calls.
+extern CounterMetric deleteManyCount;
 
 }  // namespace mongo

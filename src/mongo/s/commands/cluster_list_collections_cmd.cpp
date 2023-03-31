@@ -129,7 +129,7 @@ BSONObj rewriteCommandForListingOwnCollections(OperationContext* opCtx,
     // Compute the set of collection names which would be permissible to return.
     std::set<std::string> collectionNames;
     if (auto authUser = authzSession->getAuthenticatedUser()) {
-        for (const auto& [resource, privilege] : authUser.get()->getPrivileges()) {
+        for (const auto& [resource, privilege] : authUser.value()->getPrivileges()) {
             if (resource.isCollectionPattern() ||
                 (resource.isExactNamespacePattern() &&
                  resource.databaseToMatch() == dbName.toStringWithTenantId())) {
@@ -209,11 +209,11 @@ public:
         return false;
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const final {
-        AuthorizationSession* authzSession = AuthorizationSession::get(client);
-        return authzSession->checkAuthorizedToListCollections(dbname, cmdObj).getStatus();
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const final {
+        auto* authzSession = AuthorizationSession::get(opCtx->getClient());
+        return authzSession->checkAuthorizedToListCollections(dbName.db(), cmdObj).getStatus();
     }
 
     bool runWithRequestParser(OperationContext* opCtx,
@@ -237,7 +237,7 @@ public:
         auto dbInfoStatus =
             Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, dbName.toStringWithTenantId());
         if (!dbInfoStatus.isOK()) {
-            appendEmptyResultSet(opCtx, output, dbInfoStatus.getStatus(), nss.ns());
+            appendEmptyResultSet(opCtx, output, dbInfoStatus.getStatus(), nss);
             return true;
         }
 

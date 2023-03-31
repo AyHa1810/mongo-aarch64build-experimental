@@ -32,7 +32,6 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/s/config/initial_split_policy.h"
 #include "mongo/db/s/create_collection_coordinator_document_gen.h"
-#include "mongo/db/s/create_collection_coordinator_params.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharding_ddl_coordinator.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
@@ -49,7 +48,7 @@ public:
 
     CreateCollectionCoordinator(ShardingDDLCoordinatorService* service, const BSONObj& initialState)
         : RecoverableShardingDDLCoordinator(service, "CreateCollectionCoordinator", initialState),
-          _request(_doc.getCreateCollectionRequest(), originalNss()),
+          _request(_doc.getCreateCollectionRequest()),
           _critSecReason(BSON("command"
                               << "createCollection"
                               << "ns" << originalNss().toString())) {}
@@ -87,31 +86,36 @@ private:
      */
     void _checkCommandArguments(OperationContext* opCtx);
 
-    /**
-     * Checks that the collection has UUID matching the collectionUUID parameter, if provided.
-     */
-    void _checkCollectionUUIDMismatch(OperationContext* opCtx) const;
+    boost::optional<CreateCollectionResponse> _checkIfCollectionAlreadyShardedWithSameOptions(
+        OperationContext* opCtx);
 
-    void _acquireCriticalSections(OperationContext* opCtx) const;
+    TranslatedRequestParams _translateRequestParameters(OperationContext* opCtx);
+
+    // TODO SERVER-68008 Remove once 7.0 becomes last LTS; when the function appears in if clauses,
+    // modify the code assuming that a "false" value gets returned
+    bool _timeseriesNssResolvedByCommandHandler() const;
+
+    void _acquireCriticalSections(OperationContext* opCtx);
 
     void _promoteCriticalSectionsToBlockReads(OperationContext* opCtx) const;
 
-    void _releaseCriticalSections(OperationContext* opCtx) const;
+    void _releaseCriticalSections(OperationContext* opCt, bool throwIfReasonDiffers = true);
 
     /**
      * Ensures the collection is created locally and has the appropiate shard index.
      */
-    void _createCollectionAndIndexes(OperationContext* opCtx);
+    void _createCollectionAndIndexes(OperationContext* opCtx,
+                                     const ShardKeyPattern& shardKeyPattern);
 
     /**
      * Creates the appropiate split policy.
      */
-    void _createPolicy(OperationContext* opCtx);
+    void _createPolicy(OperationContext* opCtx, const ShardKeyPattern& shardKeyPattern);
 
     /**
      * Given the appropiate split policy, create the initial chunks.
      */
-    void _createChunks(OperationContext* opCtx);
+    void _createChunks(OperationContext* opCtx, const ShardKeyPattern& shardKeyPattern);
 
     /**
      * If the optimized path can be taken, ensure the collection is already created in all the
@@ -124,8 +128,10 @@ private:
      * Does the following writes:
      * 1. Updates the config.collections entry for the new sharded collection
      * 2. Updates config.chunks entries for the new sharded collection
+     * 3. Inserts an entry into config.placementHistory with the sublist of shards that will host
+     * one or more chunks of the new collections at creation time
      */
-    void _commit(OperationContext* opCtx);
+    void _commit(OperationContext* opCtx, const std::shared_ptr<executor::TaskExecutor>& executor);
 
     /**
      * Helper function to audit and log the shard collection event.
@@ -137,7 +143,7 @@ private:
      */
     void _logEndCreateCollection(OperationContext* opCtx);
 
-    CreateCollectionCoordinatorParams _request;
+    mongo::CreateCollectionRequest _request;
 
     const BSONObj _critSecReason;
 

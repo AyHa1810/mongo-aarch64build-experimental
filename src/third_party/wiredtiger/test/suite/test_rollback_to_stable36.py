@@ -28,7 +28,8 @@
 
 import wttest
 from helper import simulate_crash_restart
-from wiredtiger import stat, WiredTigerError, wiredtiger_strerror, WT_NOTFOUND, WT_ROLLBACK
+from rollback_to_stable_util import verify_rts_logs
+from wiredtiger import stat, WiredTigerError, wiredtiger_strerror, WT_ROLLBACK
 from wtdataset import SimpleDataSet
 from wtscenario import make_scenarios
 
@@ -38,7 +39,7 @@ from wtscenario import make_scenarios
 # everything else on the page is.
 
 class test_rollback_to_stable36(wttest.WiredTigerTestCase):
-    conn_config = 'statistics=(all)'
+    conn_config = 'statistics=(all),verbose=(rts:5)'
     session_config = 'isolation=snapshot'
 
     # Hook to run using remove instead of truncate for reference. This should not alter the
@@ -60,6 +61,13 @@ class test_rollback_to_stable36(wttest.WiredTigerTestCase):
         ('recovery', dict(crash=True)),
     ]
     scenarios = make_scenarios(trunc_values, format_values, rollback_modes)
+
+    # Don't raise errors for these, the expectation is that the RTS verifier will
+    # run on the test output.
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ignoreStdoutPattern('WT_VERB_RTS')
+        self.addTearDownAction(verify_rts_logs)
 
     def truncate(self, uri, make_key, keynum1, keynum2):
         if self.trunc_with_remove:
@@ -105,7 +113,7 @@ class test_rollback_to_stable36(wttest.WiredTigerTestCase):
         cursor.close()
 
     def test_rollback_to_stable36(self):
-        nrows = 1000
+        nrows = 10000
 
         # Create a table.
         uri = "table:rollback_to_stable36"
@@ -147,11 +155,11 @@ class test_rollback_to_stable36(wttest.WiredTigerTestCase):
         self.assertEqual(err, 0)
         self.session.commit_transaction('commit_timestamp=' + self.timestamp_str(20))
 
-        # Make sure we did at least one fast-delete. For columns, there's no fast-delete
-        # support (yet) so assert we didn't.
+        # Make sure we did at least one fast-delete. (Unless we specifically didn't want to,
+        # or running on FLCS where it isn't supported.)
         stat_cursor = self.session.open_cursor('statistics:', None, None)
         fastdelete_pages = stat_cursor[stat.conn.rec_page_delete_fast][2]
-        if self.key_format == 'r' or self.trunc_with_remove:
+        if self.value_format == '8t' or self.trunc_with_remove:
             self.assertEqual(fastdelete_pages, 0)
         else:
             self.assertGreater(fastdelete_pages, 0)
@@ -168,10 +176,10 @@ class test_rollback_to_stable36(wttest.WiredTigerTestCase):
 
         # Currently rolling back a fast-truncate works by instantiating the pages and
         # rolling back the instantiated updates, so we should see some page instantiations.
-        # (But again, not for columns, yet.)
+        # (But not for FLCS.)
         stat_cursor = self.session.open_cursor('statistics:', None, None)
         read_deleted = stat_cursor[stat.conn.cache_read_deleted][2]
-        if self.key_format == 'r' or self.trunc_with_remove:
+        if self.value_format == '8t' or self.trunc_with_remove:
             self.assertEqual(read_deleted, 0)
         else:
             self.assertGreater(read_deleted, 0)

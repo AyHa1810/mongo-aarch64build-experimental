@@ -39,6 +39,7 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/timeseries/catalog_helper.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 
@@ -55,12 +56,18 @@ CollectionPtr getCollectionForCompact(OperationContext* opCtx,
                                       const NamespaceString& collectionNss) {
     invariant(opCtx->lockState()->isCollectionLockedForMode(collectionNss, MODE_IX));
 
+    NamespaceString resolvedNs = collectionNss;
+    if (auto timeseriesOptions = timeseries::getTimeseriesOptions(
+            opCtx, collectionNss, /*convertToBucketsNamespace=*/true)) {
+        resolvedNs = collectionNss.makeTimeseriesBucketsNamespace();
+    }
+
     auto collectionCatalog = CollectionCatalog::get(opCtx);
-    CollectionPtr collection = collectionCatalog->lookupCollectionByNamespace(opCtx, collectionNss);
+    CollectionPtr collection(collectionCatalog->lookupCollectionByNamespace(opCtx, resolvedNs));
 
     if (!collection) {
         std::shared_ptr<const ViewDefinition> view =
-            collectionCatalog->lookupView(opCtx, collectionNss);
+            collectionCatalog->lookupView(opCtx, resolvedNs);
         uassert(ErrorCodes::CommandNotSupportedOnView, "can't compact a view", !view);
         uasserted(ErrorCodes::NamespaceNotFound, "collection does not exist");
     }
@@ -76,10 +83,10 @@ StatusWith<int64_t> compactCollection(OperationContext* opCtx,
     Database* database = autoDb.getDb();
     uassert(ErrorCodes::NamespaceNotFound, "database does not exist", database);
 
-    // The collection lock will be downgraded to an intent lock if the record store supports
-    // online compaction.
+    // The collection lock will be upgraded to an exclusive lock if the record store does not
+    // support online compaction.
     boost::optional<Lock::CollectionLock> collLk;
-    collLk.emplace(opCtx, collectionNss, MODE_X);
+    collLk.emplace(opCtx, collectionNss, MODE_IX);
 
     CollectionPtr collection = getCollectionForCompact(opCtx, collectionNss);
     DisableDocumentValidation validationDisabler(opCtx);
@@ -93,10 +100,9 @@ StatusWith<int64_t> compactCollection(OperationContext* opCtx,
                       str::stream() << "cannot compact collection with record store: "
                                     << recordStore->name());
 
-    if (recordStore->supportsOnlineCompaction()) {
-        // Storage engines that allow online compaction should do so using an intent lock on the
-        // collection.
-        collLk.emplace(opCtx, collectionNss, MODE_IX);
+    if (!recordStore->supportsOnlineCompaction()) {
+        // Storage engines that disallow online compaction should compact under an exclusive lock.
+        collLk.emplace(opCtx, collectionNss, MODE_X);
 
         // Ensure the collection was not dropped during the re-lock.
         collection = getCollectionForCompact(opCtx, collectionNss);
@@ -107,9 +113,9 @@ StatusWith<int64_t> compactCollection(OperationContext* opCtx,
                   {LogComponent::kCommand},
                   "compact {namespace} begin",
                   "Compact begin",
-                  "namespace"_attr = collectionNss);
+                  logAttrs(collectionNss));
 
-    auto oldTotalSize = recordStore->storageSize(opCtx) + collection->getIndexSize(opCtx);
+    auto bytesBefore = recordStore->storageSize(opCtx) + collection->getIndexSize(opCtx);
     auto indexCatalog = collection->getIndexCatalog();
 
     Status status = recordStore->compact(opCtx);
@@ -121,14 +127,21 @@ StatusWith<int64_t> compactCollection(OperationContext* opCtx,
     if (!status.isOK())
         return status;
 
-    auto totalSizeDiff =
-        oldTotalSize - recordStore->storageSize(opCtx) - collection->getIndexSize(opCtx);
-    LOGV2(20286,
-          "compact {namespace} end, bytes freed: {freedBytes}",
+    auto bytesAfter = recordStore->storageSize(opCtx) + collection->getIndexSize(opCtx);
+    auto bytesDiff = static_cast<int64_t>(bytesBefore) - static_cast<int64_t>(bytesAfter);
+
+    // The compact operation might grow the file size if there is little free space left, because
+    // running a compact also triggers a checkpoint, which requires some space. Additionally, it is
+    // possible for concurrent writes and index builds to cause the size to grow while compact is
+    // running. So it is possible for the size after a compact to be larger than before it.
+    LOGV2(7386700,
           "Compact end",
-          "namespace"_attr = collectionNss,
-          "freedBytes"_attr = totalSizeDiff);
-    return totalSizeDiff;
+          logAttrs(collectionNss),
+          "bytesBefore"_attr = bytesBefore,
+          "bytesAfter"_attr = bytesAfter,
+          "bytesDiff"_attr = bytesDiff);
+
+    return bytesDiff;
 }
 
 }  // namespace mongo

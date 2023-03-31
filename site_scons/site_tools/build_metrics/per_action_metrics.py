@@ -1,12 +1,13 @@
 import functools
-import subprocess
 import time
 import psutil
+import subprocess
+
 import memory_profiler
 import SCons
 import sys
 
-from .util import fullname
+from .util import fullname, mem_adjustment
 from .protocol import BuildMetricsCollector
 
 
@@ -124,6 +125,9 @@ class PerActionMetrics(BuildMetricsCollector):
 
         SCons.Action.FunctionAction.execute = build_metrics_FunctionAction_execute
 
+    def get_name(self):
+        return "Per-Action Metrics"
+
     def get_mem_cpu(self, proc):
         with proc.oneshot():
             cpu = (proc.cpu_times().system + proc.cpu_times().user)
@@ -176,7 +180,7 @@ class PerActionMetrics(BuildMetricsCollector):
 
         task_metrics['end_time'] = time.time_ns()
         task_metrics['cpu_time'] = int(cpu_usage * (10.0**9.0))
-        task_metrics['mem_usage'] = int(mem_usage)
+        task_metrics['mem_usage'] = mem_adjustment(int(mem_usage))
 
         self.build_tasks_metrics.append(task_metrics)
         task_metrics['array_index'] = self.build_tasks_metrics.index(task_metrics)

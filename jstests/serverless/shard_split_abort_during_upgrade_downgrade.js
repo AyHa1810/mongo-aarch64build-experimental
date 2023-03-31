@@ -1,34 +1,28 @@
 /*
  * Prove that shard splits are aborted during FCV upgrade/downgrade.
  *
- * @tags: [requires_fcv_52, featureFlagShardSplit, serverless]
+ * @tags: [requires_fcv_63, serverless]
  */
 
-(function() {
-"use strict";
+import {ShardSplitTest} from "jstests/serverless/libs/shard_split_test.js";
 load("jstests/libs/fail_point_util.js");
-load("jstests/serverless/libs/basic_serverless_test.js");
 
 // Shard split commands are gated by a feature flag, which will not be supported when we
 // downgrade versions. Eventually, we will run this test when we have two consecutive versions
 // that support `commitShardSplit` without a feature flag. This check will be removed as part
 // of SERVER-66965.
-if (MongoRunner.compareBinVersions(latestFCV, "6.2") < 0) {
-    return;
+if (MongoRunner.compareBinVersions(latestFCV, "7.0") < 0) {
+    quit();
 }
 
 // Skip db hash check because secondary is left with a different config.
 TestData.skipCheckDBHashes = true;
-const test = new BasicServerlessTest({
-    recipientTagName: "recipientNode",
-    recipientSetName: "recipient",
-    quickGarbageCollection: true
-});
 
+const test = new ShardSplitTest({quickGarbageCollection: true});
 test.addRecipientNodes();
 
-const donorPrimary = testFixture.donor.getPrimary();
-const tenantIds = ["tenant1", "tenant2"];
+const donorPrimary = test.donor.getPrimary();
+const tenantIds = [ObjectId(), ObjectId()];
 
 jsTestLog("Assert shard splits are aborted when downgrading.");
 const downgradeFCV = lastContinuousFCV;
@@ -62,4 +56,3 @@ upgradeThread.join();
 secondSplit.forget();
 
 test.stop();
-})();

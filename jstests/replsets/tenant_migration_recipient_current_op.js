@@ -11,18 +11,19 @@
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
  *   requires_persistence,
+ *   # The currentOp output field 'dataSyncCompleted' was renamed to 'migrationCompleted'.
+ *   requires_fcv_70,
  *   serverless,
  * ]
  */
 
-(function() {
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {forgetMigrationAsync} from "jstests/replsets/libs/tenant_migration_util.js";
 
-"use strict";
 load("jstests/libs/uuid_util.js");        // For extractUUIDFromObject().
 load("jstests/libs/fail_point_util.js");  // For configureFailPoint().
 load("jstests/libs/parallelTester.js");   // For the Thread().
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
+load('jstests/replsets/rslib.js');        // 'createRstArgs'
 
 const tenantMigrationTest = new TenantMigrationTest({
     name: jsTestName(),
@@ -32,7 +33,7 @@ const tenantMigrationTest = new TenantMigrationTest({
 });
 
 const kMigrationId = UUID();
-const kTenantId = 'testTenantId';
+const kTenantId = ObjectId().str;
 const kReadPreference = {
     mode: "primary"
 };
@@ -59,13 +60,21 @@ for (const db of dbsToClone) {
 // correct.
 function checkStandardFieldsOK(res) {
     assert.eq(res.inprog.length, 1, res);
-    assert.eq(bsonWoCompare(res.inprog[0].instanceID, kMigrationId), 0, res);
-    assert.eq(res.inprog[0].donorConnectionString, tenantMigrationTest.getDonorRst().getURL(), res);
-    assert.eq(bsonWoCompare(res.inprog[0].readPreference, kReadPreference), 0, res);
+    const {
+        instanceID,
+        donorConnectionString,
+        readPreference,
+        numRestartsDueToDonorConnectionFailure,
+        numRestartsDueToRecipientFailure,
+        tenantId
+    } = res.inprog[0];
+    assert.eq(bsonWoCompare(instanceID, kMigrationId), 0, res);
+    assert.eq(donorConnectionString, tenantMigrationTest.getDonorRst().getURL(), res);
+    assert.eq(bsonWoCompare(readPreference, kReadPreference), 0, res);
     // We don't test failovers in this test so we don't expect these counters to be incremented.
-    assert.eq(res.inprog[0].numRestartsDueToDonorConnectionFailure, 0, res);
-    assert.eq(res.inprog[0].numRestartsDueToRecipientFailure, 0, res);
-    assert.eq(bsonWoCompare(res.inprog[0].tenantId, kTenantId), 0, res);
+    assert.eq(numRestartsDueToDonorConnectionFailure, 0, res);
+    assert.eq(numRestartsDueToRecipientFailure, 0, res);
+    assert.eq(bsonWoCompare(tenantId, kTenantId), 0, res);
 }
 
 // Check currentOp fields' expected value once the recipient is in state "consistent" or later.
@@ -136,9 +145,9 @@ assert.commandWorked(
     let res = recipientPrimary.adminCommand({currentOp: true, desc: "tenant recipient migration"});
     checkStandardFieldsOK(res);
     let currOp = res.inprog[0];
-    assert.eq(currOp.state, TenantMigrationTest.RecipientStateEnum.kStarted, res);
+    assert.eq(currOp.state, TenantMigrationTest.RecipientState.kStarted, res);
+    assert.eq(currOp.garbageCollectable, false, res);
     assert.eq(currOp.migrationCompleted, false, res);
-    assert.eq(currOp.dataSyncCompleted, false, res);
     assert(!currOp.hasOwnProperty("startFetchingDonorOpTime"), res);
     assert(!currOp.hasOwnProperty("startApplyingDonorOpTime"), res);
     assert(!currOp.hasOwnProperty("expireAt"), res);
@@ -162,9 +171,9 @@ assert.commandWorked(
     checkStandardFieldsOK(res);
     let currOp = res.inprog[0];
     assert.gt(new Date(), currOp.receiveStart, tojson(res));
-    assert.eq(currOp.state, TenantMigrationTest.RecipientStateEnum.kStarted, res);
+    assert.eq(currOp.state, TenantMigrationTest.RecipientState.kStarted, res);
+    assert.eq(currOp.garbageCollectable, false, res);
     assert.eq(currOp.migrationCompleted, false, res);
-    assert.eq(currOp.dataSyncCompleted, false, res);
     assert(!currOp.hasOwnProperty("expireAt"), res);
     assert(!currOp.hasOwnProperty("cloneFinishedRecipientOpTime"), res);
     assert(currOp.hasOwnProperty("startFetchingDonorOpTime") &&
@@ -191,10 +200,10 @@ assert.commandWorked(
     checkStandardFieldsOK(res);
     let currOp = res.inprog[0];
 
-    assert.eq(currOp.state, TenantMigrationTest.RecipientStateEnum.kStarted, res);
+    assert.eq(currOp.state, TenantMigrationTest.RecipientState.kStarted, res);
 
+    assert.eq(currOp.garbageCollectable, false, res);
     assert.eq(currOp.migrationCompleted, false, res);
-    assert.eq(currOp.dataSyncCompleted, false, res);
     assert(!currOp.hasOwnProperty("expireAt"), res);
     // Must exist now.
     assert(currOp.hasOwnProperty("startFetchingDonorOpTime") &&
@@ -238,9 +247,9 @@ assert.commandWorked(
     checkPostConsistentFieldsOK(res);
     let currOp = res.inprog[0];
     // State should have changed.
-    assert.eq(currOp.state, TenantMigrationTest.RecipientStateEnum.kConsistent, res);
+    assert.eq(currOp.state, TenantMigrationTest.RecipientState.kConsistent, res);
+    assert.eq(currOp.garbageCollectable, false, res);
     assert.eq(currOp.migrationCompleted, false, res);
-    assert.eq(currOp.dataSyncCompleted, false, res);
     assert(!currOp.hasOwnProperty("expireAt"), res);
 
     // Wait to receive recipientSyncData with returnAfterReachingDonorTimestamp.
@@ -252,9 +261,9 @@ assert.commandWorked(
     checkPostConsistentFieldsOK(res);
     currOp = res.inprog[0];
     // State should have changed.
-    assert.eq(currOp.state, TenantMigrationTest.RecipientStateEnum.kConsistent, res);
+    assert.eq(currOp.state, TenantMigrationTest.RecipientState.kConsistent, res);
+    assert.eq(currOp.garbageCollectable, false, res);
     assert.eq(currOp.migrationCompleted, false, res);
-    assert.eq(currOp.dataSyncCompleted, false, res);
     assert(!currOp.hasOwnProperty("expireAt"), res);
     // The oplog applier should have applied at least the noop resume token.
     assert.gte(currOp.numOpsApplied, 1, tojson(res));
@@ -266,11 +275,10 @@ assert.commandWorked(
 }
 
 jsTestLog("Issuing a forget migration command.");
-const forgetMigrationThread =
-    new Thread(TenantMigrationUtil.forgetMigrationAsync,
-               migrationOpts.migrationIdString,
-               TenantMigrationUtil.createRstArgs(tenantMigrationTest.getDonorRst()),
-               true /* retryOnRetryableErrors */);
+const forgetMigrationThread = new Thread(forgetMigrationAsync,
+                                         migrationOpts.migrationIdString,
+                                         createRstArgs(tenantMigrationTest.getDonorRst()),
+                                         true /* retryOnRetryableErrors */);
 forgetMigrationThread.start();
 
 {
@@ -281,10 +289,10 @@ forgetMigrationThread.start();
     checkStandardFieldsOK(res);
     checkPostConsistentFieldsOK(res);
     let currOp = res.inprog[0];
-    assert.eq(currOp.state, TenantMigrationTest.RecipientStateEnum.kConsistent, res);
-    assert.eq(currOp.migrationCompleted, false, res);
-    // dataSyncCompleted should have changed.
-    assert.eq(currOp.dataSyncCompleted, true, res);
+    assert.eq(currOp.state, TenantMigrationTest.RecipientState.kConsistent, res);
+    assert.eq(currOp.garbageCollectable, false, res);
+    // migrationCompleted should have changed.
+    assert.eq(currOp.migrationCompleted, true, res);
     assert(!currOp.hasOwnProperty("expireAt"), res);
 
     jsTestLog("Allow the forgetMigration to complete.");
@@ -295,10 +303,10 @@ forgetMigrationThread.start();
     checkStandardFieldsOK(res);
     checkPostConsistentFieldsOK(res);
     currOp = res.inprog[0];
-    assert.eq(currOp.dataSyncCompleted, true, res);
-    // State, completion status and expireAt should have changed.
-    assert.eq(currOp.state, TenantMigrationTest.RecipientStateEnum.kDone, res);
     assert.eq(currOp.migrationCompleted, true, res);
+    // State, completion status and expireAt should have changed.
+    assert.eq(currOp.state, TenantMigrationTest.RecipientState.kDone, res);
+    assert.eq(currOp.garbageCollectable, true, res);
     assert(currOp.hasOwnProperty("expireAt") && currOp.expireAt instanceof Date, res);
 
     assert(currOp.hasOwnProperty("databases"));
@@ -318,7 +326,7 @@ forgetMigrationThread.start();
         for (const coll of collsToClone) {
             assert(dbStats.hasOwnProperty(`${tenantDB}.${coll}`), tojson(res));
             const collStats = dbStats[`${tenantDB}.${coll}`];
-            assert.eq(docs.length, collStats.documentsToCopy, tojson(res));
+            assert.eq(docs.length, collStats.documentsToCopyAtStartOfClone, tojson(res));
             assert.eq(docs.length, collStats.documentsCopied, tojson(res));
             assert.eq(1, collStats.indexes, tojson(res));
             assert.eq(collStats.insertedBatches, collStats.receivedBatches, tojson(res));
@@ -330,4 +338,3 @@ forgetMigrationThread.start();
 }
 
 tenantMigrationTest.stop();
-})();

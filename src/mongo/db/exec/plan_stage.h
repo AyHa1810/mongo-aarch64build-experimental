@@ -34,8 +34,10 @@
 
 #include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/scoped_timer.h"
+#include "mongo/db/exec/scoped_timer_factory.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/restore_context.h"
 
 namespace mongo {
@@ -116,7 +118,7 @@ public:
         if (expCtx->explain || expCtx->mayDbProfile) {
             // Populating the field for execution time indicates that this stage should time each
             // call to work().
-            _commonStats.executionTimeMillis.emplace(0);
+            _commonStats.executionTime.emplace(0);
         }
     }
 
@@ -318,7 +320,7 @@ public:
      * Creates plan stats tree which has the same topology as the original execution tree,
      * but has a separate lifetime.
      */
-    virtual std::unique_ptr<PlanStageStats> getStats() = 0;
+    virtual std::unique_ptr<mongo::PlanStageStats> getStats() = 0;
 
     /**
      * Get the CommonStats for this stage. The pointer is *not* owned by the caller.
@@ -327,7 +329,7 @@ public:
      * It must not exist past the stage. If you need the stats to outlive the stage,
      * use the getStats(...) method above.
      */
-    const CommonStats* getCommonStats() const {
+    const mongo::CommonStats* getCommonStats() const {
         return &_commonStats;
     }
 
@@ -346,8 +348,9 @@ public:
      * execution has started.
      */
     void markShouldCollectTimingInfo() {
-        invariant(!_commonStats.executionTimeMillis || *_commonStats.executionTimeMillis == 0);
-        _commonStats.executionTimeMillis.emplace(0);
+        invariant(!_commonStats.executionTime ||
+                  durationCount<Microseconds>(*_commonStats.executionTime) == 0);
+        _commonStats.executionTime.emplace(0);
     }
 
 protected:
@@ -400,15 +403,17 @@ protected:
      * stage. May return boost::none if it is not necessary to collect timing info.
      */
     boost::optional<ScopedTimer> getOptTimer() {
-        if (_commonStats.executionTimeMillis) {
-            return {{getClock(), _commonStats.executionTimeMillis.get_ptr()}};
+        if (_opCtx && _commonStats.executionTime) {
+            return scoped_timer_factory::make(_opCtx->getServiceContext(),
+                                              QueryExecTimerPrecision::kMillis,
+                                              _commonStats.executionTime.get_ptr());
         }
 
         return boost::none;
     }
 
     Children _children;
-    CommonStats _commonStats;
+    mongo::CommonStats _commonStats;
 
 private:
     OperationContext* _opCtx;

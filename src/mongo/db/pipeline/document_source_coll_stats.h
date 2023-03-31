@@ -85,6 +85,11 @@ public:
         const DocumentSourceCollStatsSpec _spec;
     };
 
+    static BSONObj makeStatsForNs(const boost::intrusive_ptr<ExpressionContext>&,
+                                  const NamespaceString&,
+                                  const DocumentSourceCollStatsSpec&,
+                                  const boost::optional<BSONObj>& filterObj = boost::none);
+
     DocumentSourceCollStats(const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
                             DocumentSourceCollStatsSpec spec)
         : DocumentSource(kStageName, pExpCtx), _collStatsSpec(std::move(spec)) {}
@@ -109,7 +114,9 @@ public:
         return boost::none;
     }
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
 
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);

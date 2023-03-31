@@ -88,10 +88,10 @@ IndexFilterCommand::IndexFilterCommand(const string& name, const string& helpTex
     : BasicCommand(name), helpText(helpText) {}
 
 bool IndexFilterCommand::run(OperationContext* opCtx,
-                             const string& dbname,
+                             const DatabaseName& dbName,
                              const BSONObj& cmdObj,
                              BSONObjBuilder& result) {
-    const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
+    const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
     AutoGetCollectionForReadCommand ctx(opCtx, nss);
     uassertStatusOK(runIndexFilterCommand(opCtx, ctx.getCollection(), cmdObj, &result));
     return true;
@@ -109,11 +109,11 @@ std::string IndexFilterCommand::help() const {
     return helpText;
 }
 
-Status IndexFilterCommand::checkAuthForCommand(Client* client,
-                                               const std::string& dbname,
-                                               const BSONObj& cmdObj) const {
-    AuthorizationSession* authzSession = AuthorizationSession::get(client);
-    ResourcePattern pattern = parseResourcePattern(dbname, cmdObj);
+Status IndexFilterCommand::checkAuthForOperation(OperationContext* opCtx,
+                                                 const DatabaseName& dbName,
+                                                 const BSONObj& cmdObj) const {
+    AuthorizationSession* authzSession = AuthorizationSession::get(opCtx->getClient());
+    ResourcePattern pattern = parseResourcePattern(dbName, cmdObj);
 
     if (authzSession->isAuthorizedForActionsOnResource(pattern, ActionType::planCacheIndexFilter)) {
         return Status::OK();
@@ -203,12 +203,9 @@ Status ClearFilters::runIndexFilterCommand(OperationContext* opCtx,
     invariant(querySettings);
 
     PlanCache* planCacheClassic = CollectionQueryInfo::get(collection).getPlanCache();
-    sbe::PlanCache* planCacheSBE = nullptr;
     invariant(planCacheClassic);
-
-    if (feature_flags::gFeatureFlagSbeFull.isEnabledAndIgnoreFCV()) {
-        planCacheSBE = &sbe::getPlanCache(opCtx);
-    }
+    sbe::PlanCache* planCacheSBE = &sbe::getPlanCache(opCtx);
+    invariant(planCacheSBE);
 
     return clear(opCtx, collection, cmdObj, querySettings, planCacheClassic, planCacheSBE);
 }
@@ -276,7 +273,7 @@ Status ClearFilters::clear(OperationContext* opCtx,
     // removePlanCacheEntriesByPlanCacheCommandKeys() function with the key from the index filter
     // entry.
     stdx::unordered_set<uint32_t> planCacheCommandKeys;
-    for (auto entry : entries) {
+    for (const auto& entry : entries) {
         // Create canonical query.
         auto findCommand = std::make_unique<FindCommandRequest>(nss);
         findCommand->setFilter(entry.query);
@@ -304,9 +301,7 @@ Status ClearFilters::clear(OperationContext* opCtx,
             planCacheCommandKeys, collection->uuid(), planCacheSBE);
     }
 
-    LOGV2(20480,
-          "Removed all index filters for collection",
-          "namespace"_attr = collection->ns().ns());
+    LOGV2(20480, "Removed all index filters for collection", logAttrs(collection->ns()));
 
     return Status::OK();
 }
@@ -327,12 +322,9 @@ Status SetFilter::runIndexFilterCommand(OperationContext* opCtx,
     invariant(querySettings);
 
     PlanCache* planCacheClassic = CollectionQueryInfo::get(collection).getPlanCache();
-    sbe::PlanCache* planCacheSBE = nullptr;
     invariant(planCacheClassic);
-
-    if (feature_flags::gFeatureFlagSbeFull.isEnabledAndIgnoreFCV()) {
-        planCacheSBE = &sbe::getPlanCache(opCtx);
-    }
+    sbe::PlanCache* planCacheSBE = &sbe::getPlanCache(opCtx);
+    invariant(planCacheSBE);
 
     return set(opCtx, collection, cmdObj, querySettings, planCacheClassic, planCacheSBE);
 }

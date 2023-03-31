@@ -4,7 +4,7 @@
  * bucket namespace of that view exists.
  *
  * @tags: [
- * featureFlagExtendValidateCommand
+ * requires_fcv_62
  * ]
  */
 
@@ -36,7 +36,7 @@ const weather_data = [
     },
 ];
 
-assert.commandWorked(coll.insertMany(weather_data));
+assert.commandWorked(coll.insertMany(weather_data), {ordered: false});
 
 // Tests that the validate command can be run on a time-series collection.
 

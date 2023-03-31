@@ -49,21 +49,24 @@ public:
 
     virtual DefragmentationPhaseEnum getNextPhase() const = 0;
 
-    virtual boost::optional<DefragmentationAction> popNextStreamableAction(
+    virtual boost::optional<BalancerStreamAction> popNextStreamableAction(
         OperationContext* opCtx) = 0;
 
     virtual boost::optional<MigrateInfo> popNextMigration(
-        OperationContext* opCtx, stdx::unordered_set<ShardId>* usedShards) = 0;
+        OperationContext* opCtx, stdx::unordered_set<ShardId>* availableShards) = 0;
 
     virtual void applyActionResult(OperationContext* opCtx,
-                                   const DefragmentationAction& action,
-                                   const DefragmentationActionResponse& response) = 0;
+                                   const BalancerStreamAction& action,
+                                   const BalancerStreamActionResponse& response) = 0;
 
     virtual BSONObj reportProgress() const = 0;
 
     virtual bool isComplete() const = 0;
 
     virtual void userAbort() = 0;
+
+protected:
+    static constexpr uint64_t kSmallChunkSizeThresholdPctg = 25;
 };
 
 class BalancerDefragmentationPolicyImpl : public BalancerDefragmentationPolicy {
@@ -72,9 +75,10 @@ class BalancerDefragmentationPolicyImpl : public BalancerDefragmentationPolicy {
 
 public:
     BalancerDefragmentationPolicyImpl(ClusterStatistics* clusterStats,
-                                      BalancerRandomSource& random,
                                       const std::function<void()>& onStateUpdated)
-        : _clusterStats(clusterStats), _random(random), _onStateUpdated(onStateUpdated) {}
+        : _clusterStats(clusterStats),
+          _random(std::random_device{}()),
+          _onStateUpdated(onStateUpdated) {}
 
     ~BalancerDefragmentationPolicyImpl() {}
 
@@ -85,18 +89,17 @@ public:
     virtual BSONObj reportProgressOn(const UUID& uuid) override;
 
     MigrateInfoVector selectChunksToMove(OperationContext* opCtx,
-                                         stdx::unordered_set<ShardId>* usedShards) override;
+                                         stdx::unordered_set<ShardId>* availableShards) override;
 
     StringData getName() const override;
 
-    boost::optional<DefragmentationAction> getNextStreamingAction(OperationContext* opCtx) override;
+    boost::optional<BalancerStreamAction> getNextStreamingAction(OperationContext* opCtx) override;
 
     void applyActionResult(OperationContext* opCtx,
-                           const DefragmentationAction& action,
-                           const DefragmentationActionResponse& response) override;
+                           const BalancerStreamAction& action,
+                           const BalancerStreamActionResponse& response) override;
 
-    void startCollectionDefragmentation(OperationContext* opCtx,
-                                        const CollectionType& coll) override;
+    void startCollectionDefragmentations(OperationContext* opCtx) override;
 
     void abortCollectionDefragmentation(OperationContext* opCtx,
                                         const NamespaceString& nss) override;
@@ -145,7 +148,7 @@ private:
 
     ClusterStatistics* const _clusterStats;
 
-    BalancerRandomSource& _random;
+    BalancerRandomSource _random;
 
     const std::function<void()> _onStateUpdated;
 

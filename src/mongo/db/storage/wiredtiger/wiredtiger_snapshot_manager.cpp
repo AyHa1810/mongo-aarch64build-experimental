@@ -84,14 +84,14 @@ Timestamp WiredTigerSnapshotManager::beginTransactionOnCommittedSnapshot(
     WT_SESSION* session,
     PrepareConflictBehavior prepareConflictBehavior,
     RoundUpPreparedTimestamps roundUpPreparedTimestamps,
-    WiredTigerBeginTxnBlock::UntimestampedWriteAssertion untimestampedWriteAssertion) const {
+    RecoveryUnit::UntimestampedWriteAssertionLevel untimestampedWriteAssertion) const {
 
     auto committedSnapshot = [this]() {
         stdx::lock_guard<Latch> lock(_committedSnapshotMutex);
         uassert(ErrorCodes::ReadConcernMajorityNotAvailableYet,
                 "Committed view disappeared while running operation",
                 _committedSnapshot);
-        return _committedSnapshot.get();
+        return _committedSnapshot.value();
     }();
 
     if (MONGO_unlikely(hangBeforeMajorityReadTransactionStarted.shouldFail())) {

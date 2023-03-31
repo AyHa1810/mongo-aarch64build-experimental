@@ -76,9 +76,6 @@ private:
     ExecutorFuture<void> _createStateDocumentTTLIndex(
         std::shared_ptr<executor::ScopedTaskExecutor> executor, const CancellationToken& token);
 
-    ExecutorFuture<void> _rebuildService(std::shared_ptr<executor::ScopedTaskExecutor> executor,
-                                         const CancellationToken& token) override;
-
     ServiceContext* const _serviceContext;
 };
 
@@ -88,6 +85,7 @@ public:
     struct DurableState {
         ShardSplitDonorStateEnum state;
         boost::optional<Status> abortReason;
+        boost::optional<repl::OpTime> blockOpTime;
     };
 
     DonorStateMachine(ServiceContext* serviceContext,
@@ -123,6 +121,10 @@ public:
         return _completionPromise.getFuture();
     }
 
+    SharedSemiFuture<void> garbageCollectableFuture() const {
+        return _garbageCollectablePromise.getFuture();
+    }
+
     UUID getId() const {
         return _migrationId;
     }
@@ -154,6 +156,10 @@ public:
         return _stateDoc.getState();
     }
 
+    SharedSemiFuture<HostAndPort> getSplitAcceptanceFuture_forTest() const {
+        return _splitAcceptancePromise.getFuture();
+    }
+
 private:
     // Tasks
     ExecutorFuture<void> _enterAbortIndexBuildsOrAbortedState(const ScopedTaskExecutorPtr& executor,
@@ -163,19 +169,21 @@ private:
     ExecutorFuture<void> _abortIndexBuildsAndEnterBlockingState(
         const ScopedTaskExecutorPtr& executor, const CancellationToken& abortToken);
 
-    ExecutorFuture<void> _waitForRecipientToReachBlockTimestamp(
-        const ScopedTaskExecutorPtr& executor, const CancellationToken& abortToken);
+    ExecutorFuture<void> _waitForRecipientToReachBlockOpTime(const ScopedTaskExecutorPtr& executor,
+                                                             const CancellationToken& abortToken);
 
     ExecutorFuture<void> _applySplitConfigToDonor(const ScopedTaskExecutorPtr& executor,
                                                   const CancellationToken& abortToken);
 
-    ExecutorFuture<void> _waitForRecipientToAcceptSplit(const ScopedTaskExecutorPtr& executor,
-                                                        const CancellationToken& primaryToken);
-
-    ExecutorFuture<void> _triggerElectionAndEnterCommitedState(
-        const ScopedTaskExecutorPtr& executor, const CancellationToken& primaryToken);
+    ExecutorFuture<void> _waitForSplitAcceptanceAndEnterCommittedState(
+        const ScopedTaskExecutorPtr& executor,
+        const CancellationToken& primaryToken,
+        const CancellationToken& abortToken);
 
     ExecutorFuture<void> _waitForForgetCmdThenMarkGarbageCollectable(
+        const ScopedTaskExecutorPtr& executor, const CancellationToken& primaryToken);
+
+    ExecutorFuture<void> _waitForGarbageCollectionTimeoutThenDeleteStateDoc(
         const ScopedTaskExecutorPtr& executor, const CancellationToken& primaryToken);
 
     ExecutorFuture<void> _removeSplitConfigFromDonor(const ScopedTaskExecutorPtr& executor,
@@ -230,11 +238,15 @@ private:
     // A promise fulfilled when the shard split has committed or aborted.
     SharedPromise<DurableState> _decisionPromise;
 
-    // A promise fulfilled when the shard split operation has fully completed.
+    // A promise fulfilled when the shard split state document has been removed following the
+    // completion of the operation.
     SharedPromise<void> _completionPromise;
 
+    // A promise fulfilled when expireAt has been set following the end of the split.
+    SharedPromise<void> _garbageCollectablePromise;
+
     // A promise fulfilled when all recipient nodes have accepted the split.
-    SharedPromise<void> _splitAcceptancePromise;
+    SharedPromise<HostAndPort> _splitAcceptancePromise;
 
     // A promise fulfilled when tryForget is called.
     SharedPromise<void> _forgetShardSplitReceivedPromise;

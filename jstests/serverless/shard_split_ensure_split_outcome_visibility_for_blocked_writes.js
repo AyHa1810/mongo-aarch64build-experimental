@@ -11,16 +11,13 @@
  *   requires_majority_read_concern,
  *   requires_persistence,
  *   serverless,
- *   requires_fcv_52,
- *   featureFlagShardSplit
+ *   requires_fcv_63
  * ]
  */
-(function() {
-'use strict';
+
+import {assertMigrationState, ShardSplitTest} from "jstests/serverless/libs/shard_split_test.js";
 
 load("jstests/libs/fail_point_util.js");
-load("jstests/libs/uuid_util.js");
-load("jstests/serverless/libs/basic_serverless_test.js");
 
 const kGarbageCollectionParams = {
     // Set the delay before a donor state doc is garbage collected to be short to speed up the test.
@@ -44,16 +41,13 @@ function insertDocument(primaryHost, dbName, collName) {
     jsTestLog(
         "Testing blocked writes can see shard split outcome for a split that has been committed and garbage collected.");
 
-    const test = new BasicServerlessTest({
-        recipientTagName: "recipientNode",
-        recipientSetName: "recipient",
-        nodeOptions: Object.assign({setParameter: kGarbageCollectionParams})
-    });
+    const test =
+        new ShardSplitTest({nodeOptions: Object.assign({setParameter: kGarbageCollectionParams})});
     test.addRecipientNodes();
-    const tenantIds = ["migrationOutcome-committed"];
+    const tenantIds = [ObjectId() /*tenantA*/];
     const operation = test.createSplitOperation(tenantIds);
 
-    const dbName = test.tenantDB(tenantIds[0], kTenantDefinedDbName);
+    const dbName = test.tenantDB(tenantIds[0].str, kTenantDefinedDbName);
     const primary = test.donor.getPrimary();
     const primaryDB = primary.getDB(dbName);
 
@@ -95,16 +89,13 @@ function insertDocument(primaryHost, dbName, collName) {
     jsTestLog(
         "Testing blocked writes can see shard split outcome for a split that has been aborted and garbage collected.");
 
-    const test = new BasicServerlessTest({
-        recipientTagName: "recipientNode",
-        recipientSetName: "recipient",
-        nodeOptions: Object.assign({setParameter: kGarbageCollectionParams})
-    });
+    const test =
+        new ShardSplitTest({nodeOptions: Object.assign({setParameter: kGarbageCollectionParams})});
     test.addRecipientNodes();
-    const tenantIds = ["migrationOutcome-committed"];
+    const tenantIds = [ObjectId() /*tenantA*/];
     const operation = test.createSplitOperation(tenantIds);
 
-    const dbName = test.tenantDB(tenantIds[0], kTenantDefinedDbName);
+    const dbName = test.tenantDB(tenantIds[0].str, kTenantDefinedDbName);
     const primary = test.donor.getPrimary();
     const primaryDB = primary.getDB(dbName);
 
@@ -143,5 +134,4 @@ function insertDocument(primaryHost, dbName, collName) {
     assert.eq(writeRes.writeErrors[0].code, ErrorCodes.TenantMigrationAborted);
 
     test.stop();
-})();
 })();

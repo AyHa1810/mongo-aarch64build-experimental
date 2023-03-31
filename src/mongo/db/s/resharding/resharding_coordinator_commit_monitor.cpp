@@ -61,7 +61,7 @@ MONGO_FAIL_POINT_DEFINE(hangBeforeQueryingRecipients);
 
 BSONObj makeCommandObj(const NamespaceString& ns) {
     auto command = _shardsvrReshardingOperationTime(ns);
-    command.setDbName("admin");
+    command.setDbName(DatabaseName(ns.tenantId(), "admin"));
     return command.toBSON({});
 }
 
@@ -136,7 +136,7 @@ CoordinatorCommitMonitor::queryRemainingOperationTimeForRecipients() const {
     LOGV2_DEBUG(5392001,
                 kDiagnosticLogLevel,
                 "Querying recipient shards for the remaining operation time",
-                "namespace"_attr = _ns);
+                logAttrs(_ns));
 
     auto opCtx = CancelableOperationContext(cc().makeOperationContext(), _cancelToken, _executor);
     auto executor = _networkExecutor ? _networkExecutor : _executor;
@@ -167,13 +167,21 @@ CoordinatorCommitMonitor::queryRemainingOperationTimeForRecipients() const {
         uassertStatusOKWithContext(status, errorContext);
 
         const auto remainingTime = extractOperationRemainingTime(shardResponse.data);
-        // A recipient shard does not report the remaining operation time when there is no data
-        // to copy and no oplog entry to apply.
-        if (remainingTime && remainingTime.get() < minRemainingTime) {
-            minRemainingTime = remainingTime.get();
+
+        // If any recipient omits the "remainingMillis" field of the response then
+        // we cannot conclude that it is safe to begin the critical section.
+        // It is possible that the recipient just had a failover and
+        // was not able to restore its metrics before it replied to the
+        // _shardsvrReshardingOperationTime command.
+        if (!remainingTime) {
+            maxRemainingTime = Milliseconds::max();
+            continue;
         }
-        if (remainingTime && remainingTime.get() > maxRemainingTime) {
-            maxRemainingTime = remainingTime.get();
+        if (remainingTime.value() < minRemainingTime) {
+            minRemainingTime = remainingTime.value();
+        }
+        if (remainingTime.value() > maxRemainingTime) {
+            maxRemainingTime = remainingTime.value();
         }
     }
 
@@ -184,7 +192,7 @@ CoordinatorCommitMonitor::queryRemainingOperationTimeForRecipients() const {
     LOGV2_DEBUG(5392002,
                 kDiagnosticLogLevel,
                 "Finished querying recipient shards for the remaining operation time",
-                "namespace"_attr = _ns,
+                logAttrs(_ns),
                 "remainingTime"_attr = maxRemainingTime);
 
     return {minRemainingTime, maxRemainingTime};
@@ -206,11 +214,19 @@ ExecutorFuture<void> CoordinatorCommitMonitor::_makeFuture() const {
                           "Encountered an error while querying recipients, will retry shortly",
                           "error"_attr = status);
 
-            return RemainingOperationTimes{Milliseconds(0), Milliseconds::max()};
+            // On error we definitely cannot begin the critical section.  Therefore,
+            // return Milliseconds::max for remainingTimes.max (remainingTimes.max is used
+            // for determining whether the critical section should begin).
+            return RemainingOperationTimes{Milliseconds(-1), Milliseconds::max()};
         })
         .then([this, anchor = shared_from_this()](RemainingOperationTimes remainingTimes) {
-            _metrics->setCoordinatorHighEstimateRemainingTimeMillis(remainingTimes.max);
-            _metrics->setCoordinatorLowEstimateRemainingTimeMillis(remainingTimes.min);
+            // If remainingTimes.max (or remainingTimes.min) is Milliseconds::max, then use -1 so
+            // that the scale of the y-axis is still useful when looking at FTDC metrics.
+            auto clampIfMax = [](Milliseconds t) {
+                return t != Milliseconds::max() ? t : Milliseconds(-1);
+            };
+            _metrics->setCoordinatorHighEstimateRemainingTimeMillis(clampIfMax(remainingTimes.max));
+            _metrics->setCoordinatorLowEstimateRemainingTimeMillis(clampIfMax(remainingTimes.min));
 
             // Check if all recipient shards are within the commit threshold.
             if (remainingTimes.max <= _threshold)

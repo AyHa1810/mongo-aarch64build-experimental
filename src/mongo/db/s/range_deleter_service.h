@@ -28,6 +28,7 @@
  */
 #pragma once
 
+#include "mongo/db/repl/replica_set_aware_service.h"
 #include "mongo/db/s/range_deletion_task_gen.h"
 #include "mongo/db/s/sharding_runtime_d_params_gen.h"
 #include "mongo/executor/network_interface_factory.h"
@@ -38,25 +39,13 @@
 
 namespace mongo {
 
-// TODO SERVER-67636 make RangeDeleterService a ReplicaSetAwareServiceShardsvr
-class RangeDeleterService {
+class RangeDeleterService : public ReplicaSetAwareServiceShardSvr<RangeDeleterService> {
 public:
-    RangeDeleterService() {
-        // TODO SERVER-67636 move executor's initialization at replica set aware service level
-        const std::string kExecName("RangeDeleterServiceExecutor");
-        auto net = executor::makeNetworkInterface(kExecName);
-        auto pool = std::make_unique<executor::NetworkInterfaceThreadPool>(net.get());
-        auto taskExecutor =
-            std::make_shared<executor::ThreadPoolTaskExecutor>(std::move(pool), std::move(net));
-        taskExecutor->startup();
-        _executor = std::move(taskExecutor);
-    }
+    RangeDeleterService() = default;
 
-    ~RangeDeleterService() {
-        // TODO SERVER-67636 move executor's shutdown at replica set aware service level
-        _executor->shutdown();
-        _executor->join();
-    }
+    static RangeDeleterService* get(ServiceContext* serviceContext);
+
+    static RangeDeleterService* get(OperationContext* opCtx);
 
 private:
     /*
@@ -65,17 +54,39 @@ private:
      */
     class RangeDeletion : public ChunkRange {
     public:
-        RangeDeletion(const RangeDeletionTask& task, SharedSemiFuture<void> completion)
-            : ChunkRange(task.getRange().getMin(), task.getRange().getMax()),
-              _completion(completion) {}
+        RangeDeletion(const RangeDeletionTask& task)
+            : ChunkRange(task.getRange().getMin(), task.getRange().getMax()) {}
+
+        ~RangeDeletion() {
+            if (!_completionPromise.getFuture().isReady()) {
+                _completionPromise.setError(
+                    Status{ErrorCodes::Interrupted, "Range deletion interrupted"});
+            }
+        }
+
+        SharedSemiFuture<void> getPendingFuture() {
+            return _pendingPromise.getFuture();
+        }
+
+        void clearPending() {
+            if (!_pendingPromise.getFuture().isReady()) {
+                _pendingPromise.emplaceValue();
+            }
+        }
 
         SharedSemiFuture<void> getCompletionFuture() const {
-            return _completion;
+            return _completionPromise.getFuture().semi().share();
+        }
+
+        void makeReady() {
+            _completionPromise.emplaceValue();
         }
 
     private:
         // Marked ready once the range deletion has been fully processed
-        const SharedSemiFuture<void> _completion;
+        SharedPromise<void> _completionPromise;
+
+        SharedPromise<void> _pendingPromise;
     };
 
     /*
@@ -92,6 +103,66 @@ private:
         }
     };
 
+    /*
+     * Class enclosing a thread continuously processing "ready" range deletions, meaning tasks
+     * that are allowed to be processed (already drained ongoing queries and already waited for
+     * `orphanCleanupDelaySecs`).
+     */
+    class ReadyRangeDeletionsProcessor {
+    public:
+        ReadyRangeDeletionsProcessor(OperationContext* opCtx);
+        ~ReadyRangeDeletionsProcessor();
+
+        /*
+         * Interrupt ongoing range deletions
+         */
+        void shutdown();
+
+        /*
+         * Schedule a range deletion at the end of the queue
+         */
+        void emplaceRangeDeletion(const RangeDeletionTask& rdt);
+
+    private:
+        /*
+         * Return true if this processor have been shutted down
+         */
+        bool _stopRequested() const;
+
+        /*
+         * Remove a range deletion from the head of the queue. Supposed to be called only once a
+         * range deletion successfully finishes.
+         */
+        void _completedRangeDeletion();
+
+        /*
+         * Code executed by the internal thread
+         */
+        void _runRangeDeletions();
+
+        mutable Mutex _mutex = MONGO_MAKE_LATCH("ReadyRangeDeletionsProcessor");
+
+        enum State { kRunning, kStopped };
+        State _state{kRunning};
+
+        /*
+         * Condition variable notified when:
+         * - The component has been initialized (the operation context has been instantiated)
+         * - The instance is shutting down (the operation context has been marked killed)
+         * - A new range deletion is scheduled (the queue size has increased by one)
+         */
+        stdx::condition_variable _condVar;
+
+        /* Queue containing scheduled range deletions */
+        std::queue<RangeDeletionTask> _queue;
+
+        /* Pointer to the (one and only) operation context used by the thread */
+        ServiceContext::UniqueOperationContext _threadOpCtxHolder;
+
+        /* Thread consuming the range deletions queue */
+        stdx::thread _thread;
+    };
+
     // Keeping track of per-collection registered range deletion tasks
     stdx::unordered_map<UUID, std::set<std::shared_ptr<ChunkRange>, RANGES_COMPARATOR>, UUID::Hash>
         _rangeDeletionTasks;
@@ -99,20 +170,49 @@ private:
     // Mono-threaded executor processing range deletion tasks
     std::shared_ptr<executor::TaskExecutor> _executor;
 
-    // TODO SERVER-67642 implement fine-grained per-collection locking
-    // Protecting the access to all class members
-    Mutex _mutex = MONGO_MAKE_LATCH("RangeDeleterService::_mutex");
+    enum State { kInitializing, kUp, kDown };
+
+    State _state{kDown};
+
+    // Future markes as ready when the state changes to "up"
+    SharedSemiFuture<void> _stepUpCompletedFuture;
+    // Operation context used for initialization
+    ServiceContext::UniqueOperationContext _initOpCtxHolder;
+
+    /* Acquire mutex only if service is up (for "user" operation) */
+    [[nodiscard]] stdx::unique_lock<Latch> _acquireMutexFailIfServiceNotUp() {
+        stdx::unique_lock<Latch> lg(_mutex_DO_NOT_USE_DIRECTLY);
+        uassert(ErrorCodes::NotYetInitialized, "Range deleter service not up", _state == kUp);
+        return lg;
+    }
+
+    /* Unconditionally acquire mutex (for internal operations) */
+    [[nodiscard]] stdx::unique_lock<Latch> _acquireMutexUnconditionally() {
+        stdx::unique_lock<Latch> lg(_mutex_DO_NOT_USE_DIRECTLY);
+        return lg;
+    }
+
+    // Protecting the access to all class members (DO NOT USE DIRECTLY: rely on
+    // `_acquireMutexUnconditionally` and `_acquireMutexFailIfServiceNotUp`)
+    Mutex _mutex_DO_NOT_USE_DIRECTLY = MONGO_MAKE_LATCH("RangeDeleterService::_mutex");
 
 public:
     /*
      * Register a task on the range deleter service.
      * Returns a future that will be marked ready once the range deletion will be completed.
      *
-     * In case of trying to register an already existing task, the future will contain an error.
+     * In case of trying to register an already existing task, the original future will be returned.
+     *
+     * A task can be registered only if the service is up (except for tasks resubmitted on step-up).
+     *
+     * When a task is registered as `pending`, it can be unblocked by calling again the same method
+     * with `pending=false`.
      */
     SharedSemiFuture<void> registerTask(
         const RangeDeletionTask& rdt,
-        SemiFuture<void>&& waitForActiveQueriesToComplete = SemiFuture<void>::makeReady());
+        SemiFuture<void>&& waitForActiveQueriesToComplete = SemiFuture<void>::makeReady(),
+        bool fromResubmitOnStepUp = false,
+        bool pending = false);
 
     /*
      * Deregister a task from the range deleter service.
@@ -123,6 +223,61 @@ public:
      * Returns the number of registered range deletion tasks for a collection
      */
     int getNumRangeDeletionTasksForCollection(const UUID& collectionUUID);
+
+    /*
+     * Returns a future marked as ready when all overlapping range deletion tasks complete.
+     *
+     * NB: in case an overlapping range deletion task is registered AFTER invoking this method,
+     * it will not be taken into account. Handling this scenario is responsibility of the caller.
+     * */
+    SharedSemiFuture<void> getOverlappingRangeDeletionsFuture(const UUID& collectionUUID,
+                                                              const ChunkRange& range);
+
+    /* ReplicaSetAwareServiceShardSvr implemented methods */
+    void onStartup(OperationContext* opCtx) override;
+    void onSetCurrentConfig(OperationContext* opCtx) override {}
+    void onStepUpComplete(OperationContext* opCtx, long long term) override;
+    void onStepDown() override;
+    void onShutdown() override;
+    inline std::string getServiceName() const override final {
+        return "RangeDeleterService";
+    }
+
+    /*
+     * Returns the RangeDeleterService state with the following schema:
+     *     {collectionUUIDA: [{min: x, max: y}, {min: w, max: z}....], collectionUUIDB: ......}
+     */
+    BSONObj dumpState();
+
+    /*
+     * Returns the total number of range deletion tasks registered on the service.
+     */
+    long long totalNumOfRegisteredTasks();
+
+    /* Returns a shared semi-future marked as ready once the service is initialized */
+    SharedSemiFuture<void> getRangeDeleterServiceInitializationFuture() {
+        return _stepUpCompletedFuture;
+    }
+
+    std::unique_ptr<ReadyRangeDeletionsProcessor> _readyRangeDeletionsProcessorPtr;
+
+private:
+    /* Join all threads and executor and reset the in memory state of the service
+     * Used for onStartUpBegin and on onShutdown
+     */
+    void _joinAndResetState();
+
+    /* Asynchronously register range deletions on the service. To be called on on step-up */
+    void _recoverRangeDeletionsOnStepUp(OperationContext* opCtx);
+
+    /* Called by shutdown/stepdown hooks to interrupt the service */
+    void _stopService();
+
+    /* ReplicaSetAwareServiceShardSvr "empty implemented" methods */
+    void onInitialDataAvailable(OperationContext* opCtx,
+                                bool isMajorityDataAvailable) override final {}
+    void onStepUpBegin(OperationContext* opCtx, long long term) override final{};
+    void onBecomeArbiter() override final {}
 };
 
 }  // namespace mongo

@@ -60,7 +60,7 @@ RangeStatement RangeStatement::parse(RangeSpec spec) {
                     "The step parameter in a range statement must be a whole number when "
                     "densifying a date range",
                     step.integral64Bit());
-            return optional<TimeUnit>(parseTimeUnit(unit.get()));
+            return optional<TimeUnit>(parseTimeUnit(unit.value()));
         } else {
             return optional<TimeUnit>(boost::none);
         }
@@ -152,7 +152,7 @@ list<intrusive_ptr<DocumentSource>> createFromBsonInternal(
     list<FieldPath> partitions;
     if (spec.getPartitionByFields()) {
         auto partitionFields = (*spec.getPartitionByFields());
-        for (auto partitionField : partitionFields)
+        for (auto& partitionField : partitionFields)
             partitions.push_back(FieldPath(partitionField));
     }
 
@@ -183,7 +183,7 @@ SortPattern getSortPatternForDensify(RangeStatement rangeStatement,
     std::vector<SortPatternPart> sortParts;
     // We do not add partitions to the sort spec if the range is "full".
     if (!stdx::holds_alternative<Full>(rangeStatement.getBounds())) {
-        for (auto partition : partitions) {
+        for (const auto& partition : partitions) {
             SortPatternPart part;
             part.fieldPath = partition.fullPath();
             sortParts.push_back(std::move(part));
@@ -292,7 +292,7 @@ Document DocumentSourceInternalDensify::DocGenerator::getNextDocument() {
         _state = GeneratorState::kDone;
         // If _finalDoc is boost::none we can't be in this state.
         tassert(5832800, "DocGenerator expected _finalDoc, found boost::none", _finalDoc);
-        return _finalDoc.get();
+        return _finalDoc.value();
     }
     // Assume all types have been checked at this point and we are in a valid state.
     DensifyValue valueToAdd = _min;
@@ -513,29 +513,29 @@ DocumentSource::GetNextResult DocumentSourceInternalDensify::finishDensifyingPar
 
 DocumentSource::GetNextResult DocumentSourceInternalDensify::handleSourceExhausted() {
     _eof = true;
-    return stdx::visit(
-        OverloadedVisitor{
-            [&](RangeStatement::Full) {
-                if (_partitionExpr) {
-                    return finishDensifyingPartitionedInput();
-                } else {
-                    _densifyState = DensifyState::kDensifyDone;
-                    return DocumentSource::GetNextResult::makeEOF();
-                }
-            },
-            [&](RangeStatement::Partition) {
-                // We have already densified up to the last document in each partition.
-                _densifyState = DensifyState::kDensifyDone;
-                return DocumentSource::GetNextResult::makeEOF();
-            },
-            [&](RangeStatement::ExplicitBounds bounds) {
-                if (_partitionExpr) {
-                    return finishDensifyingPartitionedInput();
-                }
-                return densifyExplicitRangeAfterEOF();
-            },
-        },
-        _range.getBounds());
+    return stdx::visit(OverloadedVisitor{
+                           [&](RangeStatement::Full) {
+                               if (_partitionExpr) {
+                                   return finishDensifyingPartitionedInput();
+                               } else {
+                                   _densifyState = DensifyState::kDensifyDone;
+                                   return DocumentSource::GetNextResult::makeEOF();
+                               }
+                           },
+                           [&](RangeStatement::Partition) {
+                               // We have already densified up to the last document in each
+                               // partition.
+                               _densifyState = DensifyState::kDensifyDone;
+                               return DocumentSource::GetNextResult::makeEOF();
+                           },
+                           [&](RangeStatement::ExplicitBounds bounds) {
+                               if (_partitionExpr) {
+                                   return finishDensifyingPartitionedInput();
+                               }
+                               return densifyExplicitRangeAfterEOF();
+                           },
+                       },
+                       _range.getBounds());
 }
 
 
@@ -619,7 +619,9 @@ DocumentSource::GetNextResult DocumentSourceInternalDensify::handleNeedGenExplic
             _densifyState = DensifyState::kUninitializedOrBelowRange;
             return currentDoc;
         }
-        default: { MONGO_UNREACHABLE_TASSERT(5733705); }
+        default: {
+            MONGO_UNREACHABLE_TASSERT(5733705);
+        }
     }
 }
 boost::intrusive_ptr<DocumentSource> DocumentSourceInternalDensify::createFromBson(
@@ -631,17 +633,17 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceInternalDensify::createFromBs
     return results.front();
 }
 
-Value DocumentSourceInternalDensify::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceInternalDensify::serialize(SerializationOptions opts) const {
     MutableDocument spec;
-    spec[kFieldFieldName] = Value(_field.fullPath());
+    spec[kFieldFieldName] = Value(opts.serializeFieldName(_field.fullPath()));
     std::vector<Value> serializedPartitionByFields(_partitions.size());
-    std::transform(_partitions.begin(),
-                   _partitions.end(),
-                   serializedPartitionByFields.begin(),
-                   [&](FieldPath field) -> Value { return Value(field.fullPath()); });
+    std::transform(
+        _partitions.begin(),
+        _partitions.end(),
+        serializedPartitionByFields.begin(),
+        [&](FieldPath field) -> Value { return Value(opts.serializeFieldName(field.fullPath())); });
     spec[kPartitionByFieldsFieldName] = Value(serializedPartitionByFields);
-    spec[kRangeFieldName] = _range.serialize();
+    spec[kRangeFieldName] = _range.serialize(opts);
     MutableDocument out;
     out[getSourceName()] = Value(spec.freeze());
 
@@ -716,7 +718,9 @@ DocumentSource::GetNextResult DocumentSourceInternalDensify::doGetNext() {
                         _densifyState = DensifyState::kNeedGen;
                         return nextDoc;
                     },
-                    [&](ExplicitBounds bounds) { return processFirstDocForExplicitRange(doc); }},
+                    [&](ExplicitBounds bounds) {
+                        return processFirstDocForExplicitRange(doc);
+                    }},
                 _range.getBounds());
         }
         case DensifyState::kNeedGen: {
@@ -869,7 +873,9 @@ DocumentSource::GetNextResult DocumentSourceInternalDensify::doGetNext() {
             }
             return doc;
         }
-        default: { MONGO_UNREACHABLE_TASSERT(5733706); }
+        default: {
+            MONGO_UNREACHABLE_TASSERT(5733706);
+        }
     }  // namespace mongo
 }
 

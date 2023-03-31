@@ -31,7 +31,7 @@
 
 #include <fmt/format.h>
 
-#include "mongo/db/commands/feature_compatibility_version_documentation.h"
+#include "mongo/db/feature_compatibility_version_documentation.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
@@ -43,11 +43,10 @@ namespace mongo {
 
 using boost::intrusive_ptr;
 
-REGISTER_DOCUMENT_SOURCE_WITH_MIN_VERSION(listCatalog,
-                                          DocumentSourceListCatalog::LiteParsed::parse,
-                                          DocumentSourceListCatalog::createFromBson,
-                                          AllowedWithApiStrict::kNeverInVersion1,
-                                          multiversion::FeatureCompatibilityVersion::kVersion_6_0);
+REGISTER_DOCUMENT_SOURCE(listCatalog,
+                         DocumentSourceListCatalog::LiteParsed::parse,
+                         DocumentSourceListCatalog::createFromBson,
+                         AllowedWithApiStrict::kNeverInVersion1);
 
 const char* DocumentSourceListCatalog::getSourceName() const {
     return kStageName.rawData();
@@ -109,7 +108,7 @@ intrusive_ptr<DocumentSource> DocumentSourceListCatalog::createFromBson(
     uassert(
         ErrorCodes::InvalidNamespace,
         "Collectionless $listCatalog must be run against the 'admin' database with {aggregate: 1}",
-        nss.db() == NamespaceString::kAdminDb || !nss.isCollectionlessAggregateNS());
+        nss.db() == DatabaseName::kAdmin.db() || !nss.isCollectionlessAggregateNS());
 
     uassert(ErrorCodes::QueryFeatureNotAllowed,
             fmt::format("The {} aggregation stage is not enabled", kStageName),
@@ -119,8 +118,7 @@ intrusive_ptr<DocumentSource> DocumentSourceListCatalog::createFromBson(
     return new DocumentSourceListCatalog(pExpCtx);
 }
 
-Value DocumentSourceListCatalog::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceListCatalog::serialize(SerializationOptions opts) const {
     return Value(DOC(getSourceName() << Document()));
 }
 }  // namespace mongo

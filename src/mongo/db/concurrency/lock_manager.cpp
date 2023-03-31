@@ -40,9 +40,9 @@
 #include "mongo/base/static_assert.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/config.h"
-#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/locker.h"
+#include "mongo/db/concurrency/resource_catalog.h"
 #include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
@@ -864,6 +864,16 @@ LockManager::Partition* LockManager::_getPartition(LockRequest* request) const {
     return &_partitions[request->locker->getId() % _numPartitions];
 }
 
+bool LockManager::hasConflictingRequests(const LockRequest* request) const {
+    auto lock = request->lock;
+    if (!lock) {
+        return false;
+    }
+
+    stdx::lock_guard<SimpleMutex> lk(_getBucket(lock->resourceId)->mutex);
+    return !lock->conflictList.empty();
+}
+
 void LockManager::dump() const {
     BSONArrayBuilder locks;
     _buildLocksArray(getLockToClientMap(getGlobalServiceContext()), true, nullptr, &locks);
@@ -975,9 +985,7 @@ std::string ResourceId::toString() const {
     }
 
     if (getType() == RESOURCE_DATABASE || getType() == RESOURCE_COLLECTION) {
-        auto catalog = CollectionCatalog::get(getGlobalServiceContext());
-        boost::optional<std::string> resourceName = catalog->lookupResourceName(*this);
-        if (resourceName) {
+        if (auto resourceName = ResourceCatalog::get(getGlobalServiceContext()).name(*this)) {
             ss << ", " << *resourceName;
         }
     }

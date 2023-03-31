@@ -29,16 +29,16 @@
 
 #pragma once
 
-#include "mongo/db/internal_session_pool.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/persistent_task_store.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
-#include "mongo/db/s/dist_lock_manager.h"
+#include "mongo/db/s/ddl_lock_manager.h"
 #include "mongo/db/s/forwardable_operation_metadata.h"
 #include "mongo/db/s/sharding_ddl_coordinator_gen.h"
 #include "mongo/db/s/sharding_ddl_coordinator_service.h"
+#include "mongo/db/session/internal_session_pool.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/future.h"
@@ -92,12 +92,12 @@ public:
     }
 
     const ForwardableOperationMetadata& getForwardableOpMetadata() const {
-        invariant(metadata().getForwardableOpMetadata());
-        return metadata().getForwardableOpMetadata().get();
+        invariant(_forwardableOpMetadata);
+        return _forwardableOpMetadata.get();
     }
 
     const boost::optional<mongo::DatabaseVersion>& getDatabaseVersion() const& {
-        return metadata().getDatabaseVersion();
+        return _databaseVersion;
     }
 
 protected:
@@ -137,10 +137,18 @@ protected:
         return false;
     };
 
+    /*
+     * Specify if the given error will be retried by the ddl coordinator infrastructure.
+     */
+    bool _isRetriableErrorForDDLCoordinator(const Status& status);
+
     ShardingDDLCoordinatorService* _service;
     const ShardingDDLCoordinatorId _coordId;
 
     const bool _recoveredFromDisk;
+    const boost::optional<mongo::ForwardableOperationMetadata> _forwardableOpMetadata;
+    const boost::optional<mongo::DatabaseVersion> _databaseVersion;
+
     bool _firstExecution{
         true};  // True only when executing the coordinator for the first time (meaning it's not a
                 // retry after a retryable error nor a recovered instance from a previous primary)
@@ -152,6 +160,11 @@ private:
 
     virtual ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                           const CancellationToken& token) noexcept = 0;
+
+    virtual ExecutorFuture<void> _cleanupOnAbort(
+        std::shared_ptr<executor::ScopedTaskExecutor> executor,
+        const CancellationToken& token,
+        const Status& status) noexcept;
 
     void interrupt(Status status) override final;
 
@@ -166,11 +179,13 @@ private:
     ExecutorFuture<void> _translateTimeseriesNss(
         std::shared_ptr<executor::ScopedTaskExecutor> executor, const CancellationToken& token);
 
+    virtual boost::optional<Status> getAbortReason() const;
+
     Mutex _mutex = MONGO_MAKE_LATCH("ShardingDDLCoordinator::_mutex");
     SharedPromise<void> _constructionCompletionPromise;
     SharedPromise<void> _completionPromise;
 
-    std::stack<DistLockManager::ScopedLock> _scopedLocks;
+    std::stack<DDLLockManager::ScopedLock> _scopedLocks;
 };
 
 template <class StateDoc>
@@ -188,7 +203,13 @@ protected:
                                const BSONObj& initialStateDoc)
         : ShardingDDLCoordinator(service, initialStateDoc),
           _coordinatorName(name),
-          _initialState(initialStateDoc.getOwned()),
+          /*
+           * Force a deserialisation + serialisation of the initialStateDoc to ensure that
+           * _initialState is a full deep copy of the received parameter.
+           */
+          _initialState(
+              StateDoc::parse(IDLParserContext("CoordinatorInitialState"), initialStateDoc)
+                  .toBSON()),
           _doc(StateDoc::parse(IDLParserContext("CoordinatorDocument"), _initialState)) {}
 
     ShardingDDLCoordinatorMetadata const& metadata() const override {
@@ -255,7 +276,7 @@ protected:
     virtual StringData serializePhase(const Phase& phase) const = 0;
 
     template <typename Func>
-    auto _executePhase(const Phase& newPhase, Func&& func) {
+    auto _buildPhaseHandler(const Phase& newPhase, Func&& handlerFn) {
         return [=] {
             const auto& currPhase = _doc.getPhase();
 
@@ -267,11 +288,11 @@ protected:
                 // Persist the new phase if this is the first time we are executing it.
                 _enterPhase(newPhase);
             }
-            return func();
+            return handlerFn();
         };
     }
 
-    void _enterPhase(const Phase& newPhase) {
+    virtual void _enterPhase(const Phase& newPhase) {
         auto newDoc = [&] {
             stdx::lock_guard lk{_docMutex};
             return _doc;
@@ -286,12 +307,17 @@ protected:
                     "newPhase"_attr = serializePhase(newDoc.getPhase()),
                     "oldPhase"_attr = serializePhase(_doc.getPhase()));
 
-        auto opCtx = cc().makeOperationContext();
+        ServiceContext::UniqueOperationContext uniqueOpCtx;
+        auto opCtx = cc().getOperationContext();
+        if (!opCtx) {
+            uniqueOpCtx = cc().makeOperationContext();
+            opCtx = uniqueOpCtx.get();
+        }
 
         if (_doc.getPhase() == Phase::kUnset) {
-            _insertStateDocument(opCtx.get(), std::move(newDoc));
+            _insertStateDocument(opCtx, std::move(newDoc));
         } else {
-            _updateStateDocument(opCtx.get(), std::move(newDoc));
+            _updateStateDocument(opCtx, std::move(newDoc));
         }
     }
 
@@ -346,7 +372,7 @@ protected:
         }
     }
 
-    // lazily acqiure Logical Session ID and a txn number
+    // lazily acquire Logical Session ID and a txn number
     void _updateSession(OperationContext* opCtx) {
         auto newDoc = [&] {
             stdx::lock_guard lk{_docMutex};
@@ -381,6 +407,37 @@ protected:
         osi.setSessionId(optSession->getLsid());
         osi.setTxnNumber(optSession->getTxnNumber());
         return osi;
+    }
+
+    virtual boost::optional<Status> getAbortReason() const override {
+        const auto& status = _doc.getAbortReason();
+        invariant(!status || !status->isOK(), "when persisted, status must be an error");
+        return status;
+    }
+
+    /**
+     * Persists the abort reason and throws it as an exception. This causes the coordinator to fail,
+     * and triggers the cleanup future chain since there is a the persisted reason.
+     */
+    void triggerCleanup(OperationContext* opCtx, const Status& status) {
+        LOGV2_INFO(7418502,
+                   "Coordinator failed, persisting abort reason",
+                   "coordinatorId"_attr = _doc.getId(),
+                   "phase"_attr = serializePhase(_doc.getPhase()),
+                   "reason"_attr = redact(status));
+
+        auto newDoc = [&] {
+            stdx::lock_guard lk{_docMutex};
+            return _doc;
+        }();
+
+        auto coordinatorMetadata = newDoc.getShardingDDLCoordinatorMetadata();
+        coordinatorMetadata.setAbortReason(status);
+        newDoc.setShardingDDLCoordinatorMetadata(std::move(coordinatorMetadata));
+
+        _updateStateDocument(opCtx, std::move(newDoc));
+
+        uassertStatusOK(status);
     }
 };
 

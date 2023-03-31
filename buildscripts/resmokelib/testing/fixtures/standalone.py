@@ -17,9 +17,8 @@ import buildscripts.resmokelib.testing.fixtures.interface as interface
 class MongoDFixture(interface.Fixture):
     """Fixture which provides JSTests with a standalone mongod to run against."""
 
-    def __init__(  # pylint: disable=too-many-arguments
-            self, logger, job_num, fixturelib, mongod_executable=None, mongod_options=None,
-            add_feature_flags=False, dbpath_prefix=None, preserve_dbpath=False, port=None):
+    def __init__(self, logger, job_num, fixturelib, mongod_executable=None, mongod_options=None,
+                 add_feature_flags=False, dbpath_prefix=None, preserve_dbpath=False, port=None):
         """Initialize MongoDFixture with different options for the mongod process."""
         interface.Fixture.__init__(self, logger, job_num, fixturelib, dbpath_prefix=dbpath_prefix)
         self.mongod_options = self.fixturelib.make_historic(
@@ -149,7 +148,6 @@ class MongoDFixture(interface.Fixture):
         exit_code = self.mongod.wait()
 
         # Python's subprocess module returns negative versions of system calls.
-        # pylint: disable=invalid-unary-operand-type
         if exit_code == 0 or (mode is not None and exit_code == -(mode.value)):
             self.logger.info("Successfully stopped the mongod on port {:d}.".format(self.port))
         else:
@@ -183,7 +181,7 @@ class MongoDFixture(interface.Fixture):
 
     def get_driver_connection_url(self):
         """Return the driver connection URL."""
-        return "mongodb://" + self.get_internal_connection_string()
+        return "mongodb://" + self.get_internal_connection_string() + "/?directConnection=true"
 
 
 # The below parameters define the default 'logComponentVerbosity' object passed to mongod processes
@@ -195,15 +193,16 @@ class MongoDFixture(interface.Fixture):
 # The default verbosity setting for any tests that are not started with an Evergreen task id. This
 # will apply to any tests run locally.
 DEFAULT_MONGOD_LOG_COMPONENT_VERBOSITY = {
-    "replication": {"rollback": 2}, "sharding": {"migration": 2}, "transaction": 4,
-    "tenantMigration": 4
+    "replication": {"rollback": 2}, "sharding": {"migration": 2, "rangeDeleter": 2},
+    "transaction": 4, "tenantMigration": 4
 }
 
 # The default verbosity setting for any mongod processes running in Evergreen i.e. started with an
 # Evergreen task id.
 DEFAULT_EVERGREEN_MONGOD_LOG_COMPONENT_VERBOSITY = {
-    "replication": {"election": 4, "heartbeats": 2, "initialSync": 2, "rollback": 2},
-    "sharding": {"migration": 2}, "storage": {"recovery": 2}, "transaction": 4, "tenantMigration": 4
+    "replication": {"election": 4, "heartbeats": 2, "initialSync": 2,
+                    "rollback": 2}, "sharding": {"migration": 2, "rangeDeleter": 2},
+    "storage": {"recovery": 2}, "transaction": 4, "tenantMigration": 4
 }
 
 
@@ -215,8 +214,8 @@ class MongodLauncher(object):
         self.fixturelib = fixturelib
         self.config = fixturelib.get_config()
 
-    def launch_mongod_program(  # pylint: disable=too-many-branches,too-many-statements,too-many-arguments
-            self, logger, job_num, executable=None, process_kwargs=None, mongod_options=None):
+    def launch_mongod_program(self, logger, job_num, executable=None, process_kwargs=None,
+                              mongod_options=None):
         """
         Return a Process instance that starts mongod arguments constructed from 'mongod_options'.
 
@@ -254,7 +253,8 @@ class MongodLauncher(object):
         # that has migrated off of a shard, meant to allow most dependent queries on secondaries to
         # complete first. It defaults to 900, or 15 minutes, which is prohibitively long for tests.
         # Setting it in the .yml file overrides this.
-        if "shardsvr" in mongod_options and "orphanCleanupDelaySecs" not in suite_set_parameters:
+        if (("shardsvr" in mongod_options or "configsvr" in mongod_options)
+                and "orphanCleanupDelaySecs" not in suite_set_parameters):
             suite_set_parameters["orphanCleanupDelaySecs"] = 1
 
         # The LogicalSessionCache does automatic background refreshes in the server. This is
@@ -371,7 +371,9 @@ def _add_testing_set_parameters(suite_set_parameters):
     """
     suite_set_parameters.setdefault("testingDiagnosticsEnabled", True)
     suite_set_parameters.setdefault("enableTestCommands", True)
+    suite_set_parameters.setdefault("requireConfirmInSetFcv", False)
     # The exact file location is on a per-process basis, so it'll have to be determined when the process gets spun up.
     # Set it to true for now as a placeholder that will error if no further processing is done.
     # The placeholder is needed so older versions don't have this option won't have this value set.
     suite_set_parameters.setdefault("backtraceLogFile", True)
+    suite_set_parameters.setdefault("disableTransitionFromLatestToLastContinuous", False)

@@ -2,11 +2,15 @@
  * Test creating and using partial indexes, on a time-series collection.
  *
  * @tags: [
- *   does_not_support_stepdowns,
- *   does_not_support_transactions,
- *   requires_fcv_52,
+ *   # TODO (SERVER-73316): remove
+ *   assumes_against_mongod_not_mongos,
  *   # Explain of a resolved view must be executed by mongos.
  *   directly_against_shardsvrs_incompatible,
+ *   # Refusing to run a test that issues an aggregation command with explain because it may return
+ *   # incomplete results if interrupted by a stepdown.
+ *   does_not_support_stepdowns,
+ *   # We need a timeseries collection.
+ *   requires_timeseries,
  * ]
  */
 (function() {
@@ -47,7 +51,8 @@ if (FixtureHelpers.isSharded(buckets)) {
     });
 }
 
-if (FeatureFlagUtil.isEnabled(db, "TimeseriesScalabilityImprovements")) {
+// TODO SERVER-66438: Remove feature flag check.
+if (FeatureFlagUtil.isPresentAndEnabled(db, "TimeseriesScalabilityImprovements")) {
     // When enabled, the {meta: 1, time: 1} index gets built by default on the time-series
     // bucket collection.
     extraIndexes.push({
@@ -95,10 +100,24 @@ assert.commandFailedWithCode(coll.createIndex({a: 1}, {partialFilterExpression: 
 
 // Test creating and using a partial index.
 {
-    // Make sure the query uses the {a: 1} index.
+    let ixscanInWinningPlan = 0;
+
+    // Make sure the {a: 1} index was considered for this query.
     function checkPlan(predicate) {
         const explain = coll.find(predicate).explain();
-        const scan = getAggPlanStage(explain, 'IXSCAN');
+        let scan = getAggPlanStage(explain, 'IXSCAN');
+        // If scan is not present, check rejected plans
+        if (scan === null) {
+            const rejectedPlans = getRejectedPlans(getAggPlanStage(explain, "$cursor")["$cursor"]);
+            if (rejectedPlans.length === 1) {
+                const scans = getPlanStages(getRejectedPlan(rejectedPlans[0]), "IXSCAN");
+                if (scans.length === 1) {
+                    scan = scans[0];
+                }
+            }
+        } else {
+            ixscanInWinningPlan++;
+        }
         const indexes = buckets.getIndexes();
         assert(scan,
                "Expected an index scan for predicate: " + tojson(predicate) +
@@ -107,7 +126,7 @@ assert.commandFailedWithCode(coll.createIndex({a: 1}, {partialFilterExpression: 
     }
     // Make sure the query results match a collection-scan plan.
     function checkResults(predicate) {
-        const result = coll.aggregate({$match: predicate}).toArray();
+        const result = coll.aggregate([{$match: predicate}], {hint: {a: 1}}).toArray();
         const unindexed =
             coll.aggregate([{$_internalInhibitOptimization: {}}, {$match: predicate}]).toArray();
         assert.docEq(result, unindexed);
@@ -150,10 +169,6 @@ assert.commandFailedWithCode(coll.createIndex({a: 1}, {partialFilterExpression: 
         const t1 = ISODate('2000-01-01T00:00:01Z');
         const t2 = ISODate('2000-01-01T00:00:02Z');
 
-        // When the collection is sharded, there is an index on time that can win, instead of the
-        // partial index. So only check the results in that case, not the plan.
-        const check = FixtureHelpers.isSharded(buckets) ? checkResults : checkPlanAndResults;
-
         assert.commandWorked(coll.dropIndex({a: 1}));
         assert.commandWorked(
             coll.createIndex({a: 1}, {partialFilterExpression: {[timeField]: {$lt: t1}}}));
@@ -182,6 +197,7 @@ assert.commandFailedWithCode(coll.createIndex({a: 1}, {partialFilterExpression: 
     assert.commandWorked(coll.dropIndex({a: 1}));
     assert.sameMembers(coll.getIndexes(), extraIndexes);
     assert.sameMembers(buckets.getIndexes(), extraBucketIndexes);
+    assert.gt(ixscanInWinningPlan, 0);
 }
 
 // Check that partialFilterExpression can use a mixture of metadata, time, and measurement fields,
@@ -253,18 +269,21 @@ assert.sameMembers(buckets.getIndexes(), extraBucketIndexes.concat([
 
     // Queries on the collection use the collection's collation by default.
     assert.docEq(
-        coll.find({}, {_id: 0, [metaField + '.x']: 1}).sort({[metaField + '.x']: 1}).toArray(), [
+        [
             {[metaField]: {x: "500"}},
             {[metaField]: {x: "500"}},
             {[metaField]: {x: "1000"}},
             {[metaField]: {x: "1000"}},
-        ]);
-    assert.docEq(coll.find({}, {_id: 0, a: 1}).sort({a: 1}).toArray(), [
-        {a: "3"},
-        {a: "3"},
-        {a: "120"},
-        {a: "120"},
-    ]);
+        ],
+        coll.find({}, {_id: 0, [metaField + '.x']: 1}).sort({[metaField + '.x']: 1}).toArray());
+    assert.docEq(
+        [
+            {a: "3"},
+            {a: "3"},
+            {a: "120"},
+            {a: "120"},
+        ],
+        coll.find({}, {_id: 0, a: 1}).sort({a: 1}).toArray());
 
     // Specifying a collation and partialFilterExpression together fails, even if the collation
     // matches the collection's default collation.
@@ -287,8 +306,8 @@ assert.sameMembers(buckets.getIndexes(), extraBucketIndexes.concat([
         {a: 1}, {name: "a_lt_25_default", partialFilterExpression: {a: {$lt: "25"}}}));
 
     // Verify that the index contains what we expect.
-    assert.docEq(coll.find({}, {_id: 0, a: 1}).hint("a_lt_25_default").toArray(),
-                 [{a: "3"}, {a: "3"}]);
+    assert.docEq([{a: "3"}, {a: "3"}],
+                 coll.find({}, {_id: 0, a: 1}).hint("a_lt_25_default").toArray());
 
     // Verify that the index is used when possible.
     function checkPlanAndResult({predicate, collation, stageName, indexName, expectedResults}) {
@@ -305,7 +324,7 @@ assert.sameMembers(buckets.getIndexes(), extraBucketIndexes.concat([
         }
 
         const results = cur.toArray();
-        assert.docEq(results, expectedResults);
+        assert.docEq(expectedResults, results);
     }
 
     // a < "25" can use the index, since the collations match.

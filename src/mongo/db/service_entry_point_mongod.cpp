@@ -81,13 +81,13 @@ public:
                             const OpMsgRequest& request) const override {
         Status rcStatus = mongo::waitForReadConcern(opCtx,
                                                     repl::ReadConcernArgs::get(opCtx),
-                                                    request.getDatabase(),
+                                                    invocation->ns().dbName(),
                                                     invocation->allowsAfterClusterTime());
 
         if (!rcStatus.isOK()) {
             if (ErrorCodes::isExceededTimeLimitError(rcStatus.code())) {
                 const int debugLevel =
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer ? 0 : 2;
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer) ? 0 : 2;
                 LOGV2_DEBUG(21975,
                             debugLevel,
                             "Command on database {db} timed out waiting for read concern to be "
@@ -218,19 +218,21 @@ public:
         }
     }
 
-    bool refreshDatabase(OperationContext* opCtx, const StaleDbRoutingVersion& se) const
-        noexcept override {
+    bool refreshDatabase(OperationContext* opCtx,
+                         const StaleDbRoutingVersion& se) const noexcept override {
         return onDbVersionMismatchNoExcept(opCtx, se.getDb(), se.getVersionReceived()).isOK();
     }
 
-    bool refreshCollection(OperationContext* opCtx, const StaleConfigInfo& se) const
-        noexcept override {
-        return onShardVersionMismatchNoExcept(opCtx, se.getNss(), se.getVersionReceived()).isOK();
+    bool refreshCollection(OperationContext* opCtx,
+                           const StaleConfigInfo& se) const noexcept override {
+        return onCollectionPlacementVersionMismatchNoExcept(
+                   opCtx, se.getNss(), se.getVersionReceived().placementVersion())
+            .isOK();
     }
 
-    bool refreshCatalogCache(OperationContext* opCtx,
-                             const ShardCannotRefreshDueToLocksHeldInfo& refreshInfo) const
-        noexcept override {
+    bool refreshCatalogCache(
+        OperationContext* opCtx,
+        const ShardCannotRefreshDueToLocksHeldInfo& refreshInfo) const noexcept override {
         return Grid::get(opCtx)
             ->catalogCache()
             ->getCollectionRoutingInfo(opCtx, refreshInfo.getNss())

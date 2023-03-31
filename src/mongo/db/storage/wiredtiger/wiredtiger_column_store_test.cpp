@@ -51,7 +51,7 @@ namespace {
 using std::string;
 
 TEST(WiredTigerColumnStoreTest, MakeKey) {
-    std::string out = WiredTigerColumnStore::makeKey_ForTest("a.b", RecordId(66));
+    std::string out = WiredTigerColumnStore::makeKey_ForTest("a.b", 66 /* RowId */);
 
     //                     a  .  b  \0
     //                                 < Big Endian encoding of the number 27 in uint 64>
@@ -60,7 +60,7 @@ TEST(WiredTigerColumnStoreTest, MakeKey) {
 }
 
 TEST(WiredTigerColumnStoreTest, MakeKeyRIDColumn) {
-    std::string out = WiredTigerColumnStore::makeKey_ForTest("\xFF", RecordId(256));
+    std::string out = WiredTigerColumnStore::makeKey_ForTest("\xFF", 256 /* RowId */);
 
     // For the special path 0xff, we do not encode a NUL terminator.
 
@@ -70,6 +70,6 @@ TEST(WiredTigerColumnStoreTest, MakeKeyRIDColumn) {
 
     ASSERT_EQ(expected, hexdump(out.data(), out.size()));
 }
-// TODO: SERVER-65976 Add tests for WT config string.
+// TODO: SERVER-64257 Add tests for WT config string.
 }  // namespace
 }  // namespace mongo

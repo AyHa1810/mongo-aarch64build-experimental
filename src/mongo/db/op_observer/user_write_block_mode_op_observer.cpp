@@ -40,20 +40,22 @@ namespace {
 
 const auto documentIdDecoration = OperationContext::declareDecoration<BSONObj>();
 
-bool isStandaloneOrPrimary(OperationContext* opCtx) {
+bool isStandaloneOrPrimary(OperationContext* opCtx, const NamespaceString& nss) {
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-    return replCoord->canAcceptWritesForDatabase(opCtx, NamespaceString::kAdminDb);
+    return replCoord->canAcceptWritesFor(opCtx, nss);
 }
 
 }  // namespace
 
 void UserWriteBlockModeOpObserver::onInserts(OperationContext* opCtx,
-                                             const NamespaceString& nss,
-                                             const UUID& uuid,
+                                             const CollectionPtr& coll,
                                              std::vector<InsertStatement>::const_iterator first,
                                              std::vector<InsertStatement>::const_iterator last,
-                                             bool fromMigrate) {
-    if (!fromMigrate) {
+                                             std::vector<bool> fromMigrate,
+                                             bool defaultFromMigrate) {
+    const auto& nss = coll->ns();
+
+    if (!defaultFromMigrate) {
         _checkWriteAllowed(opCtx, nss);
     }
 
@@ -65,13 +67,14 @@ void UserWriteBlockModeOpObserver::onInserts(OperationContext* opCtx,
             const auto collCSDoc = UserWriteBlockingCriticalSectionDocument::parse(
                 IDLParserContext("UserWriteBlockOpObserver"), insertedDoc);
             opCtx->recoveryUnit()->onCommit(
-                [opCtx,
-                 blockShardedDDL = collCSDoc.getBlockNewUserShardedDDL(),
+                [blockShardedDDL = collCSDoc.getBlockNewUserShardedDDL(),
                  blockWrites = collCSDoc.getBlockUserWrites(),
-                 insertedNss = collCSDoc.getNss()](boost::optional<Timestamp>) {
+                 insertedNss = collCSDoc.getNss()](OperationContext* opCtx,
+                                                   boost::optional<Timestamp>) {
                     invariant(insertedNss.isEmpty());
                     boost::optional<Lock::GlobalLock> globalLockIfNotPrimary;
-                    if (!isStandaloneOrPrimary(opCtx)) {
+                    if (!isStandaloneOrPrimary(
+                            opCtx, NamespaceString::kUserWritesCriticalSectionsNamespace)) {
                         globalLockIfNotPrimary.emplace(opCtx, MODE_IX);
                     }
 
@@ -89,56 +92,57 @@ void UserWriteBlockModeOpObserver::onInserts(OperationContext* opCtx,
 
 void UserWriteBlockModeOpObserver::onUpdate(OperationContext* opCtx,
                                             const OplogUpdateEntryArgs& args) {
+    const auto& nss = args.coll->ns();
+
     if (args.updateArgs->source != OperationSource::kFromMigrate) {
-        _checkWriteAllowed(opCtx, args.nss);
+        _checkWriteAllowed(opCtx, nss);
     }
 
-    if (args.nss == NamespaceString::kUserWritesCriticalSectionsNamespace &&
+    if (nss == NamespaceString::kUserWritesCriticalSectionsNamespace &&
         !user_writes_recoverable_critical_section_util::inRecoveryMode(opCtx)) {
         const auto collCSDoc = UserWriteBlockingCriticalSectionDocument::parse(
             IDLParserContext("UserWriteBlockOpObserver"), args.updateArgs->updatedDoc);
 
-        opCtx->recoveryUnit()->onCommit(
-            [opCtx,
-             updatedNss = collCSDoc.getNss(),
-             blockShardedDDL = collCSDoc.getBlockNewUserShardedDDL(),
-             blockWrites = collCSDoc.getBlockUserWrites(),
-             insertedNss = collCSDoc.getNss()](boost::optional<Timestamp>) {
-                invariant(updatedNss.isEmpty());
-                boost::optional<Lock::GlobalLock> globalLockIfNotPrimary;
-                if (!isStandaloneOrPrimary(opCtx)) {
-                    globalLockIfNotPrimary.emplace(opCtx, MODE_IX);
-                }
+        opCtx->recoveryUnit()->onCommit([updatedNss = collCSDoc.getNss(),
+                                         blockShardedDDL = collCSDoc.getBlockNewUserShardedDDL(),
+                                         blockWrites = collCSDoc.getBlockUserWrites(),
+                                         insertedNss = collCSDoc.getNss()](
+                                            OperationContext* opCtx, boost::optional<Timestamp>) {
+            invariant(updatedNss.isEmpty());
+            boost::optional<Lock::GlobalLock> globalLockIfNotPrimary;
+            if (!isStandaloneOrPrimary(opCtx,
+                                       NamespaceString::kUserWritesCriticalSectionsNamespace)) {
+                globalLockIfNotPrimary.emplace(opCtx, MODE_IX);
+            }
 
-                if (blockShardedDDL) {
-                    GlobalUserWriteBlockState::get(opCtx)->enableUserShardedDDLBlocking(opCtx);
-                } else {
-                    GlobalUserWriteBlockState::get(opCtx)->disableUserShardedDDLBlocking(opCtx);
-                }
+            if (blockShardedDDL) {
+                GlobalUserWriteBlockState::get(opCtx)->enableUserShardedDDLBlocking(opCtx);
+            } else {
+                GlobalUserWriteBlockState::get(opCtx)->disableUserShardedDDLBlocking(opCtx);
+            }
 
-                if (blockWrites) {
-                    GlobalUserWriteBlockState::get(opCtx)->enableUserWriteBlocking(opCtx);
-                } else {
-                    GlobalUserWriteBlockState::get(opCtx)->disableUserWriteBlocking(opCtx);
-                }
-            });
+            if (blockWrites) {
+                GlobalUserWriteBlockState::get(opCtx)->enableUserWriteBlocking(opCtx);
+            } else {
+                GlobalUserWriteBlockState::get(opCtx)->disableUserWriteBlocking(opCtx);
+            }
+        });
     }
 }
 
 void UserWriteBlockModeOpObserver::aboutToDelete(OperationContext* opCtx,
-                                                 NamespaceString const& nss,
-                                                 const UUID& uuid,
+                                                 const CollectionPtr& coll,
                                                  BSONObj const& doc) {
-    if (nss == NamespaceString::kUserWritesCriticalSectionsNamespace) {
+    if (coll->ns() == NamespaceString::kUserWritesCriticalSectionsNamespace) {
         documentIdDecoration(opCtx) = doc;
     }
 }
 
 void UserWriteBlockModeOpObserver::onDelete(OperationContext* opCtx,
-                                            const NamespaceString& nss,
-                                            const UUID& uuid,
+                                            const CollectionPtr& coll,
                                             StmtId stmtId,
                                             const OplogDeleteEntryArgs& args) {
+    const auto& nss = coll->ns();
     if (!args.fromMigrate) {
         _checkWriteAllowed(opCtx, nss);
     }
@@ -152,17 +156,18 @@ void UserWriteBlockModeOpObserver::onDelete(OperationContext* opCtx,
         const auto collCSDoc = UserWriteBlockingCriticalSectionDocument::parse(
             IDLParserContext("UserWriteBlockOpObserver"), deletedDoc);
 
-        opCtx->recoveryUnit()->onCommit(
-            [opCtx, deletedNss = collCSDoc.getNss()](boost::optional<Timestamp>) {
-                invariant(deletedNss.isEmpty());
-                boost::optional<Lock::GlobalLock> globalLockIfNotPrimary;
-                if (!isStandaloneOrPrimary(opCtx)) {
-                    globalLockIfNotPrimary.emplace(opCtx, MODE_IX);
-                }
+        opCtx->recoveryUnit()->onCommit([deletedNss = collCSDoc.getNss()](
+                                            OperationContext* opCtx, boost::optional<Timestamp> _) {
+            invariant(deletedNss.isEmpty());
+            boost::optional<Lock::GlobalLock> globalLockIfNotPrimary;
+            if (!isStandaloneOrPrimary(opCtx,
+                                       NamespaceString::kUserWritesCriticalSectionsNamespace)) {
+                globalLockIfNotPrimary.emplace(opCtx, MODE_IX);
+            }
 
-                GlobalUserWriteBlockState::get(opCtx)->disableUserShardedDDLBlocking(opCtx);
-                GlobalUserWriteBlockState::get(opCtx)->disableUserWriteBlocking(opCtx);
-            });
+            GlobalUserWriteBlockState::get(opCtx)->disableUserShardedDDLBlocking(opCtx);
+            GlobalUserWriteBlockState::get(opCtx)->disableUserWriteBlocking(opCtx);
+        });
     }
 }
 
@@ -218,7 +223,7 @@ void UserWriteBlockModeOpObserver::onCollMod(OperationContext* opCtx,
 
 void UserWriteBlockModeOpObserver::onDropDatabase(OperationContext* opCtx,
                                                   const DatabaseName& dbName) {
-    _checkWriteAllowed(opCtx, NamespaceString(dbName, ""));
+    _checkWriteAllowed(opCtx, NamespaceString(dbName));
 }
 
 repl::OpTime UserWriteBlockModeOpObserver::onDropCollection(OperationContext* opCtx,
@@ -277,7 +282,7 @@ void UserWriteBlockModeOpObserver::_checkWriteAllowed(OperationContext* opCtx,
                                                       const NamespaceString& nss) {
     // Evaluate write blocking only on replica set primaries.
     const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-    if (replCoord->isReplEnabled() && isStandaloneOrPrimary(opCtx)) {
+    if (replCoord->isReplEnabled() && replCoord->canAcceptWritesFor(opCtx, nss)) {
         GlobalUserWriteBlockState::get(opCtx)->checkUserWritesAllowed(opCtx, nss);
     }
 }

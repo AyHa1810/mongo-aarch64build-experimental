@@ -31,8 +31,6 @@
 
 #include "mongo/db/s/balancer/migration_test_fixture.h"
 
-#include "mongo/db/s/type_locks.h"
-
 namespace mongo {
 
 using unittest::assertGet;
@@ -117,49 +115,18 @@ void MigrationTestFixture::removeAllChunks(const NamespaceString& collName, cons
     ASSERT_EQ(ErrorCodes::NoMatchingDocument, findStatus);
 }
 
-void MigrationTestFixture::setUpMigration(const NamespaceString& ns,
-                                          const ChunkType& chunk,
-                                          const ShardId& toShard) {
-    BSONObjBuilder builder;
-    builder.append(MigrationType::ns(), ns.ns());
-    builder.append(MigrationType::min(), chunk.getMin());
-    builder.append(MigrationType::max(), chunk.getMax());
-    builder.append(MigrationType::toShard(), toShard.toString());
-    builder.append(MigrationType::fromShard(), chunk.getShard().toString());
-    chunk.getVersion().serializeToBSON("chunkVersion", &builder);
-    builder.append(MigrationType::forceJumbo(), "doNotForceJumbo");
+ShardId MigrationTestFixture::getShardIdByHost(HostAndPort host) {
+    if (host == kShardHost0) {
+        return kShardId0;
+    } else if (host == kShardHost1) {
+        return kShardId1;
+    } else if (host == kShardHost2) {
+        return kShardId2;
+    } else if (host == kShardHost3) {
+        return kShardId3;
+    }
 
-    MigrationType migrationType = assertGet(MigrationType::fromBSON(builder.obj()));
-    ASSERT_OK(catalogClient()->insertConfigDocument(operationContext(),
-                                                    MigrationType::ConfigNS,
-                                                    migrationType.toBSON(),
-                                                    kMajorityWriteConcern));
-}
-
-void MigrationTestFixture::checkMigrationsCollectionIsEmptyAndLocksAreUnlocked() {
-    auto statusWithMigrationsQueryResponse =
-        shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
-            operationContext(),
-            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-            repl::ReadConcernLevel::kMajorityReadConcern,
-            MigrationType::ConfigNS,
-            BSONObj(),
-            BSONObj(),
-            boost::none);
-    Shard::QueryResponse migrationsQueryResponse =
-        uassertStatusOK(statusWithMigrationsQueryResponse);
-    ASSERT_EQUALS(0U, migrationsQueryResponse.docs.size());
-
-    auto statusWithLocksQueryResponse = shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
-        operationContext(),
-        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-        repl::ReadConcernLevel::kMajorityReadConcern,
-        LocksType::ConfigNS,
-        BSON(LocksType::state(LocksType::LOCKED) << LocksType::name("{ '$ne' : 'balancer'}")),
-        BSONObj(),
-        boost::none);
-    Shard::QueryResponse locksQueryResponse = uassertStatusOK(statusWithLocksQueryResponse);
-    ASSERT_EQUALS(0U, locksQueryResponse.docs.size());
+    MONGO_UNREACHABLE;
 }
 
 }  // namespace mongo

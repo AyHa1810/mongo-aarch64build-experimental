@@ -70,9 +70,8 @@ public:
         return kStageName.rawData();
     }
 
-    void serializeToArray(
-        std::vector<Value>& array,
-        boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    void serializeToArray(std::vector<Value>& array,
+                          SerializationOptions opts = SerializationOptions()) const final override;
 
     boost::intrusive_ptr<DocumentSource> clone(
         const boost::intrusive_ptr<ExpressionContext>& newExpCtx) const final;
@@ -99,6 +98,8 @@ public:
     }
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final;
 
     boost::optional<DistributedPlanLogic> distributedPlanLogic() final;
     bool canRunInParallelBeforeWriteStage(
@@ -187,6 +188,10 @@ public:
         return &_sortExecutor->stats();
     }
 
+    SorterFileStats* getSorterFileStats() const {
+        return _sortExecutor->getSorterFileStats();
+    }
+
 protected:
     GetNextResult doGetNext() final;
     /**
@@ -201,8 +206,8 @@ private:
                        uint64_t limit,
                        uint64_t maxMemoryUsageBytes);
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final {
-        MONGO_UNREACHABLE;  // Should call serializeToArray instead.
+    Value serialize(SerializationOptions opts) const final override {
+        MONGO_UNREACHABLE_TASSERT(7484302);  // Should call serializeToArray instead.
     }
 
     /**

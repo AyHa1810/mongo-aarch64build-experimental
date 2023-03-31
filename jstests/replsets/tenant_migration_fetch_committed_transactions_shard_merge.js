@@ -10,21 +10,20 @@
  *   requires_persistence,
  *   serverless,
  *   featureFlagShardMerge,
- *   requires_fcv_53
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    isShardMergeEnabled,
+} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/core/txns/libs/prepare_helpers.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 load("jstests/replsets/rslib.js");
 load("jstests/libs/uuid_util.js");
 
-const tenantId = "testTenantId";
-const otherTenantId = "otherTestTenantId";
+const tenantId = ObjectId().str;
+const otherTenantId = ObjectId().str;
 const transactionsNS = "config.transactions";
 const collName = "testColl";
 
@@ -35,6 +34,16 @@ const tenantNS = `${tenantDB}.${collName}`;
 
 const donorPrimary = tenantMigrationTest.getDonorPrimary();
 const recipientPrimary = tenantMigrationTest.getRecipientPrimary();
+
+// Note: including this explicit early return here due to the fact that multiversion
+// suites will execute this test without featureFlagShardMerge enabled (despite the
+// presence of the featureFlagShardMerge tag above), which means the test will attempt
+// to run a multi-tenant migration and fail.
+if (!isShardMergeEnabled(donorPrimary.getDB("admin"))) {
+    tenantMigrationTest.stop();
+    jsTestLog("Skipping Shard Merge-specific test");
+    quit();
+}
 
 function validateTransactionEntryonRecipient(sessionId) {
     const donorTxnEntry =
@@ -122,8 +131,7 @@ jsTestLog("Running a migration");
 const migrationId = UUID();
 const migrationOpts = {
     migrationIdString: extractUUIDFromObject(migrationId),
-    // TODO(SERVER-63454): Remove tenantId when it is no longer required for shard merge.
-    tenantId,
+    tenantIds: [ObjectId(tenantId), ObjectId(otherTenantId)],
 };
 
 const fpAfterFetchingCommittedTransactions =
@@ -145,4 +153,3 @@ validateTransactionEntryonRecipient(sessionIdBeforeMigration);
 validateTransactionEntryonRecipient(sessionIdForOtherTenant);
 
 tenantMigrationTest.stop();
-})();

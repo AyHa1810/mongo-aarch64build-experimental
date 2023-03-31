@@ -30,11 +30,11 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/s/metrics/sharding_data_transform_cumulative_metrics.h"
+#include "mongo/db/s/metrics/sharding_data_transform_metrics_test_fixture.h"
 #include "mongo/db/s/resharding/resharding_metrics.h"
 #include "mongo/db/s/resharding/resharding_service_test_helpers.h"
 #include "mongo/db/s/resharding/resharding_util.h"
-#include "mongo/db/s/sharding_data_transform_cumulative_metrics.h"
-#include "mongo/db/s/sharding_data_transform_metrics_test_fixture.h"
 #include "mongo/unittest/unittest.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
@@ -43,12 +43,19 @@
 namespace mongo {
 namespace {
 
+using TimedPhase = ReshardingMetrics::TimedPhase;
 constexpr auto kRunningTime = Seconds(12345);
+constexpr auto kResharding = "resharding";
 const auto kShardKey = BSON("newKey" << 1);
 
 class ReshardingMetricsTest : public ShardingDataTransformMetricsTestFixture {
 
 public:
+    virtual std::unique_ptr<ShardingDataTransformCumulativeMetrics> initializeCumulativeMetrics()
+        override {
+        return std::make_unique<ReshardingCumulativeMetrics>();
+    }
+
     std::unique_ptr<ReshardingMetrics> createInstanceMetrics(ClockSource* clockSource,
                                                              UUID instanceId = UUID::gen(),
                                                              Role role = Role::kDonor) {
@@ -58,7 +65,11 @@ public:
                                                    role,
                                                    clockSource->now(),
                                                    clockSource,
-                                                   &_cumulativeMetrics);
+                                                   getCumulativeMetrics());
+    }
+
+    virtual StringData getRootSectionName() override {
+        return kResharding;
     }
 
     const UUID& getSourceCollectionId() {
@@ -69,8 +80,18 @@ public:
     template <typename T>
     BSONObj getReportFromStateDocument(T document) {
         auto metrics =
-            ReshardingMetrics::initializeFrom(document, getClockSource(), &_cumulativeMetrics);
+            ReshardingMetrics::initializeFrom(document, getClockSource(), getCumulativeMetrics());
         return metrics->reportForCurrentOp();
+    }
+
+    auto makeRecipientMetricsWithAmbiguousTimeRemaining() {
+        auto doc = createRecipientDocument(RecipientStateEnum::kApplying, UUID::gen());
+        ReshardingRecipientMetrics metricsDoc;
+        ReshardingMetricsTimeInterval interval;
+        interval.setStart(getClockSource()->now());
+        metricsDoc.setOplogApplication(interval);
+        doc.setMetrics(metricsDoc);
+        return ReshardingMetrics::initializeFrom(doc, getClockSource(), getCumulativeMetrics());
     }
 
     ReshardingRecipientDocument createRecipientDocument(RecipientStateEnum state,
@@ -169,7 +190,7 @@ public:
         doc.setMetrics(metricsDoc);
 
         auto metrics =
-            ReshardingMetrics::initializeFrom(doc, getClockSource(), &_cumulativeMetrics);
+            ReshardingMetrics::initializeFrom(doc, getClockSource(), getCumulativeMetrics());
 
         clock->advance(kInterval);
         auto report = metrics->reportForCurrentOp();
@@ -178,6 +199,18 @@ public:
         clock->advance(kInterval);
         report = metrics->reportForCurrentOp();
         ASSERT_EQ(report.getIntField(fieldName), getExpectedDuration());
+    }
+
+    void createMetricsAndAssertIncrementsCumulativeMetricsField(
+        const std::function<void(ReshardingMetrics*)>& mutate,
+        Section section,
+        const StringData& fieldName) {
+        auto metrics = createInstanceMetrics(getClockSource(), UUID::gen(), Role::kCoordinator);
+        assertIncrementsCumulativeMetricsField(
+            metrics.get(),
+            [&](auto base) { mutate(dynamic_cast<ReshardingMetrics*>(base)); },
+            section,
+            fieldName);
     }
 };
 
@@ -230,9 +263,12 @@ TEST_F(ReshardingMetricsTest, RestoresByteAndDocumentCountsFromRecipientStateDoc
 TEST_F(ReshardingMetricsTest, RestoresByteAndDocumentCountsDuringCloning) {
     constexpr auto kDocsCopied = 50;
     constexpr auto kBytesCopied = 500;
+    ReshardingMetrics::ExternallyTrackedRecipientFields external;
+    external.documentCountCopied = kDocsCopied;
+    external.documentBytesCopied = kBytesCopied;
 
     auto metrics = createInstanceMetrics(getClockSource(), UUID::gen(), Role::kRecipient);
-    metrics->restoreDocumentsProcessed(kDocsCopied, kBytesCopied);
+    metrics->restoreExternallyTrackedRecipientFields(external);
     auto report = metrics->reportForCurrentOp();
 
     ASSERT_EQ(report.getIntField("documentsCopied"), kDocsCopied);
@@ -298,8 +334,11 @@ TEST_F(ReshardingMetricsTest, RestoresFromReshardingApplierProgressDocument) {
     progressDoc.setDeletesApplied(789);
     progressDoc.setWritesToStashCollections(800);
 
+    ReshardingMetrics::ExternallyTrackedRecipientFields external;
+    external.accumulateFrom(progressDoc);
+
     auto metrics = createInstanceMetrics(getClockSource(), UUID::gen(), Role::kRecipient);
-    metrics->accumulateFrom(progressDoc);
+    metrics->restoreExternallyTrackedRecipientFields(external);
     auto report = metrics->reportForCurrentOp();
 
     ASSERT_EQ(report.getIntField("insertsApplied"), 123);
@@ -387,23 +426,27 @@ TEST_F(ReshardingMetricsTest, RecipientIncrementFetchedOplogEntries) {
 
     auto report = metrics->reportForCurrentOp();
     ASSERT_EQ(report.getIntField("oplogEntriesFetched"), 0);
-    metrics->onOplogEntriesFetched(50, Milliseconds(1));
+    metrics->onOplogEntriesFetched(50);
 
     report = metrics->reportForCurrentOp();
     ASSERT_EQ(report.getIntField("oplogEntriesFetched"), 50);
 }
 
 TEST_F(ReshardingMetricsTest, RecipientRestoreFetchedOplogEntries) {
+    ReshardingMetrics::ExternallyTrackedRecipientFields external;
+
     auto metrics = createInstanceMetrics(getClockSource(), UUID::gen(), Role::kRecipient);
 
     auto report = metrics->reportForCurrentOp();
     ASSERT_EQ(report.getIntField("oplogEntriesFetched"), 0);
 
-    metrics->restoreOplogEntriesFetched(100);
+    external.oplogEntriesFetched = 100;
+    metrics->restoreExternallyTrackedRecipientFields(external);
     report = metrics->reportForCurrentOp();
     ASSERT_EQ(report.getIntField("oplogEntriesFetched"), 100);
 
-    metrics->restoreOplogEntriesFetched(50);
+    external.oplogEntriesFetched = 50;
+    metrics->restoreExternallyTrackedRecipientFields(external);
     report = metrics->reportForCurrentOp();
     ASSERT_EQ(report.getIntField("oplogEntriesFetched"), 50);
 }
@@ -416,17 +459,13 @@ TEST_F(ReshardingMetricsTest, RecipientReportsRemainingTime) {
     const auto kIncrementSecs = durationCount<Seconds>(kIncrement);
     const auto kExpectedTotal = kIncrementSecs * 8;
     metrics->setDocumentsToProcessCounts(0, kOpsPerIncrement * 4);
-    metrics->onOplogEntriesFetched(kOpsPerIncrement * 4, Milliseconds(1));
-
-    // Before cloning.
-    auto report = metrics->reportForCurrentOp();
-    ASSERT_EQ(report.getIntField("remainingOperationTimeEstimatedSecs"), 0);
+    metrics->onOplogEntriesFetched(kOpsPerIncrement * 4);
 
     // During cloning.
-    metrics->onCopyingBegin();
+    metrics->setStartFor(TimedPhase::kCloning, getClockSource()->now());
     metrics->onDocumentsProcessed(0, kOpsPerIncrement, Milliseconds(1));
     clock->advance(kIncrement);
-    report = metrics->reportForCurrentOp();
+    auto report = metrics->reportForCurrentOp();
     ASSERT_EQ(report.getIntField("remainingOperationTimeEstimatedSecs"),
               kExpectedTotal - kIncrementSecs);
 
@@ -439,8 +478,8 @@ TEST_F(ReshardingMetricsTest, RecipientReportsRemainingTime) {
     // During applying.
     metrics->onDocumentsProcessed(0, kOpsPerIncrement, Milliseconds(1));
     clock->advance(kIncrement);
-    metrics->onCopyingEnd();
-    metrics->onApplyingBegin();
+    metrics->setEndFor(TimedPhase::kCloning, getClockSource()->now());
+    metrics->setStartFor(TimedPhase::kApplying, getClockSource()->now());
     metrics->onOplogEntriesApplied(kOpsPerIncrement);
     clock->advance(kIncrement);
     report = metrics->reportForCurrentOp();
@@ -456,24 +495,41 @@ TEST_F(ReshardingMetricsTest, RecipientReportsRemainingTime) {
     // Done.
     metrics->onOplogEntriesApplied(kOpsPerIncrement);
     clock->advance(kIncrement);
-    metrics->onApplyingEnd();
+    metrics->setEndFor(TimedPhase::kApplying, getClockSource()->now());
     report = metrics->reportForCurrentOp();
     ASSERT_EQ(report.getIntField("remainingOperationTimeEstimatedSecs"), 0);
 }
 
 TEST_F(ReshardingMetricsTest, RecipientRestoreAppliedOplogEntries) {
+    ReshardingMetrics::ExternallyTrackedRecipientFields external;
+
     auto metrics = createInstanceMetrics(getClockSource(), UUID::gen(), Role::kRecipient);
 
     auto report = metrics->reportForCurrentOp();
     ASSERT_EQ(report.getIntField("oplogEntriesApplied"), 0);
 
-    metrics->restoreOplogEntriesApplied(120);
+    external.oplogEntriesApplied = 120;
+    metrics->restoreExternallyTrackedRecipientFields(external);
     report = metrics->reportForCurrentOp();
     ASSERT_EQ(report.getIntField("oplogEntriesApplied"), 120);
 
-    metrics->restoreOplogEntriesApplied(30);
+    external.oplogEntriesApplied = 30;
+    metrics->restoreExternallyTrackedRecipientFields(external);
     report = metrics->reportForCurrentOp();
     ASSERT_EQ(report.getIntField("oplogEntriesApplied"), 30);
+}
+
+TEST_F(ReshardingMetricsTest, CurrentOpReportsCopyingTime) {
+    runTimeReportTest<ReshardingMetrics>(
+        "CurrentOpReportsCopyingTime",
+        {Role::kRecipient, Role::kCoordinator},
+        "totalCopyTimeElapsedSecs",
+        [this](ReshardingMetrics* metrics) {
+            metrics->setStartFor(TimedPhase::kCloning, getClockSource()->now());
+        },
+        [this](ReshardingMetrics* metrics) {
+            metrics->setEndFor(TimedPhase::kCloning, getClockSource()->now());
+        });
 }
 
 TEST_F(ReshardingMetricsTest, CurrentOpReportsApplyingTime) {
@@ -481,8 +537,181 @@ TEST_F(ReshardingMetricsTest, CurrentOpReportsApplyingTime) {
         "CurrentOpReportsApplyingTime",
         {Role::kRecipient, Role::kCoordinator},
         "totalApplyTimeElapsedSecs",
-        [](ReshardingMetrics* metrics) { metrics->onApplyingBegin(); },
-        [](ReshardingMetrics* metrics) { metrics->onApplyingEnd(); });
+        [this](ReshardingMetrics* metrics) {
+            metrics->setStartFor(TimedPhase::kApplying, getClockSource()->now());
+        },
+        [this](ReshardingMetrics* metrics) {
+            metrics->setEndFor(TimedPhase::kApplying, getClockSource()->now());
+        });
+}
+
+TEST_F(ReshardingMetricsTest, CurrentOpReportsCriticalSectionTime) {
+    runTimeReportTest<ReshardingMetrics>(
+        "CurrentOpReportsCriticalSectionTime",
+        {Role::kDonor, Role::kCoordinator},
+        "totalCriticalSectionTimeElapsedSecs",
+        [this](ReshardingMetrics* metrics) {
+            metrics->setStartFor(TimedPhase::kCriticalSection, getClockSource()->now());
+        },
+        [this](ReshardingMetrics* metrics) {
+            metrics->setEndFor(TimedPhase::kCriticalSection, getClockSource()->now());
+        });
+}
+
+TEST_F(ReshardingMetricsTest, RecipientEstimatesNoneOnNewInstance) {
+    auto metrics = createInstanceMetrics(getClockSource(), UUID::gen(), Role::kRecipient);
+    ASSERT_EQ(metrics->getHighEstimateRemainingTimeMillis(), boost::none);
+}
+
+TEST_F(ReshardingMetricsTest,
+       RecipientEstimatesNoneBeforeExternalFieldsRestoredForRestoredInstance) {
+    auto metrics = makeRecipientMetricsWithAmbiguousTimeRemaining();
+    ASSERT_EQ(metrics->getHighEstimateRemainingTimeMillis(), boost::none);
+}
+
+TEST_F(ReshardingMetricsTest, RecipientEstimatesAfterExternalFieldsRestoredForRestoredInstance) {
+    auto metrics = makeRecipientMetricsWithAmbiguousTimeRemaining();
+    metrics->restoreExternallyTrackedRecipientFields(
+        ReshardingMetrics::ExternallyTrackedRecipientFields{});
+    ASSERT_EQ(metrics->getHighEstimateRemainingTimeMillis(), Milliseconds{0});
+}
+
+TEST_F(ReshardingMetricsTest, CurrentOpDoesNotReportRecipientEstimateIfNotSet) {
+    auto metrics = createInstanceMetrics(getClockSource(), UUID::gen(), Role::kRecipient);
+    auto report = metrics->reportForCurrentOp();
+    ASSERT_FALSE(report.hasField("remainingOperationTimeEstimatedSecs"));
+}
+
+TEST_F(ReshardingMetricsTest, OnInsertAppliedIncrementsCumulativeMetrics) {
+    createMetricsAndAssertIncrementsCumulativeMetricsField(
+        [](auto metrics) { metrics->onInsertApplied(); }, Section::kActive, "insertsApplied");
+}
+
+TEST_F(ReshardingMetricsTest, OnUpdateAppliedIncrementsCumulativeMetrics) {
+    createMetricsAndAssertIncrementsCumulativeMetricsField(
+        [](auto metrics) { metrics->onUpdateApplied(); }, Section::kActive, "updatesApplied");
+}
+
+TEST_F(ReshardingMetricsTest, OnDeleteAppliedIncrementsCumulativeMetrics) {
+    createMetricsAndAssertIncrementsCumulativeMetricsField(
+        [](auto metrics) { metrics->onDeleteApplied(); }, Section::kActive, "deletesApplied");
+}
+
+TEST_F(ReshardingMetricsTest, OnOplogFetchedIncrementsCumulativeMetricsFetchedCount) {
+    createMetricsAndAssertIncrementsCumulativeMetricsField(
+        [](auto metrics) { metrics->onOplogEntriesFetched(1); },
+        Section::kActive,
+        "oplogEntriesFetched");
+}
+
+TEST_F(ReshardingMetricsTest,
+       OnBatchRetrievedDuringOplogFetchingIncrementsCumulativeMetricsFetchedBatchCount) {
+    createMetricsAndAssertIncrementsCumulativeMetricsField(
+        [](auto metrics) { metrics->onBatchRetrievedDuringOplogFetching(Milliseconds{0}); },
+        Section::kLatencies,
+        "oplogFetchingTotalRemoteBatchesRetrieved");
+}
+
+TEST_F(ReshardingMetricsTest,
+       OnBatchRetrievedDuringOplogFetchingIncrementsCumulativeMetricsFetchedBatchTime) {
+    createMetricsAndAssertIncrementsCumulativeMetricsField(
+        [](auto metrics) { metrics->onBatchRetrievedDuringOplogFetching(Milliseconds{1}); },
+        Section::kLatencies,
+        "oplogFetchingTotalRemoteBatchRetrievalTimeMillis");
+}
+
+TEST_F(ReshardingMetricsTest, OnLocalFetchingInsertIncrementsCumulativeMetricsFetchedBatchCount) {
+    createMetricsAndAssertIncrementsCumulativeMetricsField(
+        [](auto metrics) { metrics->onLocalInsertDuringOplogFetching(Milliseconds{0}); },
+        Section::kLatencies,
+        "oplogFetchingTotalLocalInserts");
+}
+
+TEST_F(ReshardingMetricsTest, OnLocalFetchingInsertIncrementsCumulativeMetricsFetchedBatchTime) {
+    createMetricsAndAssertIncrementsCumulativeMetricsField(
+        [](auto metrics) { metrics->onLocalInsertDuringOplogFetching(Milliseconds{1}); },
+        Section::kLatencies,
+        "oplogFetchingTotalLocalInsertTimeMillis");
+}
+
+TEST_F(ReshardingMetricsTest, OnOplogAppliedIncrementsCumulativeMetricsAppliedCount) {
+    createMetricsAndAssertIncrementsCumulativeMetricsField(
+        [](auto metrics) { metrics->onOplogEntriesApplied(1); },
+        Section::kActive,
+        "oplogEntriesApplied");
+}
+
+TEST_F(ReshardingMetricsTest, OnApplyingBatchRetrievedIncrementsCumulativeMetricsBatchCount) {
+    createMetricsAndAssertIncrementsCumulativeMetricsField(
+        [](auto metrics) { metrics->onBatchRetrievedDuringOplogApplying(Milliseconds{0}); },
+        Section::kLatencies,
+        "oplogApplyingTotalLocalBatchesRetrieved");
+}
+
+TEST_F(ReshardingMetricsTest, OnApplyingBatchRetrievedIncrementsCumulativeMetricsBatchTime) {
+    createMetricsAndAssertIncrementsCumulativeMetricsField(
+        [](auto metrics) { metrics->onBatchRetrievedDuringOplogApplying(Milliseconds{1}); },
+        Section::kLatencies,
+        "oplogApplyingTotalLocalBatchRetrievalTimeMillis");
+}
+
+TEST_F(ReshardingMetricsTest, OnApplyingBatchAppliedIncrementsCumulativeMetricsBatchCount) {
+    createMetricsAndAssertIncrementsCumulativeMetricsField(
+        [](auto metrics) { metrics->onOplogLocalBatchApplied(Milliseconds{0}); },
+        Section::kLatencies,
+        "oplogApplyingTotalLocalBatchesApplied");
+}
+
+TEST_F(ReshardingMetricsTest, OnApplyingBatchAppliedIncrementsCumulativeMetricsBatchTime) {
+    createMetricsAndAssertIncrementsCumulativeMetricsField(
+        [](auto metrics) { metrics->onOplogLocalBatchApplied(Milliseconds{1}); },
+        Section::kLatencies,
+        "oplogApplyingTotalLocalBatchApplyTimeMillis");
+}
+
+TEST_F(ReshardingMetricsTest, OnStateTransitionFromNoneInformsCumulativeMetrics) {
+    createMetricsAndAssertIncrementsCumulativeMetricsField(
+        [](auto metrics) {
+            metrics->onStateTransition(boost::none, CoordinatorStateEnum::kApplying);
+        },
+        Section::kCurrentInSteps,
+        "countInstancesInCoordinatorState4Applying");
+}
+
+TEST_F(ReshardingMetricsTest, OnStateTransitionToNoneInformsCumulativeMetrics) {
+    auto metrics = createInstanceMetrics(getClockSource(), UUID::gen(), Role::kCoordinator);
+    auto state = CoordinatorStateEnum::kApplying;
+    metrics->onStateTransition(boost::none, state);
+    assertDecrementsCumulativeMetricsField(
+        metrics.get(),
+        [=](auto base) {
+            auto reshardingMetrics = dynamic_cast<ReshardingMetrics*>(base);
+            reshardingMetrics->onStateTransition(state, boost::none);
+        },
+        Section::kCurrentInSteps,
+        "countInstancesInCoordinatorState4Applying");
+}
+
+TEST_F(ReshardingMetricsTest, OnStateTransitionInformsCumulativeMetrics) {
+    auto metrics = createInstanceMetrics(getClockSource(), UUID::gen(), Role::kCoordinator);
+    auto initialState = CoordinatorStateEnum::kApplying;
+    auto nextState = CoordinatorStateEnum::kBlockingWrites;
+    metrics->onStateTransition(boost::none, initialState);
+    assertAltersCumulativeMetrics(
+        metrics.get(),
+        [=](auto base) {
+            auto reshardingMetrics = dynamic_cast<ReshardingMetrics*>(base);
+            reshardingMetrics->onStateTransition(initialState, nextState);
+        },
+        [this](auto reportBefore, auto reportAfter) {
+            auto before = getReportSection(reportBefore, Section::kCurrentInSteps);
+            ASSERT_EQ(before.getIntField("countInstancesInCoordinatorState4Applying"), 1);
+            ASSERT_EQ(before.getIntField("countInstancesInCoordinatorState5BlockingWrites"), 0);
+            auto after = getReportSection(reportAfter, Section::kCurrentInSteps);
+            ASSERT_EQ(after.getIntField("countInstancesInCoordinatorState4Applying"), 0);
+            ASSERT_EQ(after.getIntField("countInstancesInCoordinatorState5BlockingWrites"), 1);
+            return true;
+        });
 }
 
 }  // namespace

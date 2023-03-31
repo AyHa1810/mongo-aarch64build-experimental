@@ -48,7 +48,7 @@ function findHighestChunkBounds(chunkBounds) {
     return highestBounds;
 }
 
-const st = new ShardingTest({shards: 3, other: {chunkSize: 1, enableAutoSplitter: false}});
+const st = new ShardingTest({shards: 3, other: {chunkSize: 1}});
 let primaryShard = st.shard0;
 let dbName = "test";
 let testDB = st.s.getDB(dbName);
@@ -135,10 +135,7 @@ shardTags = {
 };
 assertShardTags(configDB, shardTags);
 
-const balanceAccordingToDataSize = FeatureFlagUtil.isEnabled(
-    st.configRS.getPrimary().getDB('admin'), "BalanceAccordingToDataSize");
-let numChunksToMove = balanceAccordingToDataSize ? zoneChunkBounds["zoneB"].length
-                                                 : zoneChunkBounds["zoneB"].length / 2;
+const numChunksToMove = zoneChunkBounds["zoneB"].length - 1;
 runBalancer(st, numChunksToMove);
 shardChunkBounds = {
     [st.shard0.shardName]: zoneChunkBounds["zoneB"].slice(0, numChunksToMove),
@@ -227,7 +224,9 @@ assertChunksOnShards(configDB, ns, shardChunkBounds);
 assertDocsOnShards(st, ns, shardChunkBounds, docs, shardKey);
 
 jsTest.log("Make the chunk not aligned with zone ranges.");
-let splitPoint = {x: NumberLong(targetChunkBounds[1].x - 5000)};
+let splitPoint = (targetChunkBounds[1].x === MaxKey)
+    ? {x: NumberLong(targetChunkBounds[0].x + 5000)}
+    : {x: NumberLong(targetChunkBounds[1].x - 5000)};
 assert(chunkBoundsUtil.containsKey(splitPoint, ...targetChunkBounds));
 assert.commandWorked(st.s.adminCommand(
     {updateZoneKeyRange: ns, min: targetChunkBounds[0], max: targetChunkBounds[1], zone: null}));

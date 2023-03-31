@@ -80,6 +80,9 @@ struct StorageGlobalParams {
     // entries for collections not restored and more.
     bool restore;
 
+    // --magicRestore
+    bool magicRestore;
+
     // Whether the Storage Engine selected should be ephemeral in nature or not.
     bool ephemeral = false;
 
@@ -122,7 +125,7 @@ struct StorageGlobalParams {
     // outside of the retention window which is set by this option.
     AtomicWord<double> oplogMinRetentionHours;
 
-    // Controls whether we allow the OplogStones mechanism to delete oplog history on WT.
+    // Controls whether we allow the OplogTruncateMarkers mechanism to delete oplog history on WT.
     bool allowOplogTruncation;
 
     // Disables lock-free reads. Lock-free reads is incompatible with
@@ -132,6 +135,9 @@ struct StorageGlobalParams {
     // Delay in seconds between triggering the next checkpoint after the completion of the previous
     // one. A value of 0 indicates that checkpointing will be skipped.
     size_t checkpointDelaySecs;
+
+    // Test-only option. Disables table logging.
+    bool forceDisableTableLogging = false;
 };
 
 extern StorageGlobalParams storageGlobalParams;

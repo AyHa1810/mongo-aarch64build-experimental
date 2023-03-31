@@ -36,6 +36,7 @@
 
 #include "mongo/db/audit.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -43,7 +44,6 @@
 #include "mongo/db/query/collection_index_usage_tracker_decoration.h"
 #include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/storage/durable_catalog.h"
-#include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/db/ttl_collection_cache.h"
 #include "mongo/db/vector_clock.h"
 #include "mongo/logv2/log.h"
@@ -60,14 +60,7 @@ IndexBuildBlock::IndexBuildBlock(const NamespaceString& nss,
                                  const BSONObj& spec,
                                  IndexBuildMethod method,
                                  boost::optional<UUID> indexBuildUUID)
-    : _nss(nss),
-      _spec(spec.getOwned()),
-      _method(method),
-      _buildUUID(indexBuildUUID),
-      _pooledBuilder(
-          gOperationMemoryPoolBlockInitialSizeKB.loadRelaxed() * static_cast<size_t>(1024),
-          SharedBufferFragmentBuilder::DoubleGrowStrategy(
-              gOperationMemoryPoolBlockMaxSizeKB.loadRelaxed() * static_cast<size_t>(1024))) {}
+    : _nss(nss), _spec(spec.getOwned()), _method(method), _buildUUID(indexBuildUUID) {}
 
 void IndexBuildBlock::keepTemporaryTables() {
     if (_indexBuildInterceptor) {
@@ -80,11 +73,16 @@ void IndexBuildBlock::_completeInit(OperationContext* opCtx, Collection* collect
     // occurring while an index is being build in the background will be aware of whether or not
     // they need to modify any indexes.
     auto desc = getEntry(opCtx, collection)->descriptor();
-    CollectionQueryInfo::get(collection).rebuildIndexData(opCtx, collection);
+    CollectionQueryInfo::get(collection).rebuildIndexData(opCtx, CollectionPtr(collection));
     CollectionIndexUsageTrackerDecoration::get(collection->getSharedDecorations())
         .registerIndex(desc->indexName(),
                        desc->keyPattern(),
                        IndexFeatures::make(desc, collection->ns().isOnInternalDb()));
+    opCtx->recoveryUnit()->onRollback([collectionDecorations = collection->getSharedDecorations(),
+                                       indexName = _indexName](OperationContext*) {
+        CollectionIndexUsageTrackerDecoration::get(collectionDecorations)
+            .unregisterIndex(indexName);
+    });
 }
 
 Status IndexBuildBlock::initForResume(OperationContext* opCtx,
@@ -132,7 +130,7 @@ Status IndexBuildBlock::initForResume(OperationContext* opCtx,
     return Status::OK();
 }
 
-Status IndexBuildBlock::init(OperationContext* opCtx, Collection* collection) {
+Status IndexBuildBlock::init(OperationContext* opCtx, Collection* collection, bool forRecovery) {
     // Being in a WUOW means all timestamping responsibility can be pushed up to the caller.
     invariant(opCtx->lockState()->inAWriteUnitOfWork());
 
@@ -160,14 +158,25 @@ Status IndexBuildBlock::init(OperationContext* opCtx, Collection* collection) {
             !replCoord->getMemberState().primary() && isBackgroundIndex;
     }
 
-    // Setup on-disk structures.
-    Status status = collection->prepareForIndexBuild(
-        opCtx, descriptor.get(), _buildUUID, isBackgroundSecondaryBuild);
-    if (!status.isOK())
-        return status;
+    if (!forRecovery) {
+        // Setup on-disk structures. We skip this during startup recovery for unfinished indexes as
+        // everything is already in-place.
+        Status status = collection->prepareForIndexBuild(
+            opCtx, descriptor.get(), _buildUUID, isBackgroundSecondaryBuild);
+        if (!status.isOK())
+            return status;
+    }
 
-    auto indexCatalogEntry = collection->getIndexCatalog()->createIndexEntry(
-        opCtx, collection, std::move(descriptor), CreateIndexEntryFlags::kNone);
+    auto indexCatalog = collection->getIndexCatalog();
+    IndexCatalogEntry* indexCatalogEntry = nullptr;
+    if (forRecovery) {
+        auto desc = indexCatalog->findIndexByName(
+            opCtx, _indexName, IndexCatalog::InclusionPolicy::kUnfinished);
+        indexCatalogEntry = indexCatalog->getEntryShared(desc).get();
+    } else {
+        indexCatalogEntry = indexCatalog->createIndexEntry(
+            opCtx, collection, std::move(descriptor), CreateIndexEntryFlags::kNone);
+    }
 
     if (_method == IndexBuildMethod::kHybrid) {
         _indexBuildInterceptor = std::make_unique<IndexBuildInterceptor>(opCtx, indexCatalogEntry);
@@ -176,10 +185,11 @@ Status IndexBuildBlock::init(OperationContext* opCtx, Collection* collection) {
 
     if (isBackgroundIndex) {
         opCtx->recoveryUnit()->onCommit(
-            [entry = indexCatalogEntry, coll = collection](boost::optional<Timestamp> commitTime) {
+            [entry = indexCatalogEntry, coll = collection](OperationContext*,
+                                                           boost::optional<Timestamp> commitTime) {
                 // This will prevent the unfinished index from being visible on index iterators.
                 if (commitTime) {
-                    entry->setMinimumVisibleSnapshot(commitTime.get());
+                    entry->setMinimumVisibleSnapshot(commitTime.value());
                 }
             });
     }
@@ -254,7 +264,7 @@ void IndexBuildBlock::success(OperationContext* opCtx, Collection* collection) {
          spec = _spec,
          entry = indexCatalogEntry,
          coll = collection,
-         buildUUID = _buildUUID](boost::optional<Timestamp> commitTime) {
+         buildUUID = _buildUUID](OperationContext*, boost::optional<Timestamp> commitTime) {
             // Note: this runs after the WUOW commits but before we release our X lock on the
             // collection. This means that any snapshot created after this must include the full
             // index, and no one can try to read this index before we set the visibility.
@@ -263,22 +273,26 @@ void IndexBuildBlock::success(OperationContext* opCtx, Collection* collection) {
                   "Index build: done building",
                   "buildUUID"_attr = buildUUID,
                   "collectionUUID"_attr = coll->uuid(),
-                  "namespace"_attr = coll->ns(),
+                  logAttrs(coll->ns()),
                   "index"_attr = indexName,
                   "ident"_attr = entry->getIdent(),
                   "collectionIdent"_attr = coll->getSharedIdent()->getIdent(),
                   "commitTimestamp"_attr = commitTime);
 
             if (commitTime) {
-                entry->setMinimumVisibleSnapshot(commitTime.get());
+                entry->setMinimumVisibleSnapshot(commitTime.value());
             }
 
             // Add the index to the TTLCollectionCache upon successfully committing the index build.
-            // TTL indexes are not compatible with capped collections.
-            // Note that TTL deletion is supported on capped clustered collections via bounded
-            // collection scan, which does not use an index.
+            // TTL indexes are not compatible with capped collections.  Note that TTL deletion is
+            // supported on capped clustered collections via bounded collection scan, which does not
+            // use an index.
             if (spec.hasField(IndexDescriptor::kExpireAfterSecondsFieldName) && !coll->isCapped()) {
-                TTLCollectionCache::get(svcCtx).registerTTLInfo(coll->uuid(), indexName);
+                auto validateStatus = index_key_validate::validateExpireAfterSeconds(
+                    spec[IndexDescriptor::kExpireAfterSecondsFieldName],
+                    index_key_validate::ValidateExpireAfterSecondsMode::kSecondaryTTLIndex);
+                TTLCollectionCache::get(svcCtx).registerTTLInfo(
+                    coll->uuid(), TTLCollectionCache::Info{indexName, !validateStatus.isOK()});
             }
         });
 }

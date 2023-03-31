@@ -61,8 +61,7 @@ class ShardsvrMoveRangeCommand final : public TypedCommand<ShardsvrMoveRangeComm
 public:
     using Request = ShardsvrMoveRange;
 
-    ShardsvrMoveRangeCommand()
-        : TypedCommand<ShardsvrMoveRangeCommand>(Request::kCommandName, Request::kCommandAlias) {}
+    ShardsvrMoveRangeCommand() : TypedCommand<ShardsvrMoveRangeCommand>(Request::kCommandName) {}
 
     bool skipApiVersionCheck() const override {
         // Internal command (server to server).
@@ -199,7 +198,6 @@ public:
                              ShardsvrMoveRange&& request,
                              WriteConcernOptions&& writeConcern) {
             if (request.getFromShard() == request.getToShard()) {
-                // TODO: SERVER-46669 handle wait for delete.
                 return;
             }
 

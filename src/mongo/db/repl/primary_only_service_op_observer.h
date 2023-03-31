@@ -47,6 +47,20 @@ public:
     explicit PrimaryOnlyServiceOpObserver(ServiceContext* serviceContext);
     ~PrimaryOnlyServiceOpObserver();
 
+    void onModifyCollectionShardingIndexCatalog(OperationContext* opCtx,
+                                                const NamespaceString& nss,
+                                                const UUID& uuid,
+                                                BSONObj indexDoc) final {}
+
+    void onCreateGlobalIndex(OperationContext* opCtx,
+                             const NamespaceString& globalIndexNss,
+                             const UUID& globalIndexUUID) final{};
+
+    void onDropGlobalIndex(OperationContext* opCtx,
+                           const NamespaceString& globalIndexNss,
+                           const UUID& globalIndexUUID,
+                           long long numKeys) final{};
+
     void onCreateIndex(OperationContext* opCtx,
                        const NamespaceString& nss,
                        const UUID& uuid,
@@ -80,22 +94,32 @@ public:
                            bool fromMigrate) final {}
 
     void onInserts(OperationContext* opCtx,
-                   const NamespaceString& nss,
-                   const UUID& uuid,
+                   const CollectionPtr& coll,
                    std::vector<InsertStatement>::const_iterator first,
                    std::vector<InsertStatement>::const_iterator last,
-                   bool fromMigrate) final {}
+                   std::vector<bool> fromMigrate,
+                   bool defaultFromMigrate) final {}
+
+    void onInsertGlobalIndexKey(OperationContext* opCtx,
+                                const NamespaceString& globalIndexNss,
+                                const UUID& globalIndexUuid,
+                                const BSONObj& key,
+                                const BSONObj& docKey) final{};
+
+    void onDeleteGlobalIndexKey(OperationContext* opCtx,
+                                const NamespaceString& globalIndexNss,
+                                const UUID& globalIndexUuid,
+                                const BSONObj& key,
+                                const BSONObj& docKey) final {}
 
     void onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) final {}
 
     void aboutToDelete(OperationContext* opCtx,
-                       const NamespaceString& nss,
-                       const UUID& uuid,
+                       const CollectionPtr& coll,
                        const BSONObj& doc) final;
 
     void onDelete(OperationContext* opCtx,
-                  const NamespaceString& nss,
-                  const UUID& uuid,
+                  const CollectionPtr& coll,
                   StmtId stmtId,
                   const OplogDeleteEntryArgs& args) final;
 
@@ -181,9 +205,10 @@ public:
                        const NamespaceString& collectionName,
                        const UUID& uuid) final {}
 
+    void onTransactionStart(OperationContext* opCtx) final {}
+
     void onUnpreparedTransactionCommit(OperationContext* opCtx,
-                                       std::vector<repl::ReplOperation>* statements,
-                                       size_t numberOfPrePostImagesToWrite) final {}
+                                       const TransactionOperations& transactionOperations) final {}
 
     void onPreparedTransactionCommit(
         OperationContext* opCtx,
@@ -194,19 +219,22 @@ public:
     std::unique_ptr<ApplyOpsOplogSlotAndOperationAssignment> preTransactionPrepare(
         OperationContext* opCtx,
         const std::vector<OplogSlot>& reservedSlots,
-        size_t numberOfPrePostImagesToWrite,
-        Date_t wallClockTime,
-        std::vector<repl::ReplOperation>* statements) final {
+        const TransactionOperations& transactionOperations,
+        Date_t wallClockTime) final {
         return nullptr;
     }
 
     void onTransactionPrepare(
         OperationContext* opCtx,
         const std::vector<OplogSlot>& reservedSlots,
-        std::vector<repl::ReplOperation>* statements,
-        const ApplyOpsOplogSlotAndOperationAssignment* applyOpsOperationAssignment,
+        const TransactionOperations& transactionOperations,
+        const ApplyOpsOplogSlotAndOperationAssignment& applyOpsOperationAssignment,
         size_t numberOfPrePostImagesToWrite,
         Date_t wallClockTime) final {}
+
+    void onTransactionPrepareNonPrimary(OperationContext* opCtx,
+                                        const std::vector<repl::OplogEntry>& statements,
+                                        const repl::OpTime& prepareOpTime) final {}
 
     void onTransactionAbort(OperationContext* opCtx,
                             boost::optional<OplogSlot> abortOplogEntryOpTime) final {}

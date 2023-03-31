@@ -75,6 +75,7 @@ config_header_substs = (
     ('@mongo_config_use_libunwind@', 'MONGO_CONFIG_USE_LIBUNWIND'),
     ('@mongo_config_use_raw_latches@', 'MONGO_CONFIG_USE_RAW_LATCHES'),
     ('@mongo_config_wiredtiger_enabled@', 'MONGO_CONFIG_WIREDTIGER_ENABLED'),
+    ('@mongo_config_grpc@', 'MONGO_CONFIG_GRPC'),
 )
 
 
@@ -99,6 +100,7 @@ baseEnv = env.Clone()
 
 if use_libunwind == True:
     baseEnv.InjectThirdParty('unwind')
+baseEnv.InjectThirdParty('intel_decimal128')
 
 quick_exit_env = baseEnv.Clone()
 if has_option('gcov'):
@@ -146,8 +148,8 @@ baseEnv.Library(
         'base/validate_locale.cpp',
         'bson/bson_comparator_interface_base.cpp',
         'bson/bson_depth.cpp',
-        'bson/bson_validate.cpp',
         'bson/bsonelement.cpp',
+        'bson/bsonelementvalue.cpp',
         'bson/bsonmisc.cpp',
         'bson/bsonobj.cpp',
         'bson/bsonobjbuilder.cpp',
@@ -278,3 +280,13 @@ env.AutoInstall(
     AIB_COMPONENTS_EXTRA=['dist', 'dist-test'],
     AIB_ROLE='base',
 )
+
+if env.TargetOSIs('darwin', 'macOS'):
+    env.AutoInstall(
+        target='$PREFIX',
+        source=[
+            env.File('#/etc/macos_mongodb.plist'),
+        ],
+        AIB_COMPONENT='common',
+        AIB_ROLE='base',
+    )

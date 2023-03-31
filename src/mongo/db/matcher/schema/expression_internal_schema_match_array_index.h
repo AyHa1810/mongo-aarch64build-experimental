@@ -46,7 +46,7 @@ public:
     static constexpr int kNumChildren = 1;
 
     InternalSchemaMatchArrayIndexMatchExpression(
-        StringData path,
+        boost::optional<StringData> path,
         long long index,
         std::unique_ptr<ExpressionWithPlaceholder> expression,
         clonable_ptr<ErrorAnnotation> annotation = nullptr);
@@ -74,9 +74,9 @@ public:
         return _expression->matchesBSONElement(element, details);
     }
 
-    BSONObj getSerializedRightHandSide() const final;
+    BSONObj getSerializedRightHandSide(SerializationOptions opts) const final;
 
-    std::unique_ptr<MatchExpression> shallowClone() const final;
+    std::unique_ptr<MatchExpression> clone() const final;
 
     std::vector<std::unique_ptr<MatchExpression>>* getChildVector() final {
         return nullptr;

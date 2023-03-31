@@ -56,8 +56,8 @@ public:
                         serverGlobalParams.featureCompatibility));
             uassert(ErrorCodes::IllegalOperation,
                     "Shard split is not available on config servers",
-                    serverGlobalParams.clusterRole == ClusterRole::None ||
-                        serverGlobalParams.clusterRole == ClusterRole::ShardServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::None) ||
+                        serverGlobalParams.clusterRole.has(ClusterRole::ShardServer));
             uassert(ErrorCodes::CommandNotSupported,
                     "Shard split is only supported in serverless mode",
                     getGlobalReplSettings().isServerless());
@@ -84,13 +84,9 @@ public:
                         (state.abortReason ? state.abortReason->toString() : ""),
                     state.state != ShardSplitDonorStateEnum::kAborted);
 
-            Response response(state.state);
-            if (state.abortReason) {
-                BSONObjBuilder bob;
-
-                state.abortReason->serializeErrorToBSON(&bob);
-                response.setAbortReason(bob.obj());
-            }
+            Response response;
+            invariant(state.blockOpTime.has_value());
+            response.setBlockOpTime(*state.blockOpTime);
 
             return response;
         }
@@ -109,12 +105,12 @@ public:
         }
 
         NamespaceString ns() const {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
     };
 
     std::string help() const {
-        return "Start an opereation to split a shard into its own slice.";
+        return "Start an operation to split a shard into its own slice.";
     }
 
     bool adminOnly() const override {
@@ -166,7 +162,7 @@ public:
             uassert(ErrorCodes::CommandFailed,
                     "Failed to abort shard split",
                     state.abortReason &&
-                        state.abortReason.get() == ErrorCodes::TenantMigrationAborted);
+                        state.abortReason.value() == ErrorCodes::TenantMigrationAborted);
 
             uassert(ErrorCodes::TenantMigrationCommitted,
                     "Failed to abort : shard split already committed",
@@ -187,7 +183,7 @@ public:
         }
 
         NamespaceString ns() const {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
     };
 
@@ -235,7 +231,7 @@ public:
                     str::stream() << "Could not find shard split with id " << cmd.getMigrationId(),
                     optionalDonor);
 
-            auto donorPtr = optionalDonor.get();
+            auto donorPtr = optionalDonor.value();
 
             auto decision = donorPtr->decisionFuture().get(opCtx);
 
@@ -247,7 +243,7 @@ public:
                     decision.state == ShardSplitDonorStateEnum::kAborted);
 
             donorPtr->tryForget();
-            donorPtr->completionFuture().get(opCtx);
+            donorPtr->garbageCollectableFuture().get(opCtx);
         }
 
     private:
@@ -264,7 +260,7 @@ public:
         }
 
         NamespaceString ns() const {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
     };
 

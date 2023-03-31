@@ -113,8 +113,10 @@ constexpr auto dbName = "test"_sd;
 
 TEST_F(OplogApplierTest, GetNextApplierBatchGroupsCrudOps) {
     std::vector<OplogEntry> srcOps;
-    srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "foo")));
-    srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")));
+    srcOps.push_back(
+        makeInsertOplogEntry(1, NamespaceString::createNamespaceString_forTest(dbName, "foo")));
+    srcOps.push_back(
+        makeInsertOplogEntry(2, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
     _applier->enqueue(opCtx(), srcOps.cbegin(), srcOps.cend());
 
     auto batch = unittest::assertGet(_applier->getNextApplierBatch(opCtx(), _limits));
@@ -126,7 +128,8 @@ TEST_F(OplogApplierTest, GetNextApplierBatchGroupsCrudOps) {
 TEST_F(OplogApplierTest, GetNextApplierBatchReturnsPreparedApplyOpsOpInOwnBatch) {
     std::vector<OplogEntry> srcOps;
     srcOps.push_back(makeApplyOpsOplogEntry(1, true));
-    srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")));
+    srcOps.push_back(
+        makeInsertOplogEntry(2, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
     _applier->enqueue(opCtx(), srcOps.cbegin(), srcOps.cend());
 
     auto batch = unittest::assertGet(_applier->getNextApplierBatch(opCtx(), _limits));
@@ -137,7 +140,8 @@ TEST_F(OplogApplierTest, GetNextApplierBatchReturnsPreparedApplyOpsOpInOwnBatch)
 TEST_F(OplogApplierTest, GetNextApplierBatchGroupsUnpreparedApplyOpsOpWithOtherOps) {
     std::vector<OplogEntry> srcOps;
     srcOps.push_back(makeApplyOpsOplogEntry(1, false));
-    srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")));
+    srcOps.push_back(
+        makeInsertOplogEntry(2, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
     _applier->enqueue(opCtx(), srcOps.cbegin(), srcOps.cend());
 
     auto batch = unittest::assertGet(_applier->getNextApplierBatch(opCtx(), _limits));
@@ -148,9 +152,9 @@ TEST_F(OplogApplierTest, GetNextApplierBatchGroupsUnpreparedApplyOpsOpWithOtherO
 
 TEST_F(OplogApplierTest, GetNextApplierBatchReturnsSystemDotViewsOpInOwnBatch) {
     std::vector<OplogEntry> srcOps;
-    srcOps.push_back(makeInsertOplogEntry(
-        1, NamespaceString(dbName, NamespaceString::kSystemDotViewsCollectionName)));
-    srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")));
+    srcOps.push_back(makeInsertOplogEntry(1, NamespaceString::makeSystemDotViewsNamespace(dbName)));
+    srcOps.push_back(
+        makeInsertOplogEntry(2, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
     _applier->enqueue(opCtx(), srcOps.cbegin(), srcOps.cend());
 
     auto batch = unittest::assertGet(_applier->getNextApplierBatch(opCtx(), _limits));
@@ -161,7 +165,8 @@ TEST_F(OplogApplierTest, GetNextApplierBatchReturnsSystemDotViewsOpInOwnBatch) {
 TEST_F(OplogApplierTest, GetNextApplierBatchReturnsServerConfigurationOpInOwnBatch) {
     std::vector<OplogEntry> srcOps;
     srcOps.push_back(makeInsertOplogEntry(1, NamespaceString::kServerConfigurationNamespace));
-    srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")));
+    srcOps.push_back(
+        makeInsertOplogEntry(2, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
     _applier->enqueue(opCtx(), srcOps.cbegin(), srcOps.cend());
 
     auto batch = unittest::assertGet(_applier->getNextApplierBatch(opCtx(), _limits));
@@ -172,7 +177,8 @@ TEST_F(OplogApplierTest, GetNextApplierBatchReturnsServerConfigurationOpInOwnBat
 TEST_F(OplogApplierTest, GetNextApplierBatchReturnsConfigReshardingDonorOpInOwnBatch) {
     std::vector<OplogEntry> srcOps;
     srcOps.push_back(makeInsertOplogEntry(1, NamespaceString::kDonorReshardingOperationsNamespace));
-    srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")));
+    srcOps.push_back(
+        makeInsertOplogEntry(2, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
     _applier->enqueue(opCtx(), srcOps.cbegin(), srcOps.cend());
 
     auto batch = unittest::assertGet(_applier->getNextApplierBatch(opCtx(), _limits));
@@ -183,7 +189,8 @@ TEST_F(OplogApplierTest, GetNextApplierBatchReturnsConfigReshardingDonorOpInOwnB
 TEST_F(OplogApplierTest, GetNextApplierBatchReturnsPreparedCommitTransactionOpInOwnBatch) {
     std::vector<OplogEntry> srcOps;
     srcOps.push_back(makeCommitTransactionOplogEntry(1, dbName, true, 3));
-    srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")));
+    srcOps.push_back(
+        makeInsertOplogEntry(2, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
     _applier->enqueue(opCtx(), srcOps.cbegin(), srcOps.cend());
 
     auto batch = unittest::assertGet(_applier->getNextApplierBatch(opCtx(), _limits));
@@ -194,7 +201,8 @@ TEST_F(OplogApplierTest, GetNextApplierBatchReturnsPreparedCommitTransactionOpIn
 TEST_F(OplogApplierTest, GetNextApplierBatchGroupsUnpreparedCommitTransactionOpWithOtherOps) {
     std::vector<OplogEntry> srcOps;
     srcOps.push_back(makeCommitTransactionOplogEntry(1, dbName, false, 3));
-    srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")));
+    srcOps.push_back(
+        makeInsertOplogEntry(2, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
     _applier->enqueue(opCtx(), srcOps.cbegin(), srcOps.cend());
 
     auto batch = unittest::assertGet(_applier->getNextApplierBatch(opCtx(), _limits));
@@ -205,11 +213,16 @@ TEST_F(OplogApplierTest, GetNextApplierBatchGroupsUnpreparedCommitTransactionOpW
 
 TEST_F(OplogApplierTest, GetNextApplierBatchChecksBatchLimitsForNumberOfOperations) {
     std::vector<OplogEntry> srcOps;
-    srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "bar")));
-    srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")));
-    srcOps.push_back(makeInsertOplogEntry(3, NamespaceString(dbName, "bar")));
-    srcOps.push_back(makeInsertOplogEntry(4, NamespaceString(dbName, "bar")));
-    srcOps.push_back(makeInsertOplogEntry(5, NamespaceString(dbName, "bar")));
+    srcOps.push_back(
+        makeInsertOplogEntry(1, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
+    srcOps.push_back(
+        makeInsertOplogEntry(2, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
+    srcOps.push_back(
+        makeInsertOplogEntry(3, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
+    srcOps.push_back(
+        makeInsertOplogEntry(4, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
+    srcOps.push_back(
+        makeInsertOplogEntry(5, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
     _applier->enqueue(opCtx(), srcOps.cbegin(), srcOps.cend());
 
     // Set batch limits so that each batch contains a maximum of 'BatchLimit::ops'.
@@ -231,13 +244,17 @@ TEST_F(OplogApplierTest, GetNextApplierBatchChecksBatchLimitsForNumberOfOperatio
 
 TEST_F(OplogApplierTest, GetNextApplierBatchChecksBatchLimitsForSizeOfOperations) {
     std::vector<OplogEntry> srcOps;
-    srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "bar")));
-    srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")));
-    srcOps.push_back(makeInsertOplogEntry(3, NamespaceString(dbName, "bar")));
+    srcOps.push_back(
+        makeInsertOplogEntry(1, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
+    srcOps.push_back(
+        makeInsertOplogEntry(2, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
+    srcOps.push_back(
+        makeInsertOplogEntry(3, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
     _applier->enqueue(opCtx(), srcOps.cbegin(), srcOps.cend());
 
     // Set batch limits so that only the first two operations can fit into the first batch.
-    _limits.bytes = std::size_t(srcOps[0].getRawObjSizeBytes() + srcOps[1].getRawObjSizeBytes());
+    _limits.bytes =
+        std::size_t(srcOps[0].getRawObjSizeBytes()) + std::size_t(srcOps[1].getRawObjSizeBytes());
 
     // First batch: [insert, insert]
     auto batch = unittest::assertGet(_applier->getNextApplierBatch(opCtx(), _limits));
@@ -254,9 +271,11 @@ TEST_F(OplogApplierTest, GetNextApplierBatchChecksBatchLimitsForSizeOfOperations
 TEST_F(OplogApplierTest,
        GetNextApplierBatchChecksBatchLimitsUsingEmbededCountInUnpreparedCommitTransactionOp1) {
     std::vector<OplogEntry> srcOps;
-    srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "bar")));
+    srcOps.push_back(
+        makeInsertOplogEntry(1, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
     srcOps.push_back(makeCommitTransactionOplogEntry(2, dbName, false, 3));
-    srcOps.push_back(makeInsertOplogEntry(3, NamespaceString(dbName, "bar")));
+    srcOps.push_back(
+        makeInsertOplogEntry(3, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
     _applier->enqueue(opCtx(), srcOps.cbegin(), srcOps.cend());
 
     // Set batch limits so that commit transaction entry has to go into next batch as the only entry
@@ -277,10 +296,13 @@ TEST_F(OplogApplierTest,
 TEST_F(OplogApplierTest,
        GetNextApplierBatchChecksBatchLimitsUsingEmbededCountInUnpreparedCommitTransactionOp2) {
     std::vector<OplogEntry> srcOps;
-    srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "bar")));
-    srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")));
+    srcOps.push_back(
+        makeInsertOplogEntry(1, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
+    srcOps.push_back(
+        makeInsertOplogEntry(2, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
     srcOps.push_back(makeCommitTransactionOplogEntry(3, dbName, false, 3));
-    srcOps.push_back(makeInsertOplogEntry(4, NamespaceString(dbName, "bar")));
+    srcOps.push_back(
+        makeInsertOplogEntry(4, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
     _applier->enqueue(opCtx(), srcOps.cbegin(), srcOps.cend());
 
     // Set batch limits so that commit transaction entry has to go into next batch after taking into
@@ -303,9 +325,11 @@ TEST_F(OplogApplierTest,
 TEST_F(OplogApplierTest,
        GetNextApplierBatchChecksBatchLimitsUsingEmbededCountInUnpreparedCommitTransactionOp3) {
     std::vector<OplogEntry> srcOps;
-    srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "bar")));
+    srcOps.push_back(
+        makeInsertOplogEntry(1, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
     srcOps.push_back(makeCommitTransactionOplogEntry(2, dbName, false, 5));
-    srcOps.push_back(makeInsertOplogEntry(3, NamespaceString(dbName, "bar")));
+    srcOps.push_back(
+        makeInsertOplogEntry(3, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
     _applier->enqueue(opCtx(), srcOps.cbegin(), srcOps.cend());
 
     // Set batch limits so that commit transaction entry goes into its own batch because its
@@ -325,18 +349,20 @@ TEST_F(OplogApplierTest,
 
 TEST_F(OplogApplierTest, LastOpInLargeTransactionIsProcessedIndividually) {
     std::vector<OplogEntry> srcOps;
-    srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "bar")));
+    srcOps.push_back(
+        makeInsertOplogEntry(1, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
 
     // Makes entries with ts from range [2, 5).
     std::vector<OplogEntry> multiEntryTransaction =
         makeMultiEntryTransactionOplogEntries(2, dbName, /* prepared */ false, /* num entries*/ 3);
-    for (auto entry : multiEntryTransaction) {
+    for (const auto& entry : multiEntryTransaction) {
         srcOps.push_back(entry);
     }
 
     // Push one extra operation to ensure that the last oplog entry of a large transaction
     // is processed by itself.
-    srcOps.push_back(makeInsertOplogEntry(5, NamespaceString(dbName, "bar")));
+    srcOps.push_back(
+        makeInsertOplogEntry(5, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
 
     _applier->enqueue(opCtx(), srcOps.cbegin(), srcOps.cend());
 
@@ -427,9 +453,12 @@ TEST_F(OplogApplierDelayTest, GetNextApplierBatchReturnsEmptyBatchImmediately) {
 
 TEST_F(OplogApplierDelayTest, GetNextApplierBatchReturnsFullBatchImmediately) {
     std::vector<OplogEntry> srcOps;
-    srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "foo")));
-    srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")));
-    srcOps.push_back(makeInsertOplogEntry(3, NamespaceString(dbName, "baz")));
+    srcOps.push_back(
+        makeInsertOplogEntry(1, NamespaceString::createNamespaceString_forTest(dbName, "foo")));
+    srcOps.push_back(
+        makeInsertOplogEntry(2, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
+    srcOps.push_back(
+        makeInsertOplogEntry(3, NamespaceString::createNamespaceString_forTest(dbName, "baz")));
     _applier->enqueue(opCtx(), srcOps.cbegin(), srcOps.cend());
 
     auto batch =
@@ -439,7 +468,8 @@ TEST_F(OplogApplierDelayTest, GetNextApplierBatchReturnsFullBatchImmediately) {
 
 TEST_F(OplogApplierDelayTest, GetNextApplierBatchWaitsForBatchToFill) {
     std::vector<OplogEntry> srcOps;
-    srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "foo")));
+    srcOps.push_back(
+        makeInsertOplogEntry(1, NamespaceString::createNamespaceString_forTest(dbName, "foo")));
     _applier->enqueue(opCtx(), srcOps.cbegin(), srcOps.cend());
 
     stdx::thread insertThread([this, &srcOps] {
@@ -447,14 +477,16 @@ TEST_F(OplogApplierDelayTest, GetNextApplierBatchWaitsForBatchToFill) {
         {
             FailPointEnableBlock peekFailPoint("oplogBatcherPauseAfterSuccessfulPeek");
             srcOps.clear();
-            srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")));
+            srcOps.push_back(makeInsertOplogEntry(
+                2, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
             _applier->enqueue(opCtx(), srcOps.cbegin(), srcOps.cend());
             peekFailPoint->waitForTimesEntered(peekFailPoint.initialTimesEntered() + 1);
             _mockClock->advance(Milliseconds(5));
         }
         ASSERT(waitForWait());
         srcOps.clear();
-        srcOps.push_back(makeInsertOplogEntry(3, NamespaceString(dbName, "baz")));
+        srcOps.push_back(
+            makeInsertOplogEntry(3, NamespaceString::createNamespaceString_forTest(dbName, "baz")));
         _applier->enqueue(opCtx(), srcOps.cbegin(), srcOps.cend());
     });
     auto batch =
@@ -466,7 +498,8 @@ TEST_F(OplogApplierDelayTest, GetNextApplierBatchWaitsForBatchToFill) {
 
 TEST_F(OplogApplierDelayTest, GetNextApplierBatchWaitsForBatchToTimeout) {
     std::vector<OplogEntry> srcOps;
-    srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "foo")));
+    srcOps.push_back(
+        makeInsertOplogEntry(1, NamespaceString::createNamespaceString_forTest(dbName, "foo")));
     _applier->enqueue(opCtx(), srcOps.cbegin(), srcOps.cend());
 
     stdx::thread insertThread([this, &srcOps] {
@@ -474,7 +507,8 @@ TEST_F(OplogApplierDelayTest, GetNextApplierBatchWaitsForBatchToTimeout) {
         {
             FailPointEnableBlock peekFailPoint("oplogBatcherPauseAfterSuccessfulPeek");
             srcOps.clear();
-            srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")));
+            srcOps.push_back(makeInsertOplogEntry(
+                2, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
             _applier->enqueue(opCtx(), srcOps.cbegin(), srcOps.cend());
             peekFailPoint->waitForTimesEntered(peekFailPoint.initialTimesEntered() + 1);
             _mockClock->advance(Milliseconds(5));
@@ -493,7 +527,8 @@ TEST_F(OplogApplierDelayTest, GetNextApplierBatchWaitsForBatchToTimeout) {
 // but does not throw or lose any data.
 TEST_F(OplogApplierDelayTest, GetNextApplierBatchInterrupted) {
     std::vector<OplogEntry> srcOps;
-    srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "foo")));
+    srcOps.push_back(
+        makeInsertOplogEntry(1, NamespaceString::createNamespaceString_forTest(dbName, "foo")));
     _applier->enqueue(opCtx(), srcOps.cbegin(), srcOps.cend());
 
     stdx::thread insertThread([this, &srcOps] {
@@ -501,18 +536,19 @@ TEST_F(OplogApplierDelayTest, GetNextApplierBatchInterrupted) {
         {
             FailPointEnableBlock peekFailPoint("oplogBatcherPauseAfterSuccessfulPeek");
             srcOps.clear();
-            srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "bar")));
+            srcOps.push_back(makeInsertOplogEntry(
+                2, NamespaceString::createNamespaceString_forTest(dbName, "bar")));
             _applier->enqueue(opCtx(), srcOps.cbegin(), srcOps.cend());
             peekFailPoint->waitForTimesEntered(peekFailPoint.initialTimesEntered() + 1);
             _mockClock->advance(Milliseconds(5));
         }
         ASSERT(waitForWait());
-        opCtx()->markKilled(ErrorCodes::Interrupted);
+        opCtx()->markKilled(ErrorCodes::InterruptedAtShutdown);
     });
     auto batch =
         unittest::assertGet(_applier->getNextApplierBatch(opCtx(), _limits, Milliseconds(10)));
     ASSERT_EQ(2, batch.size());
-    ASSERT_EQ(ErrorCodes::Interrupted, opCtx()->checkForInterruptNoAssert());
+    ASSERT_EQ(ErrorCodes::InterruptedAtShutdown, opCtx()->checkForInterruptNoAssert());
     killWaits();
     insertThread.join();
 }

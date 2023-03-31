@@ -94,9 +94,9 @@ public:
      */
     void parse(const BSONObj& spec);
 
-    Document serializeTransformation(
-        boost::optional<ExplainOptions::Verbosity> explain) const final {
-        return _root->serialize(explain);
+    Document serializeTransformation(boost::optional<ExplainOptions::Verbosity> explain,
+                                     SerializationOptions options = {}) const final {
+        return _root->serialize(explain, options);
     }
 
     /**
@@ -109,6 +109,10 @@ public:
     DepsTracker::State addDependencies(DepsTracker* deps) const final {
         _root->reportDependencies(deps);
         return DepsTracker::State::SEE_NEXT;
+    }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {
+        _root->addVariableRefs(refs);
     }
 
     DocumentSource::GetModPathsReturn getModifiedPaths() const final {

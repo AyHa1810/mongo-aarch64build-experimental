@@ -53,13 +53,12 @@ struct CommonStats {
     // PlanStages corresponds to an MQL operation specified by the user.
     const PlanNodeId nodeId;
 
-    // Time elapsed while working inside this stage. When this field is set to boost::none,
-    // timing info will not be collected during query execution.
+    // Time elapsed while working inside this stage.
     //
     // The field must be populated when running explain or when running with the profiler on. It
     // must also be populated when multi planning, in order to gather stats stored in the plan
-    // cache.
-    boost::optional<long long> executionTimeMillis;
+    // cache.  This struct includes the execution time and its precision/unit.
+    QueryExecTime executionTime;
 
     size_t advances{0};
     size_t opens{0};
@@ -92,7 +91,6 @@ struct ScanStats final : public SpecificStats {
 };
 
 struct ColumnScanStats final : public SpecificStats {
-
     // Struct to hold relevant stats for ColumnCursor and ParentPathCursor
     // Note: `includeInOutput` field is only relevant for ColumnCursor
     struct CursorStats final {
@@ -121,7 +119,11 @@ struct ColumnScanStats final : public SpecificStats {
         visitor->visit(this);
     }
 
+    // Occasionally column scan might need to read records from the corresponding row store. It
+    // might either fetch a record by its id, or scan a few consecutive records from the current
+    // cursor's position ('numRowStoreScans' counts the total number of scanned records).
     size_t numRowStoreFetches{0};
+    size_t numRowStoreScans{0};
 
     // Lists holding all of the stats of current struct's cursors. These stats objects are owned
     // here, and referred to by the cursor execution objects.
@@ -317,8 +319,13 @@ struct HashAggStats : public SpecificStats {
     }
 
     bool usedDisk{false};
+    // The number of times that the entire hash table was spilled.
+    long long spills{0};
+    // The number of individual records spilled to disk.
     long long spilledRecords{0};
-    long long lastSpilledRecordSize{0};
+    // An estimate, in bytes, of the size of the final spill table after all spill events have taken
+    // place.
+    long long spilledDataStorageSize{0};
 };
 
 struct HashLookupStats : public SpecificStats {

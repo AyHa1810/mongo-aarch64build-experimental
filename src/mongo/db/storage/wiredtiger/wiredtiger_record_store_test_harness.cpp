@@ -43,7 +43,8 @@ std::string _testLoggingSettings(std::string extraStrings) {
 WiredTigerHarnessHelper::WiredTigerHarnessHelper(Options options, StringData extraStrings)
     : _dbpath("wt_test"),
       _lockerNoopClientObserverRegisterer(getServiceContext()),
-      _engine(kWiredTigerEngineName,
+      _engine(Client::getCurrent()->makeOperationContext().get(),
+              kWiredTigerEngineName,
               _dbpath.path(),
               &_cs,
               _testLoggingSettings(extraStrings.toString()),
@@ -95,20 +96,20 @@ std::unique_ptr<RecordStore> WiredTigerHarnessHelper::newRecordStore(
     params.overwrite = collOptions.clusteredIndex ? false : true;
     params.isEphemeral = false;
     params.isLogged = WiredTigerUtil::useTableLogging(nss);
-    params.cappedCallback = nullptr;
     params.sizeStorer = nullptr;
     params.tracksSizeAdjustments = true;
     params.forceUpdateWithFullDocument = collOptions.timeseries != boost::none;
 
     auto ret = std::make_unique<StandardWiredTigerRecordStore>(&_engine, opCtx.get(), params);
-    ret->postConstructorInit(opCtx.get());
+    ret->postConstructorInit(opCtx.get(), nss);
     return std::move(ret);
 }
 
 std::unique_ptr<RecordStore> WiredTigerHarnessHelper::newOplogRecordStore() {
     auto ret = newOplogRecordStoreNoInit();
     ServiceContext::UniqueOperationContext opCtx(newOperationContext());
-    dynamic_cast<WiredTigerRecordStore*>(ret.get())->postConstructorInit(opCtx.get());
+    dynamic_cast<WiredTigerRecordStore*>(ret.get())->postConstructorInit(
+        opCtx.get(), NamespaceString::kRsOplogNamespace);
     return ret;
 }
 
@@ -151,7 +152,6 @@ std::unique_ptr<RecordStore> WiredTigerHarnessHelper::newOplogRecordStoreNoInit(
     params.isLogged = true;
     // Large enough not to exceed capped limits.
     params.oplogMaxSize = 1024 * 1024 * 1024;
-    params.cappedCallback = nullptr;
     params.sizeStorer = nullptr;
     params.tracksSizeAdjustments = true;
     params.forceUpdateWithFullDocument = false;

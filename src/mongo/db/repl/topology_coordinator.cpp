@@ -1533,6 +1533,13 @@ HeartbeatResponseAction TopologyCoordinator::_shouldTakeOverPrimary(int updatedC
         return HeartbeatResponseAction::makeNoAction();
     }
 
+    // A priority 0 node cannot win an election. Even if the priority changed via reconfig to make
+    // the node eligible by the time a takeover scheduled here would happen, we would end up
+    // canceling that takeover due to the reconfig.
+    if (_selfConfig().getPriority() <= 0) {
+        return HeartbeatResponseAction::makeNoAction();
+    }
+
     // Don't schedule catchup takeover if catchup takeover or primary catchup is disabled.
     const bool catchupTakeoverDisabled =
         ReplSetConfig::kCatchUpDisabled == _rsConfig.getCatchUpTimeoutPeriod() ||
@@ -2589,7 +2596,8 @@ MemberState TopologyCoordinator::getMemberState() const {
     }
 
     if (_rsConfig.getConfigServer()) {
-        if (_options.clusterRole != ClusterRole::ConfigServer && !skipShardingConfigurationChecks) {
+        if (!_options.clusterRole.has(ClusterRole::ConfigServer) &&
+            !skipShardingConfigurationChecks) {
             return MemberState::RS_REMOVED;
         } else {
             invariant(_storageEngineSupportsReadCommitted != ReadCommittedSupport::kUnknown);
@@ -2598,7 +2606,8 @@ MemberState TopologyCoordinator::getMemberState() const {
             }
         }
     } else {
-        if (_options.clusterRole == ClusterRole::ConfigServer && !skipShardingConfigurationChecks) {
+        if (_options.clusterRole.has(ClusterRole::ConfigServer) &&
+            !skipShardingConfigurationChecks) {
             return MemberState::RS_REMOVED;
         }
     }
@@ -3025,12 +3034,7 @@ TopologyCoordinator::UpdateTermResult TopologyCoordinator::updateTerm(long long 
     if (_iAmPrimary()) {
         return TopologyCoordinator::UpdateTermResult::kTriggerStepDown;
     }
-    LOGV2_DEBUG(21827,
-                1,
-                "Updating term from {oldTerm} to {newTerm}",
-                "Updating term",
-                "oldTerm"_attr = _term,
-                "newTerm"_attr = term);
+    LOGV2(21827, "Updating term", "oldTerm"_attr = _term, "newTerm"_attr = term);
     _term = term;
     return TopologyCoordinator::UpdateTermResult::kUpdatedTerm;
 }
@@ -3201,14 +3205,7 @@ bool TopologyCoordinator::_shouldChangeSyncSourceToBreakCycle(
     // Change sync source if our sync source is also syncing from us when we are in primary
     // catchup mode, forming a sync source selection cycle, and the sync source is not ahead
     // of us. This is to prevent a deadlock situation. See SERVER-58988 for details.
-    // When checking the sync source, we use syncSourceHost if it is set, otherwise fall back
-    // to use syncSourceIndex. The difference is that syncSourceIndex might not point to the
-    // node that we think of because it was inferred from the sender node, which could have
-    // a different config. This is acceptable since we are just choosing a different sync
-    // source if that happens and reconfigs are rare.
-    const bool isSyncingFromMe = !syncSourceHost.empty()
-        ? syncSourceHost == _selfMemberData().getHostAndPort().toString()
-        : syncSourceIndex == _selfIndex;
+    const bool isSyncingFromMe = syncSourceHost == _selfMemberData().getHostAndPort().toString();
 
     if (isSyncingFromMe && _currentPrimaryIndex == _selfIndex &&
         currentSourceOpTime <= lastOpTimeFetched) {
@@ -3502,7 +3499,7 @@ void TopologyCoordinator::processReplSetRequestVotes(const ReplSetRequestVotesAr
             if (!args.isADryRun()) {
                 _lastVote.setTerm(args.getTerm());
                 _lastVote.setCandidateIndex(args.getCandidateIndex());
-                LOGV2_DEBUG(5972100, 0, "Voting yes in election");
+                LOGV2_DEBUG(5972100, 1, "Voting yes in election");
             }
             response->setVoteGranted(true);
         }

@@ -53,6 +53,15 @@ using write_ops::WriteCommandRequestBase;
 
 namespace {
 
+// This constant accounts for the null terminator in each field name and the BSONType byte for
+// each element.
+static constexpr int kPerElementOverhead = 2;
+
+// This constant tracks the overhead for serializing UUIDs. It includes 1 byte for the
+// 'BinDataType', 4 bytes for serializing the integer size of the UUID, and finally, 16 bytes
+// for the UUID itself.
+static const int kUUIDSize = 21;
+
 template <class T>
 void checkOpCountForCommand(const T& op, size_t numOps) {
     uassert(ErrorCodes::InvalidLength,
@@ -134,6 +143,136 @@ int32_t getStmtIdForWriteAt(const WriteCommandRequestBase& writeCommandBase, siz
     const auto& stmtId = writeCommandBase.getStmtId();
     const int32_t kFirstStmtId = stmtId ? *stmtId : 0;
     return kFirstStmtId + writePos;
+}
+
+int getUpdateSizeEstimate(const BSONObj& q,
+                          const write_ops::UpdateModification& u,
+                          const boost::optional<mongo::BSONObj>& c,
+                          const bool includeUpsertSupplied,
+                          const boost::optional<mongo::BSONObj>& collation,
+                          const boost::optional<std::vector<mongo::BSONObj>>& arrayFilters,
+                          const mongo::BSONObj& hint,
+                          const boost::optional<UUID>& sampleId,
+                          const bool includeAllowShardKeyUpdatesWithoutFullShardKeyInQuery) {
+    using UpdateOpEntry = write_ops::UpdateOpEntry;
+
+    // This constant accounts for the null terminator in each field name and the BSONType byte for
+    // each element.
+    static const int kPerElementOverhead = 2;
+    static const int kBoolSize = 1;
+    int estSize = static_cast<int>(BSONObj::kMinBSONLength);
+
+    // Add the sizes of the 'multi' and 'upsert' fields.
+    estSize += UpdateOpEntry::kUpsertFieldName.size() + kBoolSize + kPerElementOverhead;
+    estSize += UpdateOpEntry::kMultiFieldName.size() + kBoolSize + kPerElementOverhead;
+
+    // Add the size of 'upsertSupplied' field if present.
+    if (includeUpsertSupplied) {
+        estSize += UpdateOpEntry::kUpsertSuppliedFieldName.size() + kBoolSize + kPerElementOverhead;
+    }
+
+    // Add the sizes of the 'q' and 'u' fields.
+    estSize += (UpdateOpEntry::kQFieldName.size() + q.objsize() + kPerElementOverhead +
+                UpdateOpEntry::kUFieldName.size() + u.objsize() + kPerElementOverhead);
+
+    // Add the size of the 'c' field, if present.
+    if (c) {
+        estSize += (UpdateOpEntry::kCFieldName.size() + c->objsize() + kPerElementOverhead);
+    }
+
+    // Add the size of the 'collation' field, if present.
+    if (collation) {
+        estSize += (UpdateOpEntry::kCollationFieldName.size() + collation->objsize() +
+                    kPerElementOverhead);
+    }
+
+    // Add the size of the 'arrayFilters' field, if present.
+    if (arrayFilters) {
+        estSize += ([&]() {
+            auto size = BSONObj::kMinBSONLength + UpdateOpEntry::kArrayFiltersFieldName.size() +
+                kPerElementOverhead;
+            for (auto&& filter : *arrayFilters) {
+                // For each filter, we not only need to account for the size of the filter itself,
+                // but also for the per array element overhead.
+                size += filter.objsize();
+                size += write_ops::kWriteCommandBSONArrayPerElementOverheadBytes;
+            }
+            return size;
+        })();
+    }
+
+    // Add the size of the 'hint' field, if present.
+    if (!hint.isEmpty()) {
+        estSize += UpdateOpEntry::kHintFieldName.size() + hint.objsize() + kPerElementOverhead;
+    }
+
+    // Add the size of the 'sampleId' field, if present.
+    if (sampleId) {
+        estSize += UpdateOpEntry::kSampleIdFieldName.size() + kUUIDSize + kPerElementOverhead;
+    }
+
+    // Add the size of the '$_allowShardKeyUpdatesWithoutFullShardKeyInQuery' field, if present.
+    if (includeAllowShardKeyUpdatesWithoutFullShardKeyInQuery) {
+        estSize += UpdateOpEntry::kAllowShardKeyUpdatesWithoutFullShardKeyInQueryFieldName.size() +
+            kBoolSize + kPerElementOverhead;
+    }
+
+    return estSize;
+}
+
+int getDeleteSizeEstimate(const BSONObj& q,
+                          const boost::optional<mongo::BSONObj>& collation,
+                          const mongo::BSONObj& hint,
+                          const boost::optional<UUID>& sampleId) {
+    using DeleteOpEntry = write_ops::DeleteOpEntry;
+
+    static const int kIntSize = 4;
+    int estSize = static_cast<int>(BSONObj::kMinBSONLength);
+
+    // Add the size of the 'q' field.
+    estSize += DeleteOpEntry::kQFieldName.size() + q.objsize() + kPerElementOverhead;
+
+    // Add the size of the 'collation' field, if present.
+    if (collation) {
+        estSize +=
+            DeleteOpEntry::kCollationFieldName.size() + collation->objsize() + kPerElementOverhead;
+    }
+
+    // Add the size of the 'limit' field.
+    estSize += DeleteOpEntry::kMultiFieldName.size() + kIntSize + kPerElementOverhead;
+
+    // Add the size of the 'hint' field, if present.
+    if (!hint.isEmpty()) {
+        estSize += DeleteOpEntry::kHintFieldName.size() + hint.objsize() + kPerElementOverhead;
+    }
+
+    // Add the size of the 'sampleId' field, if present.
+    if (sampleId) {
+        estSize += DeleteOpEntry::kSampleIdFieldName.size() + kUUIDSize + kPerElementOverhead;
+    }
+
+    return estSize;
+}
+
+bool verifySizeEstimate(const write_ops::UpdateOpEntry& update) {
+    return write_ops::getUpdateSizeEstimate(
+               update.getQ(),
+               update.getU(),
+               update.getC(),
+               update.getUpsertSupplied().has_value(),
+               update.getCollation(),
+               update.getArrayFilters(),
+               update.getHint(),
+               update.getSampleId(),
+               update.getAllowShardKeyUpdatesWithoutFullShardKeyInQuery().has_value()) >=
+        update.toBSON().objsize();
+}
+
+bool verifySizeEstimate(const write_ops::DeleteOpEntry& deleteOp) {
+    return write_ops::getDeleteSizeEstimate(deleteOp.getQ(),
+                                            deleteOp.getCollation(),
+                                            deleteOp.getHint(),
+                                            deleteOp.getSampleId()) >= deleteOp.toBSON().objsize();
 }
 
 bool isClassicalUpdateReplacement(const BSONObj& update) {
@@ -241,7 +380,9 @@ int UpdateModification::objsize() const {
                 return size + kWriteCommandBSONArrayPerElementOverheadBytes;
             },
             [](const DeltaUpdate& delta) -> int { return delta.diff.objsize(); },
-            [](const TransformUpdate& transform) -> int { return 0; }},
+            [](const TransformUpdate& transform) -> int {
+                return 0;
+            }},
         _update);
 }
 
@@ -251,7 +392,9 @@ UpdateModification::Type UpdateModification::type() const {
                           [](const ModifierUpdate& modifier) { return Type::kModifier; },
                           [](const PipelineUpdate& pipelineUpdate) { return Type::kPipeline; },
                           [](const DeltaUpdate& delta) { return Type::kDelta; },
-                          [](const TransformUpdate& transform) { return Type::kTransform; }},
+                          [](const TransformUpdate& transform) {
+                              return Type::kTransform;
+                          }},
         _update);
 }
 
@@ -261,23 +404,23 @@ UpdateModification::Type UpdateModification::type() const {
  */
 void UpdateModification::serializeToBSON(StringData fieldName, BSONObjBuilder* bob) const {
 
-    stdx::visit(OverloadedVisitor{[fieldName, bob](const ReplacementUpdate& replacement) {
-                                      *bob << fieldName << replacement.bson;
-                                  },
-                                  [fieldName, bob](const ModifierUpdate& modifier) {
-                                      *bob << fieldName << modifier.bson;
-                                  },
-                                  [fieldName, bob](const PipelineUpdate& pipeline) {
-                                      BSONArrayBuilder arrayBuilder(bob->subarrayStart(fieldName));
-                                      for (auto&& stage : pipeline) {
-                                          arrayBuilder << stage;
-                                      }
-                                      arrayBuilder.doneFast();
-                                  },
-                                  [fieldName, bob](const DeltaUpdate& delta) {
-                                      *bob << fieldName << delta.diff;
-                                  },
-                                  [](const TransformUpdate& transform) {}},
+    stdx::visit(OverloadedVisitor{
+                    [fieldName, bob](const ReplacementUpdate& replacement) {
+                        *bob << fieldName << replacement.bson;
+                    },
+                    [fieldName, bob](const ModifierUpdate& modifier) {
+                        *bob << fieldName << modifier.bson;
+                    },
+                    [fieldName, bob](const PipelineUpdate& pipeline) {
+                        BSONArrayBuilder arrayBuilder(bob->subarrayStart(fieldName));
+                        for (auto&& stage : pipeline) {
+                            arrayBuilder << stage;
+                        }
+                        arrayBuilder.doneFast();
+                    },
+                    [fieldName, bob](const DeltaUpdate& delta) { *bob << fieldName << delta.diff; },
+                    [](const TransformUpdate& transform) {
+                    }},
                 _update);
 }
 

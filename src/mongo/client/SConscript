@@ -24,6 +24,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/util/dns_query',
+        '$BUILD_DIR/mongo/util/options_parser/options_parser',
     ],
 )
 
@@ -51,15 +52,13 @@ if get_option('ssl') == 'on':
             'sasl_aws_protocol_common.idl',
         ],
         LIBDEPS_PRIVATE=[
-            '$BUILD_DIR/mongo/base',
-            '$BUILD_DIR/mongo/db/server_options_core',  # For object_check.h
-            '$BUILD_DIR/mongo/idl/idl_parser',
+            '$BUILD_DIR/mongo/db/server_base',
         ],
     )
 
     kmsEnv = env.Clone()
 
-    kmsEnv.InjectThirdParty(libraries=['kms-message'])
+    kmsEnv.InjectThirdParty(libraries=['libmongocrypt'])
 
     kmsEnv.Library(
         target=[
@@ -70,10 +69,9 @@ if get_option('ssl') == 'on':
             'sasl_aws_client_protocol.idl',
         ],
         LIBDEPS_PRIVATE=[
-            '$BUILD_DIR/mongo/base',
-            '$BUILD_DIR/mongo/db/server_options_core',  # For object_check.h
-            '$BUILD_DIR/mongo/idl/idl_parser',
-            '$BUILD_DIR/third_party/shim_kms_message',
+            '$BUILD_DIR/mongo/bson/bson_validate',
+            '$BUILD_DIR/mongo/db/server_base',
+            '$BUILD_DIR/third_party/shim_libmongocrypt',
             'sasl_aws_common',
         ],
     )
@@ -86,6 +84,8 @@ saslClientSource = [
     'sasl_client_authenticate_impl.cpp',
     'sasl_client_conversation.cpp',
     'sasl_client_session.cpp',
+    'sasl_oidc_client_conversation.cpp',
+    'sasl_oidc_client_params.idl',
     'sasl_plain_client_conversation.cpp',
     'sasl_scram_client_conversation.cpp',
 ]
@@ -111,6 +111,19 @@ if env['MONGO_BUILD_SASL_CLIENT']:
     if env.TargetOSIs('windows'):
         saslLibs.extend(['secur32'])
 
+env.Library(
+    target='oauth_client',
+    source=[
+        "oauth_authorization_server_metadata.idl",
+        "oauth_discovery_factory.cpp",
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/idl/idl_parser',
+        '$BUILD_DIR/mongo/util/net/http_client',
+    ],
+)
+
 saslClientEnv.Library(
     target='sasl_client',
     source=saslClientSource,
@@ -127,8 +140,12 @@ saslClientEnv.Library(
         "sasl_aws_client" if get_option('ssl') == 'on' else '',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/auth/oidc_protocol',
         '$BUILD_DIR/mongo/db/commands/server_status_core',
+        '$BUILD_DIR/mongo/shell/program_runner',
         '$BUILD_DIR/mongo/util/net/http_client',
+        'connection_string',
+        'oauth_client',
     ],
     SYSLIBDEPS=saslLibs,
 )
@@ -172,13 +189,11 @@ clientDriverEnv.Library(
     target='clientdriver_minimal',
     source=[
         'client_api_version_parameters.idl',
-        'client_deprecated.cpp',
         'dbclient_base.cpp',
         'dbclient_cursor.cpp',
         'index_spec.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/dbmessage',
         '$BUILD_DIR/mongo/db/pipeline/aggregation_request_helper',
         '$BUILD_DIR/mongo/db/query/command_request_response',
@@ -191,7 +206,7 @@ clientDriverEnv.Library(
         'read_preference',
     ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/idl/idl_parser',
+        '$BUILD_DIR/mongo/db/server_base',
         '$BUILD_DIR/mongo/util/net/ssl_manager',
     ],
 )
@@ -235,6 +250,7 @@ clientDriverEnv.Library(
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/auth/auth',
         '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
+        '$BUILD_DIR/mongo/db/server_feature_flags',
         '$BUILD_DIR/mongo/transport/message_compressor',
         '$BUILD_DIR/mongo/util/net/ssl_manager',
     ],
@@ -247,7 +263,7 @@ env.Library(
         'replica_set_monitor_server_parameters.idl',
     ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/idl/server_parameter',
+        '$BUILD_DIR/mongo/db/server_base',
     ],
 )
 
@@ -266,6 +282,9 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
+        '$BUILD_DIR/mongo/db/connection_health_metrics_parameter',
+        '$BUILD_DIR/mongo/db/server_feature_flags',
+        '$BUILD_DIR/mongo/db/stats/counters',
         '$BUILD_DIR/mongo/executor/egress_tag_closer_manager',
         '$BUILD_DIR/mongo/transport/message_compressor',
     ],
@@ -301,7 +320,7 @@ env.Library(
         'remote_command_targeter_factory_mock.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/s/coreshard',
+        '$BUILD_DIR/mongo/db/server_base',
         '$BUILD_DIR/mongo/util/net/network',
     ],
 )
@@ -324,8 +343,7 @@ env.Library(
         'fetcher.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/namespace_string',
+        '$BUILD_DIR/mongo/db/server_base',
         '$BUILD_DIR/mongo/executor/task_executor_interface',
         '$BUILD_DIR/mongo/rpc/command_status',
         'remote_command_retry_scheduler',
@@ -347,13 +365,14 @@ if wiredtiger:
     env.CppUnitTest(
         target='client_test',
         source=[
-            'async_remote_command_targeter_test.cpp',
+            'async_remote_command_targeter_adapter_test.cpp',
             'authenticate_test.cpp',
             'connection_string_test.cpp',
             'dbclient_cursor_test.cpp',
             'fetcher_test.cpp',
             'index_spec_test.cpp',
             'mongo_uri_test.cpp',
+            'oauth_discovery_factory_test.cpp',
             'read_preference_test.cpp',
             'remote_command_retry_scheduler_test.cpp',
             'replica_set_monitor_server_parameters_test.cpp',
@@ -377,12 +396,14 @@ if wiredtiger:
             '$BUILD_DIR/mongo/transport/transport_layer_egress_init',
             '$BUILD_DIR/mongo/unittest/task_executor_proxy',
             '$BUILD_DIR/mongo/util/md5',
+            '$BUILD_DIR/mongo/util/net/mock_http_client',
             '$BUILD_DIR/mongo/util/net/network',
             'authentication',
             'clientdriver_minimal',
             'clientdriver_network',
             'connection_string',
             'fetcher',
+            'oauth_client',
             'read_preference',
             'remote_command_retry_scheduler',
             'remote_command_targeter_mock',
@@ -427,6 +448,15 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/util/clock_source_mock',
         'clientdriver_network',
         'replica_set_monitor_test_helper',
+    ],
+)
+
+env.CppUnitTest(
+    target='scoped_db_connection_pool_test',
+    source=['scoped_db_connection_test.cpp'],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/dbtests/mocklib',
+        'clientdriver_network',
     ],
 )
 

@@ -34,7 +34,7 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/s/migration_destination_manager.h"
 #include "mongo/db/s/sharding_state.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
@@ -99,7 +99,7 @@ public:
             // txnNumber happened, we need to make a dummy write so that the session gets durably
             // persisted on the oplog. This must be the last operation done on this command.
             DBDirectClient client(opCtx);
-            client.update(NamespaceString::kServerConfigurationNamespace.ns(),
+            client.update(NamespaceString::kServerConfigurationNamespace,
                           BSON("_id" << Request::kCommandName),
                           BSON("$inc" << BSON("count" << 1)),
                           true /* upsert */,

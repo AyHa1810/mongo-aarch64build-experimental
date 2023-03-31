@@ -46,6 +46,7 @@
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/pipeline/sort_reorder_helpers.h"
 #include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/stats/counters.h"
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/logv2/log.h"
 
@@ -70,7 +71,8 @@ NamespaceString parseGraphLookupFromAndResolveNamespace(const BSONElement& elem,
             elem.type() == String || elem.type() == Object);
 
     if (elem.type() == BSONType::String) {
-        NamespaceString fromNss(defaultDb, elem.valueStringData());
+        NamespaceString fromNss(
+            NamespaceStringUtil::parseNamespaceFromRequest(defaultDb, elem.valueStringData()));
         uassert(ErrorCodes::InvalidNamespace,
                 str::stream() << "invalid $graphLookup namespace: " << fromNss.ns(),
                 fromNss.isValid());
@@ -78,9 +80,13 @@ NamespaceString parseGraphLookupFromAndResolveNamespace(const BSONElement& elem,
     }
 
     // Valdate the db and coll names.
-    auto spec = NamespaceSpec::parse({elem.fieldNameStringData()}, elem.embeddedObject());
-    // TODO SERVER-62491 Use system tenantId to construct nss.
-    auto nss = NamespaceString(spec.getDb().value_or(""), spec.getColl().value_or(""));
+    auto spec = NamespaceSpec::parse(
+        IDLParserContext{elem.fieldNameStringData(), false /* apiStrict */, defaultDb.tenantId()},
+        elem.embeddedObject());
+
+    auto nss = NamespaceStringUtil::parseNamespaceFromRequest(spec.getDb().value_or(DatabaseName()),
+                                                              spec.getColl().value_or(""));
+
     uassert(ErrorCodes::FailedToParse,
             str::stream()
                 << "$graphLookup with syntax {from: {db:<>, coll:<>},..} is not supported for db: "
@@ -477,7 +483,7 @@ void DocumentSourceGraphLookUp::performSearch() {
 
     // If _startWith evaluates to an array, treat each value as a separate starting point.
     if (startingValue.isArray()) {
-        for (auto value : startingValue.getArray()) {
+        for (const auto& value : startingValue.getArray()) {
             _frontier.insert(value);
             _frontierUsageBytes += value.getApproximateSize();
         }
@@ -493,7 +499,7 @@ void DocumentSourceGraphLookUp::performSearch() {
         // throw a custom exception.
         if (auto staleInfo = ex.extraInfo<StaleConfigInfo>(); staleInfo &&
             staleInfo->getVersionWanted() &&
-            staleInfo->getVersionWanted() != ChunkVersion::UNSHARDED()) {
+            staleInfo->getVersionWanted() != ShardVersion::UNSHARDED()) {
             uassert(3904801,
                     "Cannot run $graphLookup with a sharded foreign collection in a transaction",
                     foreignShardedGraphLookupAllowed());
@@ -505,7 +511,7 @@ void DocumentSourceGraphLookUp::performSearch() {
 DocumentSource::GetModPathsReturn DocumentSourceGraphLookUp::getModifiedPaths() const {
     OrderedPathSet modifiedPaths{_as.fullPath()};
     if (_unwind) {
-        auto pathsModifiedByUnwind = _unwind.get()->getModifiedPaths();
+        auto pathsModifiedByUnwind = _unwind.value()->getModifiedPaths();
         invariant(pathsModifiedByUnwind.type == GetModPathsReturn::Type::kFiniteSet);
         modifiedPaths.insert(pathsModifiedByUnwind.paths.begin(),
                              pathsModifiedByUnwind.paths.end());
@@ -575,8 +581,13 @@ void DocumentSourceGraphLookUp::checkMemoryUsage() {
     _cache.evictDownTo(_maxMemoryUsageBytes - _frontierUsageBytes - _visitedUsageBytes);
 }
 
-void DocumentSourceGraphLookUp::serializeToArray(
-    std::vector<Value>& array, boost::optional<ExplainOptions::Verbosity> explain) const {
+void DocumentSourceGraphLookUp::serializeToArray(std::vector<Value>& array,
+                                                 SerializationOptions opts) const {
+    auto explain = opts.verbosity;
+    if (opts.redactFieldNames || opts.replacementForLiteralArgs) {
+        MONGO_UNIMPLEMENTED_TASSERT(7484344);
+    }
+
     // Do not include tenantId in serialized 'from' namespace.
     auto fromValue = (pExpCtx->ns.db() == _from.db())
         ? Value(_from.coll())
@@ -627,6 +638,10 @@ void DocumentSourceGraphLookUp::reattachToOperationContext(OperationContext* opC
     _fromExpCtx->opCtx = opCtx;
 }
 
+bool DocumentSourceGraphLookUp::validateOperationContext(const OperationContext* opCtx) const {
+    return getContext()->opCtx == opCtx && _fromExpCtx->opCtx == opCtx;
+}
+
 DocumentSourceGraphLookUp::DocumentSourceGraphLookUp(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     NamespaceString from,
@@ -653,8 +668,13 @@ DocumentSourceGraphLookUp::DocumentSourceGraphLookUp(
       _unwind(unwindSrc),
       _variables(expCtx->variables),
       _variablesParseState(expCtx->variablesParseState.copyWith(_variables.useIdGenerator())) {
+    if (!_from.isOnInternalDb()) {
+        globalOpCounters.gotNestedAggregate();
+    }
+
     const auto& resolvedNamespace = pExpCtx->getResolvedNamespace(_from);
     _fromExpCtx = pExpCtx->copyForSubPipeline(resolvedNamespace.ns, resolvedNamespace.uuid);
+    _fromExpCtx->inLookup = true;
 
     // We append an additional BSONObj to '_fromPipeline' as a placeholder for the $match stage
     // we'll eventually construct from the input document.
@@ -666,10 +686,7 @@ DocumentSourceGraphLookUp::DocumentSourceGraphLookUp(
 DocumentSourceGraphLookUp::DocumentSourceGraphLookUp(
     const DocumentSourceGraphLookUp& original,
     const boost::intrusive_ptr<ExpressionContext>& newExpCtx)
-    : DocumentSource(
-          kStageName,
-          newExpCtx ? newExpCtx
-                    : original.pExpCtx->copyWith(original.pExpCtx->ns, original.pExpCtx->uuid)),
+    : DocumentSource(kStageName, newExpCtx),
       _from(original._from),
       _as(original._as),
       _connectFromField(original._connectFromField),
@@ -688,7 +705,8 @@ DocumentSourceGraphLookUp::DocumentSourceGraphLookUp(
       _variables(original._variables),
       _variablesParseState(original._variablesParseState.copyWith(_variables.useIdGenerator())) {
     if (original._unwind) {
-        _unwind = static_cast<DocumentSourceUnwind*>(original._unwind.get()->clone().get());
+        _unwind =
+            static_cast<DocumentSourceUnwind*>(original._unwind.value()->clone(pExpCtx).get());
     }
 }
 

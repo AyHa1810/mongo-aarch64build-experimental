@@ -25,7 +25,9 @@ var defragmentationUtil = (function() {
         }
 
         createAndDistributeChunks(mongos, ns, numChunks, chunkSpacing);
-        createRandomZones(mongos, ns, numZones, chunkSpacing);
+        // Created zones will line up exactly with existing chunks so as not to trigger zone
+        // violations in the balancer.
+        createRandomZones(mongos, ns, numZones);
         fillChunksToRandomSize(mongos, ns, docSizeBytes, maxChunkFillMB);
 
         const beginningNumberChunks = findChunksUtil.countChunksForNs(mongos.getDB('config'), ns);
@@ -53,19 +55,18 @@ var defragmentationUtil = (function() {
         }
     };
 
-    let createRandomZones = function(mongos, ns, numZones, chunkSpacing) {
-        for (let i = -Math.floor(numZones / 2); i < Math.ceil(numZones / 2); i++) {
+    let createRandomZones = function(mongos, ns, numZones) {
+        let existingChunks = findChunksUtil.findChunksByNs(mongos.getDB('config'), ns);
+        existingChunks = Array.shuffle(existingChunks.toArray());
+        for (let i = 0; i < numZones; i++) {
             let zoneName = "Zone" + i;
-            let shardForZone =
-                findChunksUtil
-                    .findOneChunkByNs(mongos.getDB('config'), ns, {min: {key: i * chunkSpacing}})
-                    .shard;
+            let shardForZone = existingChunks[i].shard;
             assert.commandWorked(
                 mongos.adminCommand({addShardToZone: shardForZone, zone: zoneName}));
             assert.commandWorked(mongos.adminCommand({
                 updateZoneKeyRange: ns,
-                min: {key: i * chunkSpacing},
-                max: {key: i * chunkSpacing + chunkSpacing},
+                min: existingChunks[i].min,
+                max: existingChunks[i].max,
                 zone: zoneName
             }));
         }
@@ -98,39 +99,7 @@ var defragmentationUtil = (function() {
         assert.commandWorked(bulk.execute());
     };
 
-    let checkForOversizedChunk = function(
-        coll, chunk, shardKey, avgObjSize, oversizedChunkThreshold) {
-        let chunkSize = coll.countDocuments(
-                            {[shardKey]: {$gte: chunk.min[shardKey], $lt: chunk.max[shardKey]}}) *
-            avgObjSize;
-        assert.lte(
-            chunkSize,
-            oversizedChunkThreshold,
-            `Chunk ${tojson(chunk)} has size ${chunkSize} which is greater than max chunk size of ${
-                oversizedChunkThreshold}`);
-    };
-
-    let checkForMergeableChunkSiblings = function(
-        coll, leftChunk, rightChunk, shardKey, avgObjSize, oversizedChunkThreshold) {
-        let combinedDataSize =
-            coll.countDocuments(
-                {[shardKey]: {$gte: leftChunk.min[shardKey], $lt: rightChunk.max[shardKey]}}) *
-            avgObjSize;
-        // The autosplitter should not split chunks whose combined size is < 133% of
-        // maxChunkSize but this threshold may be off by a few documents depending on
-        // rounding of avgObjSize.
-        const autosplitRoundingTolerance = 3 * avgObjSize;
-        assert.gte(combinedDataSize,
-                   oversizedChunkThreshold - autosplitRoundingTolerance,
-                   `Chunks ${tojson(leftChunk)} and ${
-                       tojson(rightChunk)} are mergeable with combined size ${combinedDataSize}`);
-    };
-
     let checkPostDefragmentationState = function(configSvr, mongos, ns, maxChunkSizeMB, shardKey) {
-        const withAutoSplitActive =
-            !FeatureFlagUtil.isEnabled(configSvr.getDB('admin'), 'NoMoreAutoSplitter');
-        jsTest.log(`Chunk (auto)splitting functionalities assumed to be ${
-            withAutoSplitActive ? "ON" : "OFF"}`);
         const oversizedChunkThreshold = maxChunkSizeMB * 1024 * 1024 * 4 / 3;
         const chunks = findChunksUtil.findChunksByNs(mongos.getDB('config'), ns)
                            .sort({[shardKey]: 1})
@@ -157,36 +126,11 @@ var defragmentationUtil = (function() {
                 let leftChunkZone = getZoneForRange(mongos, ns, leftChunk.min, leftChunk.max);
                 let rightChunkZone = getZoneForRange(mongos, ns, rightChunk.min, rightChunk.max);
                 if (bsonWoCompare(leftChunkZone, rightChunkZone) === 0) {
-                    if (withAutoSplitActive) {
-                        checkForMergeableChunkSiblings(coll,
-                                                       leftChunk,
-                                                       rightChunk,
-                                                       shardKey,
-                                                       avgObjSizeByShard[leftChunk['shard']],
-                                                       oversizedChunkThreshold);
-                    } else {
-                        assert(false,
-                               `Chunks ${tojson(leftChunk)} and ${
-                                   tojson(rightChunk)} should have been merged`);
-                    }
+                    assert(false,
+                           `Chunks ${tojson(leftChunk)} and ${
+                               tojson(rightChunk)} should have been merged`);
                 }
             }
-            if (withAutoSplitActive) {
-                checkForOversizedChunk(coll,
-                                       leftChunk,
-                                       shardKey,
-                                       avgObjSizeByShard[leftChunk['shard']],
-                                       oversizedChunkThreshold);
-            }
-        }
-
-        if (withAutoSplitActive) {
-            const lastChunk = chunks[chunks.length - 1];
-            checkForOversizedChunk(coll,
-                                   lastChunk,
-                                   shardKey,
-                                   avgObjSizeByShard[lastChunk['shard']],
-                                   oversizedChunkThreshold);
         }
     };
 
@@ -206,6 +150,13 @@ var defragmentationUtil = (function() {
         assert.soon(function() {
             let balancerStatus =
                 assert.commandWorked(mongos.adminCommand({balancerCollectionStatus: ns}));
+
+            if (balancerStatus.balancerCompliant) {
+                // As we can't rely on `balancerCompliant` due to orphan counter non atomic update,
+                // we need to ensure the collection is balanced by some extra checks
+                sh.awaitCollectionBalance(mongos.getCollection(ns));
+            }
+
             return balancerStatus.balancerCompliant ||
                 balancerStatus.firstComplianceViolation !== 'defragmentingChunks';
         });

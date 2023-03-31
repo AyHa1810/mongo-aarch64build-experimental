@@ -55,12 +55,62 @@ const std::set<std::string> kUnsupportedTenantIds{"", "admin", "local", "config"
 
 }  // namespace
 
+namespace repl {
+
+// Common failpoints between ShardMergeRecipientService and TenantMigrationRecipientService.
+extern FailPoint pauseBeforeRunTenantMigrationRecipientInstance;
+extern FailPoint pauseAfterRunTenantMigrationRecipientInstance;
+extern FailPoint skipTenantMigrationRecipientAuth;
+extern FailPoint skipComparingRecipientAndDonorFCV;
+extern FailPoint autoRecipientForgetMigration;
+extern FailPoint skipFetchingCommittedTransactions;
+extern FailPoint skipFetchingRetryableWritesEntriesBeforeStartOpTime;
+extern FailPoint pauseTenantMigrationRecipientBeforeDeletingStateDoc;
+extern FailPoint failWhilePersistingTenantMigrationRecipientInstanceStateDoc;
+extern FailPoint fpAfterPersistingTenantMigrationRecipientInstanceStateDoc;
+extern FailPoint fpBeforeFetchingDonorClusterTimeKeys;
+extern FailPoint fpAfterConnectingTenantMigrationRecipientInstance;
+extern FailPoint fpAfterRecordingRecipientPrimaryStartingFCV;
+extern FailPoint fpAfterComparingRecipientAndDonorFCV;
+extern FailPoint fpAfterRetrievingStartOpTimesMigrationRecipientInstance;
+extern FailPoint fpSetSmallAggregationBatchSize;
+extern FailPoint fpBeforeWaitingForRetryableWritePreFetchMajorityCommitted;
+extern FailPoint pauseAfterRetrievingRetryableWritesBatch;
+extern FailPoint fpAfterFetchingRetryableWritesEntriesBeforeStartOpTime;
+extern FailPoint fpAfterStartingOplogFetcherMigrationRecipientInstance;
+extern FailPoint setTenantMigrationRecipientInstanceHostTimeout;
+extern FailPoint pauseAfterRetrievingLastTxnMigrationRecipientInstance;
+extern FailPoint fpBeforeMarkingCloneSuccess;
+extern FailPoint fpBeforeFetchingCommittedTransactions;
+extern FailPoint fpAfterFetchingCommittedTransactions;
+extern FailPoint fpAfterStartingOplogApplierMigrationRecipientInstance;
+extern FailPoint fpBeforeFulfillingDataConsistentPromise;
+extern FailPoint fpAfterDataConsistentMigrationRecipientInstance;
+extern FailPoint fpBeforePersistingRejectReadsBeforeTimestamp;
+extern FailPoint fpAfterWaitForRejectReadsBeforeTimestamp;
+extern FailPoint hangBeforeTaskCompletion;
+extern FailPoint fpAfterReceivingRecipientForgetMigration;
+extern FailPoint hangAfterCreatingRSM;
+extern FailPoint skipRetriesWhenConnectingToDonorHost;
+extern FailPoint fpBeforeDroppingTempCollections;
+extern FailPoint fpWaitUntilTimestampMajorityCommitted;
+extern FailPoint hangAfterUpdatingTransactionEntry;
+extern FailPoint fpBeforeAdvancingStableTimestamp;
+
+}  // namespace repl
+
 namespace tenant_migration_util {
 
 inline Status validateDatabasePrefix(const std::string& tenantId) {
+    const auto isValidTenantId = OID::parse(tenantId);
+    if (!isValidTenantId.isOK()) {
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << "Invalid tenant id format for tenant \'" << tenantId << "'");
+    }
+
     const bool isPrefixSupported =
         kUnsupportedTenantIds.find(tenantId) == kUnsupportedTenantIds.end() &&
-        tenantId.find("_") == std::string::npos;
+        tenantId.find('_') == std::string::npos;
 
     return isPrefixSupported
         ? Status::OK()
@@ -68,8 +118,25 @@ inline Status validateDatabasePrefix(const std::string& tenantId) {
                  str::stream() << "cannot migrate databases for tenant \'" << tenantId << "'");
 }
 
-inline Status validateDatabasePrefix(const std::vector<std::string>& tenantsId) {
+inline Status validateDatabasePrefix(const TenantId& tenantId) {
+    auto tId = tenantId.toString();
+    const bool isPrefixSupported = kUnsupportedTenantIds.find(tId) == kUnsupportedTenantIds.end() &&
+        tId.find('_') == std::string::npos;
+
+    return isPrefixSupported
+        ? Status::OK()
+        : Status(ErrorCodes::BadValue,
+                 str::stream() << "cannot migrate databases for tenant \'" << tId << "'");
+}
+
+inline Status validateDatabasePrefix(const std::vector<TenantId>& tenantsId) {
+    std::set<TenantId> tenants;
     for (const auto& tenantId : tenantsId) {
+        auto res = tenants.emplace(tenantId);
+        uassert(ErrorCodes::InvalidOptions,
+                str::stream() << "Duplicate tenantIds are not allowed. Duplicate tenantId : "
+                              << tenantId,
+                res.second);
         auto status = validateDatabasePrefix(tenantId);
         if (!status.isOK()) {
             return status;
@@ -158,30 +225,63 @@ inline Status validatePrivateKeyPEMPayload(const StringData& payload) {
 #endif
 }
 
-inline Status protocolTenantIdCompatibilityCheck(const MigrationProtocolEnum& protocol,
-                                                 const std::string& tenantId) noexcept {
+
+inline void protocolTenantIdCompatibilityCheck(const MigrationProtocolEnum protocol,
+                                               const boost::optional<StringData>& tenantId) {
     switch (protocol) {
         case MigrationProtocolEnum::kShardMerge: {
-            // TODO SERVER-63454: Add a check to ensure tenantId is not provided for 'Merge'
-            // protocol.
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << "'tenantId' must be empty for protocol '"
+                                  << MigrationProtocol_serializer(protocol) << "'",
+                    !tenantId);
             break;
         }
         case MigrationProtocolEnum::kMultitenantMigrations: {
-            if (tenantId.empty()) {
-                return Status(ErrorCodes::InvalidOptions,
-                              str::stream() << "'tenantId' is required for protocol '"
-                                            << MigrationProtocol_serializer(protocol) << "'");
-            }
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << "'tenantId' is required for protocol '"
+                                  << MigrationProtocol_serializer(protocol) << "'",
+                    tenantId);
             break;
         }
         default:
             MONGO_UNREACHABLE;
     }
-    return Status::OK();
+}
+
+inline void protocolTenantIdsCompatibilityCheck(
+    const MigrationProtocolEnum protocol, const boost::optional<std::vector<TenantId>>& tenantIds) {
+    if (serverGlobalParams.featureCompatibility.isLessThan(
+            multiversion::FeatureCompatibilityVersion::kVersion_6_3)) {
+        uassert(ErrorCodes::InvalidOptions,
+                "'tenantIds' is not supported for FCV below 6.3'",
+                !tenantIds);
+        return;
+    }
+
+    switch (protocol) {
+        case MigrationProtocolEnum::kShardMerge: {
+            {
+                uassert(ErrorCodes::InvalidOptions,
+                        str::stream() << "'tenantIds' is required for protocol '"
+                                      << MigrationProtocol_serializer(protocol) << "'",
+                        tenantIds && !tenantIds->empty());
+            }
+            break;
+        }
+        case MigrationProtocolEnum::kMultitenantMigrations: {
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << "'tenantId' must be empty for protocol '"
+                                  << MigrationProtocol_serializer(protocol) << "'",
+                    !tenantIds);
+            break;
+        }
+        default:
+            MONGO_UNREACHABLE;
+    }
 }
 
 inline void protocolStorageOptionsCompatibilityCheck(OperationContext* opCtx,
-                                                     const MigrationProtocolEnum& protocol) {
+                                                     const MigrationProtocolEnum protocol) {
     if (protocol != MigrationProtocolEnum::kShardMerge)
         return;
 
@@ -194,6 +294,37 @@ inline void protocolStorageOptionsCompatibilityCheck(OperationContext* opCtx,
         str::stream() << "protocol '" << MigrationProtocol_serializer(protocol)
                       << "' is not allowed when storage option 'directoryForIndexes' is enabled",
         !opCtx->getServiceContext()->getStorageEngine()->isUsingDirectoryForIndexes());
+}
+
+inline void protocolReadPreferenceCompatibilityCheck(OperationContext* opCtx,
+                                                     const MigrationProtocolEnum protocol,
+                                                     const ReadPreferenceSetting& readPreference) {
+    if (protocol != MigrationProtocolEnum::kShardMerge)
+        return;
+
+    uassert(ErrorCodes::FailedToSatisfyReadPreference,
+            "Shard Merge protocol only supports primary read preference",
+            !readPreference.canRunOnSecondary());
+}
+
+inline void protocolCheckRecipientForgetDecision(
+    const MigrationProtocolEnum protocol, const boost::optional<MigrationDecisionEnum>& decision) {
+    switch (protocol) {
+        case MigrationProtocolEnum::kShardMerge:
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << "'decision' is required for protocol '"
+                                  << MigrationProtocol_serializer(protocol) << "'",
+                    decision.has_value());
+            break;
+        case MigrationProtocolEnum::kMultitenantMigrations:
+            uassert(ErrorCodes::InvalidOptions,
+                    str::stream() << "'decision' must be empty for protocol '"
+                                  << MigrationProtocol_serializer(protocol) << "'",
+                    !decision.has_value());
+            break;
+        default:
+            MONGO_UNREACHABLE;
+    }
 }
 
 /*

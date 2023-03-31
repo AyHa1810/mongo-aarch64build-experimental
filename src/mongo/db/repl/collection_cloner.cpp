@@ -28,6 +28,8 @@
  */
 
 
+#include "mongo/db/index/index_descriptor_fwd.h"
+#include "mongo/db/service_context.h"
 #include "mongo/platform/basic.h"
 
 #include "mongo/base/string_data.h"
@@ -40,6 +42,7 @@
 #include "mongo/db/repl/collection_cloner.h"
 #include "mongo/db/repl/database_cloner_gen.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
@@ -87,9 +90,9 @@ CollectionCloner::CollectionCloner(const NamespaceString& sourceNss,
                      "documents copied",
                      str::stream() << _sourceNss.toString() << " collection clone progress"),
       _scheduleDbWorkFn([this](executor::TaskExecutor::CallbackFn work) {
-          auto task = [ this, work = std::move(work) ](
-                          OperationContext * opCtx,
-                          const Status& status) mutable noexcept->TaskRunner::NextAction {
+          auto task = [this, work = std::move(work)](
+                          OperationContext* opCtx,
+                          const Status& status) mutable noexcept -> TaskRunner::NextAction {
               try {
                   work(executor::TaskExecutor::CallbackArgs(nullptr, {}, status, opCtx));
               } catch (const DBException& e) {
@@ -103,8 +106,8 @@ CollectionCloner::CollectionCloner(const NamespaceString& sourceNss,
       _dbWorkTaskRunner(dbPool) {
     invariant(sourceNss.isValid());
     invariant(collectionOptions.uuid);
-    _sourceDbAndUuid = NamespaceStringOrUUID(sourceNss.db().toString(), *collectionOptions.uuid);
-    _stats.ns = _sourceNss.ns();
+    _sourceDbAndUuid = NamespaceStringOrUUID(sourceNss.dbName(), *collectionOptions.uuid);
+    _stats.nss = _sourceNss;
 }
 
 BaseCloner::ClonerStages CollectionCloner::getStages() {
@@ -126,9 +129,16 @@ BaseCloner::ClonerStages CollectionCloner::getStages() {
 void CollectionCloner::preStage() {
     stdx::lock_guard<Latch> lk(_mutex);
     _stats.start = getSharedData()->getClock()->now();
+
+    BSONObjBuilder b(BSON("collStats" << _sourceNss.coll().toString()));
+    if (gMultitenancySupport && serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+        gFeatureFlagRequireTenantID.isEnabled(serverGlobalParams.featureCompatibility) &&
+        _sourceNss.tenantId()) {
+        _sourceNss.tenantId()->serializeToBSON("$tenant", &b);
+    }
+
     BSONObj res;
-    getClient()->runCommand(
-        _sourceNss.db().toString(), BSON("collStats" << _sourceNss.coll().toString()), res);
+    getClient()->runCommand(_sourceNss.dbName(), b.obj(), res);
     if (auto status = getStatusFromCommandResult(res); status.isOK()) {
         _stats.bytesToCopy = res.getField("size").safeNumberLong();
         if (_stats.bytesToCopy > 0) {
@@ -160,7 +170,7 @@ BaseCloner::AfterStageBehavior CollectionCloner::CollectionClonerStage::run() {
               "CollectionCloner ns: '{namespace}' uuid: "
               "UUID(\"{uuid}\") stopped because collection was dropped on source.",
               "CollectionCloner stopped because collection was dropped on source",
-              "namespace"_attr = getCloner()->getSourceNss(),
+              logAttrs(getCloner()->getSourceNss()),
               "uuid"_attr = getCloner()->getSourceUuid());
         getCloner()->waitForDatabaseWorkToComplete();
         return kSkipRemainingStages;
@@ -198,23 +208,36 @@ BaseCloner::AfterStageBehavior CollectionCloner::countStage() {
 
 BaseCloner::AfterStageBehavior CollectionCloner::listIndexesStage() {
     const bool includeBuildUUIDs = true;
+
     auto indexSpecs =
         getClient()->getIndexSpecs(_sourceDbAndUuid, includeBuildUUIDs, QueryOption_SecondaryOk);
     if (indexSpecs.empty()) {
         LOGV2_WARNING(21143,
                       "No indexes found for collection {namespace} while cloning from {source}",
                       "No indexes found for collection while cloning",
-                      "namespace"_attr = _sourceNss.ns(),
+                      logAttrs(_sourceNss),
                       "source"_attr = getSource());
     }
 
+    const auto storageEngine = getGlobalServiceContext()->getStorageEngine();
     // Parse the index specs into their respective state, ready or unfinished.
     for (auto&& spec : indexSpecs) {
+        // Sanitize storage engine options to remove options which might not apply to this node. See
+        // SERVER-68122.
+        if (auto storageEngineElem = spec.getField(IndexDescriptor::kStorageEngineFieldName)) {
+            auto sanitizedStorageEngineOpts =
+                storageEngine->getSanitizedStorageOptionsForSecondaryReplication(
+                    storageEngineElem.embeddedObject());
+            fassert(6812200, sanitizedStorageEngineOpts);
+            spec = spec.addFields(BSON(IndexDescriptor::kStorageEngineFieldName
+                                       << sanitizedStorageEngineOpts.getValue()));
+        }
+
         if (spec.hasField("clustered")) {
             invariant(_collectionOptions.clusteredIndex);
             invariant(spec.getBoolField("clustered") == true);
             invariant(clustered_util::formatClusterKeyForListIndexes(
-                          _collectionOptions.clusteredIndex.get(), _collectionOptions.collation)
+                          _collectionOptions.clusteredIndex.value(), _collectionOptions.collation)
                           .woCompare(spec) == 0);
             // Skip if the spec is for the collection's clusteredIndex.
         } else if (spec.hasField("buildUUID")) {
@@ -237,7 +260,7 @@ BaseCloner::AfterStageBehavior CollectionCloner::listIndexesStage() {
                       "Found the _id_ index spec but the collection specified autoIndexId of false "
                       "on ns:{namespace}",
                       "Found the _id index spec but the collection specified autoIndexId of false",
-                      "namespace"_attr = this->_sourceNss);
+                      logAttrs(this->_sourceNss));
     }
     return kContinueNormally;
 }
@@ -323,7 +346,7 @@ void CollectionCloner::runQuery() {
         // Resume the query from where we left off.
         LOGV2_DEBUG(21133, 1, "Collection cloner will resume the last successful query");
         findCmd.setRequestResumeToken(true);
-        findCmd.setResumeAfter(_resumeToken.get());
+        findCmd.setResumeAfter(_resumeToken.value());
     } else {
         // New attempt at a resumable query.
         LOGV2_DEBUG(21134, 1, "Collection cloner will run a new query");
@@ -411,7 +434,7 @@ void CollectionCloner::handleNextBatch(DBClientCursor& cursor) {
                       "enabled for {namespace}. Blocking until fail point is disabled.",
                       "initialSyncHangCollectionClonerAfterHandlingBatchResponse fail point "
                       "enabled. Blocking until fail point is disabled",
-                      "namespace"_attr = _sourceNss.toString());
+                      logAttrs(_sourceNss));
                 mongo::sleepsecs(1);
             }
         },
@@ -424,7 +447,6 @@ void CollectionCloner::handleNextBatch(DBClientCursor& cursor) {
 
 void CollectionCloner::insertDocumentsCallback(const executor::TaskExecutor::CallbackArgs& cbd) {
     uassertStatusOK(cbd.status);
-
     {
         stdx::lock_guard<Latch> lk(_mutex);
         std::vector<BSONObj> docs;
@@ -435,7 +457,7 @@ void CollectionCloner::insertDocumentsCallback(const executor::TaskExecutor::Cal
             LOGV2_WARNING(21145,
                           "insertDocumentsCallback, but no documents to insert for ns:{namespace}",
                           "insertDocumentsCallback, but no documents to insert",
-                          "namespace"_attr = _sourceNss);
+                          logAttrs(_sourceNss));
             return;
         }
         _documentsToInsert.swap(docs);
@@ -486,7 +508,7 @@ std::string CollectionCloner::Stats::toString() const {
 
 BSONObj CollectionCloner::Stats::toBSON() const {
     BSONObjBuilder bob;
-    bob.append("ns", ns);
+    bob.append("ns", NamespaceStringUtil::serialize(nss));
     append(&bob);
     return bob.obj();
 }

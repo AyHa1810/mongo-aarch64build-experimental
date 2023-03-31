@@ -77,11 +77,12 @@ void startStorageControls(ServiceContext* serviceContext, bool forTestOnly) {
     } else {
         std::unique_ptr<JournalFlusher> journalFlusher = std::make_unique<JournalFlusher>(
             /*disablePeriodicFlushes*/ forTestOnly);
-        journalFlusher->go();
         JournalFlusher::set(serviceContext, std::move(journalFlusher));
+        JournalFlusher::get(serviceContext)->go();
     }
 
-    if (!storageEngine->isEphemeral() && !storageGlobalParams.queryableBackupMode) {
+    if (storageEngine->supportsCheckpoints() && !storageEngine->isEphemeral() &&
+        !storageGlobalParams.queryableBackupMode) {
         std::unique_ptr<Checkpointer> checkpointer =
             std::make_unique<Checkpointer>(storageEngine->getEngine());
         checkpointer->go();
@@ -114,10 +115,6 @@ void stopStorageControls(ServiceContext* serviceContext, const Status& reason, b
         // stopped.
         invariant(!forRestart);
     }
-}
-
-void triggerJournalFlush(ServiceContext* serviceContext) {
-    JournalFlusher::get(serviceContext)->triggerJournalFlush();
 }
 
 void waitForJournalFlush(OperationContext* opCtx) {

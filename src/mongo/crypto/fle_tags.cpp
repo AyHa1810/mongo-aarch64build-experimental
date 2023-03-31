@@ -31,6 +31,8 @@
 
 #include "mongo/crypto/fle_crypto.h"
 #include "mongo/crypto/fle_tags.h"
+#include "mongo/db/fle_crud.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/query/query_knobs_gen.h"
 
 namespace mongo::fle {
@@ -65,6 +67,17 @@ void verifyTagsWillFit(size_t tagCount, size_t memoryLimit) {
             sizeArrayElementsMemory(tagCount) <= memoryLimit);
 }
 
+void generateTags(uint64_t numInserts,
+                  EDCDerivedFromDataTokenAndContentionFactorToken edcTok,
+                  std::vector<PrfBlock>& binaryTags) {
+
+    auto edcTag = TwiceDerived::generateEDCTwiceDerivedToken(edcTok);
+
+    for (uint64_t i = 1; i <= numInserts; i++) {
+        binaryTags.emplace_back(EDCServerCollection::generateTag(edcTag, i));
+    }
+}
+
 }  // namespace
 
 size_t sizeArrayElementsMemory(size_t tagCount) {
@@ -83,6 +96,7 @@ size_t sizeArrayElementsMemory(size_t tagCount) {
 }
 
 
+// TODO: SERVER-73303 remove when v2 is enabled by default
 // The algorithm for constructing a list of tags matching an equality predicate on an encrypted
 // field is as follows:
 //
@@ -135,7 +149,7 @@ std::vector<PrfBlock> readTagsWithContention(const FLEStateCollectionReader& esc
     //     n => n inserts for this field value pair.
     //     none => compaction => query ESC for null document to find # of inserts.
     auto insertCounter = ESCCollection::emuBinary(esc, escTag, escVal);
-    if (insertCounter && insertCounter.get() == 0) {
+    if (insertCounter && insertCounter.value() == 0) {
         return std::move(binaryTags);
     }
 
@@ -199,22 +213,92 @@ std::vector<PrfBlock> readTagsWithContention(const FLEStateCollectionReader& esc
 }
 
 // A positive contention factor (cm) means we must run the above algorithm (cm) times.
-std::vector<PrfBlock> readTags(const FLEStateCollectionReader& esc,
-                               const FLEStateCollectionReader& ecc,
+std::vector<PrfBlock> readTags(FLETagQueryInterface* queryImpl,
+                               const NamespaceString& nssEsc,
+                               ESCDerivedFromDataToken s,
+                               EDCDerivedFromDataToken d,
+                               boost::optional<int64_t> cm) {
+
+    auto memoryLimit = static_cast<size_t>(internalQueryFLERewriteMemoryLimit.load());
+    auto contentionMax = cm.value_or(0);
+    std::vector<PrfBlock> binaryTags;
+
+    std::vector<FLEEdgePrfBlock> blocks;
+    blocks.reserve(contentionMax + 1);
+
+    for (auto cf = 0; cf <= contentionMax; cf++) {
+        auto escToken =
+            DerivedToken::generateESCDerivedFromDataTokenAndContentionFactorToken(s, cf);
+        auto edcToken =
+            DerivedToken::generateEDCDerivedFromDataTokenAndContentionFactorToken(d, cf);
+
+        FLEEdgePrfBlock edgeSet{escToken.data, edcToken.data};
+
+        blocks.push_back(edgeSet);
+    }
+
+    std::vector<std::vector<FLEEdgePrfBlock>> blockSets;
+    blockSets.push_back(blocks);
+
+    auto countInfoSets =
+        queryImpl->getTags(nssEsc, blockSets, FLETagQueryInterface::TagQueryType::kQuery);
+
+
+    // Count how many tags we will need and check once if we they will fit
+    //
+    uint32_t totalTagCount = 0;
+
+    for (const auto& countInfoSet : countInfoSets) {
+        for (const auto& countInfo : countInfoSet) {
+            totalTagCount += countInfo.count;
+        }
+    }
+
+    verifyTagsWillFit(totalTagCount, memoryLimit);
+
+    binaryTags.reserve(totalTagCount);
+
+    for (const auto& countInfoSet : countInfoSets) {
+        for (const auto& countInfo : countInfoSet) {
+
+            uassert(7415001, "Missing EDC value", countInfo.edc.has_value());
+            generateTags(countInfo.count, countInfo.edc.value(), binaryTags);
+        }
+    }
+
+    return binaryTags;
+}
+
+// TODO: SERVER-73303 remove when v2 is enabled by default
+// A positive contention factor (cm) means we must run the above algorithm (cm) times.
+std::vector<PrfBlock> readTags(FLETagQueryInterface* queryImpl,
+                               const NamespaceString& nssEsc,
+                               const NamespaceString& nssEcc,
                                ESCDerivedFromDataToken s,
                                ECCDerivedFromDataToken c,
                                EDCDerivedFromDataToken d,
                                boost::optional<int64_t> cm) {
+
     // The output of readTags will be used as the argument to a $in expression, so make sure we
     // don't exceed the configured memory limit.
-    auto limit = static_cast<size_t>(internalQueryFLERewriteMemoryLimit.load());
-    if (!cm || cm.get() == 0) {
-        auto binaryTags = readTagsWithContention(esc, ecc, s, c, d, 0, limit, {});
-    }
+    auto memoryLimit = static_cast<size_t>(internalQueryFLERewriteMemoryLimit.load());
+    auto contentionMax = cm.value_or(0);
     std::vector<PrfBlock> binaryTags;
-    for (auto i = 0; i <= cm.get(); i++) {
-        binaryTags = readTagsWithContention(esc, ecc, s, c, d, i, limit, std::move(binaryTags));
+
+    auto makeCollectionReader = [](FLETagQueryInterface* queryImpl, const NamespaceString& nss) {
+        auto docCount = queryImpl->countDocuments(nss);
+        return TxnCollectionReader(docCount, queryImpl, nss);
+    };
+
+    // Construct FLE rewriter from the transaction client and encryptionInformation.
+    auto esc = makeCollectionReader(queryImpl, nssEsc);
+    auto ecc = makeCollectionReader(queryImpl, nssEcc);
+
+    for (auto i = 0; i <= contentionMax; i++) {
+        binaryTags =
+            readTagsWithContention(esc, ecc, s, c, d, i, memoryLimit, std::move(binaryTags));
     }
+
     return binaryTags;
 }
 }  // namespace mongo::fle

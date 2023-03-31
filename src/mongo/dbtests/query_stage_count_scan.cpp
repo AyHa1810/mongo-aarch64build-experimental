@@ -55,7 +55,7 @@ public:
 
     virtual ~CountBase() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns().ns());
-        _client.dropCollection(ns().ns());
+        _client.dropCollection(ns());
     }
 
     void addIndex(const BSONObj& obj) {
@@ -63,11 +63,11 @@ public:
     }
 
     void insert(const BSONObj& obj) {
-        _client.insert(ns().ns(), obj);
+        _client.insert(ns(), obj);
     }
 
     void remove(const BSONObj& obj) {
-        _client.remove(ns().ns(), obj);
+        _client.remove(ns(), obj);
     }
 
     /*
@@ -90,7 +90,8 @@ public:
     }
 
     CollectionPtr getCollection() {
-        return CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, ns());
+        return CollectionPtr(
+            CollectionCatalog::get(&_opCtx)->lookupCollectionByNamespace(&_opCtx, ns()));
     }
 
     const IndexDescriptor* getIndex(Database* db, const BSONObj& obj) {

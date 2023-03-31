@@ -29,13 +29,13 @@
 
 #include <iostream>
 
-#include "mongo/db/query/optimizer/cascades/memo.h"
 #include "mongo/db/query/optimizer/reference_tracker.h"
+
 
 namespace mongo::optimizer {
 
 struct CollectedInfo {
-    using VarRefsMap = opt::unordered_map<std::string, opt::unordered_map<const Variable*, bool>>;
+    using VarRefsMap = ProjectionNameMap<opt::unordered_map<const Variable*, bool>>;
 
     /**
      * All resolved variables so far, regardless of visibility in the ABT.
@@ -52,7 +52,7 @@ struct CollectedInfo {
      * ABT. Maps from projection name to all Variable instances referencing that name. Variables
      * move from 'freeVars' to 'useMap' when they are resolved.
      */
-    opt::unordered_map<std::string, std::vector<std::reference_wrapper<const Variable>>> freeVars;
+    ProjectionNameMap<std::vector<std::reference_wrapper<const Variable>>> freeVars;
 
     /**
      * Maps from a node to the definitions (projections) available for use in its ancestor nodes.
@@ -69,18 +69,22 @@ struct CollectedInfo {
     /**
      * This is a destructive merge, the 'other' will be siphoned out.
      */
+    template <bool resolveFreeVarsWithOther = true>
     void merge(CollectedInfo&& other) {
-        // Incoming (other) info has some definitions. So let's try to resolve our free variables.
-        if (!other.defs.empty() && !freeVars.empty()) {
-            for (auto&& [name, def] : other.defs) {
-                resolveFreeVars(name, def);
+        if constexpr (resolveFreeVarsWithOther) {
+            // Incoming (other) info has some definitions. So let's try to resolve our free
+            // variables.
+            if (!other.defs.empty() && !freeVars.empty()) {
+                for (auto&& [name, def] : other.defs) {
+                    resolveFreeVars(name, def);
+                }
             }
-        }
 
-        // We have some definitions so let try to resolve other's free variables.
-        if (!defs.empty() && !other.freeVars.empty()) {
-            for (auto&& [name, def] : defs) {
-                other.resolveFreeVars(name, def);
+            // We have some definitions so let try to resolve other's free variables.
+            if (!defs.empty() && !other.freeVars.empty()) {
+                for (auto&& [name, def] : defs) {
+                    other.resolveFreeVars(name, def);
+                }
             }
         }
 
@@ -168,7 +172,7 @@ struct CollectedInfo {
      * Records collected last variable references for a specific variable. Should only be called
      * when the variable is guaranteed not to be referenced again in the ABT.
      */
-    void finalizeLastRefs(const std::string& name) {
+    void finalizeLastRefs(const ProjectionName& name) {
         if (auto it = varLastRefs.find(name); it != varLastRefs.end()) {
             for (auto& [var, isLastRef] : it->second) {
                 if (isLastRef) {
@@ -232,52 +236,51 @@ struct CollectedInfo {
 };
 
 /**
- * Collect all Variables into a set.
+ * Walks over all variables in the ABT and calls a callback for each variable.
  */
-class VariableCollector {
+class VariableTransporter {
 public:
+    VariableTransporter(
+        const std::function<void(const Variable&)>& variableCallback,
+        const std::function<void(const ProjectionName&)>& variableDefinitionCallback)
+        : _variableCallback(variableCallback),
+          _variableDefinitionCallback(variableDefinitionCallback) {}
+
     template <typename T, typename... Ts>
     void transport(const T& /*op*/, Ts&&... /*ts*/) {}
 
     void transport(const Variable& op) {
-        _result._variables.push_back(op);
+        _variableCallback(op);
     }
 
     void transport(const LambdaAbstraction& op, const ABT& /*bind*/) {
-        _result._definedVars.insert(op.varName());
+        _variableDefinitionCallback(op.varName());
     }
 
     void transport(const Let& op, const ABT& /*bind*/, const ABT& /*expr*/) {
-        _result._definedVars.insert(op.varName());
-    }
-
-    static VariableCollectorResult collect(const ABT& n) {
-        VariableCollector collector;
-        collector.collectInternal(n);
-        return std::move(collector._result);
+        _variableDefinitionCallback(op.varName());
     }
 
 private:
-    void collectInternal(const ABT& n) {
-        algebra::transport<false>(n, *this);
-    }
+    // Callback used on each Variable in the ABT.
+    const std::function<void(const Variable&)>& _variableCallback;
 
-    VariableCollectorResult _result;
+    // Callback used on any defined variable name (via a Let or Lambda) in the ABT.
+    const std::function<void(const ProjectionName&)>& _variableDefinitionCallback;
 };
 
 struct Collector {
-    explicit Collector(const cascades::Memo* memo) : _memo(memo) {}
+    explicit Collector(const cascades::MemoGroupBinderInterface* memoInterface)
+        : _memoInterface(memoInterface) {}
 
     template <typename T, typename... Ts>
     CollectedInfo transport(const ABT&, const T& op, Ts&&... ts) {
+        static_assert(!std::is_base_of_v<Node, T>, "Nodes must implement reference tracking");
+
         // The default behavior resolves free variables, merges known definitions and propagates
         // them up unmodified.
         CollectedInfo result{};
         (result.merge(std::forward<Ts>(ts)), ...);
-
-        if constexpr (std::is_base_of_v<Node, T>) {
-            result.nodeDefs[&op] = result.defs;
-        }
 
         return result;
     }
@@ -393,22 +396,43 @@ struct Collector {
         return collectForScan(n, node, node.binder(), std::move(refResult));
     }
 
+    CollectedInfo transport(const ABT& n, const CoScanNode& node) {
+        CollectedInfo result{};
+        result.nodeDefs[&node] = result.defs;
+        return result;
+    }
+
     CollectedInfo transport(const ABT& n,
                             const MemoLogicalDelegatorNode& memoLogicalDelegatorNode) {
         CollectedInfo result{};
 
-        tassert(6624029, "Uninitialized memo", _memo);
+        tassert(6624029, "Uninitialized memo interface", _memoInterface);
+        const auto& binder =
+            _memoInterface->getBinderForGroup(memoLogicalDelegatorNode.getGroupId());
 
-        auto& group = _memo->getGroup(memoLogicalDelegatorNode.getGroupId());
-
-        auto& projectionNames = group.binder().names();
-        auto& projections = group.binder().exprs();
+        auto& projectionNames = binder.names();
+        auto& projections = binder.exprs();
         for (size_t i = 0; i < projectionNames.size(); i++) {
             result.defs[projectionNames.at(i)] = Definition{n.ref(), projections[i].ref()};
         }
 
         result.nodeDefs[&memoLogicalDelegatorNode] = result.defs;
 
+        return result;
+    }
+
+    CollectedInfo transport(const ABT& n, const MemoPhysicalDelegatorNode& node) {
+        tasserted(7088004, "Should not be seeing memo physical delegator in this context");
+    }
+
+    CollectedInfo transport(const ABT& n,
+                            const FilterNode& filterNode,
+                            CollectedInfo childResult,
+                            CollectedInfo exprResult) {
+        CollectedInfo result{};
+        result.merge(std::move(childResult));
+        result.mergeNoDefs(std::move(exprResult));
+        result.nodeDefs[&filterNode] = result.defs;
         return result;
     }
 
@@ -455,10 +479,10 @@ struct Collector {
         return result;
     }
 
-    CollectedInfo transport(const ABT& n,
-                            const RIDIntersectNode& node,
-                            CollectedInfo leftChildResult,
-                            CollectedInfo rightChildResult) {
+    template <class T>
+    CollectedInfo handleRIDNodeReferences(const T& node,
+                                          CollectedInfo leftChildResult,
+                                          CollectedInfo rightChildResult) {
         CollectedInfo result{};
 
         // This is a special case where both children of 'node' have a definition for the scan
@@ -467,7 +491,58 @@ struct Collector {
         rightChildResult.defs.erase(node.getScanProjectionName());
 
         result.merge(std::move(leftChildResult));
-        result.merge(std::move(rightChildResult));
+        result.merge<false /*resolveFreeVarsWithOther*/>(std::move(rightChildResult));
+
+        result.nodeDefs[&node] = result.defs;
+
+        return result;
+    }
+
+    CollectedInfo transport(const ABT& n,
+                            const RIDIntersectNode& node,
+                            CollectedInfo leftChildResult,
+                            CollectedInfo rightChildResult) {
+        return handleRIDNodeReferences(
+            node, std::move(leftChildResult), std::move(rightChildResult));
+    }
+
+    CollectedInfo transport(const ABT& n,
+                            const RIDUnionNode& node,
+                            CollectedInfo leftChildResult,
+                            CollectedInfo rightChildResult) {
+        // TODO SERVER-69026 should determine how the reference tracker for RIDUnionNode will work.
+        return handleRIDNodeReferences(
+            node, std::move(leftChildResult), std::move(rightChildResult));
+    }
+
+    template <class T>
+    CollectedInfo handleJoinWithCorrelatedProjs(const T& node,
+                                                CollectedInfo leftChildResult,
+                                                CollectedInfo rightChildResult,
+                                                CollectedInfo filterResult) {
+        CollectedInfo result{};
+
+        // Note correlated projections might be coming either from the left child or from the
+        // parent.
+        const ProjectionNameSet& correlatedProjNames = node.getCorrelatedProjectionNames();
+
+        result.merge(std::move(leftChildResult));
+
+        if (!result.defs.empty() && !rightChildResult.freeVars.empty()) {
+            // Manually resolve free variables in the right child using the correlated variables
+            // from the left child.
+            for (auto&& [name, def] : result.defs) {
+                if (correlatedProjNames.count(name) > 0) {
+                    rightChildResult.resolveFreeVars(name, def);
+                }
+            }
+        }
+
+        // Do not resolve further free variables. We also need to propagate the right child
+        // projections here, since these may be useful to ancestor nodes.
+        result.merge<false /*resolveFreeVarsWithOther*/>(std::move(rightChildResult));
+
+        result.mergeNoDefs(std::move(filterResult));
 
         result.nodeDefs[&node] = result.defs;
 
@@ -479,29 +554,101 @@ struct Collector {
                             CollectedInfo leftChildResult,
                             CollectedInfo rightChildResult,
                             CollectedInfo filterResult) {
+        return handleJoinWithCorrelatedProjs<BinaryJoinNode>(binaryJoinNode,
+                                                             std::move(leftChildResult),
+                                                             std::move(rightChildResult),
+                                                             std::move(filterResult));
+    }
+
+    CollectedInfo transport(const ABT& n,
+                            const NestedLoopJoinNode& nestedLoopJoinNode,
+                            CollectedInfo leftChildResult,
+                            CollectedInfo rightChildResult,
+                            CollectedInfo filterResult) {
+        return handleJoinWithCorrelatedProjs<NestedLoopJoinNode>(nestedLoopJoinNode,
+                                                                 std::move(leftChildResult),
+                                                                 std::move(rightChildResult),
+                                                                 std::move(filterResult));
+    }
+
+    CollectedInfo transport(const ABT& n,
+                            const HashJoinNode& hashJoinNode,
+                            CollectedInfo leftChildResult,
+                            CollectedInfo rightChildResult,
+                            CollectedInfo refsResult) {
         CollectedInfo result{};
 
-        const ProjectionNameSet& correlatedProjNames =
-            binaryJoinNode.getCorrelatedProjectionNames();
-        {
-            const ProjectionNameSet& leftProjections = leftChildResult.getProjections();
-            for (const ProjectionName& boundProjectionName : correlatedProjNames) {
-                tassert(6624099,
-                        "Correlated projections must exist in left child.",
-                        leftProjections.find(boundProjectionName) != leftProjections.cend());
-            }
-        }
-
-        // The correlated projections will be resolved automatically by the merging. We need to
-        // propagate the right child projections here, since these may be useful to ancestor ndoes.
         result.merge(std::move(leftChildResult));
-        result.merge(std::move(rightChildResult));
-        result.mergeNoDefs(std::move(filterResult));
+        // Do not resolve further free variables.
+        result.merge<false /*resolveFreeVarsWithOther*/>(std::move(rightChildResult));
+        result.mergeNoDefs(std::move(refsResult));
 
-        result.nodeDefs[&binaryJoinNode] = result.defs;
+        result.nodeDefs[&hashJoinNode] = result.defs;
 
         return result;
     }
+
+    CollectedInfo transport(const ABT& n,
+                            const MergeJoinNode& mergeJoinNode,
+                            CollectedInfo leftChildResult,
+                            CollectedInfo rightChildResult,
+                            CollectedInfo refsResult) {
+        CollectedInfo result{};
+
+        result.merge(std::move(leftChildResult));
+        // Do not resolve further free variables.
+        result.merge<false /*resolveFreeVarsWithOther*/>(std::move(rightChildResult));
+        result.mergeNoDefs(std::move(refsResult));
+
+        result.nodeDefs[&mergeJoinNode] = result.defs;
+
+        return result;
+    }
+
+    CollectedInfo transport(const ABT& n,
+                            const SortedMergeNode& node,
+                            std::vector<CollectedInfo> childResults,
+                            CollectedInfo bindResult,
+                            CollectedInfo refsResult) {
+        CollectedInfo result{};
+
+        const auto& names = node.binder().names();
+
+        refsResult.assertEmptyDefs();
+
+        // Merge children but disregard any defined projections.
+        // Note that refsResult follows the structure as built by buildUnionTypeReferences, meaning
+        // it contains a free variable for each name for each child of the sorted merge and no other
+        // info.
+        size_t counter = 0;
+        for (auto& u : childResults) {
+            // Manually copy and resolve references of specific child. We do this manually because
+            // each Variable must be resolved by the appropriate child's definition.
+            for (const auto& name : names) {
+                tassert(7063706,
+                        str::stream() << "SortedMerge projection does not exist: " << name,
+                        u.defs.count(name) != 0);
+                u.useMap.emplace(&refsResult.freeVars[name][counter].get(), u.defs[name]);
+            }
+            u.defs.clear();
+            result.merge(std::move(u));
+            ++counter;
+        }
+
+        result.mergeNoDefs(std::move(bindResult));
+
+        // Propagate sorted merge projections. Note that these are the only defs propagated, since
+        // we clear the child defs before merging above.
+        const auto& defs = node.binder().exprs();
+        for (size_t idx = 0; idx < names.size(); ++idx) {
+            result.defs[names[idx]] = Definition{n.ref(), defs[idx].ref()};
+        }
+
+        result.nodeDefs[&node] = result.defs;
+
+        return result;
+    }
+
 
     CollectedInfo transport(const ABT& n,
                             const UnionNode& unionNode,
@@ -515,14 +662,16 @@ struct Collector {
         refsResult.assertEmptyDefs();
 
         // Merge children but disregard any defined projections.
-        // Note that refsResult follows the structure as built by buildUnionReferences, meaning
+        // Note that refsResult follows the structure as built by buildUnionTypeReferences, meaning
         // it contains a free variable for each name for each child of the union and no other info.
         size_t counter = 0;
         for (auto& u : childResults) {
             // Manually copy and resolve references of specific child. We do this manually because
             // each Variable must be resolved by the appropriate child's definition.
             for (const auto& name : names) {
-                tassert(6624031, "Union projection does not exist", u.defs.count(name) != 0);
+                tassert(6624031,
+                        str::stream() << "Union projection does not exist:  " << name,
+                        u.defs.count(name) != 0);
                 u.useMap.emplace(&refsResult.freeVars[name][counter].get(), u.defs[name]);
             }
             u.defs.clear();
@@ -598,11 +747,13 @@ struct Collector {
         CollectedInfo result{};
 
         // First resolve all variables from the inside point of view.
-        result.merge(std::move(refsResult));
+        result.mergeNoDefs(std::move(refsResult));
         result.merge(std::move(childResult));
 
         const auto& name = unwindNode.getProjectionName();
-        tassert(6624034, "Unwind projection does not exist", result.defs.count(name) != 0);
+        tassert(6624034,
+                str::stream() << "Unwind projection does not exist: " << name,
+                result.defs.count(name) != 0);
 
         // Redefine unwind projection.
         result.defs[name] = Definition{n.ref(), unwindNode.getProjection().ref()};
@@ -617,28 +768,151 @@ struct Collector {
         return result;
     }
 
+    CollectedInfo transport(const ABT& n,
+                            const UniqueNode& uniqueNode,
+                            CollectedInfo childResult,
+                            CollectedInfo refsResult) {
+        CollectedInfo result{};
+
+        result.merge(std::move(refsResult));
+        result.merge(std::move(childResult));
+
+        for (const auto& name : uniqueNode.getProjections()) {
+            tassert(6624060,
+                    str::stream() << "Unique projection does not exist: " << name,
+                    result.defs.count(name) != 0);
+        }
+
+        result.nodeDefs[&uniqueNode] = result.defs;
+
+        return result;
+    }
+
+    CollectedInfo transport(const ABT& n,
+                            const CollationNode& collationNode,
+                            CollectedInfo childResult,
+                            CollectedInfo refsResult) {
+        CollectedInfo result{};
+
+        result.mergeNoDefs(std::move(refsResult));
+        result.merge(std::move(childResult));
+
+        for (const auto& name : collationNode.getProperty().getAffectedProjectionNames()) {
+            tassert(7088001,
+                    str::stream() << "Collation projection does not exist: " << name,
+                    result.defs.count(name) != 0);
+        }
+
+        result.nodeDefs[&collationNode] = result.defs;
+
+        return result;
+    }
+
+    CollectedInfo transport(const ABT& n,
+                            const LimitSkipNode& limitSkipNode,
+                            CollectedInfo childResult) {
+        CollectedInfo result{};
+        result.merge(std::move(childResult));
+        result.nodeDefs[&limitSkipNode] = result.defs;
+        return result;
+    }
+
+    CollectedInfo transport(const ABT& n,
+                            const ExchangeNode& exchangeNode,
+                            CollectedInfo childResult,
+                            CollectedInfo refsResult) {
+        CollectedInfo result{};
+
+        result.mergeNoDefs(std::move(refsResult));
+        result.merge(std::move(childResult));
+
+        for (const auto& name : exchangeNode.getProperty().getAffectedProjectionNames()) {
+            tassert(7088002,
+                    str::stream() << "Exchange projection does not exist: " << name,
+                    result.defs.count(name) != 0);
+        }
+
+        result.nodeDefs[&exchangeNode] = result.defs;
+        return result;
+    }
+
+    CollectedInfo transport(const ABT& n,
+                            const RootNode& rootNode,
+                            CollectedInfo childResult,
+                            CollectedInfo refsResult) {
+        CollectedInfo result{};
+
+        result.mergeNoDefs(std::move(refsResult));
+        result.merge(std::move(childResult));
+
+        for (const auto& name : rootNode.getProperty().getAffectedProjectionNames()) {
+            tassert(7088003,
+                    str::stream() << "Root projection does not exist: " << name,
+                    result.defs.count(name) != 0);
+        }
+
+        result.nodeDefs[&rootNode] = result.defs;
+
+        return result;
+    }
+
+    CollectedInfo transport(const ABT& n,
+                            const SpoolProducerNode& node,
+                            CollectedInfo childResult,
+                            CollectedInfo filterResult,
+                            CollectedInfo bindResult,
+                            CollectedInfo refsResult) {
+        CollectedInfo result{};
+
+        result.merge(std::move(refsResult));
+        result.merge(std::move(childResult));
+
+        const auto& binder = node.binder();
+        for (size_t i = 0; i < binder.names().size(); i++) {
+            const auto& name = binder.names().at(i);
+            tassert(6624138,
+                    str::stream() << "Spool projection does not exist: " << name,
+                    result.defs.count(name) != 0);
+
+            // Redefine projection.
+            result.defs[name] = Definition{n.ref(), binder.exprs()[i].ref()};
+        }
+
+        result.mergeNoDefs(std::move(bindResult));
+        result.mergeNoDefs(std::move(filterResult));
+
+        result.nodeDefs[&node] = result.defs;
+
+        return result;
+    }
+
+    CollectedInfo transport(const ABT& n, const SpoolConsumerNode& node, CollectedInfo bindResult) {
+        return collectForScan(n, node, node.binder(), {});
+    }
+
     CollectedInfo collect(const ABT& n) {
         return algebra::transport<true>(n, *this);
     }
 
 private:
-    const cascades::Memo* _memo;
+    const cascades::MemoGroupBinderInterface* _memoInterface;
 };
 
-VariableEnvironment VariableEnvironment::build(const ABT& root, const cascades::Memo* memo) {
-    Collector c(memo);
+VariableEnvironment VariableEnvironment::build(
+    const ABT& root, const cascades::MemoGroupBinderInterface* memoInterface) {
+    Collector c(memoInterface);
     auto info = std::make_unique<CollectedInfo>(c.collect(root));
 
-    return VariableEnvironment{std::move(info), memo};
+    return VariableEnvironment{std::move(info), memoInterface};
 }
 
 void VariableEnvironment::rebuild(const ABT& root) {
-    _info = std::make_unique<CollectedInfo>(Collector{_memo}.collect(root));
+    _info = std::make_unique<CollectedInfo>(Collector{_memoInterface}.collect(root));
 }
 
 VariableEnvironment::VariableEnvironment(std::unique_ptr<CollectedInfo> info,
-                                         const cascades::Memo* memo)
-    : _info(std::move(info)), _memo(memo) {}
+                                         const cascades::MemoGroupBinderInterface* memoInterface)
+    : _info(std::move(info)), _memoInterface(memoInterface) {}
 
 VariableEnvironment::~VariableEnvironment() {}
 
@@ -689,7 +963,15 @@ bool VariableEnvironment::hasFreeVariables() const {
     return !_info->freeVars.empty();
 }
 
-size_t VariableEnvironment::freeOccurences(const std::string& variable) const {
+ProjectionNameSet VariableEnvironment::freeVariableNames() const {
+    ProjectionNameSet freeVarNames;
+    for (auto&& [name, vars] : _info->freeVars) {
+        freeVarNames.insert(name);
+    }
+    return freeVarNames;
+}
+
+size_t VariableEnvironment::freeOccurences(const ProjectionName& variable) const {
     auto it = _info->freeVars.find(variable);
     if (it == _info->freeVars.end()) {
         return 0;
@@ -702,8 +984,13 @@ bool VariableEnvironment::isLastRef(const Variable& var) const {
     return _info->lastRefs.count(&var) > 0;
 }
 
-VariableCollectorResult VariableEnvironment::getVariables(const ABT& n) {
-    return VariableCollector::collect(n);
+void VariableEnvironment::walkVariables(
+    const ABT& n,
+    const std::function<void(const Variable&)>& variableCallback,
+    const std::function<void(const ProjectionName&)>& variableDefinitionCallback) {
+    VariableTransporter transporter(variableCallback, variableDefinitionCallback);
+    algebra::transport<false>(n, transporter);
 }
+
 
 }  // namespace mongo::optimizer

@@ -60,6 +60,19 @@ namespace mongo {
 
 class AggregateCommandRequest;
 
+enum struct SbeCompatibility {
+    // Not implemented in SBE.
+    notCompatible,
+    // Implemented in SBE but behind the featureFlagSbeFull flag.
+    flagGuarded,
+    // Implemented in SBE and enabled by default.
+    fullyCompatible,
+};
+
+inline bool operator<(SbeCompatibility a, SbeCompatibility b) {
+    return static_cast<int>(a) < static_cast<int>(b);
+}
+
 class ExpressionContext : public RefCountable {
 public:
     struct ResolvedNamespace {
@@ -123,7 +136,8 @@ public:
                       std::shared_ptr<MongoProcessInterface> mongoProcessInterface,
                       StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces,
                       boost::optional<UUID> collUUID,
-                      bool mayDbProfile = true);
+                      bool mayDbProfile = true,
+                      bool allowDiskUseByDefault = false);
 
     /**
      * Constructs an ExpressionContext to be used for Pipeline parsing and evaluation. This version
@@ -299,6 +313,14 @@ public:
         return tailableMode == TailableModeEnum::kTailableAndAwaitData;
     }
 
+    /**
+     * Returns true if the pipeline is eligible for query sampling for the purpose of shard key
+     * selection metrics.
+     */
+    bool eligibleForSampling() const {
+        return !explain;
+    }
+
     void setResolvedNamespaces(StringMap<ResolvedNamespace> resolvedNamespaces) {
         _resolvedNamespaces = std::move(resolvedNamespaces);
     }
@@ -392,6 +414,11 @@ public:
         return _expressionCounters.is_initialized();
     }
 
+    /**
+     * Sets the value of the $$USER_ROLES system variable.
+     */
+    void setUserRoles();
+
     // The explain verbosity requested by the user, or boost::none if no explain was requested.
     boost::optional<ExplainOptions::Verbosity> explain;
 
@@ -436,8 +463,11 @@ public:
     // Tracks the depth of nested aggregation sub-pipelines. Used to enforce depth limits.
     long long subPipelineDepth = 0;
 
-    // True if this 'ExpressionContext' object is for the inner side of a $lookup.
+    // True if this 'ExpressionContext' object is for the inner side of a $lookup or $graphLookup.
     bool inLookup = false;
+
+    // True if this 'ExpressionContext' object is for the inner side of a $unionWith.
+    bool inUnionWith = false;
 
     // If set, this will disallow use of features introduced in versions above the provided version.
     boost::optional<multiversion::FeatureCompatibilityVersion> maxFeatureCompatibilityVersion;
@@ -455,14 +485,13 @@ public:
     // construction.
     const bool mayDbProfile = true;
 
-    // True if all expressions which use this expression context can be translated into equivalent
-    // SBE expressions.
-    bool sbeCompatible = true;
+    // The lowest SBE compatibility level of all expressions which use this expression context.
+    SbeCompatibility sbeCompatibility = SbeCompatibility::fullyCompatible;
 
-    // True if all accumulators in the $group stage currently being parsed using this expression
-    // context can be translated into equivalent SBE expressions. This value is transient and gets
-    // reset for every $group stage we parse. Each $group stage has their per-stage flag.
-    bool sbeGroupCompatible = true;
+    // The lowest SBE compatibility level of all accumulators in the $group stage currently
+    // being parsed using this expression context. This value is transient and gets
+    // reset for every $group stage we parse. Each $group stage has its own per-stage flag.
+    SbeCompatibility sbeGroupCompatibility = SbeCompatibility::fullyCompatible;
 
     // These fields can be used in a context when API version validations were not enforced during
     // parse time (Example creating a view or validator), but needs to be enforce while querying
@@ -499,6 +528,20 @@ public:
         _gotTemporarilyUnavailableException = v;
     }
 
+    // Sets or clears a flag which tells DocumentSource parsers whether any involved Collection
+    // may contain extended-range dates.
+    void setRequiresTimeseriesExtendedRangeSupport(bool v) {
+        _requiresTimeseriesExtendedRangeSupport = v;
+    }
+    bool getRequiresTimeseriesExtendedRangeSupport() const {
+        return _requiresTimeseriesExtendedRangeSupport;
+    }
+
+    // Returns true if the resolved collation of the context is simple.
+    bool isResolvedCollationSimple() const {
+        return getCollatorBSON().woCompare(CollationSpec::kSimpleSpec) == 0;
+    }
+
 protected:
     static const int kInterruptCheckPeriod = 128;
 
@@ -522,6 +565,8 @@ protected:
     int _interruptCounter = kInterruptCheckPeriod;
 
     bool _isCappedDelete = false;
+
+    bool _requiresTimeseriesExtendedRangeSupport = false;
 
 private:
     boost::optional<ExpressionCounters> _expressionCounters = boost::none;

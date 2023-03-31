@@ -32,9 +32,9 @@
 #include <memory>
 #include <vector>
 
-#include "mongo/db/logical_session_cache_noop.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context_test_fixture.h"
+#include "mongo/db/session/logical_session_cache_noop.h"
 #include "mongo/s/concurrency/locker_mongos_client_observer.h"
 #include "mongo/s/query/cluster_client_cursor_mock.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
@@ -45,7 +45,7 @@ namespace mongo {
 namespace {
 
 using unittest::assertGet;
-const NamespaceString nss("test.collection");
+const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.collection");
 
 class ClusterCursorManagerTest : public ServiceContextTest {
 protected:
@@ -498,6 +498,21 @@ TEST_F(ClusterCursorManagerTest, KillMortalCursorsInactiveSinceMultipleCursors) 
     }
 }
 
+// Test that killMortalCursorsInactiveSince() increases cursorsTimeOut().
+TEST_F(ClusterCursorManagerTest, KillMortalCursorsInactiveSinceCursorsTimedOut) {
+    ASSERT_EQ(0ULL, getManager()->cursorsTimedOut());
+    ASSERT_OK(getManager()->registerCursor(getOperationContext(),
+                                           allocateMockCursor(),
+                                           nss,
+                                           ClusterCursorManager::CursorType::SingleTarget,
+                                           ClusterCursorManager::CursorLifetime::Mortal,
+                                           boost::none));
+    ASSERT_EQ(1ULL,
+              getManager()->killMortalCursorsInactiveSince(getOperationContext(),
+                                                           getClockSource()->now()));
+    ASSERT_EQ(1ULL, getManager()->cursorsTimedOut());
+}
+
 // Test that killing all cursors successfully kills all cursors.
 TEST_F(ClusterCursorManagerTest, KillAllCursors) {
     const size_t numCursors = 10;
@@ -525,7 +540,9 @@ TEST_F(ClusterCursorManagerTest, KillCursorsSatisfyingAlwaysTrueKillsAllCursors)
                                                ClusterCursorManager::CursorLifetime::Mortal,
                                                boost::none));
     }
-    auto pred = [](CursorId, const ClusterCursorManager::CursorEntry&) { return true; };
+    auto pred = [](CursorId, const ClusterCursorManager::CursorEntry&) {
+        return true;
+    };
     auto nKilled = getManager()->killCursorsSatisfying(getOperationContext(), std::move(pred));
     ASSERT_EQ(nKilled, numCursors);
     for (size_t i = 0; i < numCursors; ++i) {
@@ -543,7 +560,9 @@ TEST_F(ClusterCursorManagerTest, KillCursorsSatisfyingAlwaysFalseKillsNoCursors)
                                                ClusterCursorManager::CursorLifetime::Mortal,
                                                boost::none));
     }
-    auto pred = [](CursorId, const ClusterCursorManager::CursorEntry&) { return false; };
+    auto pred = [](CursorId, const ClusterCursorManager::CursorEntry&) {
+        return false;
+    };
     auto nKilled = getManager()->killCursorsSatisfying(getOperationContext(), std::move(pred));
     ASSERT_EQ(nKilled, 0);
     for (size_t i = 0; i < numCursors; ++i) {
@@ -554,7 +573,9 @@ TEST_F(ClusterCursorManagerTest, KillCursorsSatisfyingAlwaysFalseKillsNoCursors)
 TEST_F(ClusterCursorManagerTest, KillCursorsSatisfyingOnlyKillsMatchingSubset) {
     const size_t numCursors = 10;
     stdx::unordered_set<CursorId> idsToKill;
-    auto shouldKillCursor = [](size_t idx) { return idx % 2 == 0; };
+    auto shouldKillCursor = [](size_t idx) {
+        return idx % 2 == 0;
+    };
     for (size_t i = 0; i < numCursors; ++i) {
         auto swCursorId =
             getManager()->registerCursor(getOperationContext(),

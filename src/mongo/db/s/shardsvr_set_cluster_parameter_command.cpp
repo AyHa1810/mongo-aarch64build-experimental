@@ -64,14 +64,14 @@ public:
         void typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::IllegalOperation,
                     str::stream() << Request::kCommandName << " can only be run on shard servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ShardServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ShardServer));
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
 
             hangInShardsvrSetClusterParameter.pauseWhileSet();
 
             SetClusterParameter setClusterParameterRequest(request().getCommandParameter());
-            setClusterParameterRequest.setDbName(NamespaceString::kAdminDb);
+            setClusterParameterRequest.setDbName(DatabaseName::kAdmin);
             std::unique_ptr<ServerParameterService> parameterService =
                 std::make_unique<ClusterParameterService>();
             DBDirectClient client(opCtx);
@@ -79,7 +79,8 @@ public:
             SetClusterParameterInvocation invocation{std::move(parameterService), dbService};
             // Use local write concern for setClusterParameter, the idea is that the command is
             // being called with majority write concern, so, we'll wait for majority after checking
-            // out the session.
+            // out the session. Note that we use the force option for invoke -- the config server
+            // should already have checked isEnabled + validate for us.
             bool writePerformed = invocation.invoke(opCtx,
                                                     setClusterParameterRequest,
                                                     request().getClusterParameterTime(),
@@ -88,7 +89,7 @@ public:
                 // Since no write happened on this txnNumber, we need to make a dummy write so
                 // that secondaries can be aware of this txn.
                 DBDirectClient client(opCtx);
-                client.update(NamespaceString::kServerConfigurationNamespace.ns(),
+                client.update(NamespaceString::kServerConfigurationNamespace,
                               BSON("_id"
                                    << "SetClusterParameterStats"),
                               BSON("$inc" << BSON("count" << 1)),

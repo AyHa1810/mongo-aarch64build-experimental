@@ -30,13 +30,11 @@
 
 #include "mongo/platform/basic.h"
 
-#include <boost/optional/optional_io.hpp>
 #include <vector>
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/cancelable_operation_context.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/logical_session_cache_noop.h"
 #include "mongo/db/persistent_task_store.h"
 #include "mongo/db/pipeline/process_interface/shardsvr_process_interface.h"
 #include "mongo/db/repl/storage_interface_impl.h"
@@ -46,9 +44,11 @@
 #include "mongo/db/s/resharding/resharding_txn_cloner_progress_gen.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/s/sharding_state.h"
-#include "mongo/db/session_catalog_mongod.h"
-#include "mongo/db/session_txn_record_gen.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/session/logical_session_cache_noop.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/session/session_txn_record_gen.h"
+#include "mongo/db/transaction/session_catalog_mongod_transaction_interface_impl.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/db/vector_clock_metadata_hook.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/thread_pool_task_executor.h"
@@ -81,10 +81,9 @@ class ReshardingTxnClonerTest : public ShardServerTestFixture {
         auto mockLoader = std::make_unique<CatalogCacheLoaderMock>();
 
         // The config database's primary shard is always config, and it is always sharded.
-        mockLoader->setDatabaseRefreshReturnValue(
-            DatabaseType{NamespaceString::kConfigDb.toString(),
-                         ShardId::kConfigServerId,
-                         DatabaseVersion::makeFixed()});
+        mockLoader->setDatabaseRefreshReturnValue(DatabaseType{DatabaseName::kConfig.toString(),
+                                                               ShardId::kConfigServerId,
+                                                               DatabaseVersion::makeFixed()});
 
         // The config.transactions collection is always unsharded.
         mockLoader->setCollectionRefreshReturnValue(
@@ -109,7 +108,12 @@ class ReshardingTxnClonerTest : public ShardServerTestFixture {
         // onStepUp() relies on the storage interface to create the config.transactions table.
         repl::StorageInterface::set(getServiceContext(),
                                     std::make_unique<repl::StorageInterfaceImpl>());
-        MongoDSessionCatalog::onStepUp(operationContext());
+        MongoDSessionCatalog::set(
+            getServiceContext(),
+            std::make_unique<MongoDSessionCatalog>(
+                std::make_unique<MongoDSessionCatalogTransactionInterfaceImpl>()));
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(operationContext());
+        mongoDSessionCatalog->onStepUp(operationContext());
         LogicalSessionCache::set(getServiceContext(), std::make_unique<LogicalSessionCacheNoop>());
     }
 
@@ -142,6 +146,15 @@ class ReshardingTxnClonerTest : public ShardServerTestFixture {
                     shardTypes.push_back(std::move(sType));
                 };
                 return repl::OpTimeWith<std::vector<ShardType>>(shardTypes);
+            }
+
+            std::pair<CollectionType, std::vector<IndexCatalogType>>
+            getCollectionAndShardingIndexCatalogEntries(
+                OperationContext* opCtx,
+                const NamespaceString& nss,
+                const repl::ReadConcernArgs& readConcern) override {
+                uasserted(ErrorCodes::NamespaceNotFound,
+                          str::stream() << "Collection " << nss.ns() << " not found");
             }
 
         private:
@@ -239,7 +252,8 @@ protected:
             opCtx->setInMultiDocumentTransaction();
         }
 
-        MongoDOperationContextSession ocs(opCtx);
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
 
         auto txnParticipant = TransactionParticipant::get(opCtx);
         ASSERT(txnParticipant);
@@ -262,9 +276,9 @@ protected:
         auto bsonOplog = client.findOne(std::move(findCmd));
         ASSERT(!bsonOplog.isEmpty());
         auto oplogEntry = repl::MutableOplogEntry::parse(bsonOplog).getValue();
-        ASSERT_EQ(oplogEntry.getTxnNumber().get(), txnNum);
+        ASSERT_EQ(oplogEntry.getTxnNumber().value(), txnNum);
         ASSERT_BSONOBJ_EQ(oplogEntry.getObject(), BSON("$sessionMigrateInfo" << 1));
-        ASSERT_BSONOBJ_EQ(oplogEntry.getObject2().get(), BSON("$incompleteOplogHistory" << 1));
+        ASSERT_BSONOBJ_EQ(oplogEntry.getObject2().value(), BSON("$incompleteOplogHistory" << 1));
         ASSERT(oplogEntry.getOpType() == repl::OpTypeEnum::kNoop);
 
         auto bsonTxn =
@@ -280,7 +294,8 @@ protected:
     void checkTxnHasNotBeenUpdated(LogicalSessionId sessionId, TxnNumber txnNum) {
         auto opCtx = operationContext();
         opCtx->setLogicalSessionId(sessionId);
-        MongoDOperationContextSession ocs(opCtx);
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
 
         DBDirectClient client(operationContext());
@@ -355,8 +370,8 @@ protected:
         std::shared_ptr<executor::ThreadPoolTaskExecutor> cleanupExecutor,
         boost::optional<CancellationToken> customCancelToken = boost::none) {
         // Allows callers to control the cancellation of the cloner's run() function when specified.
-        auto cancelToken = customCancelToken.is_initialized()
-            ? customCancelToken.get()
+        auto cancelToken = customCancelToken.has_value()
+            ? customCancelToken.value()
             : operationContext()->getCancellationToken();
 
         auto cancelableOpCtxExecutor = std::make_shared<ThreadPool>([] {
@@ -387,7 +402,8 @@ protected:
         opCtx->setLogicalSessionId(std::move(lsid));
         opCtx->setTxnNumber(txnNumber);
 
-        MongoDOperationContextSession ocs(opCtx);
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
         txnParticipant.beginOrContinue(
             opCtx, {txnNumber}, false /* autocommit */, true /* startTransaction */);
@@ -403,7 +419,8 @@ protected:
         opCtx->setLogicalSessionId(std::move(lsid));
         opCtx->setTxnNumber(txnNumber);
 
-        MongoDOperationContextSession ocs(opCtx);
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
         txnParticipant.beginOrContinue(
             opCtx, {txnNumber}, false /* autocommit */, true /* startTransaction */);
@@ -435,7 +452,8 @@ protected:
         opCtx->setLogicalSessionId(std::move(lsid));
         opCtx->setTxnNumber(txnNumber);
 
-        MongoDOperationContextSession ocs(opCtx);
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
         txnParticipant.beginOrContinue(
             opCtx, {txnNumber}, false /* autocommit */, boost::none /* startTransaction */);

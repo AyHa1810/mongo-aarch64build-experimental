@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/db/repl/replica_set_aware_service.h"
+#include "mongo/db/s/balancer/auto_merger_policy.h"
 #include "mongo/db/s/balancer/balancer_chunk_selection_policy.h"
 #include "mongo/db/s/balancer/balancer_random.h"
 #include "mongo/platform/mutex.h"
@@ -44,7 +45,6 @@ class ChunkType;
 class ClusterStatistics;
 class BalancerCommandsScheduler;
 class BalancerDefragmentationPolicy;
-class ClusterChunksResizePolicy;
 class MigrationSecondaryThrottleOptions;
 class OperationContext;
 class ServiceContext;
@@ -115,32 +115,6 @@ public:
     void joinCurrentRound(OperationContext* opCtx);
 
     /**
-     * Blocking call, which requests the balancer to move a single chunk to a more appropriate
-     * shard, in accordance with the active balancer policy. It is not guaranteed that the chunk
-     * will actually move because it may already be at the best shard. An error will be returned if
-     * the attempt to find a better shard or the actual migration fail for any reason.
-     */
-    Status rebalanceSingleChunk(OperationContext* opCtx,
-                                const NamespaceString& nss,
-                                const ChunkType& chunk);
-
-    /**
-     * Blocking call, which requests the balancer to move a single chunk to the specified location
-     * in accordance with the active balancer policy. An error will be returned if the attempt to
-     * move fails for any reason.
-     *
-     * NOTE: This call disregards the balancer enabled/disabled status and will proceed with the
-     *       move regardless. If should be used only for user-initiated moves.
-     */
-    Status moveSingleChunk(OperationContext* opCtx,
-                           const NamespaceString& nss,
-                           const ChunkType& chunk,
-                           const ShardId& newShardId,
-                           const MigrationSecondaryThrottleOptions& secondaryThrottle,
-                           bool waitForDelete,
-                           bool forceJumbo);
-
-    /**
      * Blocking call, which requests the balancer to move a range to the specified location
      * in accordance with the active balancer policy. An error will be returned if the attempt to
      * move fails for any reason.
@@ -170,12 +144,6 @@ public:
     void abortCollectionDefragmentation(OperationContext* opCtx, const NamespaceString& nss);
 
     /**
-     * Asynchronously requests the resize of all the chunks defined in the cluster, so that
-     * the "Collection Max Chunk Size" constraint existing in FCV 5.0 is enforced.
-     */
-    SharedSemiFuture<void> applyLegacyChunkSizeConstraintsOnClusterData(OperationContext* opCtx);
-
-    /**
      * Returns if a given collection is draining due to a removed shard, has chunks on an invalid
      * zone or the number of chunks is imbalanced across the cluster
      */
@@ -198,12 +166,16 @@ private:
      * ReplicaSetAwareService entry points.
      */
     void onStartup(OperationContext* opCtx) final {}
+    void onSetCurrentConfig(OperationContext* opCtx) final {}
     void onInitialDataAvailable(OperationContext* opCtx, bool isMajorityDataAvailable) final {}
     void onShutdown() final {}
     void onStepUpBegin(OperationContext* opCtx, long long term) final;
     void onStepUpComplete(OperationContext* opCtx, long long term) final;
     void onStepDown() final;
     void onBecomeArbiter() final;
+    inline std::string getServiceName() const override final {
+        return "Balancer";
+    }
 
     /**
      * The main balancer loop, which runs in a separate thread.
@@ -277,7 +249,7 @@ private:
 
     AtomicWord<int> _outstandingStreamingOps{0};
 
-    AtomicWord<bool> _newInfoOnStreamingActions{true};
+    AtomicWord<bool> _actionStreamsStateUpdated{true};
 
     // Indicates whether the balancer is currently executing a balancer round
     bool _inBalancerRound{false};
@@ -289,7 +261,7 @@ private:
     // changes (in particular, state/balancer round and number of balancer rounds).
     stdx::condition_variable _condVar;
 
-    stdx::condition_variable _defragmentationCondVar;
+    stdx::condition_variable _actionStreamCondVar;
 
     // Number of moved chunks in last round
     int _balancedLastTime;
@@ -309,8 +281,9 @@ private:
 
     std::unique_ptr<BalancerDefragmentationPolicy> _defragmentationPolicy;
 
-    // TODO  SERVER-65332 remove logic bound to this policy object When kLastLTS is 6.0
-    std::unique_ptr<ClusterChunksResizePolicy> _clusterChunksResizePolicy;
+    std::unique_ptr<AutoMergerPolicy> _autoMergerPolicy;
+
+    std::unique_ptr<stdx::unordered_set<NamespaceString>> _imbalancedCollectionsCache;
 };
 
 }  // namespace mongo

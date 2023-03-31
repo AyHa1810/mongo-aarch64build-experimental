@@ -27,19 +27,16 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
 #include <boost/optional.hpp>
 #include <vector>
 
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/logical_session_cache_noop.h"
 #include "mongo/db/op_observer/op_observer_impl.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/repl/storage_interface_impl.h"
@@ -50,15 +47,16 @@
 #include "mongo/db/s/resharding/resharding_util.h"
 #include "mongo/db/s/shard_server_test_fixture.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/session_catalog_mongod.h"
+#include "mongo/db/session/logical_session_cache_noop.h"
+#include "mongo/db/session/session_catalog_mongod.h"
 #include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/db/transaction/session_catalog_mongod_transaction_interface_impl.h"
 #include "mongo/s/catalog/sharding_catalog_client_mock.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
-
 
 namespace mongo {
 namespace {
@@ -117,7 +115,12 @@ public:
         // onStepUp() relies on the storage interface to create the config.transactions table.
         repl::StorageInterface::set(getServiceContext(),
                                     std::make_unique<repl::StorageInterfaceImpl>());
-        MongoDSessionCatalog::onStepUp(operationContext());
+        MongoDSessionCatalog::set(
+            getServiceContext(),
+            std::make_unique<MongoDSessionCatalog>(
+                std::make_unique<MongoDSessionCatalogTransactionInterfaceImpl>()));
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(operationContext());
+        mongoDSessionCatalog->onStepUp(operationContext());
         LogicalSessionCache::set(getServiceContext(), std::make_unique<LogicalSessionCacheNoop>());
         _fetchTimestamp = queryOplog(BSONObj())["ts"].timestamp();
 
@@ -171,7 +174,8 @@ public:
         // Insert some documents.
         OpDebug* const nullOpDebug = nullptr;
         const bool fromMigrate = false;
-        ASSERT_OK(coll->insertDocument(_opCtx, stmt, nullOpDebug, fromMigrate));
+        ASSERT_OK(
+            collection_internal::insertDocument(_opCtx, coll, stmt, nullOpDebug, fromMigrate));
     }
 
     BSONObj queryCollection(NamespaceString nss, const BSONObj& query) {
@@ -244,7 +248,7 @@ public:
             onCommand([&](const executor::RemoteCommandRequest& request) -> StatusWith<BSONObj> {
                 DBDirectClient client(cc().getOperationContext());
                 BSONObj result;
-                bool res = client.runCommand(request.dbname, request.cmdObj, result);
+                bool res = client.runCommand({boost::none, request.dbname}, request.cmdObj, result);
                 if (res == false || result.hasField("cursorsKilled") ||
                     result["cursor"]["id"].Long() == 0) {
                     hasMore = false;
@@ -352,8 +356,10 @@ private:
 };
 
 TEST_F(ReshardingOplogFetcherTest, TestBasic) {
-    const NamespaceString outputCollectionNss("dbtests.outputCollection");
-    const NamespaceString dataCollectionNss("dbtests.runFetchIteration");
+    const NamespaceString outputCollectionNss =
+        NamespaceString::createNamespaceString_forTest("dbtests.outputCollection");
+    const NamespaceString dataCollectionNss =
+        NamespaceString::createNamespaceString_forTest("dbtests.runFetchIteration");
 
     setupBasic(outputCollectionNss, dataCollectionNss, _destinationShard);
 
@@ -382,8 +388,10 @@ TEST_F(ReshardingOplogFetcherTest, TestBasic) {
 }
 
 TEST_F(ReshardingOplogFetcherTest, TestTrackLastSeen) {
-    const NamespaceString outputCollectionNss("dbtests.outputCollection");
-    const NamespaceString dataCollectionNss("dbtests.runFetchIteration");
+    const NamespaceString outputCollectionNss =
+        NamespaceString::createNamespaceString_forTest("dbtests.outputCollection");
+    const NamespaceString dataCollectionNss =
+        NamespaceString::createNamespaceString_forTest("dbtests.runFetchIteration");
 
     setupBasic(outputCollectionNss, dataCollectionNss, _destinationShard);
 
@@ -419,8 +427,10 @@ TEST_F(ReshardingOplogFetcherTest, TestTrackLastSeen) {
 }
 
 TEST_F(ReshardingOplogFetcherTest, TestFallingOffOplog) {
-    const NamespaceString outputCollectionNss("dbtests.outputCollection");
-    const NamespaceString dataCollectionNss("dbtests.runFetchIteration");
+    const NamespaceString outputCollectionNss =
+        NamespaceString::createNamespaceString_forTest("dbtests.outputCollection");
+    const NamespaceString dataCollectionNss =
+        NamespaceString::createNamespaceString_forTest("dbtests.runFetchIteration");
 
     setupBasic(outputCollectionNss, dataCollectionNss, _destinationShard);
 
@@ -459,8 +469,10 @@ TEST_F(ReshardingOplogFetcherTest, TestFallingOffOplog) {
 }
 
 TEST_F(ReshardingOplogFetcherTest, TestAwaitInsert) {
-    const NamespaceString outputCollectionNss("dbtests.outputCollection");
-    const NamespaceString dataCollectionNss("dbtests.runFetchIteration");
+    const NamespaceString outputCollectionNss =
+        NamespaceString::createNamespaceString_forTest("dbtests.outputCollection");
+    const NamespaceString dataCollectionNss =
+        NamespaceString::createNamespaceString_forTest("dbtests.runFetchIteration");
 
     create(outputCollectionNss);
     create(dataCollectionNss);
@@ -535,8 +547,10 @@ TEST_F(ReshardingOplogFetcherTest, TestAwaitInsert) {
 }
 
 TEST_F(ReshardingOplogFetcherTest, TestStartAtUpdatedWithProgressMarkOplogTs) {
-    const NamespaceString outputCollectionNss("dbtests.outputCollection");
-    const NamespaceString dataCollectionNss("dbtests.runFetchIteration");
+    const NamespaceString outputCollectionNss =
+        NamespaceString::createNamespaceString_forTest("dbtests.outputCollection");
+    const NamespaceString dataCollectionNss =
+        NamespaceString::createNamespaceString_forTest("dbtests.runFetchIteration");
     const NamespaceString otherCollection("dbtests.collectionNotBeingResharded");
 
     create(outputCollectionNss);
@@ -630,8 +644,10 @@ TEST_F(ReshardingOplogFetcherTest, TestStartAtUpdatedWithProgressMarkOplogTs) {
 }
 
 TEST_F(ReshardingOplogFetcherTest, RetriesOnRemoteInterruptionError) {
-    const NamespaceString outputCollectionNss("dbtests.outputCollection");
-    const NamespaceString dataCollectionNss("dbtests.runFetchIteration");
+    const NamespaceString outputCollectionNss =
+        NamespaceString::createNamespaceString_forTest("dbtests.outputCollection");
+    const NamespaceString dataCollectionNss =
+        NamespaceString::createNamespaceString_forTest("dbtests.runFetchIteration");
 
     create(outputCollectionNss);
     create(dataCollectionNss);
@@ -670,8 +686,10 @@ TEST_F(ReshardingOplogFetcherTest, RetriesOnRemoteInterruptionError) {
 }
 
 TEST_F(ReshardingOplogFetcherTest, ImmediatelyDoneWhenFinalOpHasAlreadyBeenFetched) {
-    const NamespaceString outputCollectionNss("dbtests.outputCollection");
-    const NamespaceString dataCollectionNss("dbtests.runFetchIteration");
+    const NamespaceString outputCollectionNss =
+        NamespaceString::createNamespaceString_forTest("dbtests.outputCollection");
+    const NamespaceString dataCollectionNss =
+        NamespaceString::createNamespaceString_forTest("dbtests.runFetchIteration");
 
     create(outputCollectionNss);
     create(dataCollectionNss);
@@ -700,8 +718,10 @@ TEST_F(ReshardingOplogFetcherTest, ImmediatelyDoneWhenFinalOpHasAlreadyBeenFetch
 DEATH_TEST_REGEX_F(ReshardingOplogFetcherTest,
                    CannotFetchMoreWhenFinalOpHasAlreadyBeenFetched,
                    "Invariant failure.*_startAt != kFinalOpAlreadyFetched") {
-    const NamespaceString outputCollectionNss("dbtests.outputCollection");
-    const NamespaceString dataCollectionNss("dbtests.runFetchIteration");
+    const NamespaceString outputCollectionNss =
+        NamespaceString::createNamespaceString_forTest("dbtests.outputCollection");
+    const NamespaceString dataCollectionNss =
+        NamespaceString::createNamespaceString_forTest("dbtests.runFetchIteration");
 
     create(outputCollectionNss);
     create(dataCollectionNss);

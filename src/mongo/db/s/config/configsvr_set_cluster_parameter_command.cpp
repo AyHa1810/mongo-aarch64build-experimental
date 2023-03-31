@@ -59,7 +59,7 @@ public:
         void typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::IllegalOperation,
                     str::stream() << Request::kCommandName << " can only be run on config servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
 
             const auto coordinatorCompletionFuture = [&]() -> SharedSemiFuture<void> {
                 std::unique_ptr<ServerParameterService> sps =
@@ -72,13 +72,22 @@ public:
 
                 SetClusterParameterInvocation invocation{std::move(sps), dbService};
 
-                invocation.normalizeParameter(
-                    opCtx, cmdParamObj, boost::none, serverParameter, parameterName);
+                invocation.normalizeParameter(opCtx,
+                                              cmdParamObj,
+                                              boost::none,
+                                              serverParameter,
+                                              parameterName,
+                                              request().getDbName().tenantId(),
+                                              false /* skipValidation */);
+
+                auto tenantId = request().getDbName().tenantId();
 
                 SetClusterParameterCoordinatorDocument coordinatorDoc;
-                coordinatorDoc.setConfigsvrCoordinatorMetadata(
-                    {ConfigsvrCoordinatorTypeEnum::kSetClusterParameter});
+                ConfigsvrCoordinatorId cid(ConfigsvrCoordinatorTypeEnum::kSetClusterParameter);
+                cid.setSubId(StringData(tenantId ? tenantId->toString() : ""));
+                coordinatorDoc.setConfigsvrCoordinatorMetadata({cid});
                 coordinatorDoc.setParameter(request().getCommandParameter());
+                coordinatorDoc.setTenantId(tenantId);
 
                 const auto service = ConfigsvrCoordinatorService::getService(opCtx);
                 const auto instance = service->getOrCreateService(opCtx, coordinatorDoc.toBSON());

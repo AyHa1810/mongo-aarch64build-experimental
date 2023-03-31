@@ -29,64 +29,75 @@
 
 #include "mongo/db/catalog/catalog_helper.h"
 
-#include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/catalog_raii.h"
-#include "mongo/db/s/database_sharding_state.h"
-#include "mongo/db/s/operation_sharding_state.h"
-#include "mongo/db/s/sharding_migration_critical_section.h"
-#include "mongo/db/s/sharding_state.h"
-#include "mongo/s/stale_exception.h"
+#include "mongo/db/catalog/collection_catalog.h"
 
 namespace mongo::catalog_helper {
+namespace {
+MONGO_FAIL_POINT_DEFINE(setAutoGetCollectionWait);
 
-void assertMatchingDbVersion(OperationContext* opCtx, const StringData& dbName) {
-    const auto receivedVersion = OperationShardingState::get(opCtx).getDbVersion(dbName);
-    if (!receivedVersion) {
-        return;
+/**
+ * Defines sorting order for NamespaceStrings based on what their ResourceId would be for locking.
+ */
+struct ResourceIdNssComparator {
+    bool operator()(const NamespaceString& lhs, const NamespaceString& rhs) const {
+        return ResourceId(RESOURCE_COLLECTION, lhs) < ResourceId(RESOURCE_COLLECTION, rhs);
     }
+};
+}  // namespace
 
-    {
-        const auto dss = DatabaseShardingState::getSharedForLockFreeReads(opCtx, dbName);
-        auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, dss.get());
+void acquireCollectionLocksInResourceIdOrder(
+    OperationContext* opCtx,
+    const NamespaceStringOrUUID& nsOrUUID,
+    LockMode modeColl,
+    Date_t deadline,
+    const std::vector<NamespaceStringOrUUID>& secondaryNssOrUUIDs,
+    std::vector<CollectionNamespaceOrUUIDLock>* collLocks) {
+    invariant(collLocks->empty());
+    auto catalog = CollectionCatalog::get(opCtx);
 
-        const auto critSecSignal = dss->getCriticalSectionSignal(
-            opCtx->lockState()->isWriteLocked() ? ShardingMigrationCriticalSection::kWrite
-                                                : ShardingMigrationCriticalSection::kRead,
-            dssLock);
-        uassert(
-            StaleDbRoutingVersion(dbName.toString(), *receivedVersion, boost::none, critSecSignal),
-            str::stream() << "The critical section for the database " << dbName
-                          << " is acquired with reason: " << dss->getCriticalSectionReason(dssLock),
-            !critSecSignal);
-    }
+    // Use a set so that we can easily dedupe namespaces to avoid locking the same collection twice.
+    std::set<NamespaceString, ResourceIdNssComparator> temp;
+    std::set<NamespaceString, ResourceIdNssComparator> verifyTemp;
+    do {
+        // Clear the data structures when/if we loop more than once.
+        collLocks->clear();
+        temp.clear();
+        verifyTemp.clear();
 
-    const auto wantedVersion = DatabaseHolder::get(opCtx)->getDbVersion(opCtx, dbName);
-    uassert(StaleDbRoutingVersion(dbName.toString(), *receivedVersion, boost::none),
-            str::stream() << "No cached info for the database " << dbName,
-            wantedVersion);
+        // Create a single set with all the resolved namespaces sorted by ascending
+        // ResourceId(RESOURCE_COLLECTION, nss).
+        temp.insert(catalog->resolveNamespaceStringOrUUID(opCtx, nsOrUUID));
+        for (const auto& secondaryNssOrUUID : secondaryNssOrUUIDs) {
+            invariant(secondaryNssOrUUID.db() == nsOrUUID.db(),
+                      str::stream()
+                          << "Unable to acquire locks for collections across different databases ("
+                          << secondaryNssOrUUID << " vs " << nsOrUUID << ")");
+            temp.insert(catalog->resolveNamespaceStringOrUUID(opCtx, secondaryNssOrUUID));
+        }
 
-    uassert(StaleDbRoutingVersion(dbName.toString(), *receivedVersion, *wantedVersion),
-            str::stream() << "Version mismatch for the database " << dbName,
-            *receivedVersion == *wantedVersion);
+        // Acquire all of the locks in order. And clear the 'catalog' because the locks will access
+        // a fresher one internally.
+        catalog = nullptr;
+        for (auto& nss : temp) {
+            collLocks->emplace_back(opCtx, nss, modeColl, deadline);
+        }
+
+        // Check that the namespaces have NOT changed after acquiring locks. It's possible to race
+        // with a rename collection when the given NamespaceStringOrUUID is a UUID, and consequently
+        // fail to lock the correct namespace.
+        //
+        // The catalog reference must be refreshed to see the latest Collection data. Otherwise we
+        // won't see any concurrent DDL/catalog operations.
+        auto catalog = CollectionCatalog::get(opCtx);
+        verifyTemp.insert(catalog->resolveNamespaceStringOrUUID(opCtx, nsOrUUID));
+        for (const auto& secondaryNssOrUUID : secondaryNssOrUUIDs) {
+            verifyTemp.insert(catalog->resolveNamespaceStringOrUUID(opCtx, secondaryNssOrUUID));
+        }
+    } while (temp != verifyTemp);
 }
 
-void assertIsPrimaryShardForDb(OperationContext* opCtx, const StringData& dbName) {
-    invariant(dbName != NamespaceString::kConfigDb);
-
-    uassert(ErrorCodes::IllegalOperation,
-            str::stream() << "Received request without the version for the database " << dbName,
-            OperationShardingState::get(opCtx).hasDbVersion());
-
-    // Recover the database's information if necessary (not cached or not matching).
-    AutoGetDb autoDb(opCtx, dbName, MODE_IS);
-    invariant(autoDb.getDb());
-
-    const auto primaryShardId = DatabaseHolder::get(opCtx)->getDbPrimary(opCtx, dbName).get();
-    const auto thisShardId = ShardingState::get(opCtx)->shardId();
-    uassert(ErrorCodes::IllegalOperation,
-            str::stream() << "This is not the primary shard for the database " << dbName
-                          << ". Expected: " << primaryShardId << " Actual: " << thisShardId,
-            primaryShardId == thisShardId);
+void setAutoGetCollectionWaitFailpointExecute(std::function<void(const BSONObj&)> callback) {
+    setAutoGetCollectionWait.execute(callback);
 }
 
 }  // namespace mongo::catalog_helper

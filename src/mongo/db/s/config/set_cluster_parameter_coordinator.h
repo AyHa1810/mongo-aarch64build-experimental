@@ -29,9 +29,9 @@
 
 #pragma once
 
-#include "mongo/db/internal_session_pool.h"
 #include "mongo/db/s/config/configsvr_coordinator.h"
 #include "mongo/db/s/config/set_cluster_parameter_coordinator_document_gen.h"
+#include "mongo/db/session/internal_session_pool.h"
 
 namespace mongo {
 
@@ -78,7 +78,7 @@ private:
     const ConfigsvrCoordinatorMetadata& metadata() const override;
 
     template <typename Func>
-    auto _executePhase(const Phase& newPhase, Func&& func) {
+    auto _buildPhaseHandler(const Phase& newPhase, Func&& handlerFn) {
         return [=] {
             const auto& currPhase = _doc.getPhase();
 
@@ -90,7 +90,7 @@ private:
                 // Persist the new phase if this is the first time we are executing it.
                 _enterPhase(newPhase);
             }
-            return func();
+            return handlerFn();
         };
     }
 

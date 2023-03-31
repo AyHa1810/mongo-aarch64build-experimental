@@ -30,7 +30,19 @@ global:
     cpp_namespace: "mongo"
 
 imports:
-    - "mongo/idl/basic_types.idl"
+    - "mongo/db/basic_types.idl"
+
+enums:
+    ShardingIndexCatalogOp:
+        description: "Sharding index catalog operation"
+        type: string
+        values:
+            insert: "i"
+            remove: "d"
+            replace: "r"
+            drop: "o"
+            rename: "m"
+            clear: "c"
 
 structs:
     IndexCatalogType:
@@ -42,12 +54,12 @@ structs:
                 type: string
                 description: "Index name"
             keyPattern:
-                type: object
+                type: object_owned
                 description: "Index field description"
             options:
-                type: object
+                type: object_owned
                 description: "Index options"
-            lastMod:
+            lastmod:
                 type: timestamp
                 description: "Index version"
             collectionUUID:
@@ -58,3 +70,103 @@ structs:
                 description: "UUID of the collection which backs this index. If there
                             is not indexCollectionUUID then the index is not global."
                 optional: true
+
+    IndexOptionsType:
+        description: "Option fields found in the option object"
+        strict: false
+        fields:
+            global:
+                type: optionalBool
+                description: "If true then the index entry represent a global index"
+
+    ShardingIndexCatalogOplogEntry:
+        description: "Oplog entry format for sharding's index catalog modifications"
+        strict: false
+        fields:
+            op:
+                type: ShardingIndexCatalogOp
+                description: "Index catalog operation type"
+
+    ShardingIndexCatalogInsertEntryBase:
+        description: "Oplog entry format for add operation"
+        strict: false
+        inline_chained_structs: true
+        chained_structs:
+            ShardingIndexCatalogOplogEntry: ShardingIndexCatalogOplogEntry
+        fields:
+            i:
+                type: IndexCatalogType
+                description: "Index entry"
+
+    ShardingIndexCatalogRemoveEntryBase:
+        description: "Oplog entry format for delete operation"
+        strict: false
+        inline_chained_structs: true
+        chained_structs:
+            ShardingIndexCatalogOplogEntry: ShardingIndexCatalogOplogEntry
+        fields:
+            name:
+                type: string
+                description: "Index name"
+            uuid:
+                type: uuid
+                description: "Collection uuid"
+            lastmod:
+                type: timestamp
+                description: "Final timestamp of the index version"
+    
+    ShardingIndexCatalogReplaceEntryBase:
+        description: "Oplog entry format for replace operation"
+        strict: false
+        inline_chained_structs: true
+        chained_structs:
+            ShardingIndexCatalogOplogEntry: ShardingIndexCatalogOplogEntry
+        fields:
+            uuid:
+                type: uuid
+                description: "Collection uuid"
+            lastmod:
+                type: timestamp
+                description: "Final timestamp of the index version"
+            i:
+                type: array<IndexCatalogType>
+                description: "Index array"
+
+    ShardingIndexCatalogDropEntryBase:
+        description: "Oplog entry format for drop operation"
+        strict: false
+        inline_chained_structs: true
+        chained_structs:
+            ShardingIndexCatalogOplogEntry: ShardingIndexCatalogOplogEntry
+        fields:
+            uuid:
+                type: uuid
+                description: "Collection uuid"
+
+    ShardingIndexCatalogRenameEntryBase:
+        description: "Oplog entry format for rename operation"
+        strict: false
+        inline_chained_structs: true
+        chained_structs:
+            ShardingIndexCatalogOplogEntry: ShardingIndexCatalogOplogEntry
+        fields:
+            fromNss:
+                type: namespacestring
+                description: "Source collection name"
+            toNss:
+                type: namespacestring
+                description: "Destination collection name"
+            lastmod:
+                type: timestamp
+                description: "Final timestamp of the index version"
+
+    ShardingIndexCatalogClearEntryBase:
+        description: "Oplog entry for clear operation"
+        strict: false
+        inline_chained_structs: true
+        chained_structs:
+            ShardingIndexCatalogOplogEntry: ShardingIndexCatalogOplogEntry
+        fields:
+            uuid:
+                type: uuid
+                description: "uuid of collection to be cleared"

@@ -32,6 +32,7 @@
 
 #include "mongo/db/audit.h"
 #include "mongo/db/commands/get_cluster_parameter_invocation.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/idl/cluster_server_parameter_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
@@ -41,8 +42,11 @@
 namespace mongo {
 
 std::pair<std::vector<std::string>, std::vector<BSONObj>>
-GetClusterParameterInvocation::retrieveRequestedParameters(OperationContext* opCtx,
-                                                           const CmdBody& cmdBody) {
+GetClusterParameterInvocation::retrieveRequestedParameters(
+    OperationContext* opCtx,
+    const CmdBody& cmdBody,
+    const boost::optional<TenantId>& tenantId,
+    bool excludeClusterParameterTime) {
     ServerParameterSet* clusterParameters = ServerParameterSet::getClusterParameterSet();
     std::vector<std::string> parameterNames;
     std::vector<BSONObj> parameterValues;
@@ -54,53 +58,57 @@ GetClusterParameterInvocation::retrieveRequestedParameters(OperationContext* opC
         // Skip any disabled cluster parameters.
         if (requestedParameter->isEnabled()) {
             BSONObjBuilder bob;
-            requestedParameter->append(opCtx, bob, requestedParameter->name());
-            parameterValues.push_back(bob.obj().getOwned());
+            requestedParameter->append(opCtx, &bob, requestedParameter->name(), tenantId);
+            auto paramObj = bob.obj().getOwned();
+            if (excludeClusterParameterTime) {
+                parameterValues.push_back(
+                    paramObj.filterFieldsUndotted(BSON("clusterParameterTime" << true), false));
+            } else {
+                parameterValues.push_back(paramObj);
+            }
             parameterNames.push_back(requestedParameter->name());
         }
     };
 
-    stdx::visit(
-        OverloadedVisitor{[&](const std::string& strParameterName) {
-                              if (strParameterName == "*"_sd) {
-                                  // Retrieve all cluster parameter values.
-                                  Map clusterParameterMap = clusterParameters->getMap();
-                                  parameterValues.reserve(clusterParameterMap.size());
-                                  parameterNames.reserve(clusterParameterMap.size());
-                                  for (const auto& param : clusterParameterMap) {
-                                      makeBSON(param.second);
-                                  }
-                              } else {
-                                  // Any other string must correspond to a single parameter name.
-                                  // Return an error if a disabled cluster parameter is explicitly
-                                  // requested.
-                                  ServerParameter* sp = clusterParameters->get(strParameterName);
-                                  uassert(ErrorCodes::BadValue,
-                                          str::stream() << "Server parameter: '" << strParameterName
-                                                        << "' is currently disabled",
-                                          sp->isEnabled());
-                                  makeBSON(sp);
-                              }
-                          },
-                          [&](const std::vector<std::string>& listParameterNames) {
-                              uassert(ErrorCodes::BadValue,
-                                      "Must supply at least one cluster server parameter name to "
-                                      "getClusterParameter",
-                                      listParameterNames.size() > 0);
-                              parameterValues.reserve(listParameterNames.size());
-                              parameterNames.reserve(listParameterNames.size());
-                              for (const auto& requestedParameterName : listParameterNames) {
-                                  ServerParameter* sp =
-                                      clusterParameters->get(requestedParameterName);
-                                  uassert(ErrorCodes::BadValue,
-                                          str::stream()
-                                              << "Server parameter: '" << requestedParameterName
-                                              << "' is currently disabled'",
-                                          sp->isEnabled());
-                                  makeBSON(sp);
-                              }
-                          }},
-        cmdBody);
+    stdx::visit(OverloadedVisitor{
+                    [&](const std::string& strParameterName) {
+                        if (strParameterName == "*"_sd) {
+                            // Retrieve all cluster parameter values.
+                            Map clusterParameterMap = clusterParameters->getMap();
+                            parameterValues.reserve(clusterParameterMap.size());
+                            parameterNames.reserve(clusterParameterMap.size());
+                            for (const auto& param : clusterParameterMap) {
+                                makeBSON(param.second);
+                            }
+                        } else {
+                            // Any other string must correspond to a single parameter name.
+                            // Return an error if a disabled cluster parameter is explicitly
+                            // requested.
+                            ServerParameter* sp = clusterParameters->get(strParameterName);
+                            uassert(ErrorCodes::BadValue,
+                                    str::stream() << "Server parameter: '" << strParameterName
+                                                  << "' is disabled",
+                                    sp->isEnabled());
+                            makeBSON(sp);
+                        }
+                    },
+                    [&](const std::vector<std::string>& listParameterNames) {
+                        uassert(ErrorCodes::BadValue,
+                                "Must supply at least one cluster server parameter name to "
+                                "getClusterParameter",
+                                listParameterNames.size() > 0);
+                        parameterValues.reserve(listParameterNames.size());
+                        parameterNames.reserve(listParameterNames.size());
+                        for (const auto& requestedParameterName : listParameterNames) {
+                            ServerParameter* sp = clusterParameters->get(requestedParameterName);
+                            uassert(ErrorCodes::BadValue,
+                                    str::stream() << "Server parameter: '" << requestedParameterName
+                                                  << "' is disabled'",
+                                    sp->isEnabled());
+                            makeBSON(sp);
+                        }
+                    }},
+                cmdBody);
 
     return {std::move(parameterNames), std::move(parameterValues)};
 }
@@ -109,12 +117,19 @@ GetClusterParameterInvocation::Reply GetClusterParameterInvocation::getCachedPar
     OperationContext* opCtx, const GetClusterParameter& request) {
     const CmdBody& cmdBody = request.getCommandParameter();
 
-    auto [parameterNames, parameterValues] = retrieveRequestedParameters(opCtx, cmdBody);
+    auto* repl = repl::ReplicationCoordinator::get(opCtx);
+    bool isStandalone = repl &&
+        repl->getReplicationMode() == repl::ReplicationCoordinator::modeNone &&
+        serverGlobalParams.clusterRole.has(ClusterRole::None);
+
+    auto [parameterNames, parameterValues] =
+        retrieveRequestedParameters(opCtx, cmdBody, request.getDbName().tenantId(), isStandalone);
 
     LOGV2_DEBUG(6226100,
                 2,
                 "Retrieved parameter values for cluster server parameters",
-                "parameterNames"_attr = parameterNames);
+                "parameterNames"_attr = parameterNames,
+                "tenantId"_attr = request.getDbName().tenantId());
 
     return Reply(parameterValues);
 }
@@ -132,7 +147,8 @@ GetClusterParameterInvocation::Reply GetClusterParameterInvocation::getDurablePa
     BSONObjBuilder inObjBuilder = queryDocBuilder.subobjStart("_id"_sd);
     BSONArrayBuilder parameterNameBuilder = inObjBuilder.subarrayStart("$in"_sd);
 
-    auto [requestedParameterNames, parameterValues] = retrieveRequestedParameters(opCtx, cmdBody);
+    auto [requestedParameterNames, parameterValues] = retrieveRequestedParameters(
+        opCtx, cmdBody, request.getDbName().tenantId(), false /* excludeClusterParameterTime */);
 
     for (const auto& parameterValue : parameterValues) {
         parameterNameBuilder.append(parameterValue["_id"_sd].String());
@@ -144,14 +160,14 @@ GetClusterParameterInvocation::Reply GetClusterParameterInvocation::getDurablePa
     // Perform the majority read on the config server primary.
     BSONObj query = queryDocBuilder.obj();
     LOGV2_DEBUG(6226101, 2, "Querying config servers for cluster parameters", "query"_attr = query);
-    auto findResponse = uassertStatusOK(
-        configServers->exhaustiveFindOnConfig(opCtx,
-                                              ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                                              repl::ReadConcernLevel::kMajorityReadConcern,
-                                              NamespaceString::kClusterParametersNamespace,
-                                              query,
-                                              BSONObj(),
-                                              boost::none));
+    auto findResponse = uassertStatusOK(configServers->exhaustiveFindOnConfig(
+        opCtx,
+        ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+        repl::ReadConcernLevel::kMajorityReadConcern,
+        NamespaceString::makeClusterParametersNSS(request.getDbName().tenantId()),
+        query,
+        BSONObj(),
+        boost::none));
 
     // Any parameters that are not included in the response don't have a cluster parameter
     // document yet, which means they still are using the default value.
@@ -182,7 +198,8 @@ GetClusterParameterInvocation::Reply GetClusterParameterInvocation::getDurablePa
         for (const auto& defaultParameterName : defaultParameterNames) {
             auto defaultParameter = clusterParameters->get(defaultParameterName);
             BSONObjBuilder bob;
-            defaultParameter->append(opCtx, bob, defaultParameterName);
+            defaultParameter->append(
+                opCtx, &bob, defaultParameterName, request.getDbName().tenantId());
             retrievedParameters.push_back(bob.obj());
         }
     }

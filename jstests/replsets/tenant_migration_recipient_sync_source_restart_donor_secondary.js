@@ -12,14 +12,16 @@
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
  *   requires_persistence,
+ *   # The currentOp output field 'dataSyncCompleted' was renamed to 'migrationCompleted'.
+ *   requires_fcv_70,
  *   serverless,
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/replsets/libs/tenant_migration_recipient_sync_source.js");
+import {
+    setUpMigrationSyncSourceTest
+} from "jstests/replsets/libs/tenant_migration_recipient_sync_source.js";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
 
 // After this setUp() call, we should have a migration with 'secondary' read preference. The
 // recipient should be continuously retrying sync source selection, unable to choose
@@ -34,7 +36,7 @@ const {
 
 if (!tenantMigrationTest) {
     // Feature flag was not enabled.
-    return;
+    quit();
 }
 
 const donorRst = tenantMigrationTest.getDonorRst();
@@ -63,4 +65,3 @@ assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migration
 
 donorRst.stopSet();
 tenantMigrationTest.stop();
-})();

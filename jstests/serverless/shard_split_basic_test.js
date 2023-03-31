@@ -1,29 +1,27 @@
 /**
- *
  * Tests that runs a shard split to completion.
- * @tags: [requires_fcv_52, featureFlagShardSplit]
+ * @tags: [requires_fcv_63, serverless]
  */
 
-load("jstests/serverless/libs/basic_serverless_test.js");
+import {
+    assertMigrationState,
+    findSplitOperation,
+    ShardSplitTest
+} from "jstests/serverless/libs/shard_split_test.js";
 
-(function() {
-"use strict";
-
-const recipientTagName = "recipientNode";
-const recipientSetName = "recipientSetName";
-const tenantIds = ["tenant1", "tenant2"];
-
-const test =
-    new BasicServerlessTest({recipientTagName, recipientSetName, quickGarbageCollection: true});
-
+const tenantIds = [ObjectId(), ObjectId()];
+const test = new ShardSplitTest({quickGarbageCollection: true});
 test.addRecipientNodes();
 test.donor.awaitSecondaryNodes();
 
 const donorPrimary = test.getDonorPrimary();
 const operation = test.createSplitOperation(tenantIds);
-assert.commandWorked(operation.commit());
-
+const result = assert.commandWorked(operation.commit());
 assertMigrationState(donorPrimary, operation.migrationId, "committed");
+
+// Confirm blockOpTime in result matches the state document before forgetting the operation
+const stateDoc = findSplitOperation(donorPrimary, operation.migrationId);
+assert.eq(stateDoc.blockOpTime.ts, result.blockOpTime.ts);
 
 operation.forget();
 
@@ -35,4 +33,3 @@ assert.gt(status.shardSplits.totalCommittedDurationWithoutCatchupMillis, 0);
 
 test.cleanupSuccesfulCommitted(operation.migrationId, tenantIds);
 test.stop();
-})();

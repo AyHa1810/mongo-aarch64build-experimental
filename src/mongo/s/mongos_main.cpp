@@ -51,19 +51,21 @@
 #include "mongo/db/change_stream_options_manager.h"
 #include "mongo/db/client.h"
 #include "mongo/db/client_metadata_propagation_egress_hook.h"
+#include "mongo/db/commands.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/ftdc/ftdc_mongos.h"
 #include "mongo/db/initialize_server_global_state.h"
-#include "mongo/db/kill_sessions.h"
+#include "mongo/db/keys_collection_client_sharded.h"
 #include "mongo/db/log_process_details.h"
-#include "mongo/db/logical_session_cache_impl.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/process_health/fault_manager.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_liaison_mongos.h"
-#include "mongo/db/session_killer.h"
+#include "mongo/db/session/kill_sessions.h"
+#include "mongo/db/session/logical_session_cache_impl.h"
+#include "mongo/db/session/session_killer.h"
 #include "mongo/db/startup_warnings_common.h"
 #include "mongo/db/vector_clock_metadata_hook.h"
 #include "mongo/db/wire_version.h"
@@ -89,6 +91,7 @@
 #include "mongo/s/mongos_topology_coordinator.h"
 #include "mongo/s/query/cluster_cursor_cleanup_job.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
+#include "mongo/s/query_analysis_sampler.h"
 #include "mongo/s/read_write_concern_defaults_cache_lookup_mongos.h"
 #include "mongo/s/service_entry_point_mongos.h"
 #include "mongo/s/session_catalog_router.h"
@@ -100,6 +103,7 @@
 #include "mongo/scripting/dbdirectclient_factory.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/transport/ingress_handshake_metrics.h"
 #include "mongo/transport/transport_layer_manager.h"
 #include "mongo/util/admin_access.h"
 #include "mongo/util/cmdline_utils/censor_cmdline.h"
@@ -246,7 +250,10 @@ void implicitlyAbortAllTransactions(OperationContext* opCtx) {
         OperationContextSession sessionCtx(newOpCtx, std::move(killDetails.killToken));
 
         auto session = OperationContextSession::get(newOpCtx);
-        newOpCtx->setLogicalSessionId(session->getSessionId());
+        {
+            auto lk = stdx::lock_guard(*newOpCtx->getClient());
+            newOpCtx->setLogicalSessionId(session->getSessionId());
+        }
 
         auto txnRouter = TransactionRouter::get(newOpCtx);
         if (txnRouter.isInitialized()) {
@@ -310,9 +317,18 @@ void cleanupTask(const ShutdownTaskArgs& shutdownArgs) {
             lsc->joinOnShutDown();
         }
 
+        if (analyze_shard_key::isFeatureFlagEnabled()) {
+            LOGV2_OPTIONS(
+                6973901, {LogComponent::kDefault}, "Shutting down the QueryAnalysisSampler");
+            analyze_shard_key::QueryAnalysisSampler::get(serviceContext).onShutdown();
+        }
+
         ReplicaSetMonitor::shutdown();
 
-        opCtx->setIsExecutingShutdown();
+        {
+            stdx::lock_guard lg(client);
+            opCtx->setIsExecutingShutdown();
+        }
 
         if (serviceContext) {
             serviceContext->setKillAllOperations();
@@ -436,13 +452,16 @@ Status initializeSharding(OperationContext* opCtx) {
             hookList->addHook(std::make_unique<rpc::ClientMetadataPropagationEgressHook>());
             return hookList;
         },
-        boost::none);
+        boost::none,
+        [](ShardingCatalogClient* catalogClient) {
+            return std::make_unique<KeysCollectionClientSharded>(catalogClient);
+        });
 
     if (!status.isOK()) {
         return status;
     }
 
-    status = loadGlobalSettingsFromConfigServer(opCtx);
+    status = loadGlobalSettingsFromConfigServer(opCtx, Grid::get(opCtx)->catalogClient());
     if (!status.isOK()) {
         return status;
     }
@@ -492,7 +511,9 @@ public:
     void onFoundSet(const Key& key) noexcept final {}
 
     void onConfirmedSet(const State& state) noexcept final {
-        auto connStr = state.connStr;
+        const auto& connStr = state.connStr;
+        const auto& setName = connStr.getSetName();
+
         try {
             LOGV2(471693,
                   "Updating the shard registry with confirmed replica set",
@@ -507,16 +528,17 @@ public:
                   "error"_attr = e);
         }
 
-        auto setName = connStr.getSetName();
         bool updateInProgress = false;
         {
             stdx::lock_guard lock(_mutex);
             if (!_hasUpdateState(lock, setName)) {
-                _updateStates.emplace(setName, std::make_shared<ReplSetConfigUpdateState>());
+                _updateStates.emplace(std::piecewise_construct,
+                                      std::forward_as_tuple(setName),
+                                      std::forward_as_tuple());
             }
-            auto updateState = _updateStates.at(setName);
-            updateState->nextUpdateToSend = connStr;
-            updateInProgress = updateState->updateInProgress;
+            auto& updateState = _updateStates.at(setName);
+            updateState.nextUpdateToSend = connStr;
+            updateInProgress = updateState.updateInProgress;
         }
 
         if (!updateInProgress) {
@@ -544,26 +566,28 @@ public:
 private:
     // Schedules updates for replica set 'setName' on the config server. Loosly preserves ordering
     // of update execution. Newer updates will not be overwritten by older updates in config.shards.
-    void _scheduleUpdateConfigServer(std::string setName) {
-        ConnectionString update;
+    void _scheduleUpdateConfigServer(const std::string& setName) {
+        ConnectionString updatedConnectionString;
         {
             stdx::lock_guard lock(_mutex);
             if (!_hasUpdateState(lock, setName)) {
                 return;
             }
-            auto updateState = _updateStates.at(setName);
-            if (updateState->updateInProgress) {
+            auto& updateState = _updateStates.at(setName);
+            if (updateState.updateInProgress) {
                 return;
             }
-            updateState->updateInProgress = true;
-            update = updateState->nextUpdateToSend.get();
-            updateState->nextUpdateToSend = boost::none;
+            updateState.updateInProgress = true;
+            updatedConnectionString = updateState.nextUpdateToSend.value();
+            updateState.nextUpdateToSend = boost::none;
         }
 
         auto executor = Grid::get(_serviceContext)->getExecutorPool()->getFixedExecutor();
         auto schedStatus =
             executor
-                ->scheduleWork([self = shared_from_this(), setName, update](auto args) {
+                ->scheduleWork([self = shared_from_this(),
+                                setName,
+                                update = std::move(updatedConnectionString)](const auto& args) {
                     self->_updateConfigServer(args.status, setName, update);
                 })
                 .getStatus();
@@ -579,7 +603,9 @@ private:
         uassertStatusOK(schedStatus);
     }
 
-    void _updateConfigServer(Status status, std::string setName, ConnectionString update) {
+    void _updateConfigServer(const Status& status,
+                             const std::string& setName,
+                             const ConnectionString& update) {
         if (ErrorCodes::isCancellationError(status.code())) {
             stdx::lock_guard lock(_mutex);
             _updateStates.erase(setName);
@@ -607,28 +633,28 @@ private:
         _endUpdateConfigServer(setName, update);
     }
 
-    void _endUpdateConfigServer(std::string setName, ConnectionString update) {
+    void _endUpdateConfigServer(const std::string& setName, const ConnectionString& update) {
         bool moreUpdates = false;
         {
             stdx::lock_guard lock(_mutex);
             invariant(_hasUpdateState(lock, setName));
-            auto updateState = _updateStates.at(setName);
-            updateState->updateInProgress = false;
-            moreUpdates = (updateState->nextUpdateToSend != boost::none);
+            auto& updateState = _updateStates.at(setName);
+            updateState.updateInProgress = false;
+            moreUpdates = (updateState.nextUpdateToSend != boost::none);
             if (!moreUpdates) {
                 _updateStates.erase(setName);
             }
         }
         if (moreUpdates) {
             auto executor = Grid::get(_serviceContext)->getExecutorPool()->getFixedExecutor();
-            executor->schedule([self = shared_from_this(), setName](auto args) {
+            executor->schedule([self = shared_from_this(), setName](const auto& _) {
                 self->_scheduleUpdateConfigServer(setName);
             });
         }
     }
 
     // Returns true if a ReplSetConfigUpdateState exists for replica set setName.
-    bool _hasUpdateState(WithLock, std::string setName) {
+    bool _hasUpdateState(WithLock, const std::string& setName) {
         return (_updateStates.find(setName) != _updateStates.end());
     }
 
@@ -637,11 +663,15 @@ private:
     mutable Mutex _mutex = MONGO_MAKE_LATCH("ShardingReplicaSetChangeListenerMongod::mutex");
 
     struct ReplSetConfigUpdateState {
+        ReplSetConfigUpdateState() = default;
+        ReplSetConfigUpdateState(const ReplSetConfigUpdateState&) = delete;
+        ReplSetConfigUpdateState& operator=(const ReplSetConfigUpdateState&) = delete;
+
         // True when an update to the config.shards is in progress.
         bool updateInProgress = false;
         boost::optional<ConnectionString> nextUpdateToSend;
     };
-    stdx::unordered_map<std::string, std::shared_ptr<ReplSetConfigUpdateState>> _updateStates;
+    stdx::unordered_map<std::string, ReplSetConfigUpdateState> _updateStates;
 };
 
 ExitCode runMongosServer(ServiceContext* serviceContext) {
@@ -738,6 +768,9 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
                       "error"_attr = redact(ex));
     }
 
+    CommandInvocationHooks::set(serviceContext,
+                                std::make_unique<transport::IngressHandshakeMetricsCommandHooks>());
+
     startMongoSFTDC();
 
     if (mongosGlobalParams.scriptingEnabled) {
@@ -780,6 +813,8 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
                     "error"_attr = redact(status));
         return ExitCode::processHealthCheck;
     }
+
+    srand((unsigned)(curTimeMicros64()) ^ (unsigned(uintptr_t(&opCtx))));  // NOLINT
 
     SessionKiller::set(serviceContext,
                        std::make_shared<SessionKiller>(serviceContext, killSessionsRemote));

@@ -121,17 +121,6 @@ function runTest(st, stepDownShard0PrimaryFunc, testOpts = {
         abortTxnAfterFailover: true,
         enableFindAndModifyImageCollection: true
     });
-    // Test findAnModify with pre/post image when the image collection is disabled.
-    runTest(st, stepDownShard0PrimaryFunc, {
-        runFindAndModifyWithPreOrPostImage: true,
-        abortTxnAfterFailover: false,
-        enableFindAndModifyImageCollection: false
-    });
-    runTest(st, stepDownShard0PrimaryFunc, {
-        runFindAndModifyWithPreOrPostImage: true,
-        abortTxnAfterFailover: true,
-        enableFindAndModifyImageCollection: false
-    });
 
     st.stop();
 }
@@ -168,17 +157,6 @@ function runTest(st, stepDownShard0PrimaryFunc, testOpts = {
         abortTxnAfterFailover: true,
         enableFindAndModifyImageCollection: true
     });
-    // Test findAnModify with pre/post image when the image collection is disabled.
-    runTest(st, stepDownShard0PrimaryFunc, {
-        runFindAndModifyWithPreOrPostImage: true,
-        abortTxnAfterFailover: false,
-        enableFindAndModifyImageCollection: false
-    });
-    runTest(st, stepDownShard0PrimaryFunc, {
-        runFindAndModifyWithPreOrPostImage: true,
-        abortTxnAfterFailover: true,
-        enableFindAndModifyImageCollection: false
-    });
 
     st.stop();
 }
@@ -190,9 +168,9 @@ function runTest(st, stepDownShard0PrimaryFunc, testOpts = {
         st.rs0.stopSet(null /* signal */, true /*forRestart */);
         st.rs0.startSet({restart: true});
         st.rs0.getPrimary();
-        // Wait for replication since it is illegal to run commitTransaction before the prepare
-        // oplog entry has been majority committed.
-        st.rs0.awaitReplication();
+        // Wait for replication to recover the lastCommittedOpTime since it is illegal to run
+        // commitTransaction before the prepare oplog entry has been majority committed.
+        st.rs0.awaitLastOpCommitted();
     };
 
     // Test findAnModify without pre/post image.
@@ -217,17 +195,6 @@ function runTest(st, stepDownShard0PrimaryFunc, testOpts = {
         runFindAndModifyWithPreOrPostImage: true,
         abortTxnAfterFailover: true,
         enableFindAndModifyImageCollection: true
-    });
-    // Test findAnModify with pre/post image when the image collection is disabled.
-    runTest(st, restartShard0Func, {
-        runFindAndModifyWithPreOrPostImage: true,
-        abortTxnAfterFailover: false,
-        enableFindAndModifyImageCollection: false
-    });
-    runTest(st, restartShard0Func, {
-        runFindAndModifyWithPreOrPostImage: true,
-        abortTxnAfterFailover: true,
-        enableFindAndModifyImageCollection: false
     });
 
     st.stop();

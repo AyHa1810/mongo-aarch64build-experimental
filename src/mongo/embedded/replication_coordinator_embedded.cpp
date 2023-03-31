@@ -429,7 +429,8 @@ Status ReplicationCoordinatorEmbedded::doOptimizedReconfig(OperationContext* opC
 }
 
 Status ReplicationCoordinatorEmbedded::awaitConfigCommitment(OperationContext* opCtx,
-                                                             bool waitForOplogCommitment) {
+                                                             bool waitForOplogCommitment,
+                                                             long long term) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -645,6 +646,14 @@ void ReplicationCoordinatorEmbedded::recordIfCWWCIsSetOnConfigServerOnStartup(
 ReplicationCoordinatorEmbedded::WriteConcernTagChanges*
 ReplicationCoordinatorEmbedded::getWriteConcernTagChanges() {
     UASSERT_NOT_IMPLEMENTED;
+}
+
+repl::SplitPrepareSessionManager* ReplicationCoordinatorEmbedded::getSplitPrepareSessionManager() {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+bool ReplicationCoordinatorEmbedded::isRetryableWrite(OperationContext* opCtx) const {
+    return false;
 }
 
 }  // namespace embedded

@@ -72,7 +72,7 @@ public:
 
     const char* getSourceName() const override;
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
         StageConstraints constraints(StreamType::kStreaming,
@@ -126,10 +126,20 @@ public:
         return _exec->getPlanExplainer().getVersion();
     }
 
+    PlanExecutor::QueryFramework getQueryFramework() const {
+        return _queryFramework;
+    }
+
     BSONObj serializeToBSONForDebug() const final {
         // Feel free to add any useful information here. For now this has not been useful for
         // debugging so is left empty.
         return BSON(kStageName << "{}");
+    }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {
+        // The assumption is that dependency analysis and non-correlated prefix analysis happens
+        // before a $cursor is attached to a pipeline.
+        MONGO_UNREACHABLE;
     }
 
 protected:
@@ -265,6 +275,8 @@ private:
 
     // Specific stats for $cursor stage.
     DocumentSourceCursorStats _stats;
+
+    PlanExecutor::QueryFramework _queryFramework;
 };
 
 }  // namespace mongo

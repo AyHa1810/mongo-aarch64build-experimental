@@ -77,7 +77,8 @@ const HostAndPort kTestHosts[] = {
     HostAndPort("TestHost1:12345"), HostAndPort("TestHost2:12345"), HostAndPort("TestHost3:12345")};
 
 Status getMockDuplicateKeyError() {
-    return {DuplicateKeyErrorInfo(BSON("mock" << 1), BSON("" << 1), BSONObj{}, stdx::monostate{}),
+    return {DuplicateKeyErrorInfo(
+                BSON("mock" << 1), BSON("" << 1), BSONObj{}, stdx::monostate{}, boost::none),
             "Mock duplicate key error"};
 }
 
@@ -408,7 +409,7 @@ TEST_F(UpdateRetryTest, NotWritablePrimaryOnceSuccessAfterRetry) {
     HostAndPort host2("TestHost2");
     configTargeter()->setFindHostReturnValue(host1);
 
-    CollectionType collection(NamespaceString("db.coll"),
+    CollectionType collection(NamespaceString::createNamespaceString_forTest("db.coll"),
                               OID::gen(),
                               Timestamp(1, 1),
                               network()->now(),

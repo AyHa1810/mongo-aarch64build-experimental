@@ -74,7 +74,8 @@ public:
         MatchExpressionParser::AllowedFeatureSet allowedFeatures =
             MatchExpressionParser::kDefaultSpecialFeatures,
         const ProjectionPolicies& projectionPolicies = ProjectionPolicies::findProjectionPolicies(),
-        std::vector<std::unique_ptr<InnerPipelineStageInterface>> pipeline = {});
+        std::vector<std::unique_ptr<InnerPipelineStageInterface>> pipeline = {},
+        bool isCountLike = false);
 
     /**
      * For testing or for internal clients to use.
@@ -233,6 +234,14 @@ public:
         return _sbeCompatible;
     }
 
+    void setUseCqfIfEligible(bool useCqfIfEligible) {
+        _useCqfIfEligible = useCqfIfEligible;
+    }
+
+    bool useCqfIfEligible() const {
+        return _useCqfIfEligible;
+    }
+
     bool isParameterized() const {
         return !_inputParamIdToExpressionMap.empty();
     }
@@ -243,6 +252,14 @@ public:
 
     void setExplain(bool explain) {
         _explain = explain;
+    }
+
+    bool getForceGenerateRecordId() const {
+        return _forceGenerateRecordId;
+    }
+
+    void setForceGenerateRecordId(bool value) {
+        _forceGenerateRecordId = value;
     }
 
     OperationContext* getOpCtx() const {
@@ -265,6 +282,21 @@ public:
         return _pipeline;
     }
 
+    /**
+     * Returns true if the query is a count-like query, i.e. has no dependencies on inputs (see
+     * DepsTracker::hasNoRequirements()). These queries can be served without accessing the source
+     * documents (e.g. {$group: {_id: null, c: {$min: 42}}}) in which case we might be able to avoid
+     * scanning the collection and instead use COUNT_SCAN or other optimizations.
+     *
+     * Note that this applies to the find/non-pipeline portion of the query. If the count-like group
+     * is pushed down, later execution stages cannot be treated like a count. In other words, a
+     * query with a pushed-down group may be considered a count at the data access layer but not
+     * above the canonical query.
+     */
+    bool isCountLike() const {
+        return _isCountLike;
+    }
+
 private:
     // You must go through canonicalize to create a CanonicalQuery.
     CanonicalQuery() {}
@@ -275,7 +307,8 @@ private:
                 bool canHaveNoopMatchNodes,
                 std::unique_ptr<MatchExpression> root,
                 const ProjectionPolicies& projectionPolicies,
-                std::vector<std::unique_ptr<InnerPipelineStageInterface>> pipeline);
+                std::vector<std::unique_ptr<InnerPipelineStageInterface>> pipeline,
+                bool isCountLike);
 
     // Initializes '_sortPattern', adding any metadata dependencies implied by the sort.
     //
@@ -310,8 +343,32 @@ private:
     // True if this query can be executed by the SBE.
     bool _sbeCompatible = false;
 
+    // If true, indicates that we should use CQF if this query is eligible (see the
+    // isEligibleForBonsai() function for eligiblitly requirements).
+    // If false, indicates that we shouldn't use CQF even if this query is eligible. This is used to
+    // prevent hybrid classic and CQF plans in the following cases:
+    // 1. A pipeline that is not eligible for CQF but has an eligible prefix pushed down to find.
+    // 2. A subpipeline pushed down to find as part of a $lookup or $graphLookup.
+    // The default value of false ensures that only codepaths (find command) which opt-in are able
+    // to use CQF.
+    bool _useCqfIfEligible = false;
+
+    // True if this query must produce a RecordId output in addition to the BSON objects that
+    // constitute the result set of the query. Any generated query solution must not discard record
+    // ids, even if the optimizer detects that they are not going to be consumed downstream.
+    bool _forceGenerateRecordId = false;
+
     // A map from assigned InputParamId's to parameterised MatchExpression's.
     std::vector<const MatchExpression*> _inputParamIdToExpressionMap;
+
+    // "True" for queries that after doing a scan of an index can produce an empty document and
+    // still be correct. For example, this applies to queries like [{$match: {x: 42}}, {$count:
+    // "c"}] in presence of index on "x". The stage that follows the index scan doesn't have to be
+    // $count but it must have no dependencies on the fields from the prior stages. Note, that
+    // [{$match: {x: 42}}, {$group: {_id: "$y"}}, {$count: "c"}]] is _not_ "count like" because
+    // the first $group stage needs to access field "y" and this access cannot be incorporated into
+    // the index scan.
+    bool _isCountLike = false;
 };
 
 }  // namespace mongo

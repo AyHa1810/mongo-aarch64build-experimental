@@ -55,7 +55,7 @@ public:
 
     const char* getSourceName() const override;
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const override;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const override;
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const override {
         StageConstraints constraints{StreamType::kStreaming,
@@ -101,6 +101,8 @@ public:
     void push_back(const GetNextResult& result) {
         _queue.push_back(result);
     }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {}
 
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx);

@@ -55,7 +55,8 @@ PipelineExecutor::PipelineExecutor(const boost::intrusive_ptr<ExpressionContext>
     // "Resolve" involved namespaces into a map. We have to populate this map so that any
     // $lookups, etc. will not fail instantiation. They will not be used for execution as these
     // stages are not allowed within an update context.
-    LiteParsedPipeline liteParsedPipeline(NamespaceString("dummy.namespace"), pipeline);
+    LiteParsedPipeline liteParsedPipeline(
+        NamespaceString::makeDummyNamespace(expCtx->ns.tenantId()), pipeline);
     StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces;
     for (auto&& nss : liteParsedPipeline.getInvolvedNamespaces()) {
         resolvedNamespaces.try_emplace(nss.coll(), nss, std::vector<BSONObj>{});
@@ -117,10 +118,10 @@ UpdateExecutor::ApplyResult PipelineExecutor::applyUpdate(ApplyParams applyParam
             // We're allowed to generate $v: 2 log entries. The $v:2 has certain meta-fields like
             // '$v', 'diff'. So we pad some additional byte while computing diff.
             const auto diffOutput =
-                doc_diff::computeDiff(originalDoc,
-                                      transformedDoc,
-                                      update_oplog_entry::kSizeOfDeltaOplogEntryMetadata,
-                                      applyParams.indexData);
+                doc_diff::computeOplogDiff(originalDoc,
+                                           transformedDoc,
+                                           update_oplog_entry::kSizeOfDeltaOplogEntryMetadata,
+                                           applyParams.indexData);
             if (diffOutput) {
                 ret.oplogEntry = update_oplog_entry::makeDeltaOplogEntry(diffOutput->diff);
                 ret.indexesAffected = diffOutput->indexesAffected;

@@ -78,6 +78,281 @@ index build on `{lastName: 1}`:
   'ns': 'test.employees'}
 ```
 
+### $listCatalog Aggregation Pipeline Operator
+
+[$listCatalog](https://github.com/mongodb/mongo/blob/532c0679ef4fc8313a9e00a1334ca18e04ff6914/src/mongo/db/pipeline/document_source_list_catalog.h#L46) is an internal aggregation pipeline operator that may be used to inspect the contents
+of the durable catalog on a running server. For catalog entries that refer to views, additional
+information is retrieved from the enclosing database's `system.views` collection. The $listCatalog
+is generally run on the admin database to obtain a complete view of the durable catalog, provided
+the caller has the required
+[administrative privileges](https://github.com/mongodb/mongo/blob/532c0679ef4fc8313a9e00a1334ca18e04ff6914/src/mongo/db/pipeline/document_source_list_catalog.cpp#L55).
+Example command invocation and output from
+[list_catalog.js](https://github.com/mongodb/mongo/blob/532c0679ef4fc8313a9e00a1334ca18e04ff6914/jstests/core/catalog/list_catalog.js#L98)):
+
+```
+> const adminDB = db.getSiblingDB('admin');
+> adminDB.aggregate([{$listCatalog: {}}]);
+
+Collectionless $listCatalog: [
+    {
+        "db" : "test",
+        "name" : "system.views",
+        "type" : "collection",
+        "md" : {
+            "ns" : "test.system.views",
+            "options" : {
+                "uuid" : UUID("a132c4ee-a1f4-4251-8eb2-c9f4afbeb9c1")
+            },
+            "indexes" : [
+                {
+                    "spec" : {
+                        "v" : 2,
+                        "key" : {
+                            "_id" : 1
+                        },
+                        "name" : "_id_"
+                    },
+                    "ready" : true,
+                    "multikey" : false,
+                    "multikeyPaths" : {
+                        "_id" : BinData(0,"AA==")
+                    },
+                    "head" : NumberLong(0),
+                    "backgroundSecondary" : false
+                }
+            ]
+        },
+        "idxIdent" : {
+            "_id_" : "index-6-2245557986372974053"
+        },
+        "ns" : "test.system.views",
+        "ident" : "collection-5-2245557986372974053"
+    },
+    {
+        "db" : "list_catalog",
+        "name" : "simple",
+        "type" : "collection",
+        "md" : {
+            "ns" : "list_catalog.simple",
+            "options" : {
+                "uuid" : UUID("a86445c2-3e3c-42ae-96be-5d451c977ed6")
+            },
+            "indexes" : [
+                {
+                    "spec" : {
+                        "v" : 2,
+                        "key" : {
+                            "_id" : 1
+                        },
+                        "name" : "_id_"
+                    },
+                    "ready" : true,
+                    "multikey" : false,
+                    "multikeyPaths" : {
+                        "_id" : BinData(0,"AA==")
+                    },
+                    "head" : NumberLong(0),
+                    "backgroundSecondary" : false
+                },
+                {
+                    "spec" : {
+                        "v" : 2,
+                        "key" : {
+                            "a" : 1
+                        },
+                        "name" : "a_1"
+                    },
+                    "ready" : true,
+                    "multikey" : false,
+                    "multikeyPaths" : {
+                        "a" : BinData(0,"AA==")
+                    },
+                    "head" : NumberLong(0),
+                    "backgroundSecondary" : false
+                }
+            ]
+        },
+        "idxIdent" : {
+            "_id_" : "index-62-2245557986372974053",
+            "a_1" : "index-63-2245557986372974053"
+        },
+        "ns" : "list_catalog.simple",
+        "ident" : "collection-61-2245557986372974053"
+    },
+    {
+        "db" : "list_catalog",
+        "name" : "system.views",
+        "type" : "collection",
+        "md" : {
+            "ns" : "list_catalog.system.views",
+            "options" : {
+                "uuid" : UUID("2f76dd14-1d9a-42e1-8716-c1165cdbb00f")
+            },
+            "indexes" : [
+                {
+                    "spec" : {
+                        "v" : 2,
+                        "key" : {
+                            "_id" : 1
+                        },
+                        "name" : "_id_"
+                    },
+                    "ready" : true,
+                    "multikey" : false,
+                    "multikeyPaths" : {
+                        "_id" : BinData(0,"AA==")
+                    },
+                    "head" : NumberLong(0),
+                    "backgroundSecondary" : false
+                }
+            ]
+        },
+        "idxIdent" : {
+            "_id_" : "index-65-2245557986372974053"
+        },
+        "ns" : "list_catalog.system.views",
+        "ident" : "collection-64-2245557986372974053"
+    },
+    {
+        "db" : "list_catalog",
+        "name" : "simple_view",
+        "type" : "view",
+        "ns" : "list_catalog.simple_view",
+        "_id" : "list_catalog.simple_view",
+        "viewOn" : "simple",
+        "pipeline" : [
+            {
+                "$project" : {
+                    "a" : 0
+                }
+            }
+        ]
+    },
+    ...
+]
+
+```
+
+The `$listCatalog` also supports running on a specific collection. See example in
+[list_catalog.js](https://github.com/mongodb/mongo/blob/532c0679ef4fc8313a9e00a1334ca18e04ff6914/jstests/core/catalog/list_catalog.js#L77).
+
+This aggregation pipeline operator is primarily intended for internal diagnostics and applications that require information not
+currently provided by [listDatabases](https://www.mongodb.com/docs/v6.0/reference/command/listDatabases/),
+[listCollections](https://www.mongodb.com/docs/v6.0/reference/command/listCollections/), and
+[listIndexes](https://www.mongodb.com/docs/v6.0/reference/command/listIndexes/). The three commands referenced are part of the
+[Stable API](https://www.mongodb.com/docs/v6.0/reference/stable-api/) with a well-defined output format (see
+[listIndexes IDL](https://github.com/mongodb/mongo/blob/532c0679ef4fc8313a9e00a1334ca18e04ff6914/src/mongo/db/list_indexes.idl#L225)).
+
+#### Read Concern Support
+
+In terms of accessing the current state of databases, collections, and indexes in a running server,
+the `$listCatalog` provides a consistent snapshot of the catalog in a single command invocation
+using the default or user-provided
+[read concern](https://www.mongodb.com/docs/v6.0/reference/method/db.collection.aggregate/). The
+[list_catalog_read_concern.js](https://github.com/mongodb/mongo/blob/532c0679ef4fc8313a9e00a1334ca18e04ff6914/jstests/noPassthrough/list_catalog_read_concern.js#L46)
+contains examples of using $listCatalog with a variety of read concern settings.
+
+The tradtional alternative would have involved a `listDatabases` command followed by a series of
+`listCollections` and `listIndexes` calls, with the downside of reading the catalog at a different
+point in time during each command invocation.
+
+#### Examples of differences between listIndexes and $listCatalog results
+
+The `$listCatalog` operator does not format its results with the IDL-derived formatters generated for the `listIndexes` command.
+This has implications for applications that read the durable catalog using $listCatalog rather than the recommended listIndexes
+command. Below are a few examples where the `listIndexes` results may differ from `$listCatalog`.
+
+| Index Type | Index Option | createIndexes | listIndexes | $listCatalog |
+| ---------- | ------------ | ------------- | ----------- | ------------ |
+| [Sparse](https://www.mongodb.com/docs/v6.0/core/index-sparse/) | [sparse (safeBool)](https://github.com/mongodb/mongo/blob/532c0679ef4fc8313a9e00a1334ca18e04ff6914/src/mongo/db/list_indexes.idl#L84) | `db.t.createIndex({a: 1}, {sparse: 12345})` | `{ "v" : 2, "key" : { "a" : 1 }, "name" : "a_1", "sparse" : true }` | `{ "v" : 2, "key" : { "a" : 1 }, "name" : "a_1", "sparse" : 12345 }` |
+| [TTL](https://www.mongodb.com/docs/v6.0/core/index-ttl/) | [expireAfterSeconds (safeInt)](https://github.com/mongodb/mongo/blob/532c0679ef4fc8313a9e00a1334ca18e04ff6914/src/mongo/db/list_indexes.idl#L88) | `db.t.createIndex({created: 1}, {expireAfterSeconds: 10.23})` | `{ "v" : 2, "key" : { "created" : 1 }, "name" : "created_1", "expireAfterSeconds" : 10 }` | `{ "v" : 2, "key" : { "created" : 1 }, "name" : "created_1", "expireAfterSeconds" : 10.23 }` |
+| [Geo](https://www.mongodb.com/docs/v6.0/tutorial/build-a-2d-index/) | [bits (safeInt)](https://github.com/mongodb/mongo/blob/532c0679ef4fc8313a9e00a1334ca18e04ff6914/src/mongo/db/list_indexes.idl#L117) | `db.t.createIndex({p: '2d'}, {bits: 16.578})` | `{ "v" : 2, "key" : { "p" : "2d" }, "name" : "p_2d", "bits" : 16 }` | `{ "v" : 2, "key" : { "p" : "2d" }, "name" : "p_2d", "bits" : 16.578 }` |
+
+#### $listCatalog in a sharded cluster
+
+The `$listCatalog` operator supports running in a sharded cluster where the `$listCatalog`
+result from each shard is combined at the router with additional identifying information similar
+to the [shard](https://www.mongodb.com/docs/v6.0/reference/operator/aggregation/indexStats/#std-label-indexStats-output-shard) output field
+of the `$indexStats` operator. The following is a sample test output from
+[sharding/list_catalog.js](https://github.com/mongodb/mongo/blob/532c0679ef4fc8313a9e00a1334ca18e04ff6914/jstests/sharding/list_catalog.js#L40):
+
+```
+[
+    {
+        "db" : "list_catalog",
+        "name" : "coll",
+        "type" : "collection",
+        "shard" : "list_catalog-rs0",
+        "md" : {
+            "ns" : "list_catalog.coll",
+            "options" : {
+                "uuid" : UUID("17886eb0-f157-45c9-9b63-efb8273f51da")
+            },
+            "indexes" : [
+                {
+                    "spec" : {
+                        "v" : 2,
+                        "key" : {
+                            "_id" : 1
+                        },
+                        "name" : "_id_"
+                    },
+                    "ready" : true,
+                    "multikey" : false,
+                    "multikeyPaths" : {
+                        "_id" : BinData(0,"AA==")
+                    },
+                    "head" : NumberLong(0),
+                    "backgroundSecondary" : false
+                }
+            ]
+        },
+        "idxIdent" : {
+            "_id_" : "index-56--2997668048670645427"
+        },
+        "ns" : "list_catalog.coll",
+        "ident" : "collection-55--2997668048670645427"
+    },
+    {
+        "db" : "list_catalog",
+        "name" : "coll",
+        "type" : "collection",
+        "shard" : "list_catalog-rs1",
+        "md" : {
+            "ns" : "list_catalog.coll",
+            "options" : {
+                "uuid" : UUID("17886eb0-f157-45c9-9b63-efb8273f51da")
+            },
+            "indexes" : [
+                {
+                    "spec" : {
+                        "v" : 2,
+                        "key" : {
+                            "_id" : 1
+                        },
+                        "name" : "_id_"
+                    },
+                    "ready" : true,
+                    "multikey" : false,
+                    "multikeyPaths" : {
+                        "_id" : BinData(0,"AA==")
+                    },
+                    "head" : NumberLong(0),
+                    "backgroundSecondary" : false
+                }
+            ]
+        },
+        "idxIdent" : {
+            "_id_" : "index-55--2220352983339007214"
+        },
+        "ns" : "list_catalog.coll",
+        "ident" : "collection-53--2220352983339007214"
+    }
+]
+
+```
+
+
 ## Collection Catalog
 The `CollectionCatalog` class holds in-memory state about all collections in all databases and is a
 cache of the [durable catalog](#durable-catalog) state. It provides the following functionality:
@@ -394,7 +669,7 @@ rolls-back writes when it goes out of scope and its destructor is called before 
 The WriteUnitOfWork has a [`groupOplogEntries` option](https://github.com/mongodb/mongo/blob/fa32d665bd63de7a9d246fa99df5e30840a931de/src/mongo/db/storage/write_unit_of_work.h#L67)
 to replicate multiple writes transactionally. This option uses the [`BatchedWriteContext` class](https://github.com/mongodb/mongo/blob/9ab71f9b2fac1e384529fafaf2a819ce61834228/src/mongo/db/batched_write_context.h#L46)
 to stage writes and to generate a single applyOps entry at commit, similar to what multi-document
-transactions do via the [`TransactionParticipant` class](https://github.com/mongodb/mongo/blob/9ab71f9b2fac1e384529fafaf2a819ce61834228/src/mongo/db/transaction_participant.h#L82).
+transactions do via the [`TransactionParticipant` class](https://github.com/mongodb/mongo/blob/219990f17695b0ea4695f827a42a18e012b1e9cf/src/mongo/db/transaction/transaction_participant.h#L82).
 Unlike a multi-document transaction, the applyOps entry lacks the `lsId` and the `txnNumber`
 fields. Callers must ensure that the WriteUnitOfWork does not generate more than 16MB of oplog,
 otherwise the operation will fail with `TransactionTooLarge` code.
@@ -444,6 +719,30 @@ See
 [wtRcToStatus](https://github.com/mongodb/mongo/blob/c799851554dc01493d35b43701416e9c78b3665c/src/mongo/db/storage/wiredtiger/wiredtiger_util.cpp#L178-L183)
 where we throw the exception in WiredTiger.
 See [TemporarilyUnavailableException](https://github.com/mongodb/mongo/blob/c799851554dc01493d35b43701416e9c78b3665c/src/mongo/db/concurrency/temporarily_unavailable_exception.h#L39-L45).
+
+## TransactionTooLargeForCacheException
+
+A TransactionTooLargeForCacheException may be thrown inside the server to indicate that an operation
+was rolled-back and is unlikely to ever complete because the storage engine cache is insufficient,
+even in the absence of concurrent operations. This is determined by a simple heuristic wherein,
+after a rollback, a threshold on the proportion of total dirty cache bytes the running transaction
+can represent and still be considered fullfillable is checked. The threshold can be tuned with the
+`transactionTooLargeForCacheThreshold` parameter. Setting this threshold to its maximum value (1.0)
+causes the check to be skipped and TransactionTooLargeForCacheException to be disabled.
+
+On replica sets, if an operation succeeds on a primary, it should also succeed on a secondary. It
+would be possible to convert to both TemporarilyUnavailableException and WriteConflictException,
+as if TransactionTooLargeForCacheException was disabled. But on secondaries the only
+difference between the two is the rate at which the operation is retried. Hence,
+TransactionTooLargeForCacheException is always converted to a WriteConflictException, which retries
+faster, to avoid stalling replication longer than necessary.
+
+Prior to 6.3, or when TransactionTooLargeForCacheException is disabled, multi-document
+transactions always return a WriteConflictException, which may result in drivers retrying  an
+operation indefinitely. For non-multi-document operations, there is a limited number of retries on
+TemporarilyUnavailableException, but it might still be beneficial to not retry operations which are
+unlikely to complete and are disruptive for concurrent operations.
+
 ## Collection and Index Writes
 
 Collection write operations (inserts, updates, and deletes) perform storage engine writes to both
@@ -785,7 +1084,7 @@ side writes. When a quorum is reached, the current primary, under a collection X
 all index constraints. If there are errors, it will replicate an `abortIndexBuild` oplog entry. If
 the index build is successful, it will replicate a `commitIndexBuild` oplog entry.
 
-Secondaries that were not included in the commit quorum and recieve a `commitIndexBuild` oplog entry
+Secondaries that were not included in the commit quorum and receive a `commitIndexBuild` oplog entry
 will block replication until their index build is complete.
 
 The `commitQuorum` for a running index build may be changed by the user via the
@@ -1088,26 +1387,26 @@ their own WT table. [The appendix](#Collection-and-Index-to-Table-relationship) 
 relationship between creating/dropping a collection and the underlying creation/deletion
 of a WT table which justifies the following logic. When reconciling, every WT table
 that is not "pointed to" by a MongoDB record store or index [gets
-dropped](https://github.com/mongodb/mongo/blob/e485c1a8011d85682cb8dafa87ab92b9c23daa66/src/mongo/db/storage/storage_engine_impl.cpp#L406-L408
+dropped](https://github.com/mongodb/mongo/blob/6c9adc9a2d518fa046c7739e043a568f9bee6931/src/mongo/db/storage/storage_engine_impl.cpp#L663-L676
 "Github"). A MongoDB record store that points to a WT table that doesn't exist is considered [a
 fatal
-error](https://github.com/mongodb/mongo/blob/e485c1a8011d85682cb8dafa87ab92b9c23daa66/src/mongo/db/storage/storage_engine_impl.cpp#L412-L425
-"Github"). An index that doesn't point to a WT table is [scheduled to be
-rebuilt](https://github.com/mongodb/mongo/blob/e485c1a8011d85682cb8dafa87ab92b9c23daa66/src/mongo/db/storage/storage_engine_impl.cpp#L479
-"Github"). The index logic is more relaxed because indexes do not go through two-phase drop when
-running with enableMajorityReadConcern=false.
+error](https://github.com/mongodb/mongo/blob/6c9adc9a2d518fa046c7739e043a568f9bee6931/src/mongo/db/storage/storage_engine_impl.cpp#L679-L693
+"Github"). An index that doesn't point to a WT table is [ignored and logged](https://github.com/mongodb/mongo/blob/6c9adc9a2d518fa046c7739e043a568f9bee6931/src/mongo/db/storage/storage_engine_impl.cpp#L734-L746
+"Github") because there are cetain cases where the catalog entry may reference an index ident which
+is no longer present, such as when an unclean shutdown occurs before a checkpoint is taken during
+startup recovery.
 
-The second step of recovering the catalog is [reconciling unfinished index builds](https://github.com/mongodb/mongo/blob/e485c1a8011d85682cb8dafa87ab92b9c23daa66/src/mongo/db/storage/storage_engine_impl.cpp#L427-L432
-"Github"). In 4.7+ the story will simplify, but right now there are a few outcomes:
-* An [unfinished FCV 4.2- background index build on the primary](https://github.com/mongodb/mongo/blob/e485c1a8011d85682cb8dafa87ab92b9c23daa66/src/mongo/db/storage/storage_engine_impl.cpp#L527-L542 "Github") will be discarded (no oplog entry
-  was ever written saying the index exists).
-* An [unfinished FCV 4.2- background index build on a secondary](https://github.com/mongodb/mongo/blob/e485c1a8011d85682cb8dafa87ab92b9c23daa66/src/mongo/db/storage/storage_engine_impl.cpp#L513-L525 "Github") will be rebuilt in the foreground
-  (an oplog entry was written saying the index exists).
-* An [unfinished FCV 4.4\+](https://github.com/mongodb/mongo/blob/e485c1a8011d85682cb8dafa87ab92b9c23daa66/src/mongo/db/storage/storage_engine_impl.cpp#L483-L511 "Github") background index build will be restarted in the background.
-    * If the server was previously shut down cleanly, we may be able to [resume the index build](#resumable-index-builds)
-      at the phase that it was stopped in. This resume information is stored in an internal ident
-      written at shutdown. If we fail to resume the index build, we will clean up the internal ident
-      and restart the index build in the background.
+The second step of recovering the catalog is [reconciling unfinished index builds](https://github.com/mongodb/mongo/blob/6c9adc9a2d518fa046c7739e043a568f9bee6931/src/mongo/db/storage/storage_engine_impl.cpp#L695-L699
+"Github"), that could have different outcomes:
+* An [index build with a UUID](https://github.com/mongodb/mongo/blob/6c9adc9a2d518fa046c7739e043a568f9bee6931/src/mongo/db/storage/storage_engine_impl.cpp#L748-L751 "Github")
+is an unfinished two-phase build and must be restarted, unless we are
+[resuming it](#resumable-index-builds). This resume information is stored in an internal ident
+written at (clean) shutdown. If we fail to resume the index build, we will clean up the internal
+ident and restart the index build in the background.
+* An [unfinished index build on standalone](https://github.com/mongodb/mongo/blob/6c9adc9a2d518fa046c7739e043a568f9bee6931/src/mongo/db/storage/storage_engine_impl.cpp#L792-L794 "Github")
+will be discarded (no oplog entry was ever written saying the index exists).
+
+
 
 After storage completes its recovery, control is passed to [replication
 recovery](https://github.com/mongodb/mongo/blob/master/src/mongo/db/repl/README.md#startup-recovery
@@ -1233,7 +1532,64 @@ _Code spelunking starting points:_
   * 'durable' confusingly means journaling is enabled.
 * [_Whether WT journals a collection_](https://github.com/mongodb/mongo/blob/r4.5.0/src/mongo/db/storage/wiredtiger/wiredtiger_util.cpp#L560-L580)
 
-# Flow Control
+# Global Lock Admission Control
+There are 2 separate ticketing mechanisms placed in front of the global lock acquisition. Both aim to limit the number of concurrent operations from overwhelming the system. Before an operation can acquire the global lock, it must acquire a ticket from one, or both, of the ticketing mechanisms. When both ticket mechanisms are necessary, the acquisition order is as follows:
+1. Flow Control - Required only for global lock requests in MODE_IX
+2. Execution Admission Control - Required for all global lock requests
+
+
+Flow Control is in place to prevent a majority of secondaries from falling behind in replication, whereas Execution Admission Control aims to limit the number of concurrent storage engine transactions on a single node.
+
+## Admission Priority
+Associated with every operation is an admission priority, stored as a part of the [AdmissionContext](https://github.com/mongodb/mongo/blob/r6.3.0-rc0/src/mongo/util/concurrency/admission_context.h#L40). By default, operations are 'normal' priority.
+
+In both the Execution Admission and Flow Control ticketing system, operations of 'immediate' priority bypass ticket acquisition, regardless of ticket availability. Otherwise, tickets that are not 'immediate' priority must throttle when there are no tickets available.
+
+Flow Control is only concerned whether an operation is 'immediate' priority and does not differentiate between 'normal' and 'low' priorities. The current version of Execution Admission Control relies on admission priority to administer tickets when the server is under load.
+
+**AdmissionContext::Priority**
+* `kImmediate` - An operation that bypasses ticket acquisition in both ticketing mechanisms. Reserved for operations critical to availability (e.g replication workers), or observability (e.g. FTDC), and any operation releasing resources (e.g. committing or aborting prepared transactions).
+* `kNormal` - An operation that should be throttled when the server is under load. If an operation is throttled, it will not affect availability or observability. Most operations, both user and internal, should use this priority unless they qualify as 'kLow' or 'kImmediate' priority.
+* `kLow` - It's of low importance that the operation acquires a ticket in Execution Admission Control. Reserved for background tasks that have no other operations dependent on them. The operation will be throttled under load and make significantly less progress compared to operations of higher priorities in the Execution Admission Control.
+
+Developers should consciously decide admission priority when adding new features. Admission priority can be set through the [ScopedAdmissionPriorityForLock](https://github.com/mongodb/mongo/blob/r6.3.0-rc0/src/mongo/db/concurrency/lock_state.h#L428) RAII.
+
+### Developer Guidelines for Declaring Low Admission Priority
+Developers must evaluate the consequences of each low priority operation from falling too far behind, and implement safeguards to avoid any undesirable behaviors for excessive delays in low priority operations.
+
+An operation should dynamically choose when to be deprioritized or re-prioritized. More
+specifically, all low-priority candidates must assess the state of the system before taking the
+GlobalLock with low priority.
+
+For example, since TTL deletes can be an expensive background task, they should default to low
+priority. However, it's important they don't fall too far behind TTL inserts - otherwise, there is a risk of
+unbounded collection growth. To remedy this issue, TTL deletes on a collection [are reprioritized](https://github.com/mongodb/mongo/blob/d1a0e34e1e67d4a2b23104af2512d14290b25e5f/src/mongo/db/ttl.idl#L96) to normal priority if they can't catch up after n-subpasses.
+
+## Execution Admission Control
+A ticketing mechanism that limits the number of concurrent storage engine transactions in a single mongod to reduce contention on storage engine resources.
+
+### Ticket Management
+There are 2 separate pools of available tickets: one pool for global lock read requests (MODE_S/MODE_IS), and one pool of tickets for global lock write requests (MODE_IX).
+
+The size of each pool can be specified at startup via `storageEngineConcurrentReadTransactions` (read ticket pool), and `storageEngineConcurrentWriteTransactions` (write ticket pool). Additionally, the size of the each ticket pool can be changed through the [TicketHolderManager](https://github.com/mongodb/mongo/blob/r6.3.0-rc0/src/mongo/db/storage/ticketholder_manager.h#L51) at runtime.
+
+Each pool of tickets is maintained in a [TicketHolder](https://github.com/mongodb/mongo/blob/r6.3.0-rc0/src/mongo/util/concurrency/ticketholder.h#L52). Tickets distributed from a given TicketHolder will always be returned to the same TicketHolder (a write ticket will always be returned to the TicketHolder with the write ticket pool).
+
+### Deprioritization
+When resources are limited, its important to prioritize which operations are admitted to run first. The [PriorityTicketHolder](https://github.com/mongodb/mongo/blob/r6.3.0-rc0/src/mongo/util/concurrency/priority_ticketholder.h) enables deprioritization of low priority operations and is used by default on [linux machines](https://jira.mongodb.org/browse/SERVER-72616).
+
+If the server is not under load (there are tickets available for the global lock request mode), then tickets are handed out immediately, regardless of admission priority. Otherwise, operations wait until a ticket is available.
+
+Operations waiting for a ticket are assigned to a TicketQueue according to their priority. There are two queues, one manages low priority operations, the other normal priority operations.
+When a ticket is released to the PriorityTicketHolder, the default behavior for the PriorityTicketHolder is as follows:
+1. Attempt a ticket transfer through the normal priority TicketQueue. If unsuccessful (e.g there are no normal priority operations waiting for a ticket), continue to (2)
+2. Attempt a ticket transfer through the the low priority TicketQueue
+3. If no transfer can be made, return the ticket to the general ticket pool
+
+#### Preventing Low Priority Operations from Falling too Far Behind
+If a server is consistently under load, and ticket transfers were always made through the normal priority TicketQueue first, then operations assigned to the low priority TicketQueue could starve. To remedy this, `lowPriorityAdmissionBypassThreshold` limits the number of consecutive ticket transfers to the normal priority TicketQueue before a ticket transfer is issued through the low priority TicketQueue.
+
+## Flow Control
 
 The Flow Control mechanism aims to keep replica set majority committed lag less than or equal to a
 configured maximum. The default value for this maximum lag is 10 seconds. The Flow Control mechanism
@@ -1253,7 +1609,7 @@ admin.
 Flow Control is configurable via several server parameters. Additionally, currentOp, serverStatus,
 database profiling, and slow op log lines include Flow Control information.
 
-## Ticket admission mechanism
+### Flow Control Ticket Admission Mechanism
 
 The ticket admission Flow Control mechanism allows a specified number of global IX lock acquisitions
 every second. Most global IX lock acquisitions (except for those that explicitly circumvent Flow
@@ -1266,26 +1622,27 @@ give and take from; an independent mechanism refreshes the ticket counts every s
 When the Flow Control mechanism refreshes available tickets, it calculates how many tickets it
 should allow in order to address the majority committed lag.
 
-The Flow Control mechanism determines how many tickets to replenish every period based on:
+The Flow Control mechanism determines how many flow control tickets to replenish every period based
+on:
 1. The current majority committed replication lag with respect to the configured target maximum
    replication lag
 1. How many operations the secondary sustaining the commit point has applied in the last period
 1. How many IX locks per operation were acquired in the last period
 
-## Configurable constants
+### Configurable constants
 
-Criterion #2 determines a "base" number of tickets to be used in the calculation. When the current
-majority committed lag is greater than or equal to a certain configurable threshold percentage of
-the target maximum, the Flow Control mechanism scales down this "base" number based on the
-discrepancy between the two lag values. For some configurable constant 0 < k < 1, it calculates the
-following:
+Criterion #2 determines a "base" number of flow control tickets to be used in the calculation. When
+the current majority committed lag is greater than or equal to a certain configurable threshold
+percentage of the target maximum, the Flow Control mechanism scales down this "base" number based on
+the discrepancy between the two lag values. For some configurable constant 0 < k < 1, it calculates
+the following:
 
 `base * k ^ ((lag - threshold)/threshold) * fudge factor`
 
 The fudge factor is also configurable and should be close to 1. Its purpose is to assign slightly
-lower than the "base" number of tickets when the current lag is close to the threshold.  Criterion
-#3 is then multiplied by the result of the above calculation to translate a count of operations into
-a count of lock acquisitions.
+lower than the "base" number of flow control tickets when the current lag is close to the threshold.
+Criterion #3 is then multiplied by the result of the above calculation to translate a count of
+operations into a count of lock acquisitions.
 
 When the majority committed lag is less than the threshold percentage of the target maximum, the
 number of tickets assigned in the previous period is used as the "base" of the calculation. This
@@ -1294,22 +1651,21 @@ by another configurable constant (the ticket "multiplier" constant). This produc
 of tickets to be assigned in the next period.
 
 When the Flow Control mechanism is disabled, the ticket refresher mechanism always allows one
-billion flow control ticket acquisitions per second. The Flow Control mechanism can be disabled
-explicitly via a server parameter and implicitly via setting enableMajorityReadConcern to
-false. Additionally, the mechanism is disabled on nodes that cannot accept writes.
+billion flow control ticket acquisitions per second. The Flow Control mechanism can be disabled via 
+a server parameter. Additionally, the mechanism is disabled on nodes that cannot accept writes.
 
 Criteria #2 and #3 are determined using a sampling mechanism that periodically stores the necessary
 data as primaries process writes. The sampling mechanism executes regardless of whether Flow Control
 is enabled.
 
-## Oscillations
+### Oscillations
 
 There are known scenarios in which the Flow Control mechanism causes write throughput to
 oscillate. There is no known work that can be done to eliminate oscillations entirely for this
 mechanism without hindering other aspects of the mechanism. Work was done (see SERVER-39867) to
 dampen the oscillations at the expense of throughput.
 
-## Throttling internal operations
+### Throttling internal operations
 
 The Flow Control mechanism throttles all IX lock acquisitions regardless of whether they are from
 client or system operations unless they are part of an operation that is explicitly excluded from
@@ -1341,6 +1697,9 @@ Additionally, users can specify that they'd like to perform a `full` validation.
   as part of the storage interface.
 * These hooks enable storage engines to perform internal data structure checks that MongoDB would
   otherwise not be able to perform.
+* More comprehensive and time-consuming checks will run to detect more types of non-conformant BSON
+  documents with duplicate field names, invalid UTF-8 characters, and non-decompressible BSON
+  Columns.
 * Full validations are not compatible with background validation.
 
 [Public docs on how to run validation and interpret the results.](https://docs.mongodb.com/manual/reference/command/validate/)
@@ -1353,7 +1712,7 @@ Additionally, users can specify that they'd like to perform a `full` validation.
 * Index entries are in increasing order if the sort order is ascending.
 * Index entries are in decreasing order if the sort order is descending.
 * Unique indexes do not have duplicate keys.
-* Documents in the collection are valid `BSON`.
+* Documents in the collection are valid and conformant `BSON`.
 * Fast count matches the number of records in the `RecordStore`.
   + For foreground validation only.
 * The number of _id index entries always matches the number of records in the `RecordStore`.
@@ -1363,6 +1722,7 @@ Additionally, users can specify that they'd like to perform a `full` validation.
 * The number of index entries for each index is not less than the number of records in the record
   store.
   + Not checked for sparse and partial indexes.
+* Time-series bucket collections are valid.
 
 ## Validation Procedure
 * Instantiates the objects used throughout the validation procedure.
@@ -1371,12 +1731,14 @@ Additionally, users can specify that they'd like to perform a `full` validation.
       for the collection and each index, data throttling (for background validation), and general
       information about the collection.
     + [IndexConsistency](https://github.com/mongodb/mongo/blob/r4.5.0/src/mongo/db/catalog/index_consistency.h)
-      keeps track of the number of keys detected in the record store and indexes. Detects when there
+      descendents keep track of the number of keys detected in the record store and indexes. Detects when there
       are index inconsistencies and maintains the information about the inconsistencies for
       reporting.
     + [ValidateAdaptor](https://github.com/mongodb/mongo/blob/r4.5.0/src/mongo/db/catalog/validate_adaptor.h)
       used to traverse the record store and indexes. Validates that the records seen are valid
-      `BSON` and not corrupted.
+      `BSON` conformant to most [BSON specifications](https://bsonspec.org/spec.html). In `full`
+      and `checkBSONConformant` validation modes, all `BSON` checks, including the time-consuming
+      ones, will be enabled.
 * If a `full` validation was requested, we run the storage engines validation hooks at this point to
   allow a more thorough check to be performed.
 * Validates the [collection’s in-memory](https://github.com/mongodb/mongo/blob/r4.5.0/src/mongo/db/catalog/collection.h)
@@ -1385,21 +1747,18 @@ Additionally, users can specify that they'd like to perform a `full` validation.
   between the two.
 * [Initializes all the cursors](https://github.com/mongodb/mongo/blob/07765dda62d4709cddc9506ea378c0d711791b57/src/mongo/db/catalog/validate_state.cpp#L144-L205)
   on the `RecordStore` and `SortedDataInterface` of each index in the `ValidateState` object.
-    + We choose a read timestamp (`ReadSource`) based on the validation mode and node configuration:
-      |                |  Standalone  | Replica Set  |
-      | -------------- | :----------: | ------------ |
-      | **Foreground** | kNoTimestamp | kNoTimestamp |
-      | **Background** | kNoTimestamp | kNoOverlap   |
+    + We choose a read timestamp (`ReadSource`) based on the validation mode: `kNoTimestamp`
+    for foreground validation and `kCheckpoint` for background validation.
 * Traverses the `RecordStore` using the `ValidateAdaptor` object.
-    + [Validates each record and adds the document's index key set to the IndexConsistency object](https://github.com/mongodb/mongo/blob/r4.5.0/src/mongo/db/catalog/validate_adaptor.cpp#L61-L140)
+    + [Validates each record and adds the document's index key set to the IndexConsistency objects](https://github.com/mongodb/mongo/blob/r4.5.0/src/mongo/db/catalog/validate_adaptor.cpp#L61-L140)
       for consistency checks at later stages.
-        + In an effort to reduce the memory footprint of validation, the `IndexConsistency` object
+        + In an effort to reduce the memory footprint of validation, the `IndexConsistency` objects
           [hashes](https://github.com/mongodb/mongo/blob/r4.5.0/src/mongo/db/catalog/index_consistency.cpp#L307-L309)
-          the keys passed in to one of many buckets.
-        + Document keys will
+          the keys (or paths) passed in to one of many buckets.
+        + Document keys (or paths) will
           [increment](https://github.com/mongodb/mongo/blob/r4.5.0/src/mongo/db/catalog/index_consistency.cpp#L204-L214)
           the respective bucket.
-        + Index keys will
+        + Index keys (paths) will
           [decrement](https://github.com/mongodb/mongo/blob/r4.5.0/src/mongo/db/catalog/index_consistency.cpp#L239-L248)
           the respective bucket.
     + Checks that the `RecordId` is in [increasing order](https://github.com/mongodb/mongo/blob/r4.5.0/src/mongo/db/catalog/validate_adaptor.cpp#L305-L308).
@@ -1407,8 +1766,8 @@ Additionally, users can specify that they'd like to perform a `full` validation.
       stored in the `RecordStore` (when performing a foreground validation only).
 * Traverses the index entries for each index in the collection.
     + [Validates the index key order to ensure that index entries are in increasing or decreasing order](https://github.com/mongodb/mongo/blob/r4.5.0/src/mongo/db/catalog/validate_adaptor.cpp#L144-L188).
-    + Adds the index key to the `IndexConsistency` object for consistency checks at later stages.
-* After the traversals are finished, the `IndexConsistency` object is checked to detect any
+    + Adds the index key to the `IndexConsistency` objects for consistency checks at later stages.
+* After the traversals are finished, the `IndexConsistency` objects are checked to detect any
   inconsistencies between the collection and indexes.
     + If a bucket has a `value of 0`, then there are no inconsistencies for the keys that hashed
       there.
@@ -1517,32 +1876,34 @@ The oplog collection can be truncated both at the front end (most recent entries
 (the oldest entries). The capped setting on the oplog collection causes the oldest oplog entries to
 be deleted when new writes increase the collection size past the cap. MongoDB using the WiredTiger
 storage engine with `--replSet` handles oplog collection deletion specially via a purpose built
-[OplogStones](#wiredtiger-oplogstones) mechanism, ignoring the generic capped collection deletion
+[OplogTruncateMarkers](#wiredtiger-oplogtruncatemarkers) mechanism, ignoring the generic capped collection deletion
 mechanism. The front of the oplog may be truncated back to a particular timestamp during replication
 startup recovery or replication rollback.
 
-### WiredTiger OplogStones
+### WiredTiger OplogTruncateMarkers
 
 The WiredTiger storage engine disregards the regular capped collection deletion mechanism for the
-oplog collection and instead uses `OplogStones` to improve performance by batching deletes. The
-oplog is broken up into a number of stones. Each stone tracks a range of the oplog, the number of
-bytes in that range, and the last (newest) entry's record ID. A new stone is created when existing
-stones fill up; and the oldest stone's oplog is deleted when the oplog size exceeds its cap size
-setting.
+oplog collection and instead uses `OplogTruncateMarkers` to improve performance by batching deletes.
+The oplog is broken up into a number of truncate markers. Each truncate marker tracks a range of the
+oplog, the number of bytes in that range, and the last (newest) entry's record ID. A new truncate
+marker is created when the in-progress marker segment contains more than the minimum bytes needed to
+complete the segment; and the oldest truncate marker's oplog is deleted when the oplog size exceeds
+its cap size setting.
 
 ### Special Timestamps That Will Not Be Truncated
 
-The WiredTiger integration layer's `OplogStones` implementation will stall deletion waiting for
-certain significant tracked timestamps to move forward past entries in the oldest stone. This is
+The WiredTiger integration layer's `OplogTruncateMarkers` implementation will stall deletion waiting for
+certain significant tracked timestamps to move forward past entries in the oldest truncate marker. This is
 done for correctness. Backup pins truncation in order to maintain a consistent view of the oplog;
 and startup recovery after an unclean shutdown and rollback both require oplog history back to
 certain timestamps.
 
 ### Min Oplog Retention
 
-WiredTiger `OplogStones` obey an `oplogMinRetentionHours` configurable setting. When
-`oplogMinRetentionHours` is active, the WT `OplogStones` will only truncate the oplog if a stone (a
-sequential range of oplog) is not within the minimum time range required to remain.
+WiredTiger `OplogTruncateMarkers` obey an `oplogMinRetentionHours` configurable setting. When
+`oplogMinRetentionHours` is active, the WT `OplogTruncateMarkers` will only truncate the oplog if a
+truncate marker (a sequential range of oplog) is not within the minimum time range required to
+remain.
 
 ### Oplog Hole Truncation
 

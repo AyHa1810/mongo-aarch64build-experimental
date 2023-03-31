@@ -48,12 +48,12 @@ public:
     static constexpr int kNumChildren = 1;
 
     InternalSchemaAllElemMatchFromIndexMatchExpression(
-        StringData path,
+        boost::optional<StringData> path,
         long long index,
         std::unique_ptr<ExpressionWithPlaceholder> expression,
         clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
-    std::unique_ptr<MatchExpression> shallowClone() const final;
+    std::unique_ptr<MatchExpression> clone() const final;
 
     bool matchesArray(const BSONObj& array, MatchDetails* details) const final {
         return !findFirstMismatchInArray(array, details);
@@ -78,7 +78,7 @@ public:
 
     void debugString(StringBuilder& debug, int indentationLevel) const final;
 
-    BSONObj getSerializedRightHandSide() const final;
+    BSONObj getSerializedRightHandSide(SerializationOptions opts) const final;
 
     bool equivalent(const MatchExpression* other) const final;
 

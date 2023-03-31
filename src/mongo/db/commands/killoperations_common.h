@@ -61,7 +61,8 @@ public:
             auto opKeys = Base::request().getOperationKeys();
 
             for (auto& opKey : opKeys) {
-                LOGV2(4615602, "Attempting to kill operation", "operationKey"_attr = opKey);
+                LOGV2_DEBUG(
+                    4615602, 2, "Attempting to kill operation", "operationKey"_attr = opKey);
                 opKiller.killOperation(OperationKey(opKey));
             }
             Derived::killCursors(opCtx, opKeys);
@@ -69,7 +70,7 @@ public:
 
     private:
         NamespaceString ns() const override {
-            return NamespaceString(Base::request().getDbName(), "");
+            return NamespaceString(Base::request().getDbName());
         }
 
         bool supportsWriteConcern() const override {

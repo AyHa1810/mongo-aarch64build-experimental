@@ -168,7 +168,8 @@ Status buildDupKeyErrorStatus(const BSONObj& key,
                               const std::string& indexName,
                               const BSONObj& keyPattern,
                               const BSONObj& indexCollation,
-                              DuplicateKeyErrorInfo::FoundValue&& foundValue) {
+                              DuplicateKeyErrorInfo::FoundValue&& foundValue,
+                              const boost::optional<RecordId> duplicateRid) {
     const bool hasCollation = !indexCollation.isEmpty();
 
     StringBuilder sb;
@@ -230,22 +231,23 @@ Status buildDupKeyErrorStatus(const BSONObj& key,
 
     sb << builderForErrmsg.obj();
 
-    stdx::visit(
-        OverloadedVisitor{
-            [](stdx::monostate) {},
-            [&sb](const RecordId& rid) { sb << " found value: " << rid; },
-            [&sb](const BSONObj& obj) {
-                if (obj.objsize() < BSONObjMaxUserSize / 2) {
-                    sb << " found value: " << obj;
-                }
-            },
-        },
-        foundValue);
+    stdx::visit(OverloadedVisitor{
+                    [](stdx::monostate) {},
+                    [&sb](const RecordId& rid) { sb << " found value: " << rid; },
+                    [&sb](const BSONObj& obj) {
+                        if (obj.objsize() < BSONObjMaxUserSize / 2) {
+                            sb << " found value: " << obj;
+                        }
+                    },
+                },
+                foundValue);
 
-    return Status(
-        DuplicateKeyErrorInfo(
-            keyPattern, builderForErrorExtraInfo.obj(), indexCollation, std::move(foundValue)),
-        sb.str());
+    return Status(DuplicateKeyErrorInfo(keyPattern,
+                                        builderForErrorExtraInfo.obj(),
+                                        indexCollation,
+                                        std::move(foundValue),
+                                        duplicateRid),
+                  sb.str());
 }
 
 Status buildDupKeyErrorStatus(const KeyString::Value& keyString,
@@ -273,8 +275,9 @@ Status buildDupKeyErrorStatus(OperationContext* opCtx,
                               const BSONObj& key,
                               const IndexDescriptor* desc) {
     NamespaceString nss;
-    // In testing these may be nullptr, and being a bit more lenient during error handling is OK.
-    if (desc && desc->getEntry())
+    invariant(desc);
+    // In testing this may be nullptr, and being a bit more lenient during error handling is OK.
+    if (desc->getEntry())
         nss = desc->getEntry()->getNSSFromCatalog(opCtx);
     return buildDupKeyErrorStatus(
         key, nss, desc->indexName(), desc->keyPattern(), desc->collation());

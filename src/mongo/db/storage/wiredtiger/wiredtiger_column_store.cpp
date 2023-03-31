@@ -28,43 +28,33 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/global_settings.h"
-#include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_column_store.h"
+#include "mongo/db/global_settings.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_cursor.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_cursor_helpers.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_customization_hooks.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_index_cursor_generic.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_prepare_conflict.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
-#include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_index_util.h"
 #include "mongo/logv2/log.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
-
 
 namespace mongo {
 StatusWith<std::string> WiredTigerColumnStore::generateCreateString(
     const std::string& engineName,
     const NamespaceString& collectionNamespace,
-    const IndexDescriptor& desc) {
+    const IndexDescriptor& desc,
+    bool isLogged) {
     StringBuilder sb;
 
-    // TODO: SERVER-65487 uncomment this invariant once INDEX_COLUMN is defined.
-    // invariant(desc.getIndexType() == INDEX_COLUMN);
-
-    // TODO: SERVER-65976 Tune values used in WT config string.
+    invariant(desc.getIndexType() == INDEX_COLUMN);
 
     // Separate out a prefix and suffix in the default string. User configuration will override
     // values in the prefix, but not values in the suffix.
     sb << "type=file,internal_page_max=16k,leaf_page_max=16k,";
     sb << "checksum=on,";
     sb << "prefix_compression=true,";
-    sb << "lsm=(chunk_size=100M),";
     // Ignoring wiredTigerGlobalOptions.useIndexPrefixCompression because we *always* want prefix
     // compression for column indexes.
 
@@ -72,7 +62,9 @@ StatusWith<std::string> WiredTigerColumnStore::generateCreateString(
     sb << WiredTigerCustomizationHooks::get(getGlobalServiceContext())
               ->getTableCreateConfig(collectionNamespace.ns());
 
-    // TODO: SERVER-65976 User config goes here.
+    sb << "block_compressor="
+       << desc.compressor().value_or(WiredTigerGlobalOptions::kDefaultColumnStoreIndexCompressor)
+       << ",";
 
     // WARNING: No user-specified config can appear below this line. These options are required
     // for correct behavior of the server.
@@ -81,9 +73,7 @@ StatusWith<std::string> WiredTigerColumnStore::generateCreateString(
     sb << "key_format=u,";
     sb << "value_format=u,";
 
-    // TODO: SERVER-65976 app_metadata goes here (none yet)
-
-    if (WiredTigerUtil::useTableLogging(collectionNamespace)) {
+    if (isLogged) {
         sb << "log=(enabled=true)";
     } else {
         sb << "log=(enabled=false)";
@@ -108,33 +98,27 @@ WiredTigerColumnStore::WiredTigerColumnStore(OperationContext* ctx,
                                              const std::string& uri,
                                              StringData ident,
                                              const IndexDescriptor* desc,
-                                             bool readOnly)
+                                             bool isLogged)
     : ColumnStore(ident),
       _uri(uri),
       _tableId(WiredTigerSession::genTableId()),
       _desc(desc),
-      _indexName(desc->indexName()) {}
+      _indexName(desc->indexName()),
+      _isLogged(isLogged) {}
 
-std::string& WiredTigerColumnStore::makeKey(std::string& buffer,
-                                            PathView path,
-                                            const RecordId& rid) {
-    const auto ridSize =
-        rid.withFormat([](RecordId::Null) -> unsigned long { return 0; },
-                       [](int64_t) -> unsigned long { return sizeof(int64_t); },
-                       [](const char* data, size_t len) -> unsigned long { MONGO_UNREACHABLE; });
+std::string& WiredTigerColumnStore::makeKeyInBuffer(std::string& buffer, PathView path, RowId rid) {
     buffer.clear();
-    buffer.reserve(path.size() + 1 /*NUL byte*/ + ridSize);
+    buffer.reserve(path.size() + 1 /*NUL byte*/ + sizeof(RowId));
     buffer += path;
+    // If we end up reserving more values, as we've done with kRowIdPath, this check should be
+    // changed to include the newly reserved values.
     if (path != kRowIdPath) {
-        // If we end up reserving more values, the above check should be changed.
         buffer += '\0';
     }
-    rid.withFormat([](RecordId::Null) { /* Do nothing. */ },
-                   [&](int64_t num) {
-                       num = endian::nativeToBig(num);
-                       buffer.append(reinterpret_cast<const char*>(&num), sizeof(num));
-                   },
-                   [&](const char* data, size_t len) { MONGO_UNREACHABLE; });
+    if (rid > 0) {
+        RowId num = endian::nativeToBig(rid);
+        buffer.append(reinterpret_cast<const char*>(&num), sizeof(num));
+    }
     return buffer;
 }
 
@@ -145,9 +129,9 @@ public:
         _curwrap.assertInActiveTxn();
     }
 
-    void insert(PathView, const RecordId&, CellView) override;
-    void remove(PathView, const RecordId&) override;
-    void update(PathView, const RecordId&, CellView) override;
+    void insert(PathView, RowId, CellView) override;
+    void remove(PathView, RowId) override;
+    void update(PathView, RowId, CellView) override;
 
     WT_CURSOR* c() {
         return _curwrap.get();
@@ -165,11 +149,11 @@ std::unique_ptr<ColumnStore::WriteCursor> WiredTigerColumnStore::newWriteCursor(
 
 void WiredTigerColumnStore::insert(OperationContext* opCtx,
                                    PathView path,
-                                   const RecordId& rid,
+                                   RowId rid,
                                    CellView cell) {
     WriteCursor(opCtx, _uri, _tableId).insert(path, rid, cell);
 }
-void WiredTigerColumnStore::WriteCursor::insert(PathView path, const RecordId& rid, CellView cell) {
+void WiredTigerColumnStore::WriteCursor::insert(PathView path, RowId rid, CellView cell) {
     dassert(_opCtx->lockState()->isWriteLocked());
 
     auto key = makeKey(path, rid);
@@ -181,18 +165,17 @@ void WiredTigerColumnStore::WriteCursor::insert(PathView path, const RecordId& r
     int ret = WT_OP_CHECK(wiredTigerCursorInsert(_opCtx, c()));
 
     auto& metricsCollector = ResourceConsumption::MetricsCollector::get(_opCtx);
-    metricsCollector.incrementOneIdxEntryWritten(std::string(c()->uri), keyItem.size);
+    metricsCollector.incrementOneIdxEntryWritten(c()->uri, keyItem.size);
 
-    // TODO: SERVER-65978, we may have to specially handle WT_DUPLICATE_KEY error here.
     if (ret) {
         uassertStatusOK(wtRCToStatus(ret, c()->session));
     }
 }
 
-void WiredTigerColumnStore::remove(OperationContext* opCtx, PathView path, const RecordId& rid) {
+void WiredTigerColumnStore::remove(OperationContext* opCtx, PathView path, RowId rid) {
     WriteCursor(opCtx, _uri, _tableId).remove(path, rid);
 }
-void WiredTigerColumnStore::WriteCursor::remove(PathView path, const RecordId& rid) {
+void WiredTigerColumnStore::WriteCursor::remove(PathView path, RowId rid) {
     dassert(_opCtx->lockState()->isWriteLocked());
 
     auto key = makeKey(path, rid);
@@ -205,15 +188,15 @@ void WiredTigerColumnStore::WriteCursor::remove(PathView path, const RecordId& r
     invariantWTOK(ret, c()->session);
 
     auto& metricsCollector = ResourceConsumption::MetricsCollector::get(_opCtx);
-    metricsCollector.incrementOneIdxEntryWritten(std::string(c()->uri), keyItem.size);
+    metricsCollector.incrementOneIdxEntryWritten(c()->uri, keyItem.size);
 }
 void WiredTigerColumnStore::update(OperationContext* opCtx,
                                    PathView path,
-                                   const RecordId& rid,
+                                   RowId rid,
                                    CellView cell) {
     WriteCursor(opCtx, _uri, _tableId).update(path, rid, cell);
 }
-void WiredTigerColumnStore::WriteCursor::update(PathView path, const RecordId& rid, CellView cell) {
+void WiredTigerColumnStore::WriteCursor::update(PathView path, RowId rid, CellView cell) {
     dassert(_opCtx->lockState()->isWriteLocked());
 
     auto key = makeKey(path, rid);
@@ -225,19 +208,43 @@ void WiredTigerColumnStore::WriteCursor::update(PathView path, const RecordId& r
     int ret = WT_OP_CHECK(wiredTigerCursorUpdate(_opCtx, c()));
 
     auto& metricsCollector = ResourceConsumption::MetricsCollector::get(_opCtx);
-    metricsCollector.incrementOneIdxEntryWritten(std::string(c()->uri), keyItem.size);
+    metricsCollector.incrementOneIdxEntryWritten(c()->uri, keyItem.size);
 
-    // TODO: SERVER-65978, may want to handle WT_NOTFOUND specially.
     if (ret != 0)
         return uassertStatusOK(wtRCToStatus(ret, c()->session));
 }
 
-void WiredTigerColumnStore::fullValidate(OperationContext* opCtx,
-                                         int64_t* numKeysOut,
-                                         IndexValidateResults* fullResults) const {
-    // TODO SERVER-65484: Validation for column indexes.
-    // uasserted(ErrorCodes::NotImplemented, "WiredTigerColumnStore::fullValidate()");
-    return;
+IndexValidateResults WiredTigerColumnStore::validate(OperationContext* opCtx, bool full) const {
+    dassert(opCtx->lockState()->isReadLocked());
+
+    IndexValidateResults results;
+
+    WiredTigerUtil::validateTableLogging(opCtx,
+                                         _uri,
+                                         _isLogged,
+                                         StringData{_indexName},
+                                         results.valid,
+                                         results.errors,
+                                         results.warnings);
+
+    if (!full) {
+        return results;
+    }
+
+    WiredTigerIndexUtil::validateStructure(opCtx, _uri, results);
+
+    return results;
+}
+
+int64_t WiredTigerColumnStore::numEntries(OperationContext* opCtx) const {
+    int64_t count = 0;
+
+    auto cursor = newCursor(opCtx);
+    while (cursor->next()) {
+        ++count;
+    }
+
+    return count;
 }
 
 class WiredTigerColumnStore::Cursor final : public ColumnStore::Cursor,
@@ -247,24 +254,33 @@ public:
         : WiredTigerIndexCursorGeneric(opCtx, true /* forward */), _idx(*idx) {
         _cursor.emplace(_idx.uri(), _idx._tableId, false, _opCtx);
     }
+
     boost::optional<FullCellView> next() override {
         if (_eof) {
             return {};
         }
         if (!_lastMoveSkippedKey) {
-            advanceWTCursor();
+            _eof = advanceWTCursor();
         }
 
         return curr();
     }
-    boost::optional<FullCellView> seekAtOrPast(PathView path, const RecordId& rid) override {
-        makeKey(_buffer, path, rid);
-        seekWTCursor();
+
+    /**
+     * Seeks the cursor to the column key specified by the given 'path' and 'rid'. If the key is not
+     * found, then the next key in the same path will be returned; or the first entry in the
+     * following column; or boost::none if there are no further entries.
+     */
+    boost::optional<FullCellView> seekAtOrPast(PathView path, RowId rid) override {
+        // Initialize the _buffer with the column's key (path/rid).
+        makeKeyInBuffer(_buffer, path, rid);
+        seekWTCursorAtOrPast(_buffer);
         return curr();
     }
-    boost::optional<FullCellView> seekExact(PathView path, const RecordId& rid) override {
-        makeKey(_buffer, path, rid);
-        seekWTCursor(/*exactOnly*/ true);
+
+    boost::optional<FullCellView> seekExact(PathView path, RowId rid) override {
+        makeKeyInBuffer(_buffer, path, rid);
+        seekWTCursorAtOrPast(_buffer, /*exactOnly*/ true);
         return curr();
     }
 
@@ -272,8 +288,11 @@ public:
         if (!_eof && !_lastMoveSkippedKey) {
             WT_ITEM key;
             WT_CURSOR* c = _cursor->get();
-            c->get_key(c, &key);
-            _buffer.assign(static_cast<const char*>(key.data), key.size);
+            if (c->get_key(c, &key) == 0) {
+                _buffer.assign(static_cast<const char*>(key.data), key.size);
+            } else {
+                _buffer.clear();
+            }
         }
         resetCursor();
     }
@@ -292,7 +311,8 @@ public:
         invariant(WiredTigerRecoveryUnit::get(_opCtx)->getSession() == _cursor->getSession());
 
         if (!_eof) {
-            _lastMoveSkippedKey = !seekWTCursor();
+            // Check if the exact search key stashed in _buffer was not found.
+            _lastMoveSkippedKey = !seekWTCursorAtOrPast(_buffer);
         }
     }
 
@@ -306,18 +326,35 @@ public:
         WiredTigerIndexCursorGeneric::setSaveStorageCursorOnDetachFromOperationContext(detach);
     }
 
+    /**
+     *  Returns the checkpoint ID for checkpoint cursors, otherwise 0.
+     */
+    uint64_t getCheckpointId() const override {
+        return _cursor->getCheckpointId();
+    }
+
 private:
     void resetCursor() {
         WiredTigerIndexCursorGeneric::resetCursor();
     }
-    bool seekWTCursor(bool exactOnly = false) {
+
+    /**
+     * Helper function to iterate the cursor to the given 'searchKey', or the closest key
+     * immediately after the 'searchKey' if 'searchKey' does not exist and 'exactOnly' is false.
+     * Returns true if an exact match is found.
+     */
+    bool seekWTCursorAtOrPast(const std::string& searchKey, bool exactOnly = false) {
         // Ensure an active transaction is open.
         WiredTigerRecoveryUnit::get(_opCtx)->getSession();
 
         WT_CURSOR* c = _cursor->get();
 
-        const WiredTigerItem keyItem(_buffer);
-        c->set_key(c, keyItem.Get());
+        if (searchKey.empty()) {
+            return false;
+        }
+
+        const WiredTigerItem searchKeyItem(searchKey);
+        c->set_key(c, searchKeyItem.Get());
 
         int cmp = 0;
         int ret = wiredTigerPrepareConflictRetry(
@@ -327,21 +364,63 @@ private:
             return false;
         }
         invariantWTOK(ret, c->session);
-
-        auto& metricsCollector = ResourceConsumption::MetricsCollector::get(_opCtx);
-        metricsCollector.incrementOneCursorSeek(std::string(c->uri));
-
         _eof = false;
 
-        // Make sure we land on a matching key at or after.
-        if (cmp < 0) {
-            advanceWTCursor();
+        auto& metricsCollector = ResourceConsumption::MetricsCollector::get(_opCtx);
+        metricsCollector.incrementOneCursorSeek(c->uri);
+
+        // Make sure we land on a key matching the search key or a key immediately after.
+        //
+        // If this operation is ignoring prepared updates and WT::search_near() lands on a key that
+        // compares lower than the search key, calling next() is not guaranteed to return a key that
+        // compares greater than the search key. This is because ignoring prepare conflicts does not
+        // provide snapshot isolation and the call to next() may land on a newly-committed prepared
+        // entry. We must advance our cursor until we find a key that compares greater than the
+        // search key. See SERVER-56839.
+        //
+        // Note: the problem described above is currently not possible for column indexes because
+        // (a) There is a special path in the column index present with the "path" value 0xFF, which
+        // is greater than all other paths and (b) there is incidental behavior in the
+        // WT::search_near() function. To elaborate on (b), if WT::search_near() doesn't find an
+        // exact match, it will 'prefer' to return the following key/value, which is guaranteed to
+        // exist because of (a). However, the contract of search_near is that it may return either
+        // the previous or the next value.
+        //
+        // (a) is unlikely to change, but (b) is incidental behavior. To avoid relying on this, we
+        // iterate the cursor until we find a value that is greater than or equal to the search key.
+        const bool enforcingPrepareConflicts =
+            _opCtx->recoveryUnit()->getPrepareConflictBehavior() ==
+            PrepareConflictBehavior::kEnforce;
+        WT_ITEM curKey;
+        while (cmp < 0) {
+            _eof = advanceWTCursor();
+
+            if (_eof) {
+                break;
+            }
+
+            if (!kDebugBuild && enforcingPrepareConflicts) {
+                break;
+            }
+
+            getKey(c, &curKey);
+            cmp = std::memcmp(
+                curKey.data, searchKeyItem.data, std::min(searchKeyItem.size, curKey.size));
+
+            LOGV2(6609700,
+                  "Column store index {idxName} cmp after advance: {cmp}",
+                  "cmp"_attr = cmp,
+                  "idxName"_attr = _idx.indexName());
+
+            if (enforcingPrepareConflicts) {
+                // If we are enforcing prepare conflicts, calling next() must always give us a key
+                // that compares greater than than our search key. An exact match is also possible
+                // in the case of _id indexes, because the recordid is not a part of the key.
+                dassert(cmp >= 0);
+            }
         }
 
         return cmp == 0;
-    }
-    void advanceWTCursor() {
-        _eof = WiredTigerIndexCursorGeneric::advanceWTCursor();
     }
 
     boost::optional<FullCellView> curr() {
@@ -357,8 +436,9 @@ private:
         c->get_key(c, &key);
         size_t nullByteSize = 1;
         invariant(key.size >= 1);
-        if (static_cast<const char*>(key.data)[0] == '\xFF') {
-            // See also related comment in makeKey().
+        // If we end up reserving more values, like kRowIdPath, this check should be changed to
+        // include the newly reserved values.
+        if (static_cast<const char*>(key.data)[0] == '\xFF' /* kRowIdPath */) {
             nullByteSize = 0;
             out->path = PathView("\xFF"_sd);
         } else {
@@ -371,7 +451,7 @@ private:
         const auto ridStart = static_cast<const char*>(key.data) + out->path.size() + nullByteSize;
 
         invariant(ridSize == 8);
-        out->rid = RecordId(ConstDataView(ridStart).read<BigEndian<int64_t>>());
+        out->rid = ConstDataView(ridStart).read<BigEndian<int64_t>>();
         return out;
     }
 
@@ -395,8 +475,8 @@ public:
     BulkBuilder(WiredTigerColumnStore* idx, OperationContext* opCtx)
         : _opCtx(opCtx), _cursor(idx->uri(), opCtx) {}
 
-    void addCell(PathView path, const RecordId& rid, CellView cell) override {
-        const std::string& key = makeKey(_buffer, path, rid);
+    void addCell(PathView path, RowId rid, CellView cell) override {
+        const std::string& key = makeKeyInBuffer(_buffer, path, rid);
         WiredTigerItem keyItem(key.c_str(), key.size());
         _cursor->set_key(_cursor.get(), keyItem.Get());
 
@@ -406,7 +486,7 @@ public:
         invariantWTOK(wiredTigerCursorInsert(_opCtx, _cursor.get()), _cursor->session);
 
         ResourceConsumption::MetricsCollector::get(_opCtx).incrementOneIdxEntryWritten(
-            std::string(_cursor->uri), keyItem.size);
+            _cursor->uri, keyItem.size);
     }
 
 private:
@@ -421,44 +501,36 @@ std::unique_ptr<ColumnStore::BulkBuilder> WiredTigerColumnStore::makeBulkBuilder
 }
 
 bool WiredTigerColumnStore::isEmpty(OperationContext* opCtx) {
-    // TODO: SERVER-65980, this logic could be shared with WiredTigerIndex::isEmpty().
-    WiredTigerCursor curwrap(_uri, _tableId, false, opCtx);
-    WT_CURSOR* c = curwrap.get();
-    if (!c)
-        return true;
-    int ret = wiredTigerPrepareConflictRetry(opCtx, [&] { return c->next(c); });
-    if (ret == WT_NOTFOUND)
-        return true;
-    invariantWTOK(ret, c->session);
-    return false;
+    return WiredTigerIndexUtil::isEmpty(opCtx, _uri, _tableId);
 }
 
 long long WiredTigerColumnStore::getSpaceUsedBytes(OperationContext* opCtx) const {
-    // TODO: SERVER-65980.
-    // For now we just return  this so that tests can successfully obtain collection-level stats on
-    // a collection with a columnstore index.
-    return 27017;
+    dassert(opCtx->lockState()->isReadLocked());
+    auto ru = WiredTigerRecoveryUnit::get(opCtx);
+    WT_SESSION* s = ru->getSession()->getSession();
+
+    if (ru->getSessionCache()->isEphemeral()) {
+        return static_cast<long long>(WiredTigerUtil::getEphemeralIdentSize(s, _uri));
+    }
+    return static_cast<long long>(WiredTigerUtil::getIdentSize(s, _uri));
 }
 
 long long WiredTigerColumnStore::getFreeStorageBytes(OperationContext* opCtx) const {
-    // TODO: SERVER-65980.
-    // For now we just fake this so that tests can successfully obtain collection-level stats on a
-    // collection with a columnstore index.
-    return 27017;
+    dassert(opCtx->lockState()->isReadLocked());
+    auto ru = WiredTigerRecoveryUnit::get(opCtx);
+    WiredTigerSession* session = ru->getSession();
+
+    return static_cast<long long>(WiredTigerUtil::getIdentReuseSize(session->getSession(), _uri));
 }
 
 Status WiredTigerColumnStore::compact(OperationContext* opCtx) {
-    // TODO: SERVER-65980.
-    uasserted(ErrorCodes::NotImplemented, "WiredTigerColumnStore::compact");
+    return WiredTigerIndexUtil::compact(opCtx, _uri);
 }
+
 bool WiredTigerColumnStore::appendCustomStats(OperationContext* opCtx,
                                               BSONObjBuilder* output,
                                               double scale) const {
-    // TODO: SERVER-65980.
-    // For now we just skip this so that tests can successfully obtain collection-level stats on a
-    // collection with a columnstore index.
-    output->append("note"_sd, "columnstore stats are not yet implemented"_sd);
-    return true;
+    return WiredTigerIndexUtil::appendCustomStats(opCtx, output, scale, _uri);
 }
 
 }  // namespace mongo

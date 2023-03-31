@@ -29,11 +29,15 @@
 
 #pragma once
 
+#include <boost/iterator/transform_iterator.hpp>
+
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_impl.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/multitenancy.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/durable_catalog_impl.h"
@@ -56,8 +60,9 @@ public:
             std::make_unique<repl::ReplicationCoordinatorMock>(getServiceContext()));
     }
 
-    StatusWith<DurableCatalog::Entry> createCollection(OperationContext* opCtx,
-                                                       NamespaceString ns) {
+    StatusWith<DurableCatalog::EntryIdentifier> createCollection(OperationContext* opCtx,
+                                                                 NamespaceString ns) {
+        Lock::GlobalWrite lk(opCtx);
         AutoGetDb db(opCtx, ns.dbName(), LockMode::MODE_X);
         CollectionOptions options;
         options.uuid = UUID::gen();
@@ -75,8 +80,10 @@ public:
             catalogId,
             _storageEngine->getCatalog()->getMetaData(opCtx, catalogId),
             std::move(rs));
+
         CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
-            catalog.registerCollection(opCtx, options.uuid.get(), std::move(coll));
+            catalog.registerCollection(
+                opCtx, options.uuid.get(), std::move(coll), /*ts=*/boost::none);
         });
 
         return {{_storageEngine->getCatalog()->getEntry(catalogId)}};
@@ -113,14 +120,14 @@ public:
 
     StatusWith<StorageEngine::ReconcileResult> reconcile(OperationContext* opCtx) {
         Lock::GlobalLock globalLock{opCtx, MODE_IX};
-        return _storageEngine->reconcileCatalogAndIdents(opCtx,
-                                                         StorageEngine::LastShutdownState::kClean);
+        return _storageEngine->reconcileCatalogAndIdents(
+            opCtx, Timestamp::min(), StorageEngine::LastShutdownState::kClean);
     }
 
     StatusWith<StorageEngine::ReconcileResult> reconcileAfterUncleanShutdown(
         OperationContext* opCtx) {
         return _storageEngine->reconcileCatalogAndIdents(
-            opCtx, StorageEngine::LastShutdownState::kUnclean);
+            opCtx, Timestamp::min(), StorageEngine::LastShutdownState::kUnclean);
     }
 
     std::vector<std::string> getAllKVEngineIdents(OperationContext* opCtx) {
@@ -128,7 +135,7 @@ public:
     }
 
     bool collectionExists(OperationContext* opCtx, const NamespaceString& nss) {
-        std::vector<DurableCatalog::Entry> allCollections =
+        std::vector<DurableCatalog::EntryIdentifier> allCollections =
             _storageEngine->getCatalog()->getAllCatalogEntries(opCtx);
         return std::count_if(allCollections.begin(), allCollections.end(), [&](auto& entry) {
             return nss == entry.nss;
@@ -191,8 +198,8 @@ public:
     }
 
     Status removeEntry(OperationContext* opCtx, StringData collNs, DurableCatalog* catalog) {
-        CollectionPtr collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
-            opCtx, NamespaceString(collNs));
+        const Collection* collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
+            opCtx, NamespaceString::createNamespaceString_forTest(collNs));
         return dynamic_cast<DurableCatalogImpl*>(catalog)->_removeEntry(opCtx,
                                                                         collection->getCatalogId());
     }
@@ -203,7 +210,10 @@ public:
 class StorageEngineRepairTest : public StorageEngineTest {
 public:
     StorageEngineRepairTest()
-        : StorageEngineTest(Options{}.repair(RepairAction::kRepair).ephemeral(false)) {}
+        : StorageEngineTest(Options{}.repair(RepairAction::kRepair).ephemeral(false)) {
+        repl::StorageInterface::set(getServiceContext(),
+                                    std::make_unique<repl::StorageInterfaceImpl>());
+    }
 
     void tearDown() {
         auto repairObserver = StorageRepairObserver::get(getGlobalServiceContext());

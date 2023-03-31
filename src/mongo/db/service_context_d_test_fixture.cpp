@@ -41,7 +41,6 @@
 #include "mongo/db/catalog/database_holder_impl.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/global_settings.h"
-#include "mongo/db/index/index_access_method_factory_impl.h"
 #include "mongo/db/index_builds_coordinator_mongod.h"
 #include "mongo/db/op_observer/op_observer_registry.h"
 #include "mongo/db/repl/repl_settings.h"
@@ -50,6 +49,7 @@
 #include "mongo/db/service_entry_point_mongod.h"
 #include "mongo/db/storage/control/storage_control.h"
 #include "mongo/db/storage/storage_engine_init.h"
+#include "mongo/db/storage/storage_engine_parameters_gen.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
@@ -64,6 +64,11 @@ namespace mongo {
 ServiceContextMongoDTest::ServiceContextMongoDTest(Options options)
     : _journalListener(std::move(options._journalListener)),
       _tempDir("service_context_d_test_fixture") {
+    gStorageEngineConcurrencyAdjustmentAlgorithm = "";
+
+    if (options._forceDisableTableLogging) {
+        storageGlobalParams.forceDisableTableLogging = true;
+    }
 
     if (options._useReplSettings) {
         repl::ReplSettings replSettings;
@@ -135,10 +140,10 @@ ServiceContextMongoDTest::ServiceContextMongoDTest(Options options)
     // for faster startup.
     auto opCtx = serviceContext->makeOperationContext(getClient());
     initializeStorageEngine(opCtx.get(), options._initFlags);
+
     StorageControl::startStorageControls(serviceContext, true /*forTestOnly*/);
 
     DatabaseHolder::set(serviceContext, std::make_unique<DatabaseHolderImpl>());
-    IndexAccessMethodFactory::set(serviceContext, std::make_unique<IndexAccessMethodFactoryImpl>());
     Collection::Factory::set(serviceContext, std::make_unique<CollectionImpl::FactoryImpl>());
     IndexBuildsCoordinator::set(serviceContext, std::make_unique<IndexBuildsCoordinatorMongod>());
     CollectionShardingStateFactory::set(
@@ -174,6 +179,8 @@ ServiceContextMongoDTest::~ServiceContextMongoDTest() {
     std::swap(storageGlobalParams.repair, _stashedStorageParams.repair);
     std::swap(serverGlobalParams.enableMajorityReadConcern,
               _stashedServerParams.enableMajorityReadConcern);
+
+    storageGlobalParams.reset();
 }
 
 void ServiceContextMongoDTest::tearDown() {

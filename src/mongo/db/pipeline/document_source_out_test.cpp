@@ -35,6 +35,7 @@
 #include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/document_source_out.h"
+#include "mongo/idl/server_parameter_test_util.h"
 
 namespace mongo {
 namespace {
@@ -114,12 +115,35 @@ TEST_F(DocumentSourceOutTest, SerializeToString) {
     ASSERT_EQ(reSerialized["$out"]["coll"].getStringData(), "some_collection");
 }
 
+TEST_F(DocumentSourceOutTest, Redaction) {
+    // TODO SERVER-75110 test support for redaction with timeseries options
+    auto spec = fromjson(R"({
+            $out: {
+                db: "foo",
+                coll: "bar"
+            }
+        })");
+    auto docSource = DocumentSourceOut::createFromBson(spec.firstElement(), getExpCtx());
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            $out: {
+                db: "HASH<foo>",
+                coll: "HASH<bar>"
+            }
+        })",
+        redact(*docSource));
+}
+
 using DocumentSourceOutServerlessTest = ServerlessAggregationContextFixture;
 
 TEST_F(DocumentSourceOutServerlessTest,
        LiteParsedDocumentSourceLookupContainsExpectedNamespacesInServerless) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+
     auto tenantId = TenantId(OID::gen());
-    NamespaceString nss(tenantId, "test", "testColl");
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest(tenantId, "test", "testColl");
     std::vector<BSONObj> pipeline;
 
     auto stageSpec = BSON("$out"
@@ -127,7 +151,9 @@ TEST_F(DocumentSourceOutServerlessTest,
     auto liteParsedLookup = DocumentSourceOut::LiteParsed::parse(nss, stageSpec.firstElement());
     auto namespaceSet = liteParsedLookup->getInvolvedNamespaces();
     ASSERT_EQ(1, namespaceSet.size());
-    ASSERT_EQ(1ul, namespaceSet.count(NamespaceString(tenantId, "test", "some_collection")));
+    ASSERT_EQ(1ul,
+              namespaceSet.count(NamespaceString::createNamespaceString_forTest(
+                  tenantId, "test", "some_collection")));
 
     // The tenantId for the outputNs should be the same as that on the expCtx despite outputting
     // into different dbs.
@@ -138,10 +164,14 @@ TEST_F(DocumentSourceOutServerlessTest,
     liteParsedLookup = DocumentSourceOut::LiteParsed::parse(nss, stageSpec.firstElement());
     namespaceSet = liteParsedLookup->getInvolvedNamespaces();
     ASSERT_EQ(1, namespaceSet.size());
-    ASSERT_EQ(1ul, namespaceSet.count(NamespaceString(tenantId, "target_db", "some_collection")));
+    ASSERT_EQ(1ul,
+              namespaceSet.count(NamespaceString::createNamespaceString_forTest(
+                  tenantId, "target_db", "some_collection")));
 }
 
 TEST_F(DocumentSourceOutServerlessTest, CreateFromBSONContainsExpectedNamespacesInServerless) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+
     auto expCtx = getExpCtx();
     ASSERT(expCtx->ns.tenantId());
     auto defaultDb = expCtx->ns.dbName();
@@ -151,7 +181,8 @@ TEST_F(DocumentSourceOutServerlessTest, CreateFromBSONContainsExpectedNamespaces
     auto outStage = DocumentSourceOut::createFromBson(spec.firstElement(), expCtx);
     auto outSource = static_cast<DocumentSourceOut*>(outStage.get());
     ASSERT(outSource);
-    ASSERT_EQ(outSource->getOutputNs(), NamespaceString(defaultDb, targetColl));
+    ASSERT_EQ(outSource->getOutputNs(),
+              NamespaceString::createNamespaceString_forTest(defaultDb, targetColl));
 
     // Assert the tenantId is not included in the serialized namespace.
     auto serialized = outSource->serialize().getDocument();

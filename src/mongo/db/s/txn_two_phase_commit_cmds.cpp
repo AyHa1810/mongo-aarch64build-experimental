@@ -38,8 +38,8 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/transaction_coordinator_service.h"
-#include "mongo/db/session_catalog_mongod.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 
@@ -87,7 +87,7 @@ public:
 
         Response typedRun(OperationContext* opCtx) {
             if (!getTestCommandsEnabled() &&
-                serverGlobalParams.clusterRole != ClusterRole::ConfigServer) {
+                !serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
                 uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
             }
 
@@ -184,7 +184,7 @@ public:
         }
 
         NamespaceString ns() const override {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const override {
@@ -256,7 +256,7 @@ public:
 
         void typedRun(OperationContext* opCtx) {
             // Only config servers or initialized shard servers can act as transaction coordinators.
-            if (serverGlobalParams.clusterRole != ClusterRole::ConfigServer) {
+            if (!serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
                 uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
             }
 
@@ -285,7 +285,7 @@ public:
                 // (in all cases except the one where this command aborts the local participant), so
                 // ensure waiting for the client's writeConcern of the decision.
                 repl::ReplClientInfo::forClient(opCtx->getClient())
-                    .setLastOpToSystemLastOpTimeIgnoringInterrupt(opCtx);
+                    .setLastOpToSystemLastOpTimeIgnoringCtxInterrupted(opCtx);
             });
 
             if (coordinatorDecisionFuture) {
@@ -328,8 +328,9 @@ public:
                         "txnNumberAndRetryCounter"_attr = txnNumberAndRetryCounter);
 
             boost::optional<SharedSemiFuture<void>> participantExitPrepareFuture;
+            auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
             {
-                MongoDOperationContextSession sessionTxnState(opCtx);
+                auto sessionTxnState = mongoDSessionCatalog->checkOutSession(opCtx);
                 auto txnParticipant = TransactionParticipant::get(opCtx);
                 txnParticipant.beginOrContinue(opCtx,
                                                txnNumberAndRetryCounter,
@@ -349,7 +350,7 @@ public:
             participantExitPrepareFuture->get(opCtx);
 
             {
-                MongoDOperationContextSession sessionTxnState(opCtx);
+                auto sessionTxnState = mongoDSessionCatalog->checkOutSession(opCtx);
                 auto txnParticipant = TransactionParticipant::get(opCtx);
 
                 // Call beginOrContinue again in case the transaction number has changed.
@@ -373,7 +374,7 @@ public:
         }
 
         NamespaceString ns() const override {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const override {}

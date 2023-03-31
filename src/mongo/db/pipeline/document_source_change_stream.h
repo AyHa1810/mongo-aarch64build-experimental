@@ -248,8 +248,11 @@ public:
     static constexpr StringData kRegexAllCollections = R"((?!(\$|system\.)))"_sd;
 
     // Regex matching all user collections plus collections exposed when 'showSystemEvents' is set.
+    // Does not match a collection named $ or a collection with 'system.' in the name.
+    // However, it will still match collection names starting with system.buckets or
+    // system.resharding, or a collection exactly named system.js
     static constexpr StringData kRegexAllCollectionsShowSystemEvents =
-        R"((?!(\$|system\.(?!(js$|resharding\.)))))"_sd;
+        R"((?!(\$|system\.(?!(js$|resharding\.|buckets\.)))))"_sd;
 
     static constexpr StringData kRegexAllDBs = R"(^(?!(admin|config|local)\.)[^.]+)"_sd;
     static constexpr StringData kRegexCmdColl = R"(\$cmd$)"_sd;
@@ -290,15 +293,6 @@ public:
      * Same as 'checkValueType', except it tolerates the field being missing.
      */
     static void checkValueTypeOrMissing(Value v, StringData fieldName, BSONType expectedType);
-
-    /**
-     * Extracts the resume token from the given spec. If a 'startAtOperationTime' is specified,
-     * returns the equivalent high-watermark token. This method should only ever be called on a spec
-     * where one of 'resumeAfter', 'startAfter', or 'startAtOperationTime' is populated.
-     */
-    static ResumeTokenData resolveResumeTokenFromSpec(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        const DocumentSourceChangeStreamSpec& spec);
 
     /**
      * For a change stream with no resume information supplied by the user, returns the clusterTime

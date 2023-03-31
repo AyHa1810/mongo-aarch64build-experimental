@@ -49,11 +49,13 @@ void shutdownTTLMonitor(ServiceContext* serviceContext);
 
 class TTLMonitor : public BackgroundJob {
 public:
-    explicit TTLMonitor() : BackgroundJob(false /* selfDelete */) {}
+    TTLMonitor();
 
     static TTLMonitor* get(ServiceContext* serviceCtx);
 
     static void set(ServiceContext* serviceCtx, std::unique_ptr<TTLMonitor> monitor);
+
+    static Status onUpdateTTLMonitorSleepSeconds(int newSleepSeconds);
 
     std::string name() const {
         return "TTLMonitor";
@@ -65,6 +67,13 @@ public:
      * Signals the thread to quit and then waits until it does.
      */
     void shutdown();
+
+    /**
+     * Invoked when the node enters the primary state.
+     */
+    void onStepUp(OperationContext* opCtx);
+
+    void updateSleepSeconds(Seconds newSeconds);
 
     long long getTTLPasses_forTest();
     long long getTTLSubPasses_forTest();
@@ -84,9 +93,15 @@ private:
      * Once it is confirmed there are no more expired documents on an index, the index will not be
      * visited again for the remainder of the sub-pass.
      *
+     * The 'collSubpassHistory' tracks the number of consecutive subpasses on a collection that
+     * completed with more expired documents remaining. It is used to determine when a collection's
+     * TTL deletes should be raised from 'low' to 'normal' priority to prevent TTL deletes from
+     * falling behind on TTL inserts.
+     *
      * Returns true if there are more expired documents to delete. False otherwise.
      */
-    bool _doTTLSubPass(OperationContext* opCtx);
+    bool _doTTLSubPass(OperationContext* opCtx,
+                       stdx::unordered_map<UUID, long long, UUID::Hash>& collSubpassHistory);
 
     /**
      * Given a TTL index, attempts to delete all expired documents through the index until
@@ -143,11 +158,15 @@ private:
     // Protects the state below.
     mutable Mutex _stateMutex = MONGO_MAKE_LATCH("TTLMonitorStateMutex");
 
-    // Signaled to wake up the thread, if the thread is waiting. The thread will check whether
-    // _shuttingDown is set and stop accordingly.
-    mutable stdx::condition_variable _shuttingDownCV;
+    // Signaled to wake up the thread, if the thread is waiting. This condition variable is used to
+    // notify the thread of either:
+    // * The server is shutting down.
+    // * The ttlMonitorSleepSecs variable has changed.
+    // If the server is shutting down the monitor will stop.
+    mutable stdx::condition_variable _notificationCV;
 
     bool _shuttingDown = false;
+    Seconds _ttlMonitorSleepSecs;
 };
 
 }  // namespace mongo

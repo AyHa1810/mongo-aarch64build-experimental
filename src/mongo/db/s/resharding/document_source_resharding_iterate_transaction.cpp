@@ -33,7 +33,7 @@
 #include "mongo/db/s/resharding/document_source_resharding_iterate_transaction.h"
 
 #include "mongo/db/commands/txn_cmds_gen.h"
-#include "mongo/db/transaction_history_iterator.h"
+#include "mongo/db/transaction/transaction_history_iterator.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
@@ -113,8 +113,7 @@ StageConstraints DocumentSourceReshardingIterateTransaction::constraints(
                             ChangeStreamRequirement::kDenylist);
 }
 
-Value DocumentSourceReshardingIterateTransaction::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceReshardingIterateTransaction::serialize(SerializationOptions opts) const {
     return Value(
         Document{{kStageName,
                   Value(Document{{kIncludeCommitTransactionTimestampFieldName,

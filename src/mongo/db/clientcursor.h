@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/bson/bsonobj.h"
 #include <boost/optional.hpp>
 #include <functional>
 
@@ -36,12 +37,13 @@
 #include "mongo/db/api_parameters.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/user_name.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/cursor_id.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/logical_session_id.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/repl/read_concern_level.h"
+#include "mongo/db/session/logical_session_id.h"
 
 namespace mongo {
 
@@ -117,7 +119,7 @@ struct ClientCursorParams {
  * caller as "no timeout", it will be automatically destroyed by its cursor manager after a period
  * of inactivity.
  */
-class ClientCursor {
+class ClientCursor : public Decorable<ClientCursor> {
     ClientCursor(const ClientCursor&) = delete;
     ClientCursor& operator=(const ClientCursor&) = delete;
 
@@ -202,29 +204,25 @@ public:
      * Increments the cursor's tracked number of query results returned so far by 'n'.
      */
     void incNReturnedSoFar(std::uint64_t n) {
-        _nReturnedSoFar += n;
+        _metrics.incrementNreturned(n);
     }
 
-    /**
-     * Sets the cursor's tracked number of query results returned so far to 'n'.
-     */
-    void setNReturnedSoFar(std::uint64_t n) {
-        invariant(n >= _nReturnedSoFar);
-        _nReturnedSoFar = n;
+    void incrementCursorMetrics(OpDebug::AdditiveMetrics newMetrics) {
+        _metrics.add(newMetrics);
     }
 
     /**
      * Returns the number of batches returned by this cursor so far.
      */
     std::uint64_t getNBatches() const {
-        return _nBatchesReturned;
+        return _metrics.nBatches.value_or(0);
     }
 
     /**
      * Increments the number of batches returned so far by one.
      */
     void incNBatches() {
-        ++_nBatchesReturned;
+        _metrics.incrementNBatches();
     }
 
     Date_t getLastUseDate() const {
@@ -299,6 +297,22 @@ public:
         _stashedRecoveryUnit = std::move(ru);
     }
 
+    /**
+     * Returns true if a client has requested that this cursor can be killed.
+     */
+    bool isKillPending() const {
+        return _killPending;
+    }
+
+    /**
+     * Sets 'killPending' flag of this client cursor. This indicates to the cursor that a client
+     * has requested that it be killed while it was pinned, and it can proactively clean up its
+     * resources upon unpinning.
+     */
+    void setKillPending(bool newValue) {
+        _killPending = newValue;
+    }
+
 private:
     friend class CursorManager;
     friend class ClientCursorPin;
@@ -332,17 +346,12 @@ private:
     ~ClientCursor();
 
     /**
-     * Marks this cursor as killed, so any future uses will return 'killStatus'. It is an error to
-     * call this method with Status::OK.
-     */
-    void markAsKilled(Status killStatus);
-
-    /**
      * Disposes this ClientCursor's PlanExecutor. Must be called before deleting a ClientCursor to
      * ensure it has a chance to clean up any resources it is using. Can be called multiple times.
-     * It is an error to call any other method after calling dispose().
+     * It is an error to call any other method after calling dispose(). If 'now' is specified,
+     * will track cursor lifespan metrics.
      */
-    void dispose(OperationContext* opCtx);
+    void dispose(OperationContext* opCtx, boost::optional<Date_t> now);
 
     bool isNoTimeout() const {
         return _isNoTimeout;
@@ -375,13 +384,6 @@ private:
     // Tracks whether dispose() has been called, to make sure it happens before destruction. It is
     // an error to use a ClientCursor once it has been disposed.
     bool _disposed = false;
-
-    // Tracks the number of results returned by this cursor so far. Tracked only as debugging info
-    // for display in $currentOp output.
-    std::uint64_t _nReturnedSoFar = 0;
-
-    // Tracks the number of batches returned by this cursor so far.
-    std::uint64_t _nBatchesReturned = 0;
 
     // Holds an owned copy of the command specification received from the client.
     const BSONObj _originatingCommand;
@@ -437,8 +439,18 @@ private:
     boost::optional<uint32_t> _planCacheKey;
     boost::optional<uint32_t> _queryHash;
 
+    // The shape of the original query serialized with readConcern, application name, and namespace.
+    // If boost::none, telemetry should not be collected for this cursor.
+    boost::optional<BSONObj> _telemetryStoreKey;
+    // Metrics that are accumulated over the lifetime of the cursor, incremented with each getMore.
+    // Useful for diagnostics like telemetry.
+    OpDebug::AdditiveMetrics _metrics;
+
     // The client OperationKey associated with this cursor.
     boost::optional<OperationKey> _opKey;
+
+    // Flag indicating that a client has requested to kill the cursor.
+    bool _killPending = false;
 };
 
 /**
@@ -541,9 +553,34 @@ private:
     OperationContext* _opCtx = nullptr;
     ClientCursor* _cursor = nullptr;
     CursorManager* _cursorManager = nullptr;
+
+    // A pinned cursor takes ownership of storage resources (storage-level cursors owned by the
+    // PlanExecutor) without lock-manager locks. Such an operation must ensure interruptibility when
+    // later acquiring a lock in order to avoid deadlocking with replication rollback at the storage
+    // engine level. Rollback signals interrupt to active readers, acquires a global X lock and then
+    // waits for all storage cursors to be closed in order to proceed; while a pinned cursor
+    // operation holds storage-level cursors and then may try to acquire a lock.
+    //
+    // An operation holding a pinned cursor must never have an UninterruptibleLockGuard on the stack
+    // that causes lock acquisition to hang without checking for interrupt. This
+    // InterruptibleLockGuard ensures that operations holding a ClientCursorPin will eventually
+    // observe and obey interrupt signals in the locking layer.
+    std::unique_ptr<InterruptibleLockGuard> _interruptibleLockGuard;
+
     bool _shouldSaveRecoveryUnit = false;
 };
 
 void startClientCursorMonitor();
+
+
+/**
+ * Records certain metrics for the current operation on OpDebug and aggregates those metrics for
+ * telemetry use. If a cursor pin is provided, metrics are aggregated on the cursor; otherwise,
+ * metrics are written directly to the telemetry store.
+ */
+void collectTelemetryMongod(OperationContext* opCtx, ClientCursorPin& cursor, long long nreturned);
+void collectTelemetryMongod(OperationContext* opCtx,
+                            const BSONObj& originatingCommand,
+                            long long nreturned);
 
 }  // namespace mongo

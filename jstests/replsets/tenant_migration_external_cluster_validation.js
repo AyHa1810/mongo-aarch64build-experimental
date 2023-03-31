@@ -11,12 +11,11 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {makeX509OptionsForTest} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
 
 // Multiple users cannot be authenticated on one connection within a session.
 TestData.disableImplicitSessions = true;
@@ -47,15 +46,16 @@ function createUsers(rst) {
     rst.awaitReplication();
 }
 
-const kTenantId = "testTenantId";
+const kTenantId = ObjectId().str;
 const kDbName = kTenantId + "_" +
     "testDb";
 const kCollName = "testColl";
 
-const x509Options = TenantMigrationUtil.makeX509OptionsForTest();
+const x509Options = makeX509OptionsForTest();
 const donorRst = new ReplSetTest({
     nodes: 2,
     name: "donor",
+    serverless: true,
     keyFile: "jstests/libs/key1",
     nodeOptions: Object.assign(x509Options.donor, {
         setParameter: {
@@ -69,6 +69,7 @@ const donorRst = new ReplSetTest({
 const recipientRst = new ReplSetTest({
     nodes: 2,
     name: "recipient",
+    serverless: true,
     keyFile: "jstests/libs/key1",
     nodeOptions: Object.assign(
         x509Options.recipient,
@@ -174,4 +175,3 @@ recipientSecondaryTestDB.logout();
 tenantMigrationTest.stop();
 donorRst.stopSet();
 recipientRst.stopSet();
-})();

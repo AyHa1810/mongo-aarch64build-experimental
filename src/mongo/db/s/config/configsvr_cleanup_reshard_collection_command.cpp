@@ -85,12 +85,12 @@ public:
 
             uassert(ErrorCodes::IllegalOperation,
                     "_configsvrCleanupReshardCollection can only be run on config servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
 
             repl::ReadConcernArgs::get(opCtx) =
                 repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
 
-            const auto catalogClient = Grid::get(opCtx)->catalogClient();
+            const auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
             auto collEntry = catalogClient->getCollection(opCtx, ns());
             if (!collEntry.getReshardingFields()) {
                 // If the collection entry doesn't have resharding fields, we assume that the
@@ -102,12 +102,13 @@ public:
                 ns(), collEntry.getReshardingFields()->getReshardingUUID());
             cleaner.clean(opCtx);
 
-            ShardingCatalogManager::get(opCtx)->bumpCollectionVersionAndChangeMetadataInTxn(
-                opCtx, ns(), [&](OperationContext* opCtx, TxnNumber txnNumber) {
-                    auto update = constructFinalMetadataRemovalUpdateOperation(opCtx, ns());
-                    auto res = ShardingCatalogManager::get(opCtx)->writeToConfigDocumentInTxn(
-                        opCtx, CollectionType::ConfigNS, update, txnNumber);
-                });
+            ShardingCatalogManager::get(opCtx)
+                ->bumpCollectionPlacementVersionAndChangeMetadataInTxn(
+                    opCtx, ns(), [&](OperationContext* opCtx, TxnNumber txnNumber) {
+                        auto update = constructFinalMetadataRemovalUpdateOperation(opCtx, ns());
+                        auto res = ShardingCatalogManager::get(opCtx)->writeToConfigDocumentInTxn(
+                            opCtx, CollectionType::ConfigNS, update, txnNumber);
+                    });
 
             collEntry = catalogClient->getCollection(opCtx, ns());
 

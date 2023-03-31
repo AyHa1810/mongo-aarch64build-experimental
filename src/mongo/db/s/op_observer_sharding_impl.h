@@ -33,8 +33,6 @@
 
 namespace mongo {
 
-class ShardingWriteRouter;
-
 class OpObserverShardingImpl : public OpObserverImpl {
 public:
     OpObserverShardingImpl(std::unique_ptr<OplogWriter> oplogWriter);
@@ -50,13 +48,14 @@ protected:
     void shardObserveAboutToDelete(OperationContext* opCtx,
                                    NamespaceString const& nss,
                                    BSONObj const& docToDelete) override;
-    void shardObserveInsertOp(OperationContext* opCtx,
-                              NamespaceString nss,
-                              const BSONObj& insertedDoc,
-                              const repl::OpTime& opTime,
-                              const ShardingWriteRouter& shardingWriteRouter,
-                              bool fromMigrate,
-                              bool inMultiDocumentTransaction) override;
+    void shardObserveInsertsOp(OperationContext* opCtx,
+                               NamespaceString nss,
+                               std::vector<InsertStatement>::const_iterator first,
+                               std::vector<InsertStatement>::const_iterator last,
+                               const std::vector<repl::OpTime>& opTimeList,
+                               const ShardingWriteRouter& shardingWriteRouter,
+                               bool fromMigrate,
+                               bool inMultiDocumentTransaction) override;
     void shardObserveUpdateOp(OperationContext* opCtx,
                               NamespaceString nss,
                               boost::optional<BSONObj> preImageDoc,
@@ -75,6 +74,10 @@ protected:
     void shardObserveTransactionPrepareOrUnpreparedCommit(
         OperationContext* opCtx,
         const std::vector<repl::ReplOperation>& stmts,
+        const repl::OpTime& prepareOrCommitOptime) override;
+    void shardObserveNonPrimaryTransactionPrepare(
+        OperationContext* opCtx,
+        const std::vector<repl::OplogEntry>& stmts,
         const repl::OpTime& prepareOrCommitOptime) override;
 };
 

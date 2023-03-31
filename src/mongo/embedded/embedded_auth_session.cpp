@@ -70,7 +70,9 @@ public:
 
     void startContractTracking() override {}
 
-    Status addAndAuthorizeUser(OperationContext*, const UserName&) override {
+    Status addAndAuthorizeUser(OperationContext*,
+                               const UserRequest&,
+                               boost::optional<Date_t>) override {
         UASSERT_NOT_IMPLEMENTED;
     }
 
@@ -224,6 +226,14 @@ public:
 
     bool mayBypassWriteBlockingMode() const override {
         return true;
+    }
+
+    bool isExpired() const override {
+        return false;
+    }
+
+    BSONArray getUserRoles() override {
+        UASSERT_NOT_IMPLEMENTED;
     }
 
 protected:

@@ -34,6 +34,7 @@
 #include "mongo/s/catalog/sharding_catalog_client_mock.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/s/shard_version_factory.h"
 #include "mongo/s/sharding_router_test_fixture.h"
 #include "mongo/unittest/unittest.h"
 
@@ -192,16 +193,18 @@ protected:
 
     const std::vector<ShardId> kShardIdList{kShard1, kShard2, kShard3, kShard4, kShard5};
 
-    const Status kStaleConfigErrorStatus{[] {
-                                             OID epoch{OID::gen()};
-                                             Timestamp timestamp{1, 0};
-                                             return StaleConfigInfo(
-                                                 NamespaceString("Foo.Bar"),
-                                                 ChunkVersion({epoch, timestamp}, {1, 0}),
-                                                 boost::none,
-                                                 ShardId{"dummy"});
-                                         }(),
-                                         "dummy"};
+    const Status kStaleConfigErrorStatus{
+        [] {
+            OID epoch{OID::gen()};
+            Timestamp timestamp{1, 0};
+            return StaleConfigInfo(
+                NamespaceString::createNamespaceString_forTest("Foo.Bar"),
+                ShardVersionFactory::make(ChunkVersion({epoch, timestamp}, {1, 0}),
+                                          boost::optional<CollectionIndexes>(boost::none)),
+                boost::none,
+                ShardId{"dummy"});
+        }(),
+        "dummy"};
 
 private:
     static void _assertShardIdsMatch(const std::set<ShardId>& expectedShardIds,

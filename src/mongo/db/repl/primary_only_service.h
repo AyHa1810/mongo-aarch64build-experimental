@@ -302,7 +302,9 @@ protected:
 
     /**
      * Validate the instance to be created with initialState does not conflict with any existing
-     * ones. The implementation should throw ConflictingOperationInProgress if there is a conflict.
+     * ones. The implementation can choose to throw ConflictingOperationInProgress if there is a
+     * conflict or a named error code specified to the particular service if it would like to attach
+     * ErrorExtraInfo.
      */
     virtual void checkIfConflictsWithOtherInstances(
         OperationContext* opCtx,
@@ -366,9 +368,9 @@ private:
     public:
         ActiveInstance(std::shared_ptr<Instance> instance,
                        CancellationSource source,
-                       SemiFuture<void> instanceComplete)
+                       SemiFuture<void> runCompleteFuture)
             : _instance(std::move(instance)),
-              _instanceComplete(std::move(instanceComplete)),
+              _runCompleteFuture(std::move(runCompleteFuture)),
               _source(std::move(source)) {
             invariant(_instance);
         }
@@ -383,7 +385,7 @@ private:
          * Blocking call that returns once the instance has finished running.
          */
         void waitForCompletion() const {
-            _instanceComplete.wait();
+            _runCompleteFuture.wait();
         }
 
         std::shared_ptr<Instance> getInstance() const {
@@ -399,7 +401,7 @@ private:
         const std::shared_ptr<Instance> _instance;
 
         // A future that will be resolved when the passed in Instance has finished running.
-        const SemiFuture<void> _instanceComplete;
+        const SemiFuture<void> _runCompleteFuture;
 
         // Each instance of a PrimaryOnlyService will own a CancellationSource for memory management
         // purposes. Any memory associated with an instance's CancellationSource will be cleaned up
@@ -441,11 +443,8 @@ private:
      * Called as part of onStepUp.  Queries the state document collection for this
      * PrimaryOnlyService, constructs Instance objects for each document found, and schedules work
      * to run all the newly recreated Instances.
-     *
-     * If querying the state document collection errors, that error is logged and re-thrown by this
-     * function.
      */
-    void _rebuildInstances(long long term);
+    void _rebuildInstances(long long term) noexcept;
 
     /**
      * Schedules work to call the provided instance's 'run' method and inserts the new instance into
@@ -511,11 +510,8 @@ private:
 
     State _state = State::kPaused;  // (M)
 
-    // If rebuilding the instances fails, due to i.e. a failure reloading the state documents from
-    // disk, this Status gets set to a non-ok value and calls to lookup() or getOrCreate() will
-    // throw this status until the node steps down. Note that this status must be populated with the
-    // relevant error before _setState is used to change the status to rebuildFailed and waiters on
-    // _stateChangeCV are notified, as those waiters may attempt to read this status.
+    // If reloading the state documents from disk fails, this Status gets set to a non-ok value and
+    // calls to lookup() or getOrCreate() will throw this status until the node steps down.
     Status _rebuildStatus = Status::OK();  // (M)
 
     // The term that this service is running under.
@@ -582,12 +578,16 @@ public:
                                        std::vector<BSONObj>* ops) noexcept;
 
     void onStartup(OperationContext*) final;
+    void onSetCurrentConfig(OperationContext* opCtx) final {}
     void onInitialDataAvailable(OperationContext* opCtx, bool isMajorityDataAvailable) final {}
     void onShutdown() final;
     void onStepUpBegin(OperationContext*, long long term) final {}
     void onBecomeArbiter() final {}
     void onStepUpComplete(OperationContext*, long long term) final;
     void onStepDown() final;
+    inline std::string getServiceName() const override final {
+        return "PrimaryOnlyServiceRegistry";
+    }
 
 private:
     StringMap<std::unique_ptr<PrimaryOnlyService>> _servicesByName;

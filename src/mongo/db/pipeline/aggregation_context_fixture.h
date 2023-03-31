@@ -31,6 +31,7 @@
 
 #include <boost/intrusive_ptr.hpp>
 #include <memory>
+#include <vector>
 
 #include "mongo/db/concurrency/locker_noop_client_observer.h"
 #include "mongo/db/pipeline/document_source.h"
@@ -47,7 +48,8 @@ namespace mongo {
 class AggregationContextFixture : public ServiceContextTest {
 public:
     AggregationContextFixture()
-        : AggregationContextFixture(NamespaceString(boost::none, "unittests", "pipeline_test")) {}
+        : AggregationContextFixture(NamespaceString::createNamespaceString_forTest(
+              boost::none, "unittests", "pipeline_test")) {}
 
     AggregationContextFixture(NamespaceString nss) {
         auto service = getServiceContext();
@@ -72,6 +74,24 @@ public:
         return _opCtx.get();
     }
 
+    /*
+     * Serialize and redact a document source.
+     */
+    BSONObj redact(const DocumentSource& docSource, bool performRedaction = true) {
+        SerializationOptions options;
+        if (performRedaction) {
+            options.replacementForLiteralArgs = "?";
+            options.redactFieldNamesStrategy = [](StringData s) -> std::string {
+                return str::stream() << "HASH<" << s << ">";
+            };
+            options.redactFieldNames = true;
+        }
+        std::vector<Value> serialized;
+        docSource.serializeToArray(serialized, options);
+        ASSERT_EQ(1, serialized.size());
+        return serialized[0].getDocument().toBson().getOwned();
+    }
+
 private:
     ServiceContext::UniqueOperationContext _opCtx;
     boost::intrusive_ptr<ExpressionContextForTest> _expCtx;
@@ -88,8 +108,11 @@ struct DocumentSourceDeleter {
 class ServerlessAggregationContextFixture : public AggregationContextFixture {
 public:
     ServerlessAggregationContextFixture()
-        : AggregationContextFixture(
-              NamespaceString(TenantId(OID::gen()), "unittests", "pipeline_test")) {}
+        : AggregationContextFixture(NamespaceString::createNamespaceString_forTest(
+              TenantId(OID::gen()), "unittests", "pipeline_test")) {}
+
+    const std::string _targetDb = "test";
+    const std::string _targetColl = "target_collection";
 };
 
 }  // namespace mongo

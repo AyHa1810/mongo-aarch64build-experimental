@@ -40,6 +40,7 @@
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/auth/restriction_environment.h"
+#include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
@@ -49,6 +50,7 @@
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/stdx/variant.h"
 #include "mongo/transport/hello_metrics.h"
+#include "mongo/transport/ingress_handshake_metrics.h"
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/transport/service_entry_point_impl_gen.h"
 #include "mongo/transport/service_executor.h"
@@ -56,8 +58,8 @@
 #include "mongo/transport/service_executor_gen.h"
 #include "mongo/transport/service_executor_reserved.h"
 #include "mongo/transport/service_executor_synchronous.h"
-#include "mongo/transport/service_state_machine.h"
 #include "mongo/transport/session.h"
+#include "mongo/transport/session_workflow.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/net/cidr.h"
@@ -98,7 +100,7 @@ struct ClientSummary {
 };
 }  // namespace
 
-bool shouldOverrideMaxConns(const transport::SessionHandle& session,
+bool shouldOverrideMaxConns(const std::shared_ptr<transport::Session>& session,
                             const std::vector<stdx::variant<CIDR, std::string>>& exemptions) {
     if (exemptions.empty())
         return false;
@@ -169,9 +171,10 @@ size_t getSupportedMax() {
 class ServiceEntryPointImpl::Sessions {
 public:
     struct Entry {
-        explicit Entry(std::shared_ptr<transport::ServiceStateMachine> ssm) : ssm{std::move(ssm)} {}
-        std::shared_ptr<transport::ServiceStateMachine> ssm;
-        ClientSummary summary{ssm->client()};
+        explicit Entry(std::shared_ptr<transport::SessionWorkflow> workflow)
+            : workflow{std::move(workflow)} {}
+        std::shared_ptr<transport::SessionWorkflow> workflow;
+        ClientSummary summary{workflow->client()};
     };
     using ByClientMap = stdx::unordered_map<Client*, Entry>;
     using iterator = ByClientMap::iterator;
@@ -181,11 +184,11 @@ public:
     public:
         explicit SyncToken(Sessions* src) : _src{src}, _lk{_src->_mutex} {}
 
-        /** Run `f(ssm)` for each `ServiceStateMachine& ssm`, in an unspecified order. */
+        /** Run `f(workflow)` for each `SessionWorkflow& workflow`, in an unspecified order. */
         template <typename F>
         void forEach(F&& f) {
             for (auto& e : _src->_byClient)
-                f(*e.second.ssm);
+                f(*e.second.workflow);
         }
 
         /**
@@ -198,9 +201,9 @@ public:
                 _lk, deadline.toSystemTimePoint(), [&] { return _src->_byClient.empty(); });
         }
 
-        iterator insert(std::shared_ptr<transport::ServiceStateMachine> ssm) {
-            Client* cli = ssm->client();
-            auto [it, ok] = _src->_byClient.insert({cli, Entry(std::move(ssm))});
+        iterator insert(std::shared_ptr<transport::SessionWorkflow> workflow) {
+            Client* cli = workflow->client();
+            auto [it, ok] = _src->_byClient.insert({cli, Entry(std::move(workflow))});
             invariant(ok);
             _src->_created.fetchAndAdd(1);
             _onSizeChange();
@@ -253,7 +256,10 @@ public:
 };
 
 ServiceEntryPointImpl::ServiceEntryPointImpl(ServiceContext* svcCtx)
-    : _svcCtx(svcCtx), _maxSessions(getSupportedMax()), _sessions{std::make_unique<Sessions>()} {}
+    : _svcCtx(svcCtx),
+      _maxSessions(getSupportedMax()),
+      _rejectedSessions(0),
+      _sessions{std::make_unique<Sessions>()} {}
 
 ServiceEntryPointImpl::~ServiceEntryPointImpl() = default;
 
@@ -276,8 +282,20 @@ Status ServiceEntryPointImpl::start() {
     return Status::OK();
 }
 
-void ServiceEntryPointImpl::startSession(transport::SessionHandle session) {
+void ServiceEntryPointImpl::configureServiceExecutorContext(ServiceContext::UniqueClient& client,
+                                                            bool isPrivilegedSession) {
+    auto seCtx = std::make_unique<transport::ServiceExecutorContext>();
+    seCtx->setUseDedicatedThread(transport::gInitialUseDedicatedThread);
+    seCtx->setCanUseReserved(isPrivilegedSession);
+    stdx::lock_guard lk(*client);
+    transport::ServiceExecutorContext::set(&*client, std::move(seCtx));
+}
+
+void ServiceEntryPointImpl::startSession(std::shared_ptr<transport::Session> session) {
     invariant(session);
+
+    transport::IngressHandshakeMetrics::get(*session).onSessionStarted(_svcCtx->getTickSource());
+
     // Setup the restriction environment on the Session, if the Session has local/remote Sockaddrs
     const auto& remoteAddr = session->remoteAddr();
     const auto& localAddr = session->localAddr();
@@ -290,10 +308,13 @@ void ServiceEntryPointImpl::startSession(transport::SessionHandle session) {
     auto client = _svcCtx->makeClient("conn{}"_format(session->id()), session);
     auto clientPtr = client.get();
 
-    Sessions::iterator iter;
+    std::shared_ptr<transport::SessionWorkflow> workflow;
     {
         auto sync = _sessions->sync();
         if (sync.size() >= _maxSessions && !isPrivilegedSession) {
+            // Since startSession() is guaranteed to be accessed only by a single listener thread,
+            // an atomic increment is not necessary here.
+            _rejectedSessions++;
             if (!quiet()) {
                 LOGV2(22942,
                       "Connection refused because there are too many open connections",
@@ -303,17 +324,10 @@ void ServiceEntryPointImpl::startSession(transport::SessionHandle session) {
             return;
         }
 
-        // Imbue the new Client with a ServiceExecutorContext.
-        {
-            auto seCtx = std::make_unique<transport::ServiceExecutorContext>();
-            seCtx->setUseDedicatedThread(transport::gInitialUseDedicatedThread);
-            seCtx->setCanUseReserved(isPrivilegedSession);
-            stdx::lock_guard lk(*client);
-            transport::ServiceExecutorContext::set(&*client, std::move(seCtx));
-        }
+        configureServiceExecutorContext(client, isPrivilegedSession);
 
-        auto ssm = transport::ServiceStateMachine::make(std::move(client));
-        iter = sync.insert(std::move(ssm));
+        workflow = transport::SessionWorkflow::make(std::move(client));
+        auto iter = sync.insert(workflow);
         if (!quiet()) {
             LOGV2(22943,
                   "Connection accepted",
@@ -323,7 +337,7 @@ void ServiceEntryPointImpl::startSession(transport::SessionHandle session) {
     }
 
     onClientConnect(clientPtr);
-    iter->second.ssm->start();
+    workflow->start();
 }
 
 void ServiceEntryPointImpl::onClientDisconnect(Client* client) {
@@ -342,7 +356,7 @@ void ServiceEntryPointImpl::onClientDisconnect(Client* client) {
 }
 
 void ServiceEntryPointImpl::endAllSessions(transport::Session::TagMask tags) {
-    _sessions->sync().forEach([&](auto&& ssm) { ssm.terminateIfTagsDontMatch(tags); });
+    _sessions->sync().forEach([&](auto&& workflow) { workflow.terminateIfTagsDontMatch(tags); });
 }
 
 bool ServiceEntryPointImpl::shutdown(Milliseconds timeout) {
@@ -375,6 +389,10 @@ size_t ServiceEntryPointImpl::maxOpenSessions() const {
     return _maxSessions;
 }
 
+logv2::LogSeverity ServiceEntryPointImpl::slowSessionWorkflowLogSeverity() {
+    return _slowSessionWorkflowLogSuppressor();
+}
+
 bool ServiceEntryPointImpl::shutdownAndWait(Milliseconds timeout) {
     auto deadline = _svcCtx->getPreciseClockSource()->now() + timeout;
 
@@ -385,7 +403,7 @@ bool ServiceEntryPointImpl::shutdownAndWait(Milliseconds timeout) {
     bool drainedAll;
     {
         auto sync = _sessions->sync();
-        sync.forEach([&](auto&& ssm) { ssm.terminate(); });
+        sync.forEach([&](auto&& workflow) { workflow.terminate(); });
         drainedAll = sync.waitForEmpty(deadline);
         if (!drainedAll) {
             LOGV2(22947,
@@ -402,7 +420,7 @@ bool ServiceEntryPointImpl::shutdownAndWait(Milliseconds timeout) {
 }
 
 void ServiceEntryPointImpl::endAllSessionsNoTagMask() {
-    _sessions->sync().forEach([&](auto&& ssm) { ssm.terminate(); });
+    _sessions->sync().forEach([&](auto&& workflow) { workflow.terminate(); });
 }
 
 bool ServiceEntryPointImpl::waitForNoSessions(Milliseconds timeout) {
@@ -416,11 +434,17 @@ void ServiceEntryPointImpl::appendStats(BSONObjBuilder* bob) const {
     size_t sessionCount = _sessions->size();
     size_t sessionsCreated = _sessions->created();
 
-    auto appendInt = [&](StringData n, auto v) { bob->append(n, static_cast<int>(v)); };
+    auto appendInt = [&](StringData n, auto v) {
+        bob->append(n, static_cast<int>(v));
+    };
 
     appendInt("current", sessionCount);
     appendInt("available", _maxSessions - sessionCount);
     appendInt("totalCreated", sessionsCreated);
+
+    if (gFeatureFlagConnHealthMetrics.isEnabledAndIgnoreFCV()) {
+        appendInt("rejected", _rejectedSessions);
+    }
 
     invariant(_svcCtx);
     appendInt("active", _svcCtx->getActiveClientOperations());

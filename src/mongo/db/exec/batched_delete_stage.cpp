@@ -33,9 +33,12 @@
 #include "mongo/db/exec/batched_delete_stage.h"
 
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/scoped_timer.h"
+#include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/exec/write_stage_common.h"
 #include "mongo/db/op_observer/op_observer.h"
@@ -241,20 +244,22 @@ PlanStage::StageState BatchedDeleteStage::_deleteBatch(WorkingSetID* out) {
         return PlanStage::NEED_TIME;
     }
 
-    handlePlanStageYield(expCtx(),
-                         "BatchedDeleteStage saveState",
-                         collection()->ns().ns(),
-                         [&] {
-                             child()->saveState();
-                             return PlanStage::NEED_TIME /* unused */;
-                         },
-                         [&] {
-                             // yieldHandler
-                             std::terminate();
-                         });
+    handlePlanStageYield(
+        expCtx(),
+        "BatchedDeleteStage saveState",
+        collection()->ns().ns(),
+        [&] {
+            child()->saveState();
+            return PlanStage::NEED_TIME /* unused */;
+        },
+        [&] {
+            // yieldHandler
+            std::terminate();
+        });
 
     std::set<WorkingSetID> recordsToSkip;
     unsigned int docsDeleted = 0;
+    unsigned int bytesDeleted = 0;
     unsigned int bufferOffset = 0;
     long long timeInBatch = 0;
 
@@ -264,7 +269,8 @@ PlanStage::StageState BatchedDeleteStage::_deleteBatch(WorkingSetID* out) {
             "BatchedDeleteStage::_deleteBatch",
             collection()->ns().ns(),
             [&] {
-                timeInBatch = _commitBatch(out, &recordsToSkip, &docsDeleted, &bufferOffset);
+                timeInBatch =
+                    _commitBatch(out, &recordsToSkip, &docsDeleted, &bytesDeleted, &bufferOffset);
                 return PlanStage::NEED_TIME;
             },
             [&] {
@@ -276,11 +282,12 @@ PlanStage::StageState BatchedDeleteStage::_deleteBatch(WorkingSetID* out) {
             return ret;
         }
     } catch (const ExceptionFor<ErrorCodes::StaleConfig>& ex) {
-        if (ex->getVersionReceived() == ChunkVersion::IGNORED() && ex->getCriticalSectionSignal()) {
-            // If ChunkVersion is IGNORED and we encountered a critical section, then yield, wait
-            // for critical section to finish and then we'll resume the write from the point we had
-            // left. We do this to prevent large multi-writes from repeatedly failing due to
-            // StaleConfig and exhausting the mongos retry attempts.
+        if (ShardVersion::isPlacementVersionIgnored(ex->getVersionReceived()) &&
+            ex->getCriticalSectionSignal()) {
+            // If the placement version is IGNORED and we encountered a critical section, then
+            // yield, wait for critical section to finish and then we'll resume the write from the
+            // point we had left. We do this to prevent large multi-writes from repeatedly failing
+            // due to StaleConfig and exhausting the mongos retry attempts.
             planExecutorShardingCriticalSectionFuture(opCtx()) = ex->getCriticalSectionSignal();
             _prepareToRetryDrainAfterYield(out, recordsToSkip);
             return PlanStage::NEED_YIELD;
@@ -292,6 +299,7 @@ PlanStage::StageState BatchedDeleteStage::_deleteBatch(WorkingSetID* out) {
     incrementSSSMetricNoOverflow(batchedDeletesSSS.batches, 1);
     incrementSSSMetricNoOverflow(batchedDeletesSSS.timeInBatchMillis, timeInBatch);
     _specificStats.docsDeleted += docsDeleted;
+    _specificStats.bytesDeleted += bytesDeleted;
 
     if (bufferOffset < _stagedDeletesBuffer.size()) {
         // targetBatchTimeMS was met. Remove staged deletes that have been evaluated
@@ -312,6 +320,7 @@ PlanStage::StageState BatchedDeleteStage::_deleteBatch(WorkingSetID* out) {
 long long BatchedDeleteStage::_commitBatch(WorkingSetID* out,
                                            std::set<WorkingSetID>* recordsToSkip,
                                            unsigned int* docsDeleted,
+                                           unsigned int* bytesDeleted,
                                            unsigned int* bufferOffset) {
     // Estimate the size of the oplog entry that would result from committing the batch,
     // to ensure we emit an oplog entry that's within the 16MB BSON limit.
@@ -321,10 +330,13 @@ long long BatchedDeleteStage::_commitBatch(WorkingSetID* out,
 
     // Start a WUOW with 'groupOplogEntries' which groups a delete batch into a single timestamp
     // and oplog entry.
-    WriteUnitOfWork wuow(opCtx(), true /* groupOplogEntries */);
+    WriteUnitOfWork wuow(opCtx(),
+                         _stagedDeletesBuffer.size() > 1U ? true : false /* groupOplogEntries */);
     for (; *bufferOffset < _stagedDeletesBuffer.size(); ++*bufferOffset) {
         if (MONGO_unlikely(throwWriteConflictExceptionInBatchedDeleteStage.shouldFail())) {
-            throwWriteConflictException();
+            throwWriteConflictException(
+                str::stream() << "Hit failpoint '"
+                              << throwWriteConflictExceptionInBatchedDeleteStage.getName() << "'.");
         }
 
         auto workingSetMemberID = _stagedDeletesBuffer.at(*bufferOffset);
@@ -338,80 +350,66 @@ long long BatchedDeleteStage::_commitBatch(WorkingSetID* out,
 
         // Determine whether the document being deleted is owned by this shard, and the action
         // to undertake if it isn't.
-        const auto action = docStillMatches ? _preWriteFilter.computeAction(member->doc.value())
-                                            : write_stage_common::PreWriteFilter::Action::kSkip;
         bool writeToOrphan = false;
-        switch (action) {
-            case write_stage_common::PreWriteFilter::Action::kSkip:
-                LOGV2_DEBUG(
-                    6410700,
-                    3,
-                    "Skipping delete operation in batched delete: either the record no longer "
-                    "matches the query or skipping an orphan document to prevent a wrong "
-                    "change stream event",
-                    "namespace"_attr = collection()->ns(),
-                    "isOrphan"_attr = docStillMatches,
-                    "record"_attr = member->doc.value());
-                recordsToSkip->insert(workingSetMemberID);
-                break;
-            case write_stage_common::PreWriteFilter::Action::kWriteAsFromMigrate:
-                LOGV2_DEBUG(6410701,
-                            3,
-                            "Marking delete operation to orphan document with the fromMigrate flag "
-                            "to prevent a wrong change stream event in a batched delete",
-                            "namespace"_attr = collection()->ns(),
-                            "record"_attr = member->doc.value());
-                writeToOrphan = true;
-                [[fallthrough]];  // To still peform the delete, but mark fromMigrate.
-            case write_stage_common::PreWriteFilter::Action::kWrite:
-                Snapshotted<Document> memberDoc = member->doc;
-                BSONObj bsonObjDoc = memberDoc.value().toBson();
-                applyOpsBytes += kApplyOpsArrayEntryPaddingBytes;
-                tassert(6515700,
-                        "Expected document to have an _id field present",
-                        bsonObjDoc.hasField("_id"));
-                applyOpsBytes += bsonObjDoc.getField("_id").size();
-                if (applyOpsBytes > BSONObjMaxUserSize) {
-                    // There's no room to fit this deletion in the current batch, as doing so
-                    // would exceed 16MB of oplog entry: put this deletion back into the staging
-                    // buffer and commit the batch.
-                    invariant(*bufferOffset > 0);
-                    (*bufferOffset)--;
-                    wuow.commit();
-                    return batchTimer.millis();
-                }
+        auto action = _preWriteFilter.computeActionAndLogSpecialCases(
+            member->doc.value(), "batched delete"_sd, collection()->ns());
+        if (!docStillMatches || action == write_stage_common::PreWriteFilter::Action::kSkip) {
+            recordsToSkip->insert(workingSetMemberID);
+            continue;
+        }
+        writeToOrphan = action == write_stage_common::PreWriteFilter::Action::kWriteAsFromMigrate;
 
-                collection()->deleteDocument(opCtx(),
-                                             Snapshotted(memberDoc.snapshotId(), bsonObjDoc),
-                                             _params->stmtId,
-                                             member->recordId,
-                                             _params->opDebug,
-                                             _params->fromMigrate || writeToOrphan,
-                                             false,
-                                             _params->returnDeleted
-                                                 ? Collection::StoreDeletedDoc::On
-                                                 : Collection::StoreDeletedDoc::Off);
+        auto retryableWrite = write_stage_common::isRetryableWrite(opCtx());
+        Snapshotted<Document> memberDoc = member->doc;
+        BSONObj bsonObjDoc = memberDoc.value().toBson();
+        applyOpsBytes += kApplyOpsArrayEntryPaddingBytes;
+        tassert(
+            6515700, "Expected document to have an _id field present", bsonObjDoc.hasField("_id"));
+        applyOpsBytes += bsonObjDoc.getField("_id").size();
+        if (applyOpsBytes > BSONObjMaxUserSize) {
+            // There's no room to fit this deletion in the current batch, as doing so
+            // would exceed 16MB of oplog entry: put this deletion back into the staging
+            // buffer and commit the batch.
+            invariant(*bufferOffset > 0);
+            (*bufferOffset)--;
+            wuow.commit();
+            return batchTimer.millis();
+        }
 
-                (*docsDeleted)++;
+        collection_internal::deleteDocument(
+            opCtx(),
+            collection(),
+            Snapshotted(memberDoc.snapshotId(), bsonObjDoc),
+            _params->stmtId,
+            member->recordId,
+            _params->opDebug,
+            _params->fromMigrate || writeToOrphan,
+            false,
+            _params->returnDeleted ? collection_internal::StoreDeletedDoc::On
+                                   : collection_internal::StoreDeletedDoc::Off,
+            CheckRecordId::Off,
+            retryableWrite ? collection_internal::RetryableWrite::kYes
+                           : collection_internal::RetryableWrite::kNo);
 
-                batchedDeleteStageSleepAfterNDocuments.executeIf(
-                    [&](const BSONObj& data) {
-                        int sleepMs = data["sleepMs"].safeNumberInt();
-                        opCtx()->sleepFor(Milliseconds(sleepMs));
-                    },
-                    [&](const BSONObj& data) {
-                        // hangAfterApproxNDocs is roughly estimated as the number of deletes
-                        // committed + the number of documents deleted in the current unit of work.
+        (*docsDeleted)++;
+        (*bytesDeleted) += bsonObjDoc.objsize();
 
-                        // Assume nDocs is positive.
-                        return data.hasField("sleepMs") && data.hasField("ns") &&
-                            data.getStringField("ns") == collection()->ns().toString() &&
-                            data.hasField("nDocs") &&
-                            _specificStats.docsDeleted + *docsDeleted >=
-                            static_cast<unsigned int>(data.getIntField("nDocs"));
-                    });
-                break;
-        };
+        batchedDeleteStageSleepAfterNDocuments.executeIf(
+            [&](const BSONObj& data) {
+                int sleepMs = data["sleepMs"].safeNumberInt();
+                opCtx()->sleepFor(Milliseconds(sleepMs));
+            },
+            [&](const BSONObj& data) {
+                // hangAfterApproxNDocs is roughly estimated as the number of deletes
+                // committed + the number of documents deleted in the current unit of work.
+
+                // Assume nDocs is positive.
+                return data.hasField("sleepMs") && data.hasField("ns") &&
+                    data.getStringField("ns") == collection()->ns().toString() &&
+                    data.hasField("nDocs") &&
+                    _specificStats.docsDeleted + *docsDeleted >=
+                    static_cast<unsigned int>(data.getIntField("nDocs"));
+            });
 
         const Milliseconds elapsedMillis(batchTimer.millis());
         if (_batchedDeleteParams->targetBatchTimeMS != Milliseconds(0) &&
@@ -473,17 +471,18 @@ void BatchedDeleteStage::_stageNewDelete(WorkingSetID* workingSetMemberID) {
 }
 
 PlanStage::StageState BatchedDeleteStage::_tryRestoreState(WorkingSetID* out) {
-    return handlePlanStageYield(expCtx(),
-                                "BatchedDeleteStage::_tryRestoreState",
-                                collection()->ns().ns(),
-                                [&] {
-                                    child()->restoreState(&collection());
-                                    return PlanStage::NEED_TIME;
-                                },
-                                [&] {
-                                    // yieldHandler
-                                    *out = WorkingSet::INVALID_ID;
-                                });
+    return handlePlanStageYield(
+        expCtx(),
+        "BatchedDeleteStage::_tryRestoreState",
+        collection()->ns().ns(),
+        [&] {
+            child()->restoreState(&collection());
+            return PlanStage::NEED_TIME;
+        },
+        [&] {
+            // yieldHandler
+            *out = WorkingSet::INVALID_ID;
+        });
 }
 
 void BatchedDeleteStage::_prepareToRetryDrainAfterYield(

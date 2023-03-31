@@ -145,9 +145,11 @@ REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(
     _internalBoundedSort,
     LiteParsedDocumentSourceDefault::parse,
     DocumentSourceSort::parseBoundedSort,
-    AllowedWithApiStrict::kNeverInVersion1,
-    AllowedWithClientType::kAny,
-    feature_flags::gFeatureFlagBucketUnpackWithSort.getVersion(),
+    ::mongo::getTestCommandsEnabled() ? AllowedWithApiStrict::kNeverInVersion1
+                                      : AllowedWithApiStrict::kInternal,
+    ::mongo::getTestCommandsEnabled() ? AllowedWithClientType::kAny
+                                      : AllowedWithClientType::kInternal,
+    feature_flags::gFeatureFlagBucketUnpackWithSort,
     feature_flags::gFeatureFlagBucketUnpackWithSort.isEnabledAndIgnoreFCV());
 
 DocumentSource::GetNextResult::ReturnStatus DocumentSourceSort::timeSorterPeek() {
@@ -279,8 +281,13 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceSort::clone(
                   _sortExecutor->getMaxMemoryBytes());
 }
 
-void DocumentSourceSort::serializeToArray(
-    std::vector<Value>& array, boost::optional<ExplainOptions::Verbosity> explain) const {
+void DocumentSourceSort::serializeToArray(std::vector<Value>& array,
+                                          SerializationOptions opts) const {
+    auto explain = opts.verbosity;
+    if (opts.redactFieldNames || opts.replacementForLiteralArgs) {
+        MONGO_UNIMPLEMENTED_TASSERT(7484310);
+    }
+
     if (_timeSorter) {
         tassert(6369900,
                 "$_internalBoundedSort should not absorb a $limit",
@@ -299,9 +306,11 @@ void DocumentSourceSort::serializeToArray(
 
         if (explain >= ExplainOptions::Verbosity::kExecStats) {
             mutDoc["totalDataSizeSortedBytesEstimate"] =
-                Value(static_cast<long long>(_timeSorter->totalDataSizeBytes()));
+                Value(static_cast<long long>(_timeSorter->stats().bytesSorted()));
             mutDoc["usedDisk"] = Value(_timeSorter->stats().spilledRanges() > 0);
             mutDoc["spills"] = Value(static_cast<long long>(_timeSorter->stats().spilledRanges()));
+            mutDoc["spilledDataStorageSize"] =
+                Value(static_cast<long long>(_sortExecutor->spilledDataStorageSize()));
         }
 
         array.push_back(Value{mutDoc.freeze()});
@@ -337,6 +346,8 @@ void DocumentSourceSort::serializeToArray(
             Value(static_cast<long long>(stats.totalDataSizeBytes));
         mutDoc["usedDisk"] = Value(stats.spills > 0);
         mutDoc["spills"] = Value(static_cast<long long>(stats.spills));
+        mutDoc["spilledDataStorageSize"] =
+            Value(static_cast<long long>(_sortExecutor->spilledDataStorageSize()));
     }
 
     array.push_back(Value(mutDoc.freeze()));
@@ -400,6 +411,10 @@ DepsTracker::State DocumentSourceSort::getDependencies(DepsTracker* deps) const 
     return DepsTracker::State::SEE_NEXT;
 }
 
+void DocumentSourceSort::addVariableRefs(std::set<Variables::Id>* refs) const {
+    // It's impossible for $sort or the find command's sort to refer to a variable.
+}
+
 intrusive_ptr<DocumentSource> DocumentSourceSort::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& pExpCtx) {
     uassert(15973, "the $sort key specification must be an object", elem.type() == Object);
@@ -433,10 +448,11 @@ intrusive_ptr<DocumentSourceSort> DocumentSourceSort::createBoundedSort(
     if (expCtx->allowDiskUse) {
         opts.extSortAllowed = true;
         opts.tempDir = expCtx->tempDir;
+        opts.sorterFileStats = ds->getSorterFileStats();
     }
 
     if (limit) {
-        opts.Limit(limit.get());
+        opts.Limit(limit.value());
     }
 
     if (boundBase == kMin) {
@@ -481,6 +497,10 @@ intrusive_ptr<DocumentSourceSort> DocumentSourceSort::parseBoundedSort(
     BSONElement key = args["sortKey"];
     uassert(6369904, "$_internalBoundedSort sortKey must be an object", key.type() == Object);
 
+    // Empty sort pattern is not allowed for the bounded sort.
+    uassert(6900501,
+            "$_internalBoundedSort stage must have at least one sort key",
+            !key.embeddedObject().isEmpty());
     SortPattern pat{key.embeddedObject(), expCtx};
 
     {
@@ -516,11 +536,14 @@ intrusive_ptr<DocumentSourceSort> DocumentSourceSort::parseBoundedSort(
                           << kMax << "'",
             boundBase == kMin || boundBase == kMax);
 
+    auto ds = DocumentSourceSort::create(expCtx, pat);
+
     SortOptions opts;
     opts.MaxMemoryUsageBytes(internalQueryMaxBlockingSortMemoryUsageBytes.load());
     if (expCtx->allowDiskUse) {
         opts.ExtSortAllowed(true);
         opts.TempDir(expCtx->tempDir);
+        opts.FileStats(ds->getSorterFileStats());
     }
     if (BSONElement limitElem = args["limit"]) {
         uassert(6588100,
@@ -529,7 +552,6 @@ intrusive_ptr<DocumentSourceSort> DocumentSourceSort::parseBoundedSort(
         opts.Limit(limitElem.numberLong());
     }
 
-    auto ds = DocumentSourceSort::create(expCtx, pat);
     if (boundBase == kMin) {
         if (pat.back().isAscending) {
             ds->_timeSorter.reset(

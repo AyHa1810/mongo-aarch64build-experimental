@@ -7,9 +7,15 @@
 const originalReplSet = ReplSetTest;
 
 ReplSetTest = function(opts) {
+    // Setup the 'serverless' environment if the 'opts' is not a connection string, ie. the
+    // replica-set does not already exist and the replica-set is not part of the sharded cluster,
+    // ie. 'setParametersMongos' property does not exist.
+    const newOpts = typeof opts !== "string" && !TestData.hasOwnProperty("setParametersMongos")
+        ? Object.assign({name: "OverridenServerlessChangeStreamReplSet", serverless: true}, opts)
+        : opts;
+
     // Call the constructor with the original 'ReplSetTest' to populate 'this' with required fields.
-    // TODO SERVER-67267 add {serverless:true} to the 'opts'.
-    originalReplSet.apply(this, [opts]);
+    originalReplSet.apply(this, [newOpts]);
 
     // Make a copy of the original 'startSetAsync' function and then override it to include the
     // required parameters.
@@ -17,35 +23,75 @@ ReplSetTest = function(opts) {
     this.startSetAsync = function(options, restart) {
         const newOptions = Object.assign({}, options || {});
 
-        const fpAssertChangeStreamNssColl =
-            tojson({mode: "alwaysOn", data: {collectionName: "system.change_collection"}});
+        let setParameter = {};
 
-        // The 'setParameter' that should be merged with 'newOpts' for the sharded-cluster and the
-        // replica-set.
-        const setParameters = {
-            "sharded-cluster": {
-                // TODO SERVER-67267 check if 'forceEnableChangeCollectionsMode' can be removed.
-                "failpoint.forceEnableChangeCollectionsMode": tojson({mode: "alwaysOn"}),
-                "failpoint.assertChangeStreamNssCollection": fpAssertChangeStreamNssColl
-            },
-            "replica-set": {
+        // A change collection does not exist in the config server, do not set any change collection
+        // related parameter.
+        if (!newOptions.hasOwnProperty("configsvr")) {
+            setParameter = {
+                // TODO SERVER-68341 Pass multitenancy flags here.
                 featureFlagServerlessChangeStreams: true,
-                "failpoint.assertChangeStreamNssCollection": fpAssertChangeStreamNssColl
-            }
-        };
+                internalChangeStreamUseTenantIdForTesting: true
+            };
+        }
 
-        // TODO SERVER-67634 avoid using change collection in the config server.
-        const clusterTopology =
-            newOptions.hasOwnProperty("configsvr") || newOptions.hasOwnProperty("shardsvr")
-            ? "sharded-cluster"
-            : "replica-set";
-
-        const setParameter = setParameters[clusterTopology];
         newOptions.setParameter = Object.assign({}, newOptions.setParameter, setParameter);
         return this._originalStartSetAsync(newOptions, restart);
+    };
+
+    // Make a copy of the original 'initiate' function and then override it to issue
+    // 'setChangeStreamState' command.
+    this._originalInitiate = this.initiate;
+    this.initiate = function(cfg, initCmd) {
+        this._originalInitiate(cfg, initCmd, {doNotWaitForPrimaryOnlyServices: false});
+
+        // Enable the change stream and verify that it is enabled.
+        const adminDb = this.getPrimary().getDB("admin");
+        assert.commandWorked(adminDb.runCommand({setChangeStreamState: 1, enabled: true}));
+        assert.eq(assert.commandWorked(adminDb.runCommand({getChangeStreamState: 1})).enabled,
+                  true);
+
+        // Verify that the change stream cursor is getting opened in the change collection.
+        const explain = assert.commandWorked(adminDb.getSiblingDB("test").runCommand({
+            aggregate: 1,
+            pipeline: [{$changeStream: {}}],
+            explain: true,
+        }));
+        assert.eq(explain.stages[0].$cursor.queryPlanner.namespace,
+                  'config.system.change_collection');
     };
 };
 
 // Extend the new 'ReplSetTest' fixture with the properties of the original one.
 Object.extend(ReplSetTest, originalReplSet);
+
+// Make a copy of the original 'ShardingTest' fixture.
+const originalShardingTest = ShardingTest;
+
+ShardingTest = function(params) {
+    // Call the original 'ShardingTest' fixture.
+    const retShardingTest = originalShardingTest.apply(this, [params]);
+
+    // For each shard, enable the change stream.
+    this._rs.forEach((shardSvr) => {
+        const adminDb = shardSvr.test.getPrimary().getDB("admin");
+        assert.commandWorked(adminDb.runCommand({setChangeStreamState: 1, enabled: true}));
+        assert.eq(assert.commandWorked(adminDb.runCommand({getChangeStreamState: 1})).enabled,
+                  true);
+
+        // Verify that the change stream cursor is getting opened in the change collection.
+        const explain = assert.commandWorked(adminDb.getSiblingDB("test").runCommand({
+            aggregate: 1,
+            pipeline: [{$changeStream: {}}],
+            explain: true,
+        }));
+        assert.eq(explain.stages[0].$cursor.queryPlanner.namespace,
+                  'config.system.change_collection');
+    });
+
+    return retShardingTest;
+};
+
+// Extend the new 'ShardingTest' fixture with the properties of the original one.
+Object.extend(ShardingTest, originalShardingTest);
 })();

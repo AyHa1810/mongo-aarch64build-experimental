@@ -29,7 +29,6 @@
 
 #include "mongo/platform/basic.h"
 
-#include <boost/optional/optional_io.hpp>
 #include <iostream>
 #include <string>
 
@@ -67,8 +66,8 @@ public:
     void setUp() override {
         CatalogTestFixture::setUp();
 
-        _nss = NamespaceString("unittests.durable_catalog");
-        _collectionUUID = std::get<UUID>(createCollection(_nss, CollectionOptions()));
+        _nss = NamespaceString::createNamespaceString_forTest("unittests.durable_catalog");
+        _collectionUUID = createCollection(_nss, CollectionOptions()).uuid;
     }
 
     NamespaceString ns() {
@@ -80,16 +79,22 @@ public:
     }
 
     CollectionPtr getCollection() {
-        return CollectionCatalog::get(operationContext())
-            ->lookupCollectionByUUID(operationContext(), *_collectionUUID);
+        return CollectionPtr(CollectionCatalog::get(operationContext())
+                                 ->lookupCollectionByUUID(operationContext(), *_collectionUUID));
     }
 
     CollectionWriter getCollectionWriter() {
         return CollectionWriter(operationContext(), *_collectionUUID);
     }
 
-    std::tuple<RecordId, UUID> createCollection(const NamespaceString& nss,
+    struct CollectionCatalogIdAndUUID {
+        RecordId catalogId;
+        UUID uuid;
+    };
+
+    CollectionCatalogIdAndUUID createCollection(const NamespaceString& nss,
                                                 CollectionOptions options) {
+        Lock::GlobalWrite lk(operationContext());
         Lock::DBLock dbLk(operationContext(), nss.dbName(), MODE_IX);
         Lock::CollectionLock collLk(operationContext(), nss, MODE_IX);
 
@@ -111,14 +116,17 @@ public:
             catalogId,
             getCatalog()->getMetaData(operationContext(), catalogId),
             std::move(coll.second));
+
         CollectionCatalog::write(operationContext(), [&](CollectionCatalog& catalog) {
-            catalog.registerCollection(
-                operationContext(), options.uuid.get(), std::move(collection));
+            catalog.registerCollection(operationContext(),
+                                       options.uuid.value(),
+                                       std::move(collection),
+                                       /*ts=*/boost::none);
         });
 
         wuow.commit();
 
-        return {catalogId, *options.uuid};
+        return CollectionCatalogIdAndUUID{catalogId, *options.uuid};
     }
 
     IndexCatalogEntry* createIndex(BSONObj keyPattern,
@@ -234,7 +242,7 @@ protected:
         wuow.commit();
 
         auto engine = operationContext()->getServiceContext()->getStorageEngine()->getEngine();
-        engine->checkpoint();
+        engine->checkpoint(operationContext());
 
         storageMetadata =
             BSON(ident << unittest::assertGet(engine->getStorageMetadata(ident)) << idxIdent
@@ -263,7 +271,7 @@ protected:
         return res;
     }
 
-    NamespaceString nss{"unittest", "import"};
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("unittest", "import");
     std::string ident;
     std::string idxIdent;
     std::shared_ptr<BSONCollectionCatalogEntry::MetaData> md;
@@ -538,6 +546,135 @@ TEST_F(DurableCatalogTest, NoOpWhenEntireIndexAlreadySetAsMultikey) {
     }
 }
 
+class ConcurrentMultikeyTest : public DurableCatalogTest {
+public:
+    void testConcurrentMultikey(BSONObj keyPattern,
+                                const MultikeyPaths& first,
+                                const MultikeyPaths& second,
+                                const MultikeyPaths& expected) {
+        /*
+         * This test verifies that we can set multikey on two threads concurrently with the
+         * following interleaving that do not cause a WCE from the storage engine:
+         *
+         * T1: open storage snapshot
+         *
+         * T1: set multikey paths to {first}
+         *
+         * T1: commit
+         *
+         * T2: open storage snapshot
+         *
+         * T2: set multikey paths to {second}
+         *
+         * T2: commit
+         *
+         * T1: onCommit handler
+         *
+         * T2: onCommit handler
+         *
+         */
+
+        auto indexEntry = createIndex(keyPattern);
+        auto collection = getCollection();
+
+        mongo::Mutex mutex;
+        stdx::condition_variable cv;
+        int numMultikeyCalls = 0;
+
+        // Start a thread that will set multikey paths to 'first'. It will commit the change to the
+        // storage engine but block before running the onCommit handler that updates the in-memory
+        // state in the Collection instance.
+        stdx::thread t([svcCtx = getServiceContext(),
+                        &collection,
+                        &indexEntry,
+                        &first,
+                        &mutex,
+                        &cv,
+                        &numMultikeyCalls] {
+            ThreadClient client(svcCtx);
+            auto opCtx = client->makeOperationContext();
+
+            Lock::GlobalLock globalLock{opCtx.get(), MODE_IX};
+            WriteUnitOfWork wuow(opCtx.get());
+
+            // Register a onCommit that will block until the main thread has committed its multikey
+            // write. This onCommit handler is registered before any writes and will thus be
+            // performed first, blocking all other onCommit handlers.
+            opCtx->recoveryUnit()->onCommit(
+                [&mutex, &cv, &numMultikeyCalls](OperationContext*,
+                                                 boost::optional<Timestamp> commitTime) {
+                    stdx::unique_lock lock(mutex);
+
+                    // Let the main thread now we have committed to the storage engine
+                    numMultikeyCalls = 1;
+                    cv.notify_all();
+
+                    // Wait until the main thread has committed its multikey write
+                    cv.wait(lock, [&numMultikeyCalls]() { return numMultikeyCalls == 2; });
+                });
+
+            // Set the index to multikey with 'first' as paths.
+            collection->setIndexIsMultikey(
+                opCtx.get(), indexEntry->descriptor()->indexName(), first);
+            wuow.commit();
+        });
+
+        // Wait for the thread above to commit its multikey write to the storage engine
+        {
+            stdx::unique_lock lock(mutex);
+            cv.wait(lock, [&numMultikeyCalls]() { return numMultikeyCalls == 1; });
+        }
+
+        // Set the index to multikey with 'second' as paths. This will not cause a WCE as the write
+        // in the thread is fully committed to the storage engine.
+        {
+            Lock::GlobalLock globalLock{operationContext(), MODE_IX};
+            // First confirm that we can observe the multikey write set by the other thread.
+            MultikeyPaths paths;
+            ASSERT_TRUE(collection->isIndexMultikey(
+                operationContext(), indexEntry->descriptor()->indexName(), &paths));
+            assertMultikeyPathsAreEqual(paths, first);
+
+            // Then perform our own multikey write.
+            WriteUnitOfWork wuow(operationContext());
+            collection->setIndexIsMultikey(
+                operationContext(), indexEntry->descriptor()->indexName(), second);
+            wuow.commit();
+        }
+
+        // Notify the thread that our multikey write is committed
+        {
+            stdx::unique_lock lock(mutex);
+            numMultikeyCalls = 2;
+            cv.notify_all();
+        }
+        t.join();
+
+        // Verify that our Collection instance has 'expected' as multikey paths for this index
+        {
+            MultikeyPaths multikeyPaths;
+            ASSERT(collection->isIndexMultikey(
+                operationContext(), indexEntry->descriptor()->indexName(), &multikeyPaths));
+            assertMultikeyPathsAreEqual(multikeyPaths, expected);
+        }
+
+        // Verify that the durable catalog has 'expected' as multikey paths for this index
+        Lock::GlobalLock globalLock{operationContext(), MODE_IS};
+        auto md = getCatalog()->getMetaData(operationContext(), collection->getCatalogId());
+
+        auto indexOffset = md->findIndexOffset(indexEntry->descriptor()->indexName());
+        assertMultikeyPathsAreEqual(md->indexes[indexOffset].multikeyPaths, expected);
+    }
+};
+
+TEST_F(ConcurrentMultikeyTest, MultikeyPathsConcurrentSecondSubset) {
+    testConcurrentMultikey(BSON("a.b" << 1), {{0U, 1U}}, {{0U}}, {{0U, 1U}});
+}
+
+TEST_F(ConcurrentMultikeyTest, MultikeyPathsConcurrentDistinct) {
+    testConcurrentMultikey(BSON("a.b" << 1), {{0U}}, {{1U}}, {{0U, 1U}});
+}
+
 TEST_F(DurableCatalogTest, SinglePhaseIndexBuild) {
     auto indexEntry = createIndex(BSON("a" << 1));
     auto collection = getCollection();
@@ -645,7 +782,7 @@ TEST_F(ImportCollectionTest, ImportCollection) {
               idxIdent);
 
     // Test that a collection UUID is generated for import.
-    ASSERT_NE(md->options.uuid.get(), importResult.uuid);
+    ASSERT_NE(md->options.uuid.value(), importResult.uuid);
     // Substitute in the generated UUID and check that the rest of fields in the catalog entry
     // match.
     md->options.uuid = importResult.uuid;
@@ -670,9 +807,9 @@ TEST_F(DurableCatalogTest, IdentSuffixUsesRand) {
     const std::string rand = "0000000000000000000";
     getCatalog()->setRand_forTest(rand);
 
-    const NamespaceString nss = NamespaceString("a.b");
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.b");
 
-    auto uuid = std::get<UUID>(createCollection(nss, CollectionOptions()));
+    auto uuid = (createCollection(nss, CollectionOptions())).uuid;
     auto collection = CollectionCatalog::get(operationContext())
                           ->lookupCollectionByUUID(operationContext(), uuid);
     RecordId catalogId = collection->getCatalogId();
@@ -696,8 +833,8 @@ TEST_F(ImportCollectionTest, ImportCollectionRandConflict) {
 
     {
         // Check that a newly created collection doesn't use 'rand' as the suffix in the ident.
-        const NamespaceString nss = NamespaceString("a.b");
-        auto catalogId = std::get<RecordId>(createCollection(nss, CollectionOptions()));
+        const NamespaceString nss = NamespaceString::createNamespaceString_forTest("a.b");
+        auto catalogId = (createCollection(nss, CollectionOptions())).catalogId;
 
         ASSERT(!StringData(getCatalog()->getEntry(catalogId).ident).endsWith(rand));
     }
@@ -710,7 +847,8 @@ TEST_F(DurableCatalogTest, CheckTimeseriesBucketsMayHaveMixedSchemaDataFlagFCVLa
     serverGlobalParams.mutableFeatureCompatibility.setVersion(multiversion::GenericFCV::kLatest);
 
     {
-        const NamespaceString regularNss = NamespaceString("test.regular");
+        const NamespaceString regularNss =
+            NamespaceString::createNamespaceString_forTest("test.regular");
         createCollection(regularNss, CollectionOptions());
 
         Lock::GlobalLock globalLock{operationContext(), MODE_IS};
@@ -723,7 +861,8 @@ TEST_F(DurableCatalogTest, CheckTimeseriesBucketsMayHaveMixedSchemaDataFlagFCVLa
     }
 
     {
-        const NamespaceString bucketsNss = NamespaceString("system.buckets.ts");
+        const NamespaceString bucketsNss =
+            NamespaceString::createNamespaceString_forTest("system.buckets.ts");
         CollectionOptions options;
         options.timeseries = TimeseriesOptions(/*timeField=*/"t");
         createCollection(bucketsNss, options);
@@ -739,6 +878,91 @@ TEST_F(DurableCatalogTest, CheckTimeseriesBucketsMayHaveMixedSchemaDataFlagFCVLa
                           ->getMetaData(operationContext(), catalogId)
                           ->timeseriesBucketsMayHaveMixedSchemaData);
     }
+}
+
+TEST_F(DurableCatalogTest, CreateCollectionCatalogEntryHasCorrectTenantNamespace) {
+    gMultitenancySupport = true;
+
+    auto tenantId = TenantId(OID::gen());
+    const NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest(tenantId, "test.regular");
+    createCollection(nss, CollectionOptions());
+
+    auto collection = CollectionCatalog::get(operationContext())
+                          ->lookupCollectionByNamespace(operationContext(), nss);
+    RecordId catalogId = collection->getCatalogId();
+    ASSERT_EQ(getCatalog()->getEntry(catalogId).nss.tenantId(), nss.tenantId());
+    ASSERT_EQ(getCatalog()->getEntry(catalogId).nss, nss);
+
+    Lock::GlobalLock globalLock{operationContext(), MODE_IS};
+    ASSERT_EQ(getCatalog()->getMetaData(operationContext(), catalogId)->nss.tenantId(),
+              nss.tenantId());
+    ASSERT_EQ(getCatalog()->getMetaData(operationContext(), catalogId)->nss, nss);
+
+    auto catalogEntry = getCatalog()->scanForCatalogEntryByNss(operationContext(), nss);
+
+    gMultitenancySupport = false;
+}
+
+
+TEST_F(DurableCatalogTest, ScanForCatalogEntryByNssBasic) {
+    gMultitenancySupport = true;
+    ON_BLOCK_EXIT([&] { gMultitenancySupport = false; });
+
+    /**
+     * Create some collections for which to scan.
+     */
+
+    auto tenantId = TenantId(OID::gen());
+    const NamespaceString nssFirst =
+        NamespaceString::createNamespaceString_forTest(tenantId, "test.first");
+    auto catalogIdAndUUIDFirst = createCollection(nssFirst, CollectionOptions());
+
+    const NamespaceString nssSecond =
+        NamespaceString::createNamespaceString_forTest("system.buckets.ts");
+    CollectionOptions options;
+    options.timeseries = TimeseriesOptions(/*timeField=*/"t");
+    auto catalogIdAndUUIDSecond = createCollection(nssSecond, options);
+
+    const NamespaceString nssThird = NamespaceString::createNamespaceString_forTest("test.third");
+    auto catalogIdAndUUIDThird = createCollection(nssThird, CollectionOptions());
+
+    /**
+     * Fetch catalog entries by namespace by scanning the mdb catalog.
+     */
+
+    // Need a read lock for DurableCatalog::getMetaData() calls.
+    Lock::GlobalLock globalLock{operationContext(), MODE_IS};
+
+    auto catalogEntryThird = getCatalog()->scanForCatalogEntryByNss(operationContext(), nssThird);
+    ASSERT(catalogEntryThird != boost::none);
+    ASSERT_EQ(nssThird, catalogEntryThird->metadata->nss);
+    ASSERT_EQ(catalogIdAndUUIDThird.uuid, catalogEntryThird->metadata->options.uuid);
+    ASSERT_EQ(getCatalog()->getMetaData(operationContext(), catalogIdAndUUIDThird.catalogId)->nss,
+              nssThird);
+    ASSERT_EQ(getCatalog()->getEntry(catalogIdAndUUIDThird.catalogId).nss, nssThird);
+
+    auto catalogEntrySecond = getCatalog()->scanForCatalogEntryByNss(operationContext(), nssSecond);
+    ASSERT(catalogEntrySecond != boost::none);
+    ASSERT_EQ(nssSecond, catalogEntrySecond->metadata->nss);
+    ASSERT_EQ(catalogIdAndUUIDSecond.uuid, catalogEntrySecond->metadata->options.uuid);
+    ASSERT(catalogEntrySecond->metadata->options.timeseries);
+    ASSERT_EQ(getCatalog()->getMetaData(operationContext(), catalogIdAndUUIDSecond.catalogId)->nss,
+              nssSecond);
+    ASSERT_EQ(getCatalog()->getEntry(catalogIdAndUUIDSecond.catalogId).nss, nssSecond);
+
+    auto catalogEntryFirst = getCatalog()->scanForCatalogEntryByNss(operationContext(), nssFirst);
+    ASSERT(catalogEntryFirst != boost::none);
+    ASSERT_EQ(nssFirst, catalogEntryFirst->metadata->nss);
+    ASSERT_EQ(catalogIdAndUUIDFirst.uuid, catalogEntryFirst->metadata->options.uuid);
+    ASSERT_EQ(nssFirst.tenantId(), catalogEntryFirst->metadata->nss.tenantId());
+    ASSERT_EQ(getCatalog()->getMetaData(operationContext(), catalogIdAndUUIDFirst.catalogId)->nss,
+              nssFirst);
+    ASSERT_EQ(getCatalog()->getEntry(catalogIdAndUUIDFirst.catalogId).nss, nssFirst);
+
+    auto catalogEntryDoesNotExist = getCatalog()->scanForCatalogEntryByNss(
+        operationContext(), NamespaceString::createNamespaceString_forTest("foo", "bar"));
+    ASSERT(catalogEntryDoesNotExist == boost::none);
 }
 
 }  // namespace

@@ -66,12 +66,14 @@ TEST_F(StorageEngineTest, ReconcileIdentsTest) {
 
     // Add a collection, `db.coll1` to both the DurableCatalog and KVEngine. The returned value is
     // the `ident` name given to the collection.
-    auto swCollInfo = createCollection(opCtx.get(), NamespaceString("db.coll1"));
+    auto swCollInfo =
+        createCollection(opCtx.get(), NamespaceString::createNamespaceString_forTest("db.coll1"));
     ASSERT_OK(swCollInfo.getStatus());
 
     // Create a table in the KVEngine not reflected in the DurableCatalog. This should be dropped
     // when reconciling.
-    ASSERT_OK(createCollTable(opCtx.get(), NamespaceString("db.coll2")));
+    ASSERT_OK(
+        createCollTable(opCtx.get(), NamespaceString::createNamespaceString_forTest("db.coll2")));
 
     auto reconcileResult = unittest::assertGet(reconcile(opCtx.get()));
     ASSERT_EQUALS(0UL, reconcileResult.indexesToRebuild.size());
@@ -98,7 +100,7 @@ TEST_F(StorageEngineTest, ReconcileIdentsTest) {
 TEST_F(StorageEngineTest, LoadCatalogDropsOrphansAfterUncleanShutdown) {
     auto opCtx = cc().makeOperationContext();
 
-    const NamespaceString collNs("db.coll1");
+    const NamespaceString collNs = NamespaceString::createNamespaceString_forTest("db.coll1");
     auto swCollInfo = createCollection(opCtx.get(), collNs);
     ASSERT_OK(swCollInfo.getStatus());
 
@@ -110,7 +112,8 @@ TEST_F(StorageEngineTest, LoadCatalogDropsOrphansAfterUncleanShutdown) {
     {
         Lock::GlobalWrite writeLock(opCtx.get(), Date_t::max(), Lock::InterruptBehavior::kThrow);
         _storageEngine->closeCatalog(opCtx.get());
-        _storageEngine->loadCatalog(opCtx.get(), StorageEngine::LastShutdownState::kUnclean);
+        _storageEngine->loadCatalog(
+            opCtx.get(), boost::none, StorageEngine::LastShutdownState::kUnclean);
     }
 
     ASSERT(!identExists(opCtx.get(), swCollInfo.getValue().ident));
@@ -121,10 +124,10 @@ TEST_F(StorageEngineTest, TemporaryRecordStoreClustered) {
     auto opCtx = cc().makeOperationContext();
 
     Lock::GlobalLock lk(&*opCtx, MODE_IS);
-
-    const auto trs = makeTemporaryClustered(opCtx.get());
+    auto trs = makeTemporaryClustered(opCtx.get());
     ASSERT(trs.get());
-    const auto rs = trs->rs();
+
+    auto rs = trs->rs();
     ASSERT(identExists(opCtx.get(), rs->getIdent()));
 
     // Insert record with RecordId of KeyFormat::String.
@@ -145,13 +148,14 @@ TEST_F(StorageEngineTest, TemporaryRecordStoreClustered) {
 TEST_F(StorageEngineTest, ReconcileDropsTemporary) {
     auto opCtx = cc().makeOperationContext();
 
-    Lock::GlobalLock lk(&*opCtx, MODE_IS);
+    std::unique_ptr<TemporaryRecordStore> rs;
+    {
+        Lock::GlobalLock lk(&*opCtx, MODE_IS);
+        rs = makeTemporary(opCtx.get());
+        ASSERT(rs.get());
+    }
 
-    auto rs = makeTemporary(opCtx.get());
-    ASSERT(rs.get());
-    const std::string ident = rs->rs()->getIdent();
-
-    ASSERT(identExists(opCtx.get(), ident));
+    ASSERT(identExists(opCtx.get(), rs->rs()->getIdent()));
 
     // Reconcile will only drop temporary idents when starting up after an unclean shutdown.
     auto reconcileResult = unittest::assertGet(reconcileAfterUncleanShutdown(opCtx.get()));
@@ -160,25 +164,26 @@ TEST_F(StorageEngineTest, ReconcileDropsTemporary) {
     ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToResume.size());
 
     // The storage engine is responsible for dropping its temporary idents.
-    ASSERT(!identExists(opCtx.get(), ident));
+    ASSERT(!identExists(opCtx.get(), rs->rs()->getIdent()));
 }
 
 TEST_F(StorageEngineTest, ReconcileKeepsTemporary) {
     auto opCtx = cc().makeOperationContext();
 
-    Lock::GlobalLock lk(&*opCtx, MODE_IS);
+    std::unique_ptr<TemporaryRecordStore> rs;
+    {
+        Lock::GlobalLock lk(&*opCtx, MODE_IS);
+        rs = makeTemporary(opCtx.get());
+        ASSERT(rs.get());
+    }
 
-    auto rs = makeTemporary(opCtx.get());
-    ASSERT(rs.get());
-    const std::string ident = rs->rs()->getIdent();
-
-    ASSERT(identExists(opCtx.get(), ident));
+    ASSERT(identExists(opCtx.get(), rs->rs()->getIdent()));
 
     auto reconcileResult = unittest::assertGet(reconcile(opCtx.get()));
     ASSERT_EQUALS(0UL, reconcileResult.indexesToRebuild.size());
     ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToRestart.size());
 
-    ASSERT_FALSE(identExists(opCtx.get(), ident));
+    ASSERT_FALSE(identExists(opCtx.get(), rs->rs()->getIdent()));
 }
 
 class StorageEngineTimestampMonitorTest : public StorageEngineTest {
@@ -245,7 +250,7 @@ TEST_F(StorageEngineTest, ReconcileUnfinishedIndex) {
 
     Lock::GlobalLock lk(&*opCtx, MODE_X);
 
-    const NamespaceString ns("db.coll1");
+    const NamespaceString ns = NamespaceString::createNamespaceString_forTest("db.coll1");
     const std::string indexName("a_1");
 
     auto swCollInfo = createCollection(opCtx.get(), ns);
@@ -282,13 +287,13 @@ TEST_F(StorageEngineTest, ReconcileUnfinishedIndex) {
 TEST_F(StorageEngineTest, ReconcileUnfinishedBackgroundSecondaryIndex) {
     auto opCtx = cc().makeOperationContext();
 
-    Lock::GlobalLock lk(&*opCtx, MODE_IX);
-
-    const NamespaceString ns("db.coll1");
+    const NamespaceString ns = NamespaceString::createNamespaceString_forTest("db.coll1");
     const std::string indexName("a_1");
 
     auto swCollInfo = createCollection(opCtx.get(), ns);
     ASSERT_OK(swCollInfo.getStatus());
+
+    Lock::GlobalLock lk(&*opCtx, MODE_IX);
 
     // Start a backgroundSecondary single-phase (i.e. no build UUID) index.
     const bool isBackgroundSecondaryBuild = true;
@@ -327,14 +332,14 @@ TEST_F(StorageEngineTest, ReconcileUnfinishedBackgroundSecondaryIndex) {
 TEST_F(StorageEngineTest, ReconcileTwoPhaseIndexBuilds) {
     auto opCtx = cc().makeOperationContext();
 
-    Lock::GlobalLock lk(&*opCtx, MODE_IX);
-
-    const NamespaceString ns("db.coll1");
+    const NamespaceString ns = NamespaceString::createNamespaceString_forTest("db.coll1");
     const std::string indexA("a_1");
     const std::string indexB("b_1");
 
     auto swCollInfo = createCollection(opCtx.get(), ns);
     ASSERT_OK(swCollInfo.getStatus());
+
+    Lock::GlobalLock lk(&*opCtx, MODE_IX);
 
     // Using a build UUID implies that this index build is two-phase, so the isBackgroundSecondary
     // field will be ignored. There is no special behavior on primaries or secondaries.
@@ -395,7 +400,7 @@ TEST_F(StorageEngineTest, ReconcileTwoPhaseIndexBuilds) {
 TEST_F(StorageEngineRepairTest, LoadCatalogRecoversOrphans) {
     auto opCtx = cc().makeOperationContext();
 
-    const NamespaceString collNs("db.coll1");
+    const NamespaceString collNs = NamespaceString::createNamespaceString_forTest("db.coll1");
     auto swCollInfo = createCollection(opCtx.get(), collNs);
     ASSERT_OK(swCollInfo.getStatus());
 
@@ -408,7 +413,8 @@ TEST_F(StorageEngineRepairTest, LoadCatalogRecoversOrphans) {
     {
         Lock::GlobalWrite writeLock(opCtx.get(), Date_t::max(), Lock::InterruptBehavior::kThrow);
         _storageEngine->closeCatalog(opCtx.get());
-        _storageEngine->loadCatalog(opCtx.get(), StorageEngine::LastShutdownState::kClean);
+        _storageEngine->loadCatalog(
+            opCtx.get(), boost::none, StorageEngine::LastShutdownState::kClean);
     }
 
     ASSERT(identExists(opCtx.get(), swCollInfo.getValue().ident));
@@ -421,7 +427,7 @@ TEST_F(StorageEngineRepairTest, LoadCatalogRecoversOrphans) {
 TEST_F(StorageEngineRepairTest, ReconcileSucceeds) {
     auto opCtx = cc().makeOperationContext();
 
-    const NamespaceString collNs("db.coll1");
+    const NamespaceString collNs = NamespaceString::createNamespaceString_forTest("db.coll1");
     auto swCollInfo = createCollection(opCtx.get(), collNs);
     ASSERT_OK(swCollInfo.getStatus());
 
@@ -444,11 +450,12 @@ TEST_F(StorageEngineRepairTest, ReconcileSucceeds) {
 TEST_F(StorageEngineRepairTest, LoadCatalogRecoversOrphansInCatalog) {
     auto opCtx = cc().makeOperationContext();
 
-    const NamespaceString collNs("db.coll1");
+    const NamespaceString collNs = NamespaceString::createNamespaceString_forTest("db.coll1");
     auto swCollInfo = createCollection(opCtx.get(), collNs);
     ASSERT_OK(swCollInfo.getStatus());
     ASSERT(collectionExists(opCtx.get(), collNs));
 
+    Lock::GlobalWrite writeLock(opCtx.get(), Date_t::max(), Lock::InterruptBehavior::kThrow);
     AutoGetDb db(opCtx.get(), collNs.dbName(), LockMode::MODE_X);
     // Only drop the catalog entry; storage engine still knows about this ident.
     // This simulates an unclean shutdown happening between dropping the catalog entry and
@@ -462,13 +469,11 @@ TEST_F(StorageEngineRepairTest, LoadCatalogRecoversOrphansInCatalog) {
     ASSERT(!collectionExists(opCtx.get(), collNs));
 
     // When in a repair context, loadCatalog() recreates catalog entries for orphaned idents.
-    {
-        Lock::GlobalWrite writeLock(opCtx.get(), Date_t::max(), Lock::InterruptBehavior::kThrow);
-        _storageEngine->loadCatalog(opCtx.get(), StorageEngine::LastShutdownState::kClean);
-    }
+    _storageEngine->loadCatalog(opCtx.get(), boost::none, StorageEngine::LastShutdownState::kClean);
     auto identNs = swCollInfo.getValue().ident;
     std::replace(identNs.begin(), identNs.end(), '-', '_');
-    NamespaceString orphanNs = NamespaceString("local.orphan." + identNs);
+    NamespaceString orphanNs =
+        NamespaceString::createNamespaceString_forTest("local.orphan." + identNs);
 
     ASSERT(identExists(opCtx.get(), swCollInfo.getValue().ident));
     ASSERT(collectionExists(opCtx.get(), orphanNs));
@@ -480,16 +485,16 @@ TEST_F(StorageEngineRepairTest, LoadCatalogRecoversOrphansInCatalog) {
 TEST_F(StorageEngineTest, LoadCatalogDropsOrphans) {
     auto opCtx = cc().makeOperationContext();
 
-    const NamespaceString collNs("db.coll1");
+    const NamespaceString collNs = NamespaceString::createNamespaceString_forTest("db.coll1");
     auto swCollInfo = createCollection(opCtx.get(), collNs);
     ASSERT_OK(swCollInfo.getStatus());
     ASSERT(collectionExists(opCtx.get(), collNs));
 
-    AutoGetDb db(opCtx.get(), collNs.dbName(), LockMode::MODE_X);
     // Only drop the catalog entry; storage engine still knows about this ident.
     // This simulates an unclean shutdown happening between dropping the catalog entry and
     // the actual drop in storage engine.
     {
+        AutoGetDb db(opCtx.get(), collNs.dbName(), LockMode::MODE_X);
         WriteUnitOfWork wuow(opCtx.get());
         ASSERT_OK(removeEntry(opCtx.get(), collNs.ns(), _storageEngine->getCatalog()));
         wuow.commit();
@@ -500,7 +505,8 @@ TEST_F(StorageEngineTest, LoadCatalogDropsOrphans) {
     // orphaned idents.
     {
         Lock::GlobalWrite writeLock(opCtx.get(), Date_t::max(), Lock::InterruptBehavior::kThrow);
-        _storageEngine->loadCatalog(opCtx.get(), StorageEngine::LastShutdownState::kClean);
+        _storageEngine->loadCatalog(
+            opCtx.get(), boost::none, StorageEngine::LastShutdownState::kClean);
     }
     // reconcileCatalogAndIdents() drops orphaned idents.
     auto reconcileResult = unittest::assertGet(reconcile(opCtx.get()));
@@ -510,7 +516,8 @@ TEST_F(StorageEngineTest, LoadCatalogDropsOrphans) {
     ASSERT(!identExists(opCtx.get(), swCollInfo.getValue().ident));
     auto identNs = swCollInfo.getValue().ident;
     std::replace(identNs.begin(), identNs.end(), '-', '_');
-    NamespaceString orphanNs = NamespaceString("local.orphan." + identNs);
+    NamespaceString orphanNs =
+        NamespaceString::createNamespaceString_forTest("local.orphan." + identNs);
     ASSERT(!collectionExists(opCtx.get(), orphanNs));
 }
 
@@ -569,7 +576,7 @@ public:
     }
 
     void tearDown() {
-        _storageEngine->cleanShutdown();
+        _storageEngine->cleanShutdown(getServiceContext());
         _storageEngine.reset();
 
         ServiceContextTest::tearDown();
@@ -688,8 +695,8 @@ TEST_F(TimestampKVEngineTest, TimestampAdvancesOnNotification) {
 TEST_F(StorageEngineTestNotEphemeral, UseAlternateStorageLocation) {
     auto opCtx = cc().makeOperationContext();
 
-    const NamespaceString coll1Ns("db.coll1");
-    const NamespaceString coll2Ns("db.coll2");
+    const NamespaceString coll1Ns = NamespaceString::createNamespaceString_forTest("db.coll1");
+    const NamespaceString coll2Ns = NamespaceString::createNamespaceString_forTest("db.coll2");
     auto swCollInfo = createCollection(opCtx.get(), coll1Ns);
     ASSERT_OK(swCollInfo.getStatus());
     ASSERT(collectionExists(opCtx.get(), coll1Ns));

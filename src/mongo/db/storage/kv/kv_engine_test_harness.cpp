@@ -31,6 +31,7 @@
 
 #include "mongo/db/catalog/collection_impl.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/multitenancy_gen.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/db/storage/durable_catalog_impl.h"
@@ -117,7 +118,9 @@ protected:
 namespace {
 
 std::function<std::unique_ptr<KVHarnessHelper>(ServiceContext*)> basicFactory =
-    [](ServiceContext*) -> std::unique_ptr<KVHarnessHelper> { fassertFailed(40355); };
+    [](ServiceContext*) -> std::unique_ptr<KVHarnessHelper> {
+    fassertFailed(40355);
+};
 
 class KVEngineTestHarness : public ServiceContextTest {
 protected:
@@ -323,6 +326,9 @@ TEST_F(KVEngineTestHarness, TemporaryRecordStoreSimple) {
         ASSERT_EQUALS(1U, all.size());
         ASSERT_EQUALS(ident, all[0]);
 
+        // Dropping a collection might fail if we haven't checkpointed the data
+        engine->checkpoint(opCtx.get());
+
         WriteUnitOfWork wuow(opCtx.get());
         ASSERT_OK(engine->dropIdent(opCtx->recoveryUnit(), ident));
         wuow.commit();
@@ -350,41 +356,28 @@ TEST_F(KVEngineTestHarness, AllDurableTimestamp) {
         Timestamp t52(5, 2);
         Timestamp t61(6, 1);
 
-        Timestamp allDurable = engine->getAllDurableTimestamp();
-        ASSERT_EQ(allDurable, Timestamp(StorageEngine::kMinimumTimestamp));
+        ASSERT_EQ(engine->getAllDurableTimestamp(), Timestamp(StorageEngine::kMinimumTimestamp));
 
         auto opCtx1 = opCtxs[0].second.get();
         WriteUnitOfWork uow1(opCtx1);
         ASSERT_OK(rs->insertRecord(opCtx1, "abc", 4, t51));
 
-        Timestamp lastAllDurable = allDurable;
-        allDurable = engine->getAllDurableTimestamp();
-        ASSERT_GT(allDurable, lastAllDurable);
-        ASSERT_EQ(allDurable, t51);
+        ASSERT_EQ(engine->getAllDurableTimestamp(), Timestamp(StorageEngine::kMinimumTimestamp));
 
         auto opCtx2 = opCtxs[1].second.get();
         WriteUnitOfWork uow2(opCtx2);
         ASSERT_OK(rs->insertRecord(opCtx2, "abc", 4, t61));
         uow2.commit();
 
-        lastAllDurable = allDurable;
-        allDurable = engine->getAllDurableTimestamp();
-        ASSERT_EQ(allDurable, lastAllDurable);
-        ASSERT_EQ(allDurable, t51);
+        ASSERT_EQ(engine->getAllDurableTimestamp(), t51 - 1);
 
         ASSERT_OK(rs->insertRecord(opCtx1, "abc", 4, t52));
 
-        lastAllDurable = allDurable;
-        allDurable = engine->getAllDurableTimestamp();
-        ASSERT_EQ(allDurable, lastAllDurable);
-        ASSERT_EQ(allDurable, t51);
+        ASSERT_EQ(engine->getAllDurableTimestamp(), t51 - 1);
 
         uow1.commit();
 
-        lastAllDurable = allDurable;
-        allDurable = engine->getAllDurableTimestamp();
-        ASSERT_GT(allDurable, lastAllDurable);
-        ASSERT_EQ(allDurable, t61);
+        ASSERT_EQ(engine->getAllDurableTimestamp(), t61);
     }
 }
 
@@ -460,11 +453,12 @@ TEST_F(KVEngineTestHarness, PinningOldestWithAnotherSession) {
  * | Session 1            | Session 2            | GlobalActor                      |
  * |----------------------+----------------------+----------------------------------|
  * | Begin                |                      |                                  |
- * | Commit :commit 10    |                      |                                  |
+ * | Timestamp :commit 10 |                      |                                  |
+ * | Commit               |                      |                                  |
  * |                      |                      | QueryTimestamp :all_durable (10) |
  * | Begin                |                      |                                  |
  * | Timestamp :commit 20 |                      |                                  |
- * |                      |                      | QueryTimestamp :all_durable (19) |
+ * |                      |                      | QueryTimestamp :all_durable (10) |
  * |                      | Begin                |                                  |
  * |                      | Timestamp :commit 30 |                                  |
  * |                      | Commit               |                                  |
@@ -473,7 +467,7 @@ TEST_F(KVEngineTestHarness, PinningOldestWithAnotherSession) {
  * |                      |                      | QueryTimestamp :all_durable (30) |
  * | Begin                |                      |                                  |
  * | Timestamp :commit 25 |                      |                                  |
- * |                      |                      | QueryTimestamp :all_durable (30) |
+ * |                      |                      | QueryTimestamp :all_durable (24) |
  */
 TEST_F(KVEngineTestHarness, AllDurable) {
     std::unique_ptr<KVHarnessHelper> helper(KVHarnessHelper::create(getServiceContext()));
@@ -497,27 +491,20 @@ TEST_F(KVEngineTestHarness, AllDurable) {
         const Timestamp kInsertTimestamp3 = Timestamp(30, 30);
         const Timestamp kInsertTimestamp4 = Timestamp(25, 25);
 
-        Timestamp allDurable = engine->getAllDurableTimestamp();
         auto opCtx1 = opCtxs[0].second.get();
         WriteUnitOfWork uow1(opCtx1);
         auto swRid = rs->insertRecord(opCtx1, "abc", 4, kInsertTimestamp1);
         ASSERT_OK(swRid);
         uow1.commit();
 
-        Timestamp lastAllDurable = allDurable;
-        allDurable = engine->getAllDurableTimestamp();
-        ASSERT_GTE(allDurable, lastAllDurable);
-        ASSERT_LTE(allDurable, kInsertTimestamp1);
+        ASSERT_EQ(engine->getAllDurableTimestamp(), kInsertTimestamp1);
 
         auto opCtx2 = opCtxs[1].second.get();
         WriteUnitOfWork uow2(opCtx2);
         swRid = rs->insertRecord(opCtx2, "abc", 4, kInsertTimestamp2);
         ASSERT_OK(swRid);
 
-        lastAllDurable = allDurable;
-        allDurable = engine->getAllDurableTimestamp();
-        ASSERT_GTE(allDurable, lastAllDurable);
-        ASSERT_LT(allDurable, kInsertTimestamp2);
+        ASSERT_EQ(engine->getAllDurableTimestamp(), kInsertTimestamp1);
 
         auto opCtx3 = opCtxs[2].second.get();
         WriteUnitOfWork uow3(opCtx3);
@@ -525,27 +512,19 @@ TEST_F(KVEngineTestHarness, AllDurable) {
         ASSERT_OK(swRid);
         uow3.commit();
 
-        lastAllDurable = allDurable;
-        allDurable = engine->getAllDurableTimestamp();
-        ASSERT_GTE(allDurable, lastAllDurable);
-        ASSERT_LT(allDurable, kInsertTimestamp2);
+        ASSERT_EQ(engine->getAllDurableTimestamp(), kInsertTimestamp2 - 1);
 
         uow2.commit();
 
-        lastAllDurable = allDurable;
-        allDurable = engine->getAllDurableTimestamp();
-        ASSERT_GTE(allDurable, lastAllDurable);
-        ASSERT_LTE(allDurable, kInsertTimestamp3);
+        ASSERT_EQ(engine->getAllDurableTimestamp(), kInsertTimestamp3);
 
         auto opCtx4 = opCtxs[3].second.get();
         WriteUnitOfWork uow4(opCtx4);
         swRid = rs->insertRecord(opCtx4, "abc", 4, kInsertTimestamp4);
         ASSERT_OK(swRid);
 
-        lastAllDurable = allDurable;
-        allDurable = engine->getAllDurableTimestamp();
-        ASSERT_GTE(allDurable, lastAllDurable);
-        ASSERT_LTE(allDurable, kInsertTimestamp3);
+        ASSERT_EQ(engine->getAllDurableTimestamp(), kInsertTimestamp4 - 1);
+
         uow4.commit();
     }
 }
@@ -1112,7 +1091,7 @@ TEST_F(DurableCatalogImplTest, Idx1) {
         WriteUnitOfWork uow(opCtx);
 
         BSONCollectionCatalogEntry::MetaData md;
-        md.ns = "a.b";
+        md.nss = NamespaceString::createNamespaceString_forTest(boost::none, "a.b");
 
         BSONCollectionCatalogEntry::IndexMetaData imd;
         imd.spec = BSON("name"
@@ -1146,7 +1125,7 @@ TEST_F(DurableCatalogImplTest, Idx1) {
         WriteUnitOfWork uow(opCtx);
 
         BSONCollectionCatalogEntry::MetaData md;
-        md.ns = "a.b";
+        md.nss = NamespaceString::createNamespaceString_forTest(boost::none, "a.b");
         putMetaData(opCtx, catalog.get(), catalogId, md);  // remove index
 
         BSONCollectionCatalogEntry::IndexMetaData imd;
@@ -1202,7 +1181,7 @@ TEST_F(DurableCatalogImplTest, DirectoryPerDb1) {
         WriteUnitOfWork uow(opCtx);
 
         BSONCollectionCatalogEntry::MetaData md;
-        md.ns = "a.b";
+        md.nss = NamespaceString::createNamespaceString_forTest(boost::none, "a.b");
 
         BSONCollectionCatalogEntry::IndexMetaData imd;
         imd.spec = BSON("name"
@@ -1254,7 +1233,7 @@ TEST_F(DurableCatalogImplTest, Split1) {
         WriteUnitOfWork uow(opCtx);
 
         BSONCollectionCatalogEntry::MetaData md;
-        md.ns = "a.b";
+        md.nss = NamespaceString::createNamespaceString_forTest(boost::none, "a.b");
 
         BSONCollectionCatalogEntry::IndexMetaData imd;
         imd.spec = BSON("name"
@@ -1306,7 +1285,7 @@ TEST_F(DurableCatalogImplTest, DirectoryPerAndSplit1) {
         WriteUnitOfWork uow(opCtx);
 
         BSONCollectionCatalogEntry::MetaData md;
-        md.ns = "a.b";
+        md.nss = NamespaceString::createNamespaceString_forTest(boost::none, "a.b");
 
         BSONCollectionCatalogEntry::IndexMetaData imd;
         imd.spec = BSON("name"
@@ -1379,6 +1358,60 @@ DEATH_TEST_REGEX_F(DurableCatalogImplTest,
         sorted = engine->getSortedDataInterface(opCtx, nss, CollectionOptions(), ident, &desc);
         ASSERT(sorted);
     }
+}
+
+TEST_F(DurableCatalogImplTest, EntryIncludesTenantIdInMultitenantEnv) {
+    gMultitenancySupport = true;
+    KVEngine* engine = helper->getEngine();
+
+    // Create a DurableCatalog and RecordStore
+    std::unique_ptr<RecordStore> rs;
+    std::unique_ptr<DurableCatalogImpl> catalog;
+    {
+        auto clientAndCtx = makeClientAndCtx("opCtx");
+        auto opCtx = clientAndCtx.opCtx();
+        WriteUnitOfWork uow(opCtx);
+        ASSERT_OK(engine->createRecordStore(
+            opCtx, NamespaceString("catalog"), "catalog", CollectionOptions()));
+        rs = engine->getRecordStore(
+            opCtx, NamespaceString("catalog"), "catalog", CollectionOptions());
+        catalog = std::make_unique<DurableCatalogImpl>(rs.get(), false, false, nullptr);
+        uow.commit();
+    }
+
+    // Insert an entry into the DurableCatalog, and ensure the tenantId is stored on the nss in the
+    // entry.
+    RecordId catalogId;
+    auto tenantId = TenantId(OID::gen());
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest(tenantId, "a.b");
+    {
+        auto clientAndCtx = makeClientAndCtx("opCtx");
+        auto opCtx = clientAndCtx.opCtx();
+        WriteUnitOfWork uow(opCtx);
+        catalogId = newCollection(opCtx, nss, CollectionOptions(), catalog.get());
+        uow.commit();
+    }
+    ASSERT_EQUALS(nss.tenantId(), catalog->getEntry(catalogId).nss.tenantId());
+    ASSERT_EQUALS(nss, catalog->getEntry(catalogId).nss);
+
+    // Re-initialize the DurableCatalog (as if it read from disk). Ensure the tenantId is still
+    // stored on the nss in the entry.
+    std::string ident = catalog->getEntry(catalogId).ident;
+    {
+        auto clientAndCtx = makeClientAndCtx("opCtx");
+        auto opCtx = clientAndCtx.opCtx();
+        Lock::GlobalLock globalLk(opCtx, MODE_IX);
+
+        WriteUnitOfWork uow(opCtx);
+        catalog = std::make_unique<DurableCatalogImpl>(rs.get(), false, false, nullptr);
+        catalog->init(opCtx);
+        uow.commit();
+    }
+    ASSERT_EQUALS(ident, catalog->getEntry(catalogId).ident);
+    ASSERT_EQUALS(nss.tenantId(), catalog->getEntry(catalogId).nss.tenantId());
+    ASSERT_EQUALS(nss, catalog->getEntry(catalogId).nss);
+
+    gMultitenancySupport = false;
 }
 
 }  // namespace

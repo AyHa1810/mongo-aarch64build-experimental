@@ -38,12 +38,12 @@ function getCachedPlan(cachedPlan) {
 /**
  * Given the root stage of explain's JSON representation of a query plan ('root'), returns all
  * subdocuments whose stage is 'stage'. Returns an empty array if the plan does not have the
- * requested stage.
+ * requested stage. if 'stage' is 'null' returns all the stages in 'root'.
  */
 function getPlanStages(root, stage) {
     var results = [];
 
-    if (root.stage === stage) {
+    if (root.stage === stage || stage === undefined) {
         results.push(root);
     }
 
@@ -93,6 +93,14 @@ function getPlanStages(root, stage) {
     }
 
     return results;
+}
+
+/**
+ * Given the root stage of explain's JSON representation of a query plan ('root'), returns a list of
+ * all the stages in 'root'.
+ */
+function getAllPlanStages(root) {
+    return getPlanStages(root);
 }
 
 /**
@@ -320,6 +328,9 @@ function aggPlanHasStage(root, stage) {
 /**
  * Given the root stage of explain's BSON representation of a query plan ('root'),
  * returns true if the plan has a stage called 'stage'.
+ *
+ * Expects that the stage appears once or zero times per node. If the stage appears more than once
+ * on one node's query plan, an error will be thrown.
  */
 function planHasStage(db, root, stage) {
     const matchingStages = getPlanStages(root, stage);
@@ -513,26 +524,54 @@ function assertStagesForExplainOfCommand({coll, cmdObj, expectedStages, stagesNo
 }
 
 /**
- * Get the "planCacheKey" from the explain result.
+ * Utility to obtain a value from 'explainRes' using 'getValueCallback'.
+ */
+function getFieldValueFromExplain(explainRes, getValueCallback) {
+    assert(explainRes.hasOwnProperty("queryPlanner"), explainRes);
+    const plannerOutput = explainRes.queryPlanner;
+    const fieldValue = getValueCallback(plannerOutput);
+    assert.eq(typeof fieldValue, "string");
+    return fieldValue;
+}
+
+/**
+ * Get the 'planCacheKey' from 'explainRes'.
  */
 function getPlanCacheKeyFromExplain(explainRes, db) {
-    const hash = FixtureHelpers.isMongos(db) &&
-            explainRes.queryPlanner.hasOwnProperty("winningPlan") &&
-            explainRes.queryPlanner.winningPlan.hasOwnProperty("shards")
-        ? explainRes.queryPlanner.winningPlan.shards[0].planCacheKey
-        : explainRes.queryPlanner.planCacheKey;
-    assert.eq(typeof hash, "string");
+    return getFieldValueFromExplain(explainRes, function(plannerOutput) {
+        return FixtureHelpers.isMongos(db) && plannerOutput.hasOwnProperty("winningPlan") &&
+                plannerOutput.winningPlan.hasOwnProperty("shards")
+            ? plannerOutput.winningPlan.shards[0].planCacheKey
+            : plannerOutput.planCacheKey;
+    });
+}
 
-    return hash;
+/**
+ * Get the 'queryHash' from 'explainRes'.
+ */
+function getQueryHashFromExplain(explainRes, db) {
+    return getFieldValueFromExplain(explainRes, function(plannerOutput) {
+        return FixtureHelpers.isMongos(db) ? plannerOutput.winningPlan.shards[0].queryHash
+                                           : plannerOutput.queryHash;
+    });
 }
 
 /**
  * Helper to run a explain on the given query shape and get the "planCacheKey" from the explain
  * result.
  */
-function getPlanCacheKeyFromShape({query = {}, projection = {}, sort = {}, collection, db}) {
-    const explainRes =
-        assert.commandWorked(collection.explain().find(query, projection).sort(sort).finish());
+function getPlanCacheKeyFromShape({
+    query = {},
+    projection = {},
+    sort = {},
+    collation = {
+        locale: "simple"
+    },
+    collection,
+    db
+}) {
+    const explainRes = assert.commandWorked(
+        collection.explain().find(query, projection).collation(collation).sort(sort).finish());
 
     return getPlanCacheKeyFromExplain(explainRes, db);
 }

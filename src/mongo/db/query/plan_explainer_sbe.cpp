@@ -37,13 +37,10 @@
 #include "mongo/db/fts/fts_query_impl.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/query/optimizer/explain_interface.h"
-#include "mongo/db/query/optimizer/node.h"
 #include "mongo/db/query/plan_explainer_impl.h"
 #include "mongo/db/query/plan_summary_stats_visitor.h"
 #include "mongo/db/query/projection_ast_util.h"
 #include "mongo/db/query/query_knobs_gen.h"
-#include "mongo/db/query/tree_walker.h"
-#include "mongo/db/record_id_helpers.h"
 
 namespace mongo {
 namespace {
@@ -183,6 +180,32 @@ void statsToBSON(const QuerySolutionNode* node,
             }
             break;
         }
+        case STAGE_COLUMN_SCAN: {
+            auto cisn = static_cast<const ColumnIndexScanNode*>(node);
+
+            {
+                BSONArrayBuilder fieldsBab{bob->subarrayStart("allFields")};
+                for (const auto& field : cisn->allFields) {
+                    fieldsBab.append(field);
+                }
+            }
+
+            if (!cisn->filtersByPath.empty()) {
+                BSONObjBuilder filtersBob(bob->subobjStart("filtersByPath"));
+                for (const auto& [path, matchExpr] : cisn->filtersByPath) {
+                    SerializationOptions opts;
+                    opts.includePath = false;
+                    filtersBob.append(path, matchExpr->serialize(opts));
+                }
+            }
+
+            if (cisn->postAssemblyFilter) {
+                bob->append("residualPredicate", cisn->postAssemblyFilter->serialize());
+            }
+            bob->appendBool("extraFieldsPermitted", cisn->extraFieldsPermitted);
+
+            break;
+        }
         default:
             break;
     }
@@ -238,9 +261,21 @@ void statsToBSONHelper(const sbe::PlanStageStats* stats,
 
     // Some top-level exec stats get pulled out of the root stage.
     bob->appendNumber("nReturned", static_cast<long long>(stats->common.advances));
-    // Include executionTimeMillis if it was recorded.
-    if (stats->common.executionTimeMillis) {
-        bob->appendNumber("executionTimeMillisEstimate", *stats->common.executionTimeMillis);
+    // Include the execution time if it was recorded.
+    if (stats->common.executionTime.precision == QueryExecTimerPrecision::kMillis) {
+        bob->appendNumber(
+            "executionTimeMillisEstimate",
+            durationCount<Milliseconds>(stats->common.executionTime.executionTimeEstimate));
+    } else if (stats->common.executionTime.precision == QueryExecTimerPrecision::kNanos) {
+        bob->appendNumber(
+            "executionTimeMillisEstimate",
+            durationCount<Milliseconds>(stats->common.executionTime.executionTimeEstimate));
+        bob->appendNumber(
+            "executionTimeMicros",
+            durationCount<Microseconds>(stats->common.executionTime.executionTimeEstimate));
+        bob->appendNumber(
+            "executionTimeNanos",
+            durationCount<Nanoseconds>(stats->common.executionTime.executionTimeEstimate));
     }
     bob->appendNumber("opens", static_cast<long long>(stats->common.opens));
     bob->appendNumber("closes", static_cast<long long>(stats->common.closes));
@@ -361,6 +396,7 @@ void PlanExplainerSBE::getSummaryStats(PlanSummaryStats* statsOut) const {
     auto common = _root->getCommonStats();
     statsOut->nReturned = common->advances;
     statsOut->fromMultiPlanner = isMultiPlan();
+    statsOut->fromPlanCache = isFromCache();
     statsOut->totalKeysExamined = 0;
     statsOut->totalDocsExamined = 0;
     statsOut->replanReason = _rootData->replanReason;
@@ -371,9 +407,10 @@ void PlanExplainerSBE::getSummaryStats(PlanSummaryStats* statsOut) const {
 
     // Use the pre-computed summary stats instead of traversing the QuerySolution tree.
     const auto& indexesUsed = _debugInfo->mainStats.indexesUsed;
+    statsOut->indexesUsed.clear();
     statsOut->indexesUsed.insert(indexesUsed.begin(), indexesUsed.end());
-    statsOut->collectionScans += _debugInfo->mainStats.collectionScans;
-    statsOut->collectionScansNonTailable += _debugInfo->mainStats.collectionScansNonTailable;
+    statsOut->collectionScans = _debugInfo->mainStats.collectionScans;
+    statsOut->collectionScansNonTailable = _debugInfo->mainStats.collectionScansNonTailable;
 }
 
 void PlanExplainerSBE::getSecondarySummaryStats(std::string secondaryColl,
@@ -435,7 +472,8 @@ std::vector<PlanExplainer::PlanStatsDetails> PlanExplainerSBE::getRejectedPlansS
 
         auto stats = candidate.root->getStats(true /* includeDebugInfo  */);
         invariant(stats);
-        auto execPlanDebugInfo = buildExecPlanDebugInfo(candidate.root.get(), &candidate.data);
+        auto execPlanDebugInfo =
+            buildExecPlanDebugInfo(candidate.root.get(), &candidate.data.stageData);
         res.push_back(buildPlanStatsDetails(
             candidate.solution.get(), *stats, execPlanDebugInfo, boost::none, verbosity));
     }

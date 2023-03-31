@@ -84,7 +84,15 @@ std::pair<rpc::UniqueReply, DBClientBase*> MockDBClientConnection::runCommandWit
                 str::stream() << "network error while attempting to run "
                               << "command '" << request.getCommandName() << "' " << status,
                 !ErrorCodes::isNetworkError(status));
-        auto cursorRes = CursorResponse::parseFromBSON(reply->getCommandReply());
+
+        auto dollarTenant = [&]() -> boost::optional<TenantId> {
+            if (auto tenant = request.body.getField("$tenant")) {
+                return TenantId::parseFromBSON(tenant);
+            }
+            return boost::none;
+        }();
+        auto cursorRes =
+            CursorResponse::parseFromBSON(reply->getCommandReply(), nullptr, dollarTenant);
         if (cursorRes.isOK() && cursorRes.getValue().getCursorId() != 0) {
             _lastCursorMessage = request;
         }
@@ -168,27 +176,27 @@ uint64_t MockDBClientConnection::getSockCreationMicroSec() const {
     return _sockCreationTime;
 }
 
-void MockDBClientConnection::insert(const string& ns,
+void MockDBClientConnection::insert(const NamespaceString& nss,
                                     BSONObj obj,
                                     bool ordered,
                                     boost::optional<BSONObj> writeConcernObj) {
-    _remoteServer->insert(ns, obj);
+    _remoteServer->insert(nss, obj);
 }
 
-void MockDBClientConnection::insert(const string& ns,
+void MockDBClientConnection::insert(const NamespaceString& nss,
                                     const vector<BSONObj>& objList,
                                     bool ordered,
                                     boost::optional<BSONObj> writeConcernObj) {
     for (vector<BSONObj>::const_iterator iter = objList.begin(); iter != objList.end(); ++iter) {
-        insert(ns, *iter, ordered);
+        insert(nss, *iter, ordered);
     }
 }
 
-void MockDBClientConnection::remove(const string& ns,
+void MockDBClientConnection::remove(const NamespaceString& nss,
                                     const BSONObj& filter,
                                     bool removeMany,
                                     boost::optional<BSONObj> writeConcernObj) {
-    _remoteServer->remove(ns, filter);
+    _remoteServer->remove(nss, filter);
 }
 
 void MockDBClientConnection::killCursor(const NamespaceString& ns, long long cursorID) {

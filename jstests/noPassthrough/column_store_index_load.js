@@ -4,28 +4,22 @@
  * Indexes are validated by comparing query results that use the index with results from a control
  * query that uses a collection scan.
  * @tags: [
- *   # columnstore indexes are new in 6.1.
- *   requires_fcv_61,
  *   # We could potentially need to resume an index build in the event of a stepdown, which is not
  *   # yet implemented.
  *   does_not_support_stepdowns,
- *   # Columnstore indexes are incompatible with clustered collections.
- *   incompatible_with_clustered_collection,
+ *   featureFlagColumnstoreIndexes,
  * ]
  */
 (function() {
 "use strict";
 
 load("jstests/libs/analyze_plan.js");
-load("jstests/libs/sbe_util.js");  // For checkSBEEnabled.
+load("jstests/libs/columnstore_util.js");  // For setUpServerForColumnStoreIndexTest.
 
 const mongod = MongoRunner.runMongod({});
 const db = mongod.getDB("test");
 
-const columnStoreEnabled =
-    checkSBEEnabled(db, ["featureFlagColumnstoreIndexes", "featureFlagSbeFull"]);
-if (!columnStoreEnabled) {
-    jsTestLog("Skipping column store bulk load test test since the feature flag is not enabled.");
+if (!setUpServerForColumnStoreIndexTest(db)) {
     MongoRunner.stopMongod(mongod);
     return;
 }
@@ -65,6 +59,23 @@ const testDocs = kPermutations(testValues, 4).map((permutation, idx) => ({
                                                       bar: [permutation[2], permutation[3]]
                                                   }));
 
+// Compute the number of paths that this document will add to the column store index, assuming it is
+// structured according to the above testDocs template that generates two-level documents.
+let numPathsToProcess = 0;
+for (const doc of testDocs) {
+    numPathsToProcess += 5;  // _id, idx, foo, bar, special dense field
+
+    for (const arr of [doc.foo, doc.bar]) {
+        let keys = {};
+        for (const obj of arr) {
+            for (const field of Object.keys(obj)) {
+                keys[field] = true;
+            }
+        }
+        numPathsToProcess += Object.keys(keys).length;
+    }
+}
+
 // Test queries use a projection that includes every possible leaf field. Projections on fields that
 // have sub-documents fall back to the row store, which would not serve to validate the contents of
 // the index.
@@ -81,7 +92,7 @@ const testProjection = {
 
 const maxMemUsageBytes = 20000;
 const numDocs = testDocs.length;
-const approxDocSize = 800;
+const approxDocSize = 500;
 const approxMemoryUsage = numDocs * approxDocSize;
 const expectedSpilledRanges = Math.ceil(approxMemoryUsage / maxMemUsageBytes);
 
@@ -127,15 +138,25 @@ loadDocs(bulkLoadInMemoryColl, testDocs);
 assert.commandWorked(bulkLoadInMemoryColl.createIndex({"$**": "columnstore"}));
 
 const statsAfterInMemoryBuild = assert.commandWorked(db.runCommand({serverStatus: 1}));
-assert.docEq({
-    count: NumberLong(1),
-    resumed: NumberLong(0),
-    filesOpenedForExternalSort: NumberLong(0),
-    filesClosedForExternalSort: NumberLong(0),
-    spilledRanges: NumberLong(0),
-    bytesSpilled: NumberLong(0),
-},
-             statsAfterInMemoryBuild.indexBulkBuilder);
+let indexBulkBuilderSection = statsAfterInMemoryBuild.indexBulkBuilder;
+assert.eq(indexBulkBuilderSection.count, 1, tojson(indexBulkBuilderSection));
+assert.eq(indexBulkBuilderSection.resumed, 0, tojson(indexBulkBuilderSection));
+assert.eq(indexBulkBuilderSection.filesOpenedForExternalSort, 0, tojson(indexBulkBuilderSection));
+assert.eq(indexBulkBuilderSection.filesClosedForExternalSort, 0, tojson(indexBulkBuilderSection));
+assert.eq(indexBulkBuilderSection.spilledRanges, 0, tojson(indexBulkBuilderSection));
+assert.eq(indexBulkBuilderSection.bytesSpilledUncompressed, 0, tojson(indexBulkBuilderSection));
+assert.eq(indexBulkBuilderSection.bytesSpilled, 0, tojson(indexBulkBuilderSection));
+assert.eq(indexBulkBuilderSection.numSorted, numPathsToProcess, tojson(indexBulkBuilderSection));
+assert.between(0.7 * approxMemoryUsage,
+               indexBulkBuilderSection.bytesSorted,
+               1.3 * approxMemoryUsage,
+               tojson(indexBulkBuilderSection));
+assert.between(0.7 * approxMemoryUsage,
+               indexBulkBuilderSection.memUsage,
+               1.3 * approxMemoryUsage,
+               tojson(indexBulkBuilderSection),
+               /*inclusive=*/ true);
+assert.eq(Object.keys(indexBulkBuilderSection).length, 10, tojson(indexBulkBuilderSection));
 
 // Perform the external bulk load. The server config won't allow a memory limit lower than 50MB, so
 // we use a failpoint to set it lower than that for the purposes of this test.
@@ -149,7 +170,7 @@ loadDocs(bulkLoadExternalColl, testDocs);
 assert.commandWorked(bulkLoadExternalColl.createIndex({"$**": "columnstore"}));
 
 const statsAfterExternalLoad = assert.commandWorked(db.runCommand({serverStatus: 1}));
-let indexBulkBuilderSection = statsAfterExternalLoad.indexBulkBuilder;
+indexBulkBuilderSection = statsAfterExternalLoad.indexBulkBuilder;
 assert.eq(indexBulkBuilderSection.count, 2, tojson(indexBulkBuilderSection));
 assert.eq(indexBulkBuilderSection.resumed, 0, tojson(indexBulkBuilderSection));
 assert.eq(indexBulkBuilderSection.filesOpenedForExternalSort, 1, tojson(indexBulkBuilderSection));
@@ -160,13 +181,28 @@ assert.between(expectedSpilledRanges - 1,
                indexBulkBuilderSection.spilledRanges,
                expectedSpilledRanges + 1,
                tojson(indexBulkBuilderSection),
-               true);
+               /*inclusive=*/ true);
 // We can only approximate the memory usage and bytes that will be spilled.
 assert.between(0,
                indexBulkBuilderSection.bytesSpilled,
                approxMemoryUsage,
                tojson(indexBulkBuilderSection),
-               true);
+               /*inclusive=*/ true);
+assert.gte(indexBulkBuilderSection.bytesSpilledUncompressed,
+           indexBulkBuilderSection.bytesSpilled,
+           tojson(indexBulkBuilderSection));
+// Multiply expected values by 2 to account for the previous index build.
+assert.eq(
+    indexBulkBuilderSection.numSorted, numPathsToProcess * 2, tojson(indexBulkBuilderSection));
+assert.between(approxMemoryUsage * 0.7 * 2,
+               indexBulkBuilderSection.bytesSorted,
+               approxMemoryUsage * 1.3 * 2,
+               tojson(indexBulkBuilderSection));
+assert.between(approxMemoryUsage * 0.7,
+               indexBulkBuilderSection.memUsage,
+               approxMemoryUsage * 1.3,
+               tojson(indexBulkBuilderSection),
+               /*inclusive=*/ true);
 
 // Perfom the online load.
 onlineLoadColl.drop();

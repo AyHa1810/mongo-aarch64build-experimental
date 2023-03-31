@@ -5,17 +5,15 @@
  * @tags: [
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
+ *   # Shard merge recipient state doc deletion is no longer managed by TTL monitor.
+ *   incompatible_with_shard_merge,
  *   requires_persistence,
  *   serverless,
  * ]
  */
 
-(function() {
-
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
 load("jstests/libs/uuid_util.js");  // For extractUUIDFromObject().
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 
 const kGarbageCollectionParams = {
     // Set the delay to 20s so that we can see the `expireAt` set prior to the document vanishing.
@@ -33,7 +31,8 @@ const tenantMigrationTest = new TenantMigrationTest({
 const kRecipientTTLIndexName = "TenantMigrationRecipientTTLIndex";
 
 const kMigrationId = UUID();
-const kTenantId = 'testTenantId';
+const kTenantId = ObjectId().str;
+
 const migrationOpts = {
     migrationIdString: extractUUIDFromObject(kMigrationId),
     tenantId: kTenantId,
@@ -84,4 +83,3 @@ jsTestLog("Waiting for the state document to have been deleted.");
 tenantMigrationTest.waitForMigrationGarbageCollection(kMigrationId, kTenantId);
 
 tenantMigrationTest.stop();
-})();

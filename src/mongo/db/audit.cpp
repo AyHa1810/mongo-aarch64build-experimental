@@ -229,7 +229,7 @@ void logEnableSharding(Client* client, StringData dbname) {
     invariant(client);
 }
 
-void logAddShard(Client* client, StringData name, const std::string& servers, long long maxSize) {
+void logAddShard(Client* client, StringData name, const std::string& servers) {
     invariant(client);
 }
 
@@ -263,13 +263,24 @@ void logGetClusterParameter(
     invariant(client);
 }
 
-void logSetClusterParameter(Client* client, const BSONObj& oldValue, const BSONObj& newValue) {
+void logSetClusterParameter(Client* client,
+                            const BSONObj& oldValue,
+                            const BSONObj& newValue,
+                            const boost::optional<TenantId>&) {
     invariant(client);
 }
 
 void logUpdateCachedClusterParameter(Client* client,
                                      const BSONObj& oldValue,
-                                     const BSONObj& newValue) {
+                                     const BSONObj& newValue,
+                                     const boost::optional<TenantId>&) {
+    invariant(client);
+}
+
+void logRotateLog(Client* client,
+                  const Status& logStatus,
+                  const std::vector<Status>& errors,
+                  const std::string& suffix) {
     invariant(client);
 }
 

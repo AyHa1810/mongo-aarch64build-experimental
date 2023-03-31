@@ -32,6 +32,7 @@
 
 #include "mongo/db/mirror_maestro.h"
 
+#include "mongo/rpc/get_status_from_command_result.h"
 #include <cmath>
 #include <cstdlib>
 #include <utility>
@@ -72,9 +73,10 @@ constexpr auto kMirroredReadsParamName = "mirrorReads"_sd;
 
 constexpr auto kMirroredReadsSeenKey = "seen"_sd;
 constexpr auto kMirroredReadsSentKey = "sent"_sd;
-constexpr auto kMirroredReadsReceivedKey = "received"_sd;
+constexpr auto kMirroredReadsProcessedAsSecondaryKey = "processedAsSecondary"_sd;
 constexpr auto kMirroredReadsResolvedKey = "resolved"_sd;
 constexpr auto kMirroredReadsResolvedBreakdownKey = "resolvedBreakdown"_sd;
+constexpr auto kMirroredReadsSucceededKey = "succeeded"_sd;
 constexpr auto kMirroredReadsPendingKey = "pending"_sd;
 
 MONGO_FAIL_POINT_DEFINE(mirrorMaestroExpectsResponse);
@@ -165,6 +167,7 @@ private:
     MirroringSampler _sampler;
     std::shared_ptr<executor::TaskExecutor> _executor;
     repl::TopologyVersionObserver _topologyVersionObserver;
+    PseudoRandom _random{SecureRandom{}.nextInt64()};
 };
 
 const auto getMirrorMaestroImpl = ServiceContext::declareDecoration<MirrorMaestroImpl>();
@@ -185,12 +188,13 @@ public:
         BSONObjBuilder section;
         section.append(kMirroredReadsSeenKey, seen.loadRelaxed());
         section.append(kMirroredReadsSentKey, sent.loadRelaxed());
-        section.append(kMirroredReadsReceivedKey, received.loadRelaxed());
+        section.append(kMirroredReadsProcessedAsSecondaryKey, processedAsSecondary.loadRelaxed());
 
         if (MONGO_unlikely(mirrorMaestroExpectsResponse.shouldFail())) {
             // We only can see if the command resolved if we got a response
             section.append(kMirroredReadsResolvedKey, resolved.loadRelaxed());
             section.append(kMirroredReadsResolvedBreakdownKey, resolvedBreakdown.toBSON());
+            section.append(kMirroredReadsSucceededKey, succeeded.loadRelaxed());
         }
         if (MONGO_unlikely(mirrorMaestroTracksPending.shouldFail())) {
             section.append(kMirroredReadsPendingKey, pending.loadRelaxed());
@@ -218,7 +222,7 @@ public:
         BSONObj toBSON() const noexcept {
             stdx::lock_guard<Mutex> lk(_mutex);
             BSONObjBuilder bob;
-            for (auto entry : _resolved) {
+            for (const auto& entry : _resolved) {
                 bob.append(entry.first, entry.second);
             }
             return bob.obj();
@@ -232,13 +236,22 @@ public:
 
     ResolvedBreakdownByHost resolvedBreakdown;
 
+    // Counts the number of operations (as primary) recognized as "to be mirrored".
     AtomicWord<CounterT> seen;
+    // Counts the number of remote requests (for mirroring as primary) sent over the network.
     AtomicWord<CounterT> sent;
+    // Counts the number of responses (as primary) from secondaries after mirrored operations.
     AtomicWord<CounterT> resolved;
-    // Counts the number of operations that are scheduled to be mirrored, but haven't yet been sent.
+    // Counts the number of responses (as primary) of successful mirrored operations. Disabled by
+    // default, hidden behind the mirrorMaestroExpectsResponse fail point.
+    AtomicWord<CounterT> succeeded;
+    // Counts the number of operations (as primary) that are scheduled to be mirrored, but
+    // haven't yet been sent. Disabled by default, hidden behind the mirrorMaestroTracksPending
+    // fail point.
     AtomicWord<CounterT> pending;
-    // Counts the number of mirrored operations received by this node as a secondary.
-    AtomicWord<CounterT> received;
+    // Counts the number of mirrored operations processed successfully by this node as a
+    // secondary. Disabled by default, hidden behind the mirrorMaestroExpectsResponse fail point.
+    AtomicWord<CounterT> processedAsSecondary;
 } gMirroredReadsSection;
 
 auto parseMirroredReadsParameters(const BSONObj& obj) {
@@ -249,13 +262,15 @@ auto parseMirroredReadsParameters(const BSONObj& obj) {
 }  // namespace
 
 void MirroredReadsServerParameter::append(OperationContext*,
-                                          BSONObjBuilder& bob,
-                                          const std::string& name) {
-    auto subBob = BSONObjBuilder(bob.subobjStart(name));
+                                          BSONObjBuilder* bob,
+                                          StringData name,
+                                          const boost::optional<TenantId>&) {
+    auto subBob = BSONObjBuilder(bob->subobjStart(name));
     _data->serialize(&subBob);
 }
 
-Status MirroredReadsServerParameter::set(const BSONElement& value) try {
+Status MirroredReadsServerParameter::set(const BSONElement& value,
+                                         const boost::optional<TenantId>&) try {
     auto obj = value.Obj();
 
     _data = parseMirroredReadsParameters(obj);
@@ -265,7 +280,8 @@ Status MirroredReadsServerParameter::set(const BSONElement& value) try {
     return e.toStatus();
 }
 
-Status MirroredReadsServerParameter::setFromString(const std::string& str) try {
+Status MirroredReadsServerParameter::setFromString(StringData str,
+                                                   const boost::optional<TenantId>&) try {
     auto obj = fromjson(str);
 
     _data = parseMirroredReadsParameters(obj);
@@ -303,7 +319,7 @@ void MirrorMaestro::tryMirrorRequest(OperationContext* opCtx) noexcept {
 void MirrorMaestro::onReceiveMirroredRead(OperationContext* opCtx) noexcept {
     const auto& invocation = CommandInvocation::get(opCtx);
     if (MONGO_unlikely(invocation->isMirrored())) {
-        gMirroredReadsSection.received.fetchAndAddRelaxed(1);
+        gMirroredReadsSection.processedAsSecondary.fetchAndAddRelaxed(1);
     }
 }
 
@@ -401,7 +417,7 @@ void MirrorMaestroImpl::_mirror(const std::vector<HostAndPort>& hosts,
     }();
 
     // Mirror to a normalized subset of eligible hosts (i.e., secondaries).
-    const auto startIndex = rand() % hosts.size();
+    const auto startIndex = _random.nextInt64(hosts.size());
     const auto mirroringFactor = std::ceil(params.getSamplingRate() * hosts.size());
 
     for (auto i = 0; i < mirroringFactor; i++) {
@@ -415,6 +431,11 @@ void MirrorMaestroImpl::_mirror(const std::vector<HostAndPort>& hosts,
             // Count both failed and successful reads as resolved
             gMirroredReadsSection.resolved.fetchAndAdd(1);
             gMirroredReadsSection.resolvedBreakdown.onResponseReceived(host);
+
+            if (getStatusFromCommandResult(args.response.data).isOK()) {
+                gMirroredReadsSection.succeeded.fetchAndAdd(1);
+            }
+
             LOGV2_DEBUG(
                 31457, 4, "Response received", "host"_attr = host, "response"_attr = args.response);
 

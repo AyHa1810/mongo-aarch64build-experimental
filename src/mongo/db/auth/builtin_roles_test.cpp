@@ -108,11 +108,12 @@ TEST(BuiltinRoles, addPrivilegesForBuiltinRole) {
         ActionType::killCursors,
         ActionType::listCollections,
         ActionType::listIndexes,
+        ActionType::listSearchIndexes,
         ActionType::planCacheRead,
     });
     const auto adminDB = ResourcePattern::forDatabaseName("admin");
-    const auto adminSystemJS =
-        ResourcePattern::forExactNamespace(NamespaceString("admin", "system.js"));
+    const auto adminSystemJS = ResourcePattern::forExactNamespace(
+        NamespaceString::createNamespaceString_forTest("admin", "system.js"));
 
     for (const auto& priv : privs) {
         auto resource = priv.getResourcePattern();

@@ -27,9 +27,6 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
@@ -46,10 +43,10 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/migration_secondary_throttle_options.h"
 #include "mongo/s/request_types/move_range_request_gen.h"
+#include "mongo/s/shard_key_pattern_query_util.h"
 #include "mongo/util/timer.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
-
 
 namespace mongo {
 namespace {
@@ -103,9 +100,12 @@ public:
         void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) {
 
             Timer t;
-            const auto chunkManager = uassertStatusOK(
-                Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx,
-                                                                                             ns()));
+            const auto chunkManager =
+                uassertStatusOK(
+                    Grid::get(opCtx)
+                        ->catalogCache()
+                        ->getShardedCollectionRoutingInfoWithPlacementRefresh(opCtx, ns()))
+                    .cm;
 
             uassert(ErrorCodes::InvalidOptions,
                     "bounds can only have exactly 2 elements",
@@ -131,7 +131,7 @@ public:
                     " does not exist",
                     "moveChunk destination shard does not exist",
                     "toShardId"_attr = destination,
-                    "namespace"_attr = ns());
+                    logAttrs(ns()));
             }
 
 
@@ -145,12 +145,17 @@ public:
 
             if (find) {
                 // find
-                BSONObj shardKey = uassertStatusOK(
-                    chunkManager.getShardKeyPattern().extractShardKeyFromQuery(opCtx, ns(), *find));
+                BSONObj shardKey = uassertStatusOK(extractShardKeyFromBasicQuery(
+                    opCtx, ns(), chunkManager.getShardKeyPattern(), *find));
 
                 uassert(656450,
                         str::stream() << "no shard key found in chunk query " << *find,
                         !shardKey.isEmpty());
+
+                if (find && chunkManager.getShardKeyPattern().isHashedPattern()) {
+                    LOGV2_WARNING(7065400,
+                                  "bounds should be used instead of query for hashed shard keys");
+                }
 
                 chunk.emplace(chunkManager.findIntersectingChunkWithSimpleCollation(shardKey));
             } else {
@@ -186,7 +191,7 @@ public:
 
 
             ConfigsvrMoveRange configsvrRequest(ns());
-            configsvrRequest.setDbName(NamespaceString::kAdminDb);
+            configsvrRequest.setDbName(DatabaseName::kAdmin);
             configsvrRequest.setMoveRangeRequestBase(moveRangeReq);
 
             const auto secondaryThrottle = uassertStatusOK(
@@ -201,7 +206,7 @@ public:
             auto commandResponse = configShard->runCommand(
                 opCtx,
                 ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                NamespaceString::kAdminDb.toString(),
+                DatabaseName::kAdmin.toString(),
                 CommandHelpers::appendMajorityWriteConcern(configsvrRequest.toBSON({})),
                 Shard::RetryPolicy::kIdempotent);
             uassertStatusOK(Shard::CommandResponse::getEffectiveStatus(std::move(commandResponse)));

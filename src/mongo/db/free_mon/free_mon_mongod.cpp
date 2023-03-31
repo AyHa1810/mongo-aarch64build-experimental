@@ -248,7 +248,7 @@ private:
 
 }  // namespace
 
-Status onValidateFreeMonEndpointURL(StringData str) {
+Status onValidateFreeMonEndpointURL(StringData str, const boost::optional<TenantId>&) {
     // Check for http, not https here because testEnabled may not be set yet
     if (!str.startsWith("http"_sd) != 0) {
         return Status(ErrorCodes::BadValue,
@@ -293,7 +293,7 @@ void registerCollectors(FreeMonController* controller) {
             "replSetGetConfig", "replSetGetConfig", "", BSON("replSetGetConfig" << 1)));
 
         // Collect UUID for certain collections.
-        std::set<NamespaceString> namespaces({NamespaceString("local.oplog.rs")});
+        std::set<NamespaceString> namespaces({NamespaceString::kRsOplogNamespace});
         controller->addRegistrationCollector(
             std::make_unique<FreeMonNamespaceUUIDCollector>(namespaces));
         controller->addMetricsCollector(

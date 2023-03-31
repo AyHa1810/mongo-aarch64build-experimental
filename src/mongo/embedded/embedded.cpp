@@ -38,7 +38,6 @@
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_impl.h"
 #include "mongo/db/catalog/database_holder_impl.h"
-#include "mongo/db/catalog/health_log.h"
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
@@ -46,16 +45,15 @@
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/global_settings.h"
-#include "mongo/db/index/index_access_method_factory_impl.h"
-#include "mongo/db/kill_sessions_local.h"
-#include "mongo/db/logical_session_cache_impl.h"
 #include "mongo/db/op_observer/op_observer_impl.h"
 #include "mongo/db/op_observer/op_observer_registry.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/s/collection_sharding_state_factory_standalone.h"
 #include "mongo/db/service_liaison_mongod.h"
-#include "mongo/db/session_killer.h"
-#include "mongo/db/sessions_collection_standalone.h"
+#include "mongo/db/session/kill_sessions_local.h"
+#include "mongo/db/session/logical_session_cache_impl.h"
+#include "mongo/db/session/session_killer.h"
+#include "mongo/db/session/sessions_collection_standalone.h"
 #include "mongo/db/startup_recovery.h"
 #include "mongo/db/storage/control/storage_control.h"
 #include "mongo/db/storage/encryption_hooks.h"
@@ -106,7 +104,6 @@ MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
 
 void setUpCatalog(ServiceContext* serviceContext) {
     DatabaseHolder::set(serviceContext, std::make_unique<DatabaseHolderImpl>());
-    IndexAccessMethodFactory::set(serviceContext, std::make_unique<IndexAccessMethodFactoryImpl>());
     Collection::Factory::set(serviceContext, std::make_unique<CollectionImpl::FactoryImpl>());
 }
 
@@ -146,7 +143,9 @@ ServiceContext::ConstructorActionRegisterer collectionShardingStateFactoryRegist
         CollectionShardingStateFactory::set(
             service, std::make_unique<CollectionShardingStateFactoryStandalone>(service));
     },
-    [](ServiceContext* service) { CollectionShardingStateFactory::clear(service); }};
+    [](ServiceContext* service) {
+        CollectionShardingStateFactory::clear(service);
+    }};
 
 }  // namespace
 
@@ -165,7 +164,8 @@ void shutdown(ServiceContext* srvContext) {
         // Close all open databases, shutdown storage engine and run all deinitializers.
         auto shutdownOpCtx = serviceContext->makeOperationContext(client);
         {
-            UninterruptibleLockGuard noInterrupt(shutdownOpCtx->lockState());
+            // TODO (SERVER-71610): Fix to be interruptible or document exception.
+            UninterruptibleLockGuard noInterrupt(shutdownOpCtx->lockState());  // NOLINT.
             Lock::GlobalLock lk(shutdownOpCtx.get(), MODE_X);
             auto databaseHolder = DatabaseHolder::get(shutdownOpCtx.get());
             databaseHolder->closeAll(shutdownOpCtx.get());
@@ -191,7 +191,7 @@ void shutdown(ServiceContext* srvContext) {
 
 
 ServiceContext* initialize(const char* yaml_config) {
-    srand(static_cast<unsigned>(curTimeMicros64()));
+    srand(static_cast<unsigned>(curTimeMicros64()));  // NOLINT
 
     if (yaml_config)
         embedded::EmbeddedOptionsConfig::instance().set(yaml_config);
@@ -323,7 +323,7 @@ ServiceContext* initialize(const char* yaml_config) {
     }
 
     // This is for security on certain platforms (nonce generation)
-    srand((unsigned)(curTimeMicros64()) ^ (unsigned(uintptr_t(&startupOpCtx))));
+    srand((unsigned)(curTimeMicros64()) ^ (unsigned(uintptr_t(&startupOpCtx))));  // NOLINT
 
     // Set up the logical session cache
     LogicalSessionCache::set(serviceContext,

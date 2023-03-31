@@ -358,6 +358,7 @@ TEST_F(FaultManagerTest, HealthCheckWithOffFacetCreatesNoFaultInOk) {
     configPtr->setIntensityForType(faultFacetType, HealthObserverIntensityEnum::kOff);
     manager().acceptTest(HealthCheckStatus(faultFacetType, Severity::kFailure, "error"));
     ASSERT_EQ(manager().getFaultState(), FaultState::kOk);
+    resetManager();
 }
 
 TEST_F(FaultManagerTest, DNSHealthCheckWithBadHostNameFailsAndGoodHostNameSuccess) {
@@ -376,7 +377,7 @@ TEST_F(FaultManagerTest, DNSHealthCheckWithBadHostNameFailsAndGoodHostNameSucces
                                                     << "interval" << 1000)));
     const BSONObj newParameterObj = BSON("key" << bsonOBj);
     auto element = newParameterObj.getField("key");
-    uassertStatusOK(serverParam->set(element));
+    uassertStatusOK(serverParam->set(element, boost::none));
 
     registerHealthObserver<DnsHealthObserver>();
     globalFailPointRegistry()

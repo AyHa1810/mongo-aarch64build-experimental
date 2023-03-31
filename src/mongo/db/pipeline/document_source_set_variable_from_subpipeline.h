@@ -89,11 +89,17 @@ public:
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
+    void addVariableRefs(std::set<Variables::Id>* refs) const final;
+
     /**
      * Set the sub-pipeline's initial source. Similar to Pipeline's addInitialSource().
      * Should be used to add a cursor/document generating stage to the pipeline.
      */
     void addSubPipelineInitialSource(boost::intrusive_ptr<DocumentSource> source);
+
+    void detachFromOperationContext() final;
+    void reattachToOperationContext(OperationContext* opCtx) final;
+    bool validateOperationContext(const OperationContext* opCtx) const final;
 
 protected:
     DocumentSourceSetVariableFromSubPipeline(const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -106,7 +112,7 @@ protected:
 
 private:
     GetNextResult doGetNext() final;
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
     std::unique_ptr<Pipeline, PipelineDeleter> _subPipeline;
     Variables::Id _variableID;
     // $setVariableFromSubPipeline sets the value of $$SEARCH_META only on the first call to

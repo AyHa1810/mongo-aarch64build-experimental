@@ -110,7 +110,9 @@ private:
 /**
  *  Schedule a write via appendOplogNote command to the primary of this replica set.
  */
-Status makeNoopWriteIfNeeded(OperationContext* opCtx, LogicalTime clusterTime, StringData dbName) {
+Status makeNoopWriteIfNeeded(OperationContext* opCtx,
+                             LogicalTime clusterTime,
+                             const DatabaseName& dbName) {
     repl::ReplicationCoordinator* const replCoord = repl::ReplicationCoordinator::get(opCtx);
     invariant(replCoord->isReplEnabled());
 
@@ -145,7 +147,7 @@ Status makeNoopWriteIfNeeded(OperationContext* opCtx, LogicalTime clusterTime, S
         // Standalone replica set, so there is no need to advance the OpLog on the primary. The only
         // exception is after a tenant migration because the target time may be from the other
         // replica set and is not guaranteed to be in the oplog of this node's set.
-        if (serverGlobalParams.clusterRole == ClusterRole::None &&
+        if (serverGlobalParams.clusterRole.has(ClusterRole::None) &&
             !tenant_migration_access_blocker::hasActiveTenantMigration(opCtx, dbName)) {
             return Status::OK();
         }
@@ -168,16 +170,18 @@ Status makeNoopWriteIfNeeded(OperationContext* opCtx, LogicalTime clusterTime, S
                             "clusterTime"_attr = clusterTime.toString(),
                             "remainingAttempts"_attr = remainingAttempts);
 
-                auto onRemoteCmdScheduled = [](executor::TaskExecutor::CallbackHandle handle) {};
-                auto onRemoteCmdComplete = [](executor::TaskExecutor::CallbackHandle handle) {};
+                auto onRemoteCmdScheduled = [](executor::TaskExecutor::CallbackHandle handle) {
+                };
+                auto onRemoteCmdComplete = [](executor::TaskExecutor::CallbackHandle handle) {
+                };
                 auto appendOplogNoteResponse = replCoord->runCmdOnPrimaryAndAwaitResponse(
                     opCtx,
-                    NamespaceString::kAdminDb.toString(),
+                    DatabaseName::kAdmin.toString(),
                     BSON("appendOplogNote"
                          << 1 << "maxClusterTime" << clusterTime.asTimestamp() << "data"
                          << BSON("noop write for afterClusterTime read concern" << 1)
                          << WriteConcernOptions::kWriteConcernField
-                         << WriteConcernOptions::kInternalWriteDefault),
+                         << WriteConcernOptions::Acknowledged),
                     onRemoteCmdScheduled,
                     onRemoteCmdComplete);
 
@@ -281,7 +285,7 @@ void setPrepareConflictBehaviorForReadConcernImpl(OperationContext* opCtx,
 
 Status waitForReadConcernImpl(OperationContext* opCtx,
                               const repl::ReadConcernArgs& readConcernArgs,
-                              StringData dbName,
+                              const DatabaseName& dbName,
                               bool allowAfterClusterTime) {
     // If we are in a direct client within a transaction, then we may be holding locks, so it is
     // illegal to wait for read concern. This is fine, since the outer operation should have handled
@@ -424,7 +428,8 @@ Status waitForReadConcernImpl(OperationContext* opCtx,
             return Status::OK();
         }
 
-        const int debugLevel = serverGlobalParams.clusterRole == ClusterRole::ConfigServer ? 1 : 2;
+        const int debugLevel =
+            serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer) ? 1 : 2;
 
         LOGV2_DEBUG(
             20991,

@@ -28,6 +28,7 @@
  */
 
 #include "mongo/db/query/optimizer/rewrites/const_eval.h"
+#include "mongo/db/exec/sbe/values/arith_common.h"
 #include "mongo/db/query/optimizer/utils/utils.h"
 
 namespace mongo::optimizer {
@@ -75,6 +76,12 @@ bool ConstEval::optimize(ABT& n) {
     return _changed;
 }
 
+void ConstEval::constFold(ABT& n) {
+    VariableEnvironment env = VariableEnvironment::build(n);
+    ConstEval instance(env);
+    instance.optimize(n);
+}
+
 void ConstEval::removeUnusedEvalNodes() {
     for (auto&& [k, v] : _projectRefs) {
         if (v.size() == 0) {
@@ -85,8 +92,7 @@ void ConstEval::removeUnusedEvalNodes() {
             // Do not inline nodes which can become Sargable.
             // TODO: consider caching.
             // TODO: consider deriving IndexingAvailability.
-            if (!_disableSargableInlining ||
-                !convertExprToPartialSchemaReq(k->getProjection(), false /*isFilterContext*/)) {
+            if (!_canInlineEval || _canInlineEval(*k)) {
                 // Schedule node inlining as there is exactly one reference.
                 _singleRef.emplace(v.front());
                 _changed = true;
@@ -118,6 +124,9 @@ void ConstEval::transport(ABT& n, const Variable& var) {
             // This is a indirection to another variable. So we can skip, but first remember that we
             // inlined this variable so that we won't try to replace it with a common expression and
             // revert the inlining.
+            if (_renamedProj) {
+                _renamedProj(var.name(), variable->name());
+            }
             _inlinedDefs.emplace(def.definition);
             swapAndUpdate(n, def.definition);
         } else if (_singleRef.erase(&var)) {
@@ -187,35 +196,27 @@ void ConstEval::transport(ABT& n, const LambdaApplication& app, ABT& lam, ABT& a
     }
 }
 
-namespace fold_helpers {
-using namespace sbe::value;
+void ConstEval::transport(ABT& n, const UnaryOp& op, ABT& child) {
+    switch (op.op()) {
+        case Operations::Not: {
+            if (const auto childConst = child.cast<Constant>();
+                childConst && childConst->isValueBool()) {
+                swapAndUpdate(n, Constant::boolean(!childConst->getValueBool()));
+            }
+            break;
+        }
 
-template <class T>
-sbe::value::Value constFoldNumberHelper(const sbe::value::TypeTags lhsTag,
-                                        const sbe::value::Value lhsValue,
-                                        const TypeTags rhsTag,
-                                        const sbe::value::Value rhsValue) {
-    const auto result = numericCast<T>(lhsTag, lhsValue) + numericCast<T>(rhsTag, rhsValue);
-    return bitcastFrom<T>(result);
+            // Could also constant fold arithmetic negation.
+
+        default:
+            break;
+    }
 }
-
-template <>
-sbe::value::Value constFoldNumberHelper<Decimal128>(const TypeTags lhsTag,
-                                                    const sbe::value::Value lhsValue,
-                                                    const TypeTags rhsTag,
-                                                    const sbe::value::Value rhsValue) {
-    const auto result =
-        numericCast<Decimal128>(lhsTag, lhsValue).add(numericCast<Decimal128>(rhsTag, rhsValue));
-    return makeCopyDecimal(result).second;
-}
-
-}  // namespace fold_helpers
 
 // Specific transport for binary operation
 // The const correctness is probably wrong (as const ABT& lhs, const ABT& rhs does not work for
 // some reason but we can fix it later).
 void ConstEval::transport(ABT& n, const BinaryOp& op, ABT& lhs, ABT& rhs) {
-    using namespace fold_helpers;
 
     switch (op.op()) {
         case Operations::Add: {
@@ -223,50 +224,44 @@ void ConstEval::transport(ABT& n, const BinaryOp& op, ABT& lhs, ABT& rhs) {
             // addition.
             auto lhsConst = lhs.cast<Constant>();
             auto rhsConst = rhs.cast<Constant>();
+            if (lhsConst && rhsConst) {
+                auto [lhsTag, lhsValue] = lhsConst->get();
+                auto [rhsTag, rhsValue] = rhsConst->get();
+                auto [_, resultType, resultValue] =
+                    sbe::value::genericAdd(lhsTag, lhsValue, rhsTag, rhsValue);
+                swapAndUpdate(n, make<Constant>(resultType, resultValue));
+            }
+            break;
+        }
+
+        case Operations::Sub: {
+            // Let say we want to recognize ConstLhs - ConstRhs and replace it with the result of
+            // subtraction.
+            auto lhsConst = lhs.cast<Constant>();
+            auto rhsConst = rhs.cast<Constant>();
 
             if (lhsConst && rhsConst) {
                 auto [lhsTag, lhsValue] = lhsConst->get();
                 auto [rhsTag, rhsValue] = rhsConst->get();
+                auto [_, resultType, resultValue] =
+                    sbe::value::genericSub(lhsTag, lhsValue, rhsTag, rhsValue);
+                swapAndUpdate(n, make<Constant>(resultType, resultValue));
+            }
+            break;
+        }
 
-                if (isNumber(lhsTag) && isNumber(rhsTag)) {
-                    // So this is the addition operation and both arguments are number constants,
-                    // hence we can compute the result.
+        case Operations::Mult: {
+            // Let say we want to recognize ConstLhs * ConstRhs and replace it with the result of
+            // multiplication.
+            auto lhsConst = lhs.cast<Constant>();
+            auto rhsConst = rhs.cast<Constant>();
 
-                    const TypeTags resultType = getWidestNumericalType(lhsTag, rhsTag);
-                    sbe::value::Value resultValue;
-
-                    switch (resultType) {
-                        case TypeTags::NumberInt32: {
-                            resultValue =
-                                constFoldNumberHelper<int32_t>(lhsTag, lhsValue, rhsTag, rhsValue);
-                            break;
-                        }
-
-                        case TypeTags::NumberInt64: {
-                            resultValue =
-                                constFoldNumberHelper<int64_t>(lhsTag, lhsValue, rhsTag, rhsValue);
-                            break;
-                        }
-
-                        case TypeTags::NumberDouble: {
-                            resultValue =
-                                constFoldNumberHelper<double>(lhsTag, lhsValue, rhsTag, rhsValue);
-                            break;
-                        }
-
-                        case TypeTags::NumberDecimal: {
-                            resultValue = constFoldNumberHelper<Decimal128>(
-                                lhsTag, lhsValue, rhsTag, rhsValue);
-                            break;
-                        }
-
-                        default:
-                            MONGO_UNREACHABLE;
-                    }
-
-                    // And this is the crucial step - we swap the current node (n) for the result.
-                    swapAndUpdate(n, make<Constant>(resultType, resultValue));
-                }
+            if (lhsConst && rhsConst) {
+                auto [lhsTag, lhsValue] = lhsConst->get();
+                auto [rhsTag, rhsValue] = rhsConst->get();
+                auto [_, resultType, resultValue] =
+                    sbe::value::genericMul(lhsTag, lhsValue, rhsTag, rhsValue);
+                swapAndUpdate(n, make<Constant>(resultType, resultValue));
             }
             break;
         }
@@ -335,6 +330,9 @@ void ConstEval::transport(ABT& n, const BinaryOp& op, ABT& lhs, ABT& rhs) {
 
                     const auto [compareTag, compareVal] =
                         sbe::value::compareValue(lhsTag, lhsVal, rhsTag, rhsVal);
+                    uassert(7086701,
+                            "Invalid comparison result",
+                            compareTag == sbe::value::TypeTags::NumberInt32);
                     const auto cmpVal = sbe::value::bitcastTo<int32_t>(compareVal);
 
                     switch (op.op()) {
@@ -415,7 +413,7 @@ void ConstEval::transport(ABT& n, const BinaryOp& op, ABT& lhs, ABT& rhs) {
                     }
                 }
             }
-            [[fallthrough]];
+            break;
         }
 
         default:
@@ -456,6 +454,14 @@ void ConstEval::transport(ABT& n, const FunctionCall& op, std::vector<ABT>& args
             auto [tag, val] = sbe::value::makeCopyArray(array);
             swapAndUpdate(n, make<Constant>(tag, val));
         }
+    } else if (op.name() == "traverseP") {
+        // TraverseP with an identity lambda. Replace with the input.
+        if (const auto* lambdaPtr = args.at(1).cast<LambdaAbstraction>()) {
+            if (const auto* varPtr = lambdaPtr->getBody().cast<Variable>();
+                varPtr != nullptr && varPtr->name() == lambdaPtr->varName()) {
+                swapAndUpdate(n, args.front());
+            }
+        }
     }
 }
 
@@ -471,6 +477,20 @@ void ConstEval::transport(ABT& n, const If& op, ABT& cond, ABT& thenBranch, ABT&
             // if false -> elseBranch
             swapAndUpdate(n, std::exchange(elseBranch, make<Blackhole>()));
         }
+    }
+}
+
+void ConstEval::transport(ABT& n, const EvalPath& op, ABT& path, ABT& input) {
+    if (const auto* pathConstPtr = path.cast<PathConstant>()) {
+        // PathConst does not depend on its parent, so replace with the PathConst's child.
+        swapAndUpdate(n, pathConstPtr->getConstant());
+    }
+}
+
+void ConstEval::transport(ABT& n, const EvalFilter& op, ABT& path, ABT& input) {
+    if (const auto* pathConstPtr = path.cast<PathConstant>()) {
+        // PathConst does not depend on its parent, so replace with the PathConst's child.
+        swapAndUpdate(n, pathConstPtr->getConstant());
     }
 }
 
@@ -514,11 +534,23 @@ void ConstEval::transport(ABT&, const LambdaAbstraction&, ABT&) {
     --_inCostlyCtx;
 }
 
+void ConstEval::transport(ABT& n, const FilterNode& op, ABT& child, ABT& expr) {
+    if (expr == Constant::boolean(true)) {
+        // Remove trivially true filter.
+
+        // First, pull out the child and put in a blackhole.
+        auto result = std::exchange(child, make<Blackhole>());
+
+        // Replace the filter node itself with the extracted child.
+        swapAndUpdate(n, std::move(result));
+    }
+}
+
 void ConstEval::transport(ABT& n, const EvaluationNode& op, ABT& child, ABT& expr) {
     if (_noRefProj.erase(&op)) {
         // The evaluation node is unused so replace it with its own child.
-        if (_erasedProjNames != nullptr) {
-            _erasedProjNames->insert(op.getProjectionName());
+        if (_erasedProj) {
+            _erasedProj(op.getProjectionName());
         }
 
         // First, pull out the child and put in a blackhole.

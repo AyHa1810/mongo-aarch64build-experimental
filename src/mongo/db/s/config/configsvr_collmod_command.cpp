@@ -77,7 +77,7 @@ public:
         void typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::IllegalOperation,
                     "_configsvrCollMod can only be run on config servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
 
@@ -88,11 +88,12 @@ public:
             repl::ReadConcernArgs::get(opCtx) =
                 repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
 
-            const auto& collMod = request().getCollModRequest();
-            if (collMod.getTimeseries() && collMod.getTimeseries().get().getGranularity()) {
-                auto granularity = collMod.getTimeseries().get().getGranularity().get();
-                ShardingCatalogManager::get(opCtx)->updateTimeSeriesGranularity(
-                    opCtx, ns(), granularity);
+            auto& ts = request().getCollModRequest().getTimeseries();
+            if (ts.has_value() &&
+                (ts->getGranularity().has_value() || ts->getBucketMaxSpanSeconds().has_value() ||
+                 ts->getBucketRoundingSeconds().has_value())) {
+                ShardingCatalogManager::get(opCtx)->updateTimeSeriesBucketingParameters(
+                    opCtx, ns(), ts.get());
             }
         }
 

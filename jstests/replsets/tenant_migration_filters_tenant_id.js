@@ -11,20 +11,18 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    isNamespaceForTenant,
+} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 
-const tenantIdPrefix = "tenantId";
 const baseDBName = "testDB";
 const collName = "testColl";
 
-let currId = 0;
 const makeBaseTenantId = () => {
-    return `${tenantIdPrefix}${currId++}`;
+    return ObjectId().str;
 };
 
 const runTest = (baseTenantId, dbName, shouldMatch) => {
@@ -32,7 +30,7 @@ const runTest = (baseTenantId, dbName, shouldMatch) => {
 
     const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
 
-    assert.eq(shouldMatch, TenantMigrationUtil.isNamespaceForTenant(baseTenantId, dbName));
+    assert.eq(shouldMatch, isNamespaceForTenant(baseTenantId, dbName));
     tenantMigrationTest.insertDonorDB(dbName, collName);
 
     // Run a migration with the base tenant ID.
@@ -53,12 +51,6 @@ const testCases = [
     {makeTenantId: baseId => baseId, shouldMatch: true},
     {makeTenantId: baseId => `${baseId}_`, shouldMatch: true},
     {makeTenantId: baseId => `${baseId}_${baseId}`, shouldMatch: true},
-    {makeTenantId: baseId => `a${baseId}`, shouldMatch: false},
-    {makeTenantId: baseId => `${baseId}a`, shouldMatch: false},
-    {makeTenantId: baseId => `^${baseId}`, shouldMatch: false},
-    {makeTenantId: baseId => `${baseId.toUpperCase()}`, shouldMatch: false},
-    {makeTenantId: baseId => `${baseId.toLowerCase()}`, shouldMatch: false},
-    {makeTenantId: baseId => `${baseId}${baseId}`, shouldMatch: false},
 ];
 
 for (const {makeTenantId, shouldMatch} of testCases) {
@@ -66,4 +58,3 @@ for (const {makeTenantId, shouldMatch} of testCases) {
     const tenantId = makeTenantId(baseTenantId);
     runTest(baseTenantId, `${tenantId}_${baseDBName}`, shouldMatch);
 }
-})();

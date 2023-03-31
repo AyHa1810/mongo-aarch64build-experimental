@@ -38,8 +38,9 @@
 #include "mongo/db/s/drop_collection_coordinator.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/range_deletion_util.h"
-#include "mongo/db/s/recoverable_critical_section_service.h"
 #include "mongo/db/s/sharding_ddl_util.h"
+#include "mongo/db/s/sharding_recovery_service.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/grid.h"
@@ -55,29 +56,14 @@ const Backoff kExponentialBackoff(Seconds(1), Milliseconds::max());
 /*
  * Drop the collection locally and clear stale metadata from cache collections.
  */
-void dropCollectionLocally(OperationContext* opCtx, const NamespaceString& nss) {
-    bool knownNss = [&]() {
-        try {
-            DropCollectionCoordinator::dropCollectionLocally(opCtx, nss);
-            return true;
-        } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
-            return false;
-        }
-    }();
-
+void dropCollectionLocally(OperationContext* opCtx,
+                           const NamespaceString& nss,
+                           bool markFromMigrate) {
+    DropCollectionCoordinator::dropCollectionLocally(opCtx, nss, markFromMigrate);
     LOGV2_DEBUG(5515100,
                 1,
-                "Dropped target collection locally on renameCollection participant",
-                "namespace"_attr = nss,
-                "collectionExisted"_attr = knownNss);
-}
-
-void clearFilteringMetadata(OperationContext* opCtx, const NamespaceString& nss) {
-    UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-    Lock::DBLock dbLock(opCtx, nss.dbName(), MODE_IX);
-    Lock::CollectionLock collLock(opCtx, nss, MODE_IX);
-    auto* csr = CollectionShardingRuntime::get(opCtx, nss);
-    csr->clearFilteringMetadata(opCtx);
+                "Dropped target collection locally on renameCollection participant.",
+                logAttrs(nss));
 }
 
 /*
@@ -125,8 +111,8 @@ void renameOrDropTarget(OperationContext* opCtx,
         LOGV2_DEBUG(5515101,
                     1,
                     "Source namespace not found while trying to rename collection on participant",
-                    "namespace"_attr = fromNss);
-        dropCollectionLocally(opCtx, toNss);
+                    logAttrs(fromNss));
+        dropCollectionLocally(opCtx, toNss, options.markFromMigrate);
         deleteRangeDeletionTasksForRename(opCtx, fromNss, toNss);
     }
 }
@@ -169,7 +155,7 @@ boost::optional<BSONObj> RenameParticipantInstance::reportForCurrentOp(
 
     BSONObjBuilder cmdBob;
     if (const auto& optComment = _doc.getForwardableOpMetadata().getComment()) {
-        cmdBob.append(optComment.get().firstElement());
+        cmdBob.append(optComment.value().firstElement());
     }
     BSONObjBuilder bob;
     bob.append("type", "op");
@@ -297,7 +283,7 @@ SemiFuture<void> RenameParticipantInstance::_runImpl(
     std::shared_ptr<executor::ScopedTaskExecutor> executor,
     const CancellationToken& token) noexcept {
     return ExecutorFuture<void>(**executor)
-        .then(_executePhase(
+        .then(_buildPhaseHandler(
             Phase::kBlockCRUDAndSnapshotRangeDeletions,
             [this, anchor = shared_from_this()] {
                 auto opCtxHolder = cc().makeOperationContext();
@@ -306,7 +292,7 @@ SemiFuture<void> RenameParticipantInstance::_runImpl(
                 // Acquire source/target critical sections
                 const auto reason =
                     sharding_ddl_util::getCriticalSectionReasonForRename(fromNss(), toNss());
-                auto service = RecoverableCriticalSectionService::get(opCtx);
+                auto service = ShardingRecoveryService::get(opCtx);
                 service->acquireRecoverableCriticalSectionBlockWrites(
                     opCtx, fromNss(), reason, ShardingCatalogClient::kLocalWriteConcern);
                 service->promoteRecoverableCriticalSectionToBlockAlsoReads(
@@ -320,46 +306,74 @@ SemiFuture<void> RenameParticipantInstance::_runImpl(
                 // recovered the next time is accessed) and to safely create new range deletion
                 // tasks (the submission will serialize on the renamed collection's metadata
                 // refresh).
-                clearFilteringMetadata(opCtx, fromNss());
-                clearFilteringMetadata(opCtx, toNss());
+                {
+                    Lock::DBLock dbLock(opCtx, fromNss().dbName(), MODE_IX);
+                    Lock::CollectionLock collLock(opCtx, fromNss(), MODE_IX);
+                    auto scopedCsr =
+                        CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(
+                            opCtx, fromNss());
+                    scopedCsr->clearFilteringMetadataForDroppedCollection(opCtx);
+                }
+
+                {
+                    Lock::DBLock dbLock(opCtx, toNss().dbName(), MODE_IX);
+                    Lock::CollectionLock collLock(opCtx, toNss(), MODE_IX);
+                    auto scopedCsr =
+                        CollectionShardingRuntime::assertCollectionLockedAndAcquireExclusive(
+                            opCtx, toNss());
+                    scopedCsr->clearFilteringMetadata(opCtx);
+                }
 
                 snapshotRangeDeletionsForRename(opCtx, fromNss(), toNss());
             }))
-        .then(_executePhase(
+        .then(_buildPhaseHandler(
             Phase::kRenameLocalAndRestoreRangeDeletions,
             [this, anchor = shared_from_this()] {
                 auto opCtxHolder = cc().makeOperationContext();
                 auto* opCtx = opCtxHolder.get();
                 _doc.getForwardableOpMetadata().setOn(opCtx);
 
+                // TODO SERVER-74719 replace with a query to config.system.sharding_ddl_coordinators
+                const auto primaryShardId =
+                    Grid::get(opCtx)
+                        ->catalogClient()
+                        ->getDatabase(opCtx,
+                                      fromNss().dbName().db(),
+                                      repl::ReadConcernLevel::kMajorityReadConcern)
+                        .getPrimary();
+                const auto thisShardId = ShardingState::get(opCtx)->shardId();
+
                 RenameCollectionOptions options;
                 options.dropTarget = _doc.getDropTarget();
                 options.stayTemp = _doc.getStayTemp();
+                // Use the "markFromMigrate" option so that change streams capturing events about
+                // fromNss/toNss won't receive duplicate drop notifications.
+                options.markFromMigrate = (thisShardId != primaryShardId);
 
                 renameOrDropTarget(
                     opCtx, fromNss(), toNss(), options, _doc.getSourceUUID(), _doc.getTargetUUID());
 
                 restoreRangeDeletionTasksForRename(opCtx, toNss());
             }))
-        .then(
-            _executePhase(Phase::kDeleteFromRangeDeletions,
-                          [this, anchor = shared_from_this()] {
-                              auto opCtxHolder = cc().makeOperationContext();
-                              auto* opCtx = opCtxHolder.get();
-                              deleteRangeDeletionTasksForRename(opCtx, fromNss(), toNss());
+        .then(_buildPhaseHandler(
+            Phase::kDeleteFromRangeDeletions,
+            [this, anchor = shared_from_this()] {
+                auto opCtxHolder = cc().makeOperationContext();
+                auto* opCtx = opCtxHolder.get();
+                deleteRangeDeletionTasksForRename(opCtx, fromNss(), toNss());
 
-                              {
-                                  stdx::lock_guard<Latch> lg(_mutex);
-                                  if (!_blockCRUDAndRenameCompletionPromise.getFuture().isReady()) {
-                                      _blockCRUDAndRenameCompletionPromise.setFrom(Status::OK());
-                                  }
-                              }
+                {
+                    stdx::lock_guard<Latch> lg(_mutex);
+                    if (!_blockCRUDAndRenameCompletionPromise.getFuture().isReady()) {
+                        _blockCRUDAndRenameCompletionPromise.setFrom(Status::OK());
+                    }
+                }
 
-                              LOGV2(5515106,
-                                    "Collection locally renamed, waiting for CRUD to be unblocked",
-                                    "fromNs"_attr = fromNss(),
-                                    "toNs"_attr = toNss());
-                          }))
+                LOGV2(5515106,
+                      "Collection locally renamed, waiting for CRUD to be unblocked",
+                      "fromNs"_attr = fromNss(),
+                      "toNs"_attr = toNss());
+            }))
         .then([this, anchor = shared_from_this()] {
             if (_doc.getPhase() < Phase::kUnblockCRUD) {
                 return _canUnblockCRUDPromise.getFuture();
@@ -367,22 +381,28 @@ SemiFuture<void> RenameParticipantInstance::_runImpl(
 
             return SemiFuture<void>::makeReady().share();
         })
-        .then(_executePhase(
+        .then(_buildPhaseHandler(
             Phase::kUnblockCRUD,
             [this, anchor = shared_from_this()] {
                 auto opCtxHolder = cc().makeOperationContext();
                 auto* opCtx = opCtxHolder.get();
 
                 // Release source/target critical sections
+                // Note: Use 'throwIfReasonDiffers=false' on the destination collection because as
+                // soon as the critical section is released migrations can start. In case this phase
+                // needs to be retried, we could then encounter a critical section related to a
+                // migration. It is not needed for the source collection because no migration can
+                // start until it first becomes sharded, which cannot happen until the DDLLock is
+                // released.
                 const auto reason =
                     BSON("command"
                          << "rename"
                          << "from" << fromNss().toString() << "to" << toNss().toString());
-                auto service = RecoverableCriticalSectionService::get(opCtx);
+                auto service = ShardingRecoveryService::get(opCtx);
                 service->releaseRecoverableCriticalSection(
                     opCtx, fromNss(), reason, ShardingCatalogClient::kLocalWriteConcern);
                 service->releaseRecoverableCriticalSection(
-                    opCtx, toNss(), reason, WriteConcerns::kMajorityWriteConcernNoTimeout);
+                    opCtx, toNss(), reason, WriteConcerns::kMajorityWriteConcernNoTimeout, false);
 
                 LOGV2(5515107, "CRUD unblocked", "fromNs"_attr = fromNss(), "toNs"_attr = toNss());
             }))

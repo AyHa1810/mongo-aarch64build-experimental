@@ -43,11 +43,12 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/request_execution_context.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/session_catalog.h"
+#include "mongo/db/session/session_catalog.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/db/stats/top.h"
 #include "mongo/logv2/log.h"
+#include "mongo/rpc/check_allowed_op_query_cmd.h"
 #include "mongo/rpc/message.h"
-#include "mongo/rpc/warn_unsupported_wire_ops.h"
 #include "mongo/s/commands/strategy.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/load_balancer_support.h"
@@ -138,8 +139,6 @@ Future<DbResponse> HandleRequest::handleRequest() {
     switch (op) {
         case dbQuery:
             if (!nsString.isCommand()) {
-                globalOpCounters.gotQueryDeprecated();
-                warnUnsupportedOp(*(rec->getOpCtx()->getClient()), networkOpToString(dbQuery));
                 return Future<DbResponse>::makeReady(
                     makeErrorResponseToUnsupportedOpQuery("OP_QUERY is no longer supported"));
             }
@@ -147,28 +146,17 @@ Future<DbResponse> HandleRequest::handleRequest() {
         case dbMsg:
             return std::make_unique<CommandOpRunner>(shared_from_this())->run();
         case dbGetMore: {
-            globalOpCounters.gotGetMoreDeprecated();
-            warnUnsupportedOp(*(rec->getOpCtx()->getClient()), networkOpToString(dbGetMore));
             return Future<DbResponse>::makeReady(
                 makeErrorResponseToUnsupportedOpQuery("OP_GET_MORE is no longer supported"));
         }
         case dbKillCursors:
-            globalOpCounters.gotKillCursorsDeprecated();
-            warnUnsupportedOp(*(rec->getOpCtx()->getClient()), networkOpToString(op));
             uasserted(5745707, "OP_KILL_CURSORS is no longer supported");
         case dbInsert: {
-            auto opInsert = InsertOp::parseLegacy(rec->getMessage());
-            globalOpCounters.gotInsertsDeprecated(opInsert.getDocuments().size());
-            warnUnsupportedOp(*(rec->getOpCtx()->getClient()), networkOpToString(op));
             uasserted(5745706, "OP_INSERT is no longer supported");
         }
         case dbUpdate:
-            globalOpCounters.gotUpdateDeprecated();
-            warnUnsupportedOp(*(rec->getOpCtx()->getClient()), networkOpToString(op));
             uasserted(5745705, "OP_UPDATE is no longer supported");
         case dbDelete:
-            globalOpCounters.gotDeleteDeprecated();
-            warnUnsupportedOp(*(rec->getOpCtx()->getClient()), networkOpToString(op));
             uasserted(5745704, "OP_DELETE is no longer supported");
         default:
             MONGO_UNREACHABLE;
@@ -177,9 +165,23 @@ Future<DbResponse> HandleRequest::handleRequest() {
 
 void HandleRequest::onSuccess(const DbResponse& dbResponse) {
     auto opCtx = rec->getOpCtx();
+    const auto currentOp = CurOp::get(opCtx);
+
     // Mark the op as complete, populate the response length, and log it if appropriate.
-    CurOp::get(opCtx)->completeAndLogOperation(
-        opCtx, logv2::LogComponent::kCommand, dbResponse.response.size(), slowMsOverride);
+    currentOp->completeAndLogOperation(
+        logv2::LogComponent::kCommand,
+        CollectionCatalog::get(opCtx)
+            ->getDatabaseProfileSettings(currentOp->getNSS().dbName())
+            .filter,
+        dbResponse.response.size(),
+        slowMsOverride);
+
+    // Update the source of stats shown in the db.serverStatus().opLatencies section.
+    Top::get(opCtx->getServiceContext())
+        .incrementGlobalLatencyStats(
+            opCtx,
+            durationCount<Microseconds>(currentOp->elapsedTimeExcludingPauses()),
+            currentOp->getReadWriteType());
 }
 
 Future<DbResponse> HandleRequest::run() {

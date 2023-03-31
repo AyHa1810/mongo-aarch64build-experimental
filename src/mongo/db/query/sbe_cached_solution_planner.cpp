@@ -52,69 +52,42 @@ CandidatePlans CachedSolutionPlanner::plan(
     std::vector<std::unique_ptr<QuerySolution>> solutions,
     std::vector<std::pair<std::unique_ptr<PlanStage>, stage_builder::PlanStageData>> roots) {
     if (!_cq.pipeline().empty()) {
-        // When "featureFlagSbeFull" is enabled we use the SBE plan cache. If the plan cache is
-        // enabled we'd like to check if there is any foreign collection in the hash_lookup stage
-        // that is no longer eligible for it. In this case we invalidate the cache and immediately
-        // replan without ever running a trial period.
+        // We'd like to check if there is any foreign collection in the hash_lookup stage that is no
+        // longer eligible for using a hash_lookup plan. In this case we invalidate the cache and
+        // immediately replan without ever running a trial period.
         auto secondaryCollectionsInfo =
             fillOutSecondaryCollectionsInformation(_opCtx, _collections, &_cq);
 
-        if (feature_flags::gFeatureFlagSbeFull.isEnabledAndIgnoreFCV()) {
-            for (const auto& foreignCollection : roots[0].second.foreignHashJoinCollections) {
-                const auto collectionInfo = secondaryCollectionsInfo.find(foreignCollection);
-                tassert(6693500,
-                        "Foreign collection must be present in the collections info",
-                        collectionInfo != secondaryCollectionsInfo.end());
-                tassert(6693501, "Foreign collection must exist", collectionInfo->second.exists);
+        for (const auto& foreignCollection : roots[0].second.foreignHashJoinCollections) {
+            const auto collectionInfo = secondaryCollectionsInfo.find(foreignCollection);
+            tassert(6693500,
+                    "Foreign collection must be present in the collections info",
+                    collectionInfo != secondaryCollectionsInfo.end());
+            tassert(6693501, "Foreign collection must exist", collectionInfo->second.exists);
 
-                if (!QueryPlannerAnalysis::isEligibleForHashJoin(collectionInfo->second)) {
-                    return replan(/* shouldCache */ true,
-                                  str::stream() << "Foreign collection " << foreignCollection
-                                                << " is not eligible for hash join anymore");
-                }
+            if (!QueryPlannerAnalysis::isEligibleForHashJoin(collectionInfo->second)) {
+                return replan(/* shouldCache */ true,
+                              str::stream() << "Foreign collection " << foreignCollection
+                                            << " is not eligible for hash join anymore");
             }
-        } else {
-            // The SBE plan cache is not enabled. If the cached plan is accepted we'd like to keep
-            // the results from the trials even if there are parts of agg pipelines being lowered
-            // into SBE, so we run the trial with the extended plan. This works because
-            // TrialRunTracker, attached to HashAgg stage in $group queries, tracks as "results" the
-            // results of its child stage. For $lookup queries, the TrialRunTracker will only track
-            // the number of reads from the local side. Thus, we can use the number of reads the
-            // plan was cached with during multiplanning even though multiplanning ran trials of
-            // pre-extended plans.
-            //
-            // The SBE plan cache stores the entire plan, including the part for any agg pipeline
-            // pushed down to SBE. Therefore, this logic is only necessary when "featureFlagSbeFull"
-            // is disabled.
-            _yieldPolicy->clearRegisteredPlans();
-            solutions[0] = QueryPlanner::extendWithAggPipeline(
-                _cq, std::move(solutions[0]), secondaryCollectionsInfo);
-            roots[0] = stage_builder::buildSlotBasedExecutableTree(
-                _opCtx, _collections, _cq, *solutions[0], _yieldPolicy);
         }
     }
-
     // If the '_decisionReads' is not present then we do not run a trial period, keeping the current
     // plan.
     if (!_decisionReads) {
-        const auto status = prepareExecutionPlan(
-            roots[0].first.get(), &roots[0].second, true /* preparingFromCache */);
-        uassertStatusOK(status);
-        bool exitedEarly;
-
-        // Discarding SlotAccessor pointers as they will be reacquired later.
-        std::tie(std::ignore, std::ignore, exitedEarly) = status.getValue();
-        tassert(
-            6693502, "TrialRunTracker is not attached therefore can not exit early", !exitedEarly);
-        return {makeVector(plan_ranker::CandidatePlan{std::move(solutions[0]),
-                                                      std::move(roots[0].first),
-                                                      std::move(roots[0].second),
-                                                      false /* exitedEarly*/,
-                                                      Status::OK()}),
+        prepareExecutionPlan(roots[0].first.get(), &roots[0].second, true /* preparingFromCache */);
+        roots[0].first->open(false /* reOpen */);
+        return {makeVector(plan_ranker::CandidatePlan{
+                    std::move(solutions[0]),
+                    std::move(roots[0].first),
+                    plan_ranker::CandidatePlanData{std::move(roots[0].second)},
+                    false /* exitedEarly*/,
+                    Status::OK(),
+                    true /*isFromPlanCache */}),
                 0};
     }
 
-    const size_t maxReadsBeforeReplan = internalQueryCacheEvictionRatio * _decisionReads.get();
+    const size_t maxReadsBeforeReplan = internalQueryCacheEvictionRatio * _decisionReads.value();
 
     // In cached solution planning we collect execution stats with an upper bound on reads allowed
     // per trial run computed based on previous decision reads. If the trial run ends before
@@ -124,16 +97,18 @@ CandidatePlans CachedSolutionPlanner::plan(
                                                         std::move(roots[0].first),
                                                         std::move(roots[0].second),
                                                         maxReadsBeforeReplan);
+
     auto explainer = plan_explainer_factory::make(
         candidate.root.get(),
-        &candidate.data,
+        &candidate.data.stageData,
         candidate.solution.get(),
         {},    /* optimizedData */
         {},    /* rejectedCandidates */
         false, /* isMultiPlan */
-        candidate.data.debugInfo
-            ? std::make_unique<plan_cache_debug_info::DebugInfoSBE>(*candidate.data.debugInfo)
-            : nullptr);
+        true,  /* isFromPlanCache */
+        candidate.data.stageData.debugInfo ? std::make_unique<plan_cache_debug_info::DebugInfoSBE>(
+                                                 *candidate.data.stageData.debugInfo)
+                                           : nullptr);
 
     if (!candidate.status.isOK()) {
         // On failure, fall back to replanning the whole query. We neither evict the existing cache
@@ -183,10 +158,11 @@ plan_ranker::CandidatePlan CachedSolutionPlanner::collectExecutionStatsForCached
 
     plan_ranker::CandidatePlan candidate{std::move(solution),
                                          std::move(root),
-                                         std::move(data),
+                                         plan_ranker::CandidatePlanData{std::move(data)},
                                          false /* exitedEarly*/,
-                                         Status::OK()};
-
+                                         Status::OK(),
+                                         true,
+                                         /*is Cached plan*/};
     ON_BLOCK_EXIT([rootPtr = candidate.root.get()] { rootPtr->detachFromTrialRunTracker(); });
 
     // Callback for the tracker when it exceeds any of the tracked metrics. If the tracker exceeds
@@ -208,10 +184,10 @@ plan_ranker::CandidatePlan CachedSolutionPlanner::collectExecutionStatsForCached
                 MONGO_UNREACHABLE;
         }
     };
-    auto tracker = std::make_unique<TrialRunTracker>(
+    candidate.data.tracker = std::make_unique<TrialRunTracker>(
         std::move(onMetricReached), maxNumResults, maxTrialPeriodNumReads);
-    candidate.root->attachToTrialRunTracker(tracker.get());
-    executeCandidateTrial(&candidate, maxNumResults, /*isCachedPlanTrial*/ true);
+    candidate.root->attachToTrialRunTracker(candidate.data.tracker.get());
+    executeCachedCandidateTrial(&candidate, maxNumResults);
 
     return candidate;
 }
@@ -222,18 +198,9 @@ CandidatePlans CachedSolutionPlanner::replan(bool shouldCache, std::string reaso
     _yieldPolicy->clearRegisteredPlans();
 
     if (shouldCache) {
-        const auto& mainColl = _collections.getMainCollection();
         // Deactivate the current cache entry.
-        //
-        // TODO SERVER-64882: We currently deactivate cache entries in both the classic and SBE plan
-        // caches. Once we always use the SBE plan cache for queries eligible for SBE, this code can
-        // be simplified to only deactivate the entry in the SBE plan cache.
-        auto cache = CollectionQueryInfo::get(mainColl).getPlanCache();
-        cache->deactivate(plan_cache_key_factory::make<mongo::PlanCacheKey>(_cq, mainColl));
-        if (feature_flags::gFeatureFlagSbeFull.isEnabledAndIgnoreFCV()) {
-            auto&& sbePlanCache = sbe::getPlanCache(_opCtx);
-            sbePlanCache.deactivate(plan_cache_key_factory::make(_cq, _collections));
-        }
+        auto&& sbePlanCache = sbe::getPlanCache(_opCtx);
+        sbePlanCache.deactivate(plan_cache_key_factory::make(_cq, _collections));
     }
 
     auto buildExecutableTree = [&](const QuerySolution& sol) {
@@ -260,11 +227,8 @@ CandidatePlans CachedSolutionPlanner::replan(bool shouldCache, std::string reaso
 
         // Only one possible plan. Build the stages from the solution.
         auto [root, data] = buildExecutableTree(*solutions[0]);
-        auto status = prepareExecutionPlan(root.get(), &data);
-        uassertStatusOK(status);
-        auto [result, recordId, exitedEarly] = status.getValue();
-        tassert(
-            5323800, "cached planner unexpectedly exited early during prepare phase", !exitedEarly);
+        prepareExecutionPlan(root.get(), &data, false /*preparingFromCache*/);
+        root->open(false /* reOpen */);
 
         auto explainer = plan_explainer_factory::make(root.get(), &data, solutions[0].get());
         LOGV2_DEBUG(2058101,
@@ -292,7 +256,7 @@ CandidatePlans CachedSolutionPlanner::replan(bool shouldCache, std::string reaso
     MultiPlanner multiPlanner{_opCtx, _collections, _cq, plannerParams, cachingMode, _yieldPolicy};
     auto&& [candidates, winnerIdx] = multiPlanner.plan(std::move(solutions), std::move(roots));
     auto explainer = plan_explainer_factory::make(candidates[winnerIdx].root.get(),
-                                                  &candidates[winnerIdx].data,
+                                                  &candidates[winnerIdx].data.stageData,
                                                   candidates[winnerIdx].solution.get());
     LOGV2_DEBUG(2058201,
                 1,

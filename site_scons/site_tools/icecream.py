@@ -29,7 +29,7 @@ from pkg_resources import parse_version
 
 import SCons
 
-_icecream_version_min = parse_version("1.1rc2")
+_icecream_version_min = parse_version("1.3")
 _icecream_version_gcc_remote_cpp = parse_version("1.2")
 
 
@@ -84,13 +84,6 @@ def icecc_create_env(env, target, source, for_signature):
 
 
 def generate(env):
-    # icecc lower then 1.1 supports addfile remapping accidentally
-    # and above it adds an empty cpuinfo so handle cpuinfo issues for icecream
-    # below version 1.1
-    if (env['ICECREAM_VERSION'] <= parse_version('1.1') and env.ToolchainIs("clang")
-            and os.path.exists('/proc/cpuinfo')):
-        env.AppendUnique(ICECC_CREATE_ENV_ADDFILES=[('/proc/cpuinfo', '/dev/null')])
-
     # Absoluteify, so we can derive ICERUN
     env["ICECC"] = env.WhereIs("$ICECC")
 
@@ -564,16 +557,16 @@ def exists(env):
     else:
         icerun = env.File("$ICECC").File("icerun")
     if not icerun:
-        print(f"Error: the icerun wrapper does not exist at {icerun} as expected")
+        print(f"Error: the icerun wrapper does not exist which is needed for icecream")
+        return False
 
     if "ICECC_CREATE_ENV" in env:
         icecc_create_env_bin = env.WhereIs("$ICECC_CREATE_ENV")
     else:
         icecc_create_env_bin = env.File("ICECC").File("icecc-create-env")
     if not icecc_create_env_bin:
-        print(
-            f"Error: the icecc-create-env utility does not exist at {icecc_create_env_bin} as expected"
-        )
+        print(f"Error: the icecc-create-env utility does not exist which is needed for icecream")
+        return False
 
     for line in pipe.stdout:
         line = line.decode("utf-8")
@@ -585,15 +578,14 @@ def exists(env):
         icecc_version = re.split("ICECC (.+)", line)
         if len(icecc_version) < 2:
             continue
-        icecc_version = parse_version(icecc_version[1])
-        if icecc_version >= _icecream_version_min:
+        icecc_current_version = parse_version(icecc_version[1])
+        if icecc_current_version >= _icecream_version_min:
             validated = True
-
-    if validated:
-        env['ICECREAM_VERSION'] = icecc_version
-    else:
+    if icecc_current_version:
+        env['ICECREAM_VERSION'] = icecc_current_version
+    if not validated:
         print(
-            f"Error: failed to verify icecream version >= {_icecream_version_min}, found {icecc_version}"
+            f"Error: failed to verify icecream version >= {_icecream_version_min}, found {icecc_current_version}"
         )
 
     return validated

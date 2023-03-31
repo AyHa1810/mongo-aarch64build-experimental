@@ -34,7 +34,6 @@
 
 #include <fmt/format.h>
 
-#include "mongo/db/catalog/catalog_helper.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/shard_filterer_impl.h"
@@ -52,6 +51,7 @@
 #include "mongo/s/cluster_write.h"
 #include "mongo/s/query/document_source_merge_cursors.h"
 #include "mongo/s/router.h"
+#include "mongo/s/shard_version_factory.h"
 #include "mongo/s/stale_shard_version_helpers.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
@@ -62,7 +62,7 @@ namespace mongo {
 using namespace fmt::literals;
 
 bool ShardServerProcessInterface::isSharded(OperationContext* opCtx, const NamespaceString& nss) {
-    const auto cm =
+    const auto [cm, _] =
         uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
     return cm.isSharded();
 }
@@ -70,26 +70,35 @@ bool ShardServerProcessInterface::isSharded(OperationContext* opCtx, const Names
 void ShardServerProcessInterface::checkRoutingInfoEpochOrThrow(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const NamespaceString& nss,
-    ChunkVersion targetCollectionVersion) const {
+    ChunkVersion targetCollectionPlacementVersion) const {
     auto const shardId = ShardingState::get(expCtx->opCtx)->shardId();
     auto* catalogCache = Grid::get(expCtx->opCtx)->catalogCache();
 
+    // Since we are only checking the epoch, don't advance the time in store of the index cache
+    auto currentShardingIndexCatalogInfo =
+        uassertStatusOK(catalogCache->getCollectionRoutingInfo(expCtx->opCtx, nss)).sii;
+
     // Mark the cache entry routingInfo for the 'nss' and 'shardId' if the entry is staler than
-    // 'targetCollectionVersion'.
+    // 'targetCollectionPlacementVersion'.
+    const ShardVersion ignoreIndexVersion = ShardVersionFactory::make(
+        targetCollectionPlacementVersion,
+        currentShardingIndexCatalogInfo
+            ? boost::make_optional(currentShardingIndexCatalogInfo->getCollectionIndexes())
+            : boost::none);
     catalogCache->invalidateShardOrEntireCollectionEntryForShardedCollection(
-        nss, targetCollectionVersion, shardId);
+        nss, ignoreIndexVersion, shardId);
 
     const auto routingInfo =
-        uassertStatusOK(catalogCache->getCollectionRoutingInfo(expCtx->opCtx, nss));
+        uassertStatusOK(catalogCache->getCollectionRoutingInfo(expCtx->opCtx, nss)).cm;
 
     const auto foundVersion =
         routingInfo.isSharded() ? routingInfo.getVersion() : ChunkVersion::UNSHARDED();
 
     uassert(StaleEpochInfo(nss),
             str::stream() << "Could not act as router for " << nss.ns() << ", wanted "
-                          << targetCollectionVersion.toString() << ", but found "
+                          << targetCollectionPlacementVersion.toString() << ", but found "
                           << foundVersion.toString(),
-            foundVersion.isSameCollection(targetCollectionVersion));
+            foundVersion.isSameCollection(targetCollectionPlacementVersion));
 }
 
 boost::optional<Document> ShardServerProcessInterface::lookupSingleDocument(
@@ -161,16 +170,6 @@ BSONObj ShardServerProcessInterface::preparePipelineAndExplain(
     return sharded_agg_helpers::targetShardsForExplain(ownedPipeline);
 }
 
-std::unique_ptr<ShardFilterer> ShardServerProcessInterface::getShardFilterer(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx) const {
-    auto collectionFilter =
-        CollectionShardingState::get(expCtx->opCtx, expCtx->ns)
-            ->getOwnershipFilter(
-                expCtx->opCtx,
-                CollectionShardingState::OrphanCleanupPolicy::kDisallowOrphanCleanup);
-    return std::make_unique<ShardFiltererImpl>(std::move(collectionFilter));
-}
-
 void ShardServerProcessInterface::renameIfOptionsAndIndexesHaveNotChanged(
     OperationContext* opCtx,
     const NamespaceString& sourceNs,
@@ -190,7 +189,7 @@ void ShardServerProcessInterface::renameIfOptionsAndIndexesHaveNotChanged(
     auto response =
         executeCommandAgainstDatabasePrimary(opCtx,
                                              // internalRenameIfOptionsAndIndexesMatch is adminOnly.
-                                             NamespaceString::kAdminDb,
+                                             DatabaseName::kAdmin.db(),
                                              std::move(cachedDbInfo),
                                              newCmdObj,
                                              ReadPreferenceSetting(ReadPreference::PrimaryOnly),
@@ -390,6 +389,24 @@ ShardServerProcessInterface::attachCursorSourceToPipeline(Pipeline* ownedPipelin
         ownedPipeline, shardTargetingPolicy, std::move(readConcern));
 }
 
+std::unique_ptr<Pipeline, PipelineDeleter>
+ShardServerProcessInterface::attachCursorSourceToPipeline(
+    const AggregateCommandRequest& aggRequest,
+    Pipeline* pipeline,
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    boost::optional<BSONObj> shardCursorsSortSpec,
+    ShardTargetingPolicy shardTargetingPolicy,
+    boost::optional<BSONObj> readConcern) {
+    std::unique_ptr<Pipeline, PipelineDeleter> targetPipeline(pipeline,
+                                                              PipelineDeleter(expCtx->opCtx));
+    return sharded_agg_helpers::targetShardsAndAddMergeCursors(
+        expCtx,
+        std::make_pair(aggRequest, std::move(targetPipeline)),
+        shardCursorsSortSpec,
+        shardTargetingPolicy,
+        std::move(readConcern));
+}
+
 std::unique_ptr<MongoProcessInterface::ScopedExpectUnshardedCollection>
 ShardServerProcessInterface::expectUnshardedCollectionInScope(
     OperationContext* opCtx,
@@ -400,7 +417,7 @@ ShardServerProcessInterface::expectUnshardedCollectionInScope(
         ScopedExpectUnshardedCollectionImpl(OperationContext* opCtx,
                                             const NamespaceString& nss,
                                             const boost::optional<DatabaseVersion>& dbVersion)
-            : _expectUnsharded(opCtx, nss, ChunkVersion::UNSHARDED(), dbVersion) {}
+            : _expectUnsharded(opCtx, nss, ShardVersion::UNSHARDED(), dbVersion) {}
 
     private:
         ScopedSetShardRole _expectUnsharded;
@@ -411,7 +428,7 @@ ShardServerProcessInterface::expectUnshardedCollectionInScope(
 
 void ShardServerProcessInterface::checkOnPrimaryShardForDb(OperationContext* opCtx,
                                                            const NamespaceString& nss) {
-    catalog_helper::assertIsPrimaryShardForDb(opCtx, nss.db());
+    DatabaseShardingState::assertIsPrimaryShardForDb(opCtx, nss.db());
 }
 
 }  // namespace mongo

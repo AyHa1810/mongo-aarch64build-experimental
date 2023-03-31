@@ -33,10 +33,10 @@
 
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/commit_quorum_options.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/rollback.h"
+#include "mongo/db/transaction/transaction_operations.h"
 
 namespace mongo {
 
@@ -54,9 +54,6 @@ enum class RetryableFindAndModifyLocation {
 
     // Store the pre-image in the side collection.
     kSideCollection,
-
-    // Store the pre-image in the oplog.
-    kOplog,
 };
 
 /**
@@ -65,15 +62,14 @@ enum class RetryableFindAndModifyLocation {
 struct OplogUpdateEntryArgs {
     CollectionUpdateArgs* updateArgs;
 
-    NamespaceString nss;
-    UUID uuid;
+    const CollectionPtr& coll;
 
     // Specifies the pre-image recording option for retryable "findAndModify" commands.
     RetryableFindAndModifyLocation retryableFindAndModifyLocation =
         RetryableFindAndModifyLocation::kNone;
 
-    OplogUpdateEntryArgs(CollectionUpdateArgs* updateArgs, NamespaceString nss, UUID uuid)
-        : updateArgs(updateArgs), nss(std::move(nss)), uuid(std::move(uuid)) {}
+    OplogUpdateEntryArgs(CollectionUpdateArgs* updateArgs, const CollectionPtr& coll)
+        : updateArgs(updateArgs), coll(coll) {}
 };
 
 struct OplogDeleteEntryArgs {
@@ -82,7 +78,6 @@ struct OplogDeleteEntryArgs {
     // "fromMigrate" indicates whether the delete was induced by a chunk migration, and so
     // should be ignored by the user as an internal maintenance operation and not a real delete.
     bool fromMigrate = false;
-    bool preImageRecordingEnabledForCollection = false;
     bool changeStreamPreAndPostImagesEnabledForCollection = false;
 
     // Specifies the pre-image recording option for retryable "findAndModify" commands.
@@ -116,6 +111,8 @@ struct IndexCollModInfo {
  */
 class OpObserver {
 public:
+    using ApplyOpsOplogSlotAndOperationAssignment = TransactionOperations::ApplyOpsInfo;
+
     enum class CollectionDropType {
         // The collection is being dropped immediately, in one step.
         kOnePhase,
@@ -126,6 +123,20 @@ public:
     };
 
     virtual ~OpObserver() = default;
+
+    virtual void onModifyCollectionShardingIndexCatalog(OperationContext* opCtx,
+                                                        const NamespaceString& nss,
+                                                        const UUID& uuid,
+                                                        BSONObj indexDoc) = 0;
+
+    virtual void onCreateGlobalIndex(OperationContext* opCtx,
+                                     const NamespaceString& globalIndexNss,
+                                     const UUID& globalIndexUUID) = 0;
+
+    virtual void onDropGlobalIndex(OperationContext* opCtx,
+                                   const NamespaceString& globalIndexNss,
+                                   const UUID& globalIndexUUID,
+                                   long long numKeys) = 0;
 
     virtual void onCreateIndex(OperationContext* opCtx,
                                const NamespaceString& nss,
@@ -165,16 +176,38 @@ public:
                                    const Status& cause,
                                    bool fromMigrate) = 0;
 
+    /**
+     * 'fromMigrate' array contains settings for each insert operation and takes into
+     * account orphan documents.
+     * 'defaultFromMigrate' is the initial 'fromMigrate' value for the 'fromMigrate' array
+     * and is intended to be forwarded to downstream subsystems that expect a single
+     * 'fromMigrate' to describe the entire set of inserts.
+     * Examples: ShardServerOpObserver, UserWriteBlockModeOpObserver, and
+     * OpObserverShardingImpl::shardObserveInsertsOp().
+     */
     virtual void onInserts(OperationContext* opCtx,
-                           const NamespaceString& nss,
-                           const UUID& uuid,
+                           const CollectionPtr& coll,
                            std::vector<InsertStatement>::const_iterator begin,
                            std::vector<InsertStatement>::const_iterator end,
-                           bool fromMigrate) = 0;
+                           std::vector<bool> fromMigrate,
+                           bool defaultFromMigrate) = 0;
+
+    virtual void onInsertGlobalIndexKey(OperationContext* opCtx,
+                                        const NamespaceString& globalIndexNss,
+                                        const UUID& globalIndexUuid,
+                                        const BSONObj& key,
+                                        const BSONObj& docKey) = 0;
+
+    virtual void onDeleteGlobalIndexKey(OperationContext* opCtx,
+                                        const NamespaceString& globalIndexNss,
+                                        const UUID& globalIndexUuid,
+                                        const BSONObj& key,
+                                        const BSONObj& docKey) = 0;
+
     virtual void onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) = 0;
+
     virtual void aboutToDelete(OperationContext* opCtx,
-                               const NamespaceString& nss,
-                               const UUID& uuid,
+                               const CollectionPtr& coll,
                                const BSONObj& doc) = 0;
 
     /**
@@ -187,8 +220,7 @@ public:
      * opObserver must store the `deletedDoc` in addition to the documentKey.
      */
     virtual void onDelete(OperationContext* opCtx,
-                          const NamespaceString& nss,
-                          const UUID& uuid,
+                          const CollectionPtr& coll,
                           StmtId stmtId,
                           const OplogDeleteEntryArgs& args) = 0;
 
@@ -385,19 +417,21 @@ public:
                                const UUID& uuid) = 0;
 
     /**
+     * The onTransaction Start method is called at the beginning of a multi-document transaction.
+     * It must not be called when the transaction is already in progress.
+     */
+    virtual void onTransactionStart(OperationContext* opCtx) = 0;
+
+    /**
      * The onUnpreparedTransactionCommit method is called on the commit of an unprepared
      * transaction, before the RecoveryUnit onCommit() is called.  It must not be called when no
      * transaction is active.
      *
-     * The 'statements' are the list of CRUD operations to be applied in this transaction.
-     *
-     * The 'numberOfPrePostImagesToWrite' is the number of CRUD operations that have a pre-image
-     * to write as a noop oplog entry. The op observer will reserve oplog slots for these
-     * preimages in addition to the statements.
+     * The 'transactionOperations' contains the list of CRUD operations (formerly 'statements') to
+     * be applied in this transaction.
      */
-    virtual void onUnpreparedTransactionCommit(OperationContext* opCtx,
-                                               std::vector<repl::ReplOperation>* statements,
-                                               size_t numberOfPrePostImagesToWrite) = 0;
+    virtual void onUnpreparedTransactionCommit(
+        OperationContext* opCtx, const TransactionOperations& transactionOperations) = 0;
     /**
      * The onPreparedTransactionCommit method is called on the commit of a prepared transaction,
      * after the RecoveryUnit onCommit() is called.  It must not be called when no transaction is
@@ -423,8 +457,8 @@ public:
 
     /**
      * The write operations between onBatchedWriteStart() and onBatchedWriteCommit()
-     * are gathered in a single applyOps oplog entry, similar to atomic applyOps and
-     * multi-doc transactions, and written to the oplog.
+     * are gathered in a single applyOps oplog entry, similar to multi-doc transactions, and written
+     * to the oplog.
      */
     virtual void onBatchedWriteCommit(OperationContext* opCtx) = 0;
 
@@ -434,29 +468,6 @@ public:
      * should be fine for cleanup purposes.
      */
     virtual void onBatchedWriteAbort(OperationContext* opCtx) = 0;
-
-    /**
-     * Contains "applyOps" oplog entries and oplog slots to be used for writing pre- and post- image
-     * oplog entries for a transaction. "applyOps" entries are not actual "applyOps" entries to be
-     * written to the oplog, but comprise certain parts of those entries - BSON serialized
-     * operations, and the assigned oplog slot. The operations in field 'ApplyOpsEntry::operations'
-     * should be considered opaque outside the OpObserver.
-     */
-    struct ApplyOpsOplogSlotAndOperationAssignment {
-        struct ApplyOpsEntry {
-            OplogSlot oplogSlot;
-            std::vector<BSONObj> operations;
-        };
-
-        // Oplog slots to be used for writing pre- and post- image oplog entries.
-        std::vector<OplogSlot> prePostImageOplogEntryOplogSlots;
-
-        // Representation of "applyOps" oplog entries.
-        std::vector<ApplyOpsEntry> applyOpsEntries;
-
-        // Number of oplog slots utilized.
-        size_t numberOfOplogSlotsUsed;
-    };
 
     /**
      * This method is called before an atomic transaction is prepared. It must be called when a
@@ -470,21 +481,18 @@ public:
      * The 'reservedSlots' is a list of oplog slots reserved for the oplog entries in a transaction.
      * The last reserved slot represents the prepareOpTime used for the prepare oplog entry.
      *
-     * The 'numberOfPrePostImagesToWrite' is the number of CRUD operations that have a pre-image
-     * to write as a noop oplog entry.
-     *
      * The 'wallClockTime' is the time to record as wall clock time on oplog entries resulting from
      * transaction preparation.
      *
-     * The 'statements' are the list of CRUD operations to be applied in this transaction. The
-     * operations may be modified by setting pre-image and post-image oplog entry timestamps.
+     * The 'transactionOperations' contains the list of CRUD operations to be applied in this
+     * transaction. The operations may be modified by setting pre-image and post-image oplog entry
+     * timestamps.
      */
     virtual std::unique_ptr<ApplyOpsOplogSlotAndOperationAssignment> preTransactionPrepare(
         OperationContext* opCtx,
         const std::vector<OplogSlot>& reservedSlots,
-        size_t numberOfPrePostImagesToWrite,
-        Date_t wallClockTime,
-        std::vector<repl::ReplOperation>* statements) = 0;
+        const TransactionOperations& transactionOperations,
+        Date_t wallClockTime) = 0;
 
     /**
      * The onTransactionPrepare method is called when an atomic transaction is prepared. It must be
@@ -493,7 +501,8 @@ public:
      * 'reservedSlots' is a list of oplog slots reserved for the oplog entries in a transaction. The
      * last reserved slot represents the prepareOpTime used for the prepare oplog entry.
      *
-     * The 'statements' are the list of CRUD operations to be applied in this transaction.
+     * The 'transactionOperations' contains the list of CRUD operations to be applied in
+     * this transaction.
      *
      * The 'applyOpsOperationAssignment' contains a representation of "applyOps" entries and oplog
      * slots to be used for writing pre- and post- image oplog entries for a transaction. A value
@@ -509,10 +518,19 @@ public:
     virtual void onTransactionPrepare(
         OperationContext* opCtx,
         const std::vector<OplogSlot>& reservedSlots,
-        std::vector<repl::ReplOperation>* statements,
-        const ApplyOpsOplogSlotAndOperationAssignment* applyOpsOperationAssignment,
+        const TransactionOperations& transactionOperations,
+        const ApplyOpsOplogSlotAndOperationAssignment& applyOpsOperationAssignment,
         size_t numberOfPrePostImagesToWrite,
         Date_t wallClockTime) = 0;
+
+    /**
+     * This is called when a transaction transitions into prepare while it is not primary. Example
+     * case can include secondary oplog application or when node was restared and tries to
+     * recover prepared transactions from the oplog.
+     */
+    virtual void onTransactionPrepareNonPrimary(OperationContext* opCtx,
+                                                const std::vector<repl::OplogEntry>& statements,
+                                                const repl::OpTime& prepareOpTime) = 0;
 
     /**
      * The onTransactionAbort method is called when an atomic transaction aborts, before the

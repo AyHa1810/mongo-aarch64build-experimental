@@ -32,6 +32,7 @@ global:
     cpp_namespace: "mongo"
     cpp_includes:
         - "mongo/s/catalog/type_collection.h"
+        - "mongo/s/shard_version.h"
 
 imports:
     - "mongo/db/commands/rename_collection.idl"
@@ -40,11 +41,11 @@ imports:
     - "mongo/db/drop_database.idl"
     - "mongo/db/keypattern.idl"
     - "mongo/db/coll_mod.idl"
-    - "mongo/idl/basic_types.idl"
-    - "mongo/s/chunk_version.idl"
+    - "mongo/db/basic_types.idl"
     - "mongo/s/sharding_types.idl"
     - "mongo/s/resharding/common_types.idl"
     - "mongo/db/timeseries/timeseries.idl"
+    - "mongo/db/query/cursor_response.idl"
 
 types:
     CollectionType:
@@ -73,6 +74,7 @@ structs:
     ConfigsvrCreateDatabaseResponse:
         description: "Response for the create database command"
         strict: false
+        is_command_reply: true
         fields:
             databaseVersion:
                 type: database_version
@@ -108,9 +110,10 @@ structs:
     RenameCollectionResponse:
         description: "Response for the rename collection command"
         strict: false
+        is_command_reply: true
         fields:
             collectionVersion:
-                type: ChunkVersion
+                type: shard_version
                 description: "Latest version of the collection"
                 optional: false
 
@@ -139,12 +142,6 @@ structs:
                     True if the chunks should be pre-split based on the existing zones when
                     sharding a collection with hashed shard key.
                 optional: true
-            initialSplitPoints:
-                type: array<object_owned>
-                description: >-
-                    A specific set of points to create initial splits at, currently used only by
-                    mapReduce.
-                optional: true
             timeseries:
                 description: "The options to create the time-series collection with."
                 type: TimeseriesOptions
@@ -170,13 +167,14 @@ structs:
     CreateCollectionResponse:
         description: "Response of the create collection command"
         strict: false
+        is_command_reply: true
         fields:
             collectionUUID:
                 type: uuid
                 description: "UUID of the created collection"
                 optional: true
             collectionVersion:
-                type: ChunkVersion
+                type: shard_version
                 description: "Latest version of the collection"
                 optional: false
 
@@ -277,6 +275,26 @@ commands:
                 type: object
                 description: "Id index."
 
+    _shardsvrCreateGlobalIndex:
+        description: "Internal command sent to participant shards to create a global index container with a given UUID."
+        command_name: _shardsvrCreateGlobalIndex
+        cpp_name: CreateGlobalIndex
+        strict: true
+        type: uuid
+        namespace: type
+        api_version: ""
+        reply_type: OkReply
+
+    _shardsvrDropGlobalIndex:
+        description: "Internal command sent to participant shards to drop a global index container with a given UUID."
+        command_name: _shardsvrDropGlobalIndex
+        cpp_name: DropGlobalIndex
+        strict: true
+        type: uuid
+        namespace: type
+        api_version: ""
+        reply_type: OkReply
+
     _shardsvrDropDatabase:
         description: "Internal command sent to the primary shard of a database to drop it."
         command_name: _shardsvrDropDatabase
@@ -312,6 +330,11 @@ commands:
         api_version: ""
         cpp_name: ShardsvrDropCollectionParticipant
         strict: false
+        fields:
+            fromMigrate: 
+                type: bool 
+                description: "Whether the drop comes as a result of an interrupted migration process."
+                optional: true
 
     _shardsvrRenameCollection:
         command_name: _shardsvrRenameCollection
@@ -375,6 +398,24 @@ commands:
         strict: false
         chained_structs:
             RefineCollectionShardKeyRequest: RefineCollectionShardKeyRequest
+    
+    _shardsvrValidateShardKeyCandidate:
+        description: "Command run on shards to ensure we have a viable key to refine the shard key."
+        command_name: _shardsvrValidateShardKeyCandidate
+        cpp_name: ShardsvrValidateShardKeyCandidate
+        strict: false
+        namespace: type
+        api_version: ""
+        type: namespacestring
+        fields:
+            key:
+                type: KeyPattern
+                description: "The index specification document to use as the new shard key."
+                optional: false
+            enforceUniquenessCheck:
+                description: >-
+                    Verifies that the shard key index has the same unique setting as the command.
+                type: optionalBool
 
     _configsvrRefineCollectionShardKey:
         command_name: _configsvrRefineCollectionShardKey
@@ -473,6 +514,66 @@ commands:
             clusterParameterTime:
                 type: timestamp
                 description: "Time that will be associated with the cluster parameter"
+
+    _shardsvrCheckMetadataConsistency:
+        description: "Internal command sent to the primary shard of a database to check metadata 
+                      consistency."
+        command_name: _shardsvrCheckMetadataConsistency
+        cpp_name: ShardsvrCheckMetadataConsistency
+        namespace: concatenate_with_db
+        allow_global_collection_name: true
+        api_version: ""
+        reply_type: CursorInitialReply
+        strict: false
+        fields:
+            cursor:
+                type: SimpleCursorOptions
+                optional: true
+
+    _shardsvrCheckMetadataConsistencyParticipant:
+        description: "Internal command sent to participants shards to check metadata consistency."
+        command_name: _shardsvrCheckMetadataConsistencyParticipant
+        cpp_name: ShardsvrCheckMetadataConsistencyParticipant
+        namespace: concatenate_with_db
+        allow_global_collection_name: true
+        api_version: ""
+        reply_type: CursorInitialReply
+        strict: false
+        fields:
+            cursor:
+                type: SimpleCursorOptions
+                optional: true
+            primaryShardId:
+                description: "The shard id of the db primary shard"
+                type: shard_id
+
+    _configsvrCheckClusterMetadataConsistency:
+          description: "Internal command sent to the config server to check cluster metadata 
+                        consistency."
+          command_name: _configsvrCheckClusterMetadataConsistency
+          cpp_name: ConfigsvrCheckClusterMetadataConsistency
+          namespace: ignored
+          api_version: ""
+          reply_type: CursorInitialReply
+          strict: false
+          fields:
+              cursor:
+                  type: SimpleCursorOptions
+                  optional: true
+                  
+    _configsvrCheckMetadataConsistency:
+         description: "Internal command sent to the config server to check metadata consistency."
+         command_name: _configsvrCheckMetadataConsistency
+         cpp_name: ConfigsvrCheckMetadataConsistency
+         namespace: concatenate_with_db
+         allow_global_collection_name: true
+         api_version: ""
+         reply_type: CursorInitialReply
+         strict: false
+         fields:
+             cursor:
+                 type: SimpleCursorOptions
+                 optional: true
 
     _configsvrSetClusterParameter:
         command_name: _configsvrSetClusterParameter

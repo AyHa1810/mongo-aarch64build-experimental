@@ -155,6 +155,7 @@ public:
         void explain(OperationContext* opCtx,
                      ExplainOptions::Verbosity verbosity,
                      rpc::ReplyBuilderInterface* result) override {
+            Impl::checkCanExplainHere(opCtx);
             auto bodyBuilder = result->getBodyBuilder();
             _runAggCommand(opCtx, _dbName, _request.body, &bodyBuilder);
         }
@@ -181,6 +182,10 @@ public:
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
+    }
+
+    ReadWriteType getReadWriteType() const override {
+        return ReadWriteType::kRead;
     }
 
     bool adminOnly() const override {

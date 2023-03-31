@@ -89,6 +89,7 @@ std::unique_ptr<PlanStage> ClassicStageBuilder::build(const QuerySolutionNode* r
             params.resumeAfterRecordId = csn->resumeAfterRecordId;
             params.stopApplyingFilterAfterFirstMatch = csn->stopApplyingFilterAfterFirstMatch;
             params.boundInclusion = csn->boundInclusion;
+            params.lowPriority = csn->lowPriority;
             return std::make_unique<CollectionScan>(
                 expCtx, _collection, params, _ws, csn->filter.get());
         }
@@ -109,7 +110,8 @@ std::unique_ptr<PlanStage> ClassicStageBuilder::build(const QuerySolutionNode* r
                                    ixn->index.identifier.catalogName,
                                    ixn->index.keyPattern,
                                    ixn->index.multikeyPaths,
-                                   ixn->index.multikey};
+                                   ixn->index.multikey,
+                                   ixn->lowPriority};
             params.bounds = ixn->bounds;
             params.direction = ixn->direction;
             params.addKeyMetadata = ixn->addKeyMetadata;
@@ -322,10 +324,11 @@ std::unique_ptr<PlanStage> ClassicStageBuilder::build(const QuerySolutionNode* r
             const ShardingFilterNode* fn = static_cast<const ShardingFilterNode*>(root);
             auto childStage = build(fn->children[0].get());
 
-            auto css = CollectionShardingState::get(_opCtx, _collection->ns());
+            auto scopedCss = CollectionShardingState::assertCollectionLockedAndAcquire(
+                _opCtx, _collection->ns());
             return std::make_unique<ShardFilterStage>(
                 expCtx,
-                css->getOwnershipFilter(
+                scopedCss->getOwnershipFilter(
                     _opCtx, CollectionShardingState::OrphanCleanupPolicy::kDisallowOrphanCleanup),
                 _ws,
                 std::move(childStage));
@@ -420,6 +423,8 @@ std::unique_ptr<PlanStage> ClassicStageBuilder::build(const QuerySolutionNode* r
         case STAGE_TRIAL:
         case STAGE_UNKNOWN:
         case STAGE_UNPACK_TIMESERIES_BUCKET:
+        case STAGE_TIMESERIES_MODIFY:
+        case STAGE_SPOOL:
         case STAGE_SENTINEL:
         case STAGE_COLUMN_SCAN:
         case STAGE_UPDATE: {

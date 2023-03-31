@@ -41,7 +41,6 @@
 #include "mongo/db/pipeline/plan_executor_pipeline.h"
 #include "mongo/db/query/explain_options.h"
 #include "mongo/db/write_concern_options.h"
-#include "mongo/idl/basic_types_gen.h"
 
 namespace mongo {
 
@@ -85,13 +84,13 @@ StatusWith<AggregateCommandRequest> parseFromBSONForTests(
  * name and command object.
  */
 AggregateCommandRequest parseFromBSON(OperationContext* opCtx,
-                                      const std::string& dbName,
+                                      const DatabaseName& dbName,
                                       const BSONObj& cmdObj,
                                       boost::optional<ExplainOptions::Verbosity> explainVerbosity,
                                       bool apiStrict);
 
 StatusWith<AggregateCommandRequest> parseFromBSONForTests(
-    const std::string& dbName,
+    const DatabaseName& dbName,
     const BSONObj& cmdObj,
     boost::optional<ExplainOptions::Verbosity> explainVerbosity = boost::none,
     bool apiStrict = false);
@@ -101,7 +100,7 @@ StatusWith<AggregateCommandRequest> parseFromBSONForTests(
  * number 1. In the latter case, returns a reserved namespace that does not represent a user
  * collection. See 'NamespaceString::makeCollectionlessAggregateNSS()'.
  */
-NamespaceString parseNs(const std::string& dbname, const BSONObj& cmdObj);
+NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj);
 
 /**
  * Serializes the options to a Document. Note that this serialization includes the original
@@ -122,6 +121,11 @@ BSONObj serializeToCommandObj(const AggregateCommandRequest& request);
  */
 void validateRequestForAPIVersion(const OperationContext* opCtx,
                                   const AggregateCommandRequest& request);
+/**
+ * Validates if 'AggregateCommandRequest' sets the "isClusterQueryWithoutShardKeyCmd" field then the
+ * request must have been fromMongos.
+ */
+void validateRequestFromClusterQueryWithoutShardKey(const AggregateCommandRequest& request);
 
 /**
  * Returns the type of resumable scan required by this aggregation, if applicable. Otherwise returns

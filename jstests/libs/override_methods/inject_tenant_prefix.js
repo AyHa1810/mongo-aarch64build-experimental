@@ -18,6 +18,10 @@ const originalCloseMethod = Mongo.prototype.close;
 // multiple internal routing connections for the lifetime of the test execution.
 const initialConn = db.getMongo();
 
+const testTenantMigrationDB = "testTenantMigration";
+// For shard merge we need to use the local DB that is not blocked by tenant access blockers.
+const localDB = "local";
+
 /**
  * Asserts that the provided connection is an internal routing connection, not the top-level proxy
  * connection. The proxy connection also has an internal routing connection, so it is excluded from
@@ -78,9 +82,9 @@ function closeRoutingConnection(conn) {
 }
 
 /**
- * @returns Whether we are currently running a shard split passthrough.
+ * @returns Whether we are currently running an operation with multiple tenants.
  */
-function isShardSplitPassthrough() {
+function usingMultipleTenants() {
     return !!TestData.tenantIds;
 }
 
@@ -104,7 +108,7 @@ function prependTenantIdToDbNameIfApplicable(dbName) {
 
     let prefix;
     // If running shard split passthroughs, then assign a database to a randomly selected tenant
-    if (isShardSplitPassthrough()) {
+    if (usingMultipleTenants()) {
         if (!kTenantPrefixMap[dbName]) {
             const tenantId =
                 TestData.tenantIds[Math.floor(Math.random() * TestData.tenantIds.length)];
@@ -138,7 +142,7 @@ function prependTenantIdToNsIfApplicable(ns) {
  * Remove a tenant prefix from the provided database name, if applicable.
  */
 function extractOriginalDbName(dbName) {
-    if (isShardSplitPassthrough()) {
+    if (usingMultipleTenants()) {
         const anyTenantPrefixOnceRegex = new RegExp(Object.values(kTenantPrefixMap).join('|'), '');
         return dbName.replace(anyTenantPrefixOnceRegex, "");
     }
@@ -159,13 +163,20 @@ function extractOriginalNs(ns) {
  * Removes all occurrences of a tenant prefix in the provided string.
  */
 function removeTenantIdFromString(string) {
-    if (isShardSplitPassthrough()) {
+    if (usingMultipleTenants()) {
         const anyTenantPrefixGlobalRegex =
             new RegExp(Object.values(kTenantPrefixMap).join('|'), 'g');
         return string.replace(anyTenantPrefixGlobalRegex, "");
     }
 
     return string.replace(new RegExp(`${TestData.tenantId}_`, 'g'), "");
+}
+
+/**
+ * @returns Whether we are running a shard split passthrough.
+ */
+function isShardSplitPassthrough() {
+    return !!TestData.splitPassthrough;
 }
 
 /**
@@ -436,10 +447,16 @@ function convertServerConnectionStringToURI(input) {
  */
 function getOperationStateDocument(conn) {
     const collection = isShardSplitPassthrough() ? "shardSplitDonors" : "tenantMigrationDonors";
-    const filter =
-        isShardSplitPassthrough() ? {tenantIds: TestData.tenantIds} : {tenantId: TestData.tenantId};
+    let filter = {tenantId: TestData.tenantId};
+    if (usingMultipleTenants()) {
+        let tenantIds = [];
+        TestData.tenantIds.forEach(tenantId => tenantIds.push(ObjectId(tenantId)));
+        filter = {tenantIds: tenantIds};
+    }
+
     const findRes = assert.commandWorked(
         originalRunCommand.apply(conn, ["config", {find: collection, filter}, 0]));
+
     const docs = findRes.cursor.firstBatch;
     // There should only be one active migration at any given time.
     assert.eq(docs.length, 1, tojson(docs));
@@ -455,15 +472,16 @@ function getOperationStateDocument(conn) {
 
 /**
  * Marks the outgoing tenant migration or shard split operation as having caused the shell to
- * reroute commands by inserting a document for it into the testTenantMigration.rerouted collection.
+ * reroute commands by inserting a document for it into the testTenantMigration.rerouted collection
+ * or local.rerouted collection for the shard merge protocol.
  */
 function recordRerouteDueToTenantMigration(conn, migrationStateDoc) {
     assertRoutingConnection(conn);
-
+    const dbToCheck = TestData.useLocalDBForDBCheck ? localDB : testTenantMigrationDB;
     while (true) {
         try {
             const res = originalRunCommand.apply(conn, [
-                "testTenantMigration",
+                dbToCheck,
                 {
                     insert: "rerouted",
                     documents: [{_id: migrationStateDoc._id}],
@@ -639,9 +657,10 @@ function runCommandRetryOnTenantMigrationErrors(
                 // After getting a TenantMigrationCommitted error, wait for the python test fixture
                 // to do a dbhash check on the donor and recipient primaries before we retry the
                 // command on the recipient.
+                const dbToCheck = TestData.useLocalDBForDBCheck ? localDB : testTenantMigrationDB;
                 assert.soon(() => {
                     let findRes = assert.commandWorked(originalRunCommand.apply(donorConnection, [
-                        "testTenantMigration",
+                        dbToCheck,
                         {
                             find: "dbhashCheck",
                             filter: {_id: migrationStateDoc._id},
@@ -736,6 +755,7 @@ Mongo.prototype.runCommand = function(dbName, cmdObj, options) {
  'isTLS',
  'getApiParameters',
  '_startSession',
+ '_refreshAccessToken',
  // Don't override this method, since it is never called directly in jstests. The expectation of is
  // that it will be run on the connection `Mongo.prototype.runCommand` chose.
  // '_runCommandImpl',

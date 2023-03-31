@@ -69,7 +69,7 @@ TEST(PcreTest, BadPatterns) {
         {"h)", Errc::ERROR_UNMATCHED_CLOSING_PARENTHESIS},
         {"h\\", Errc::ERROR_END_BACKSLASH},
     };
-    for (auto [in, err] : badPatterns) {
+    for (const auto& [in, err] : badPatterns) {
         Regex re{in};
         ASSERT_FALSE(!!re);
         ASSERT_EQ(re.error(), err);
@@ -124,7 +124,9 @@ TEST(PcreTest, RegexMoveAssign) {
 }
 
 TEST(PcreTest, CodeSize) {
-    auto reSize = [](std::string p) { return Regex{std::move(p)}.codeSize(); };
+    auto reSize = [](std::string p) {
+        return Regex{std::move(p)}.codeSize();
+    };
     ASSERT_LT(reSize(""), reSize("hi"));
     ASSERT_LT(reSize("hi"), reSize("^(hi)*|(\\d{45})$"));
 }

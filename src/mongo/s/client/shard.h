@@ -39,8 +39,8 @@
 #include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/executor/remote_command_response.h"
-#include "mongo/s/shard_id.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 
@@ -137,7 +137,11 @@ public:
      * (i.e. is safe to retry and has the potential to succeed next time).  The 'options' argument
      * describes whether the operation that generated the given code was idempotent, which affects
      * which codes are safe to retry on.
+     *
+     * isRetriableError() routes to either of the static functions depending on object type.
      */
+    static bool localIsRetriableError(ErrorCodes::Error code, RetryPolicy options);
+    static bool remoteIsRetriableError(ErrorCodes::Error code, RetryPolicy options);
     virtual bool isRetriableError(ErrorCodes::Error code, RetryPolicy options) = 0;
 
     /**

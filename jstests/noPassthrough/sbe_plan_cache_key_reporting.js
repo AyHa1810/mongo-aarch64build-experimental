@@ -20,8 +20,8 @@ assert.neq(conn, null, "mongod failed to start");
 const db = conn.getDB("plan_cache_key_reporting");
 const coll = db.coll;
 
-if (!checkSBEEnabled(db, ["featureFlagSbeFull"])) {
-    jsTest.log("Skipping test because SBE is not fully enabled");
+if (!checkSBEEnabled(db)) {
+    jsTest.log("Skipping test because SBE is not enabled");
     MongoRunner.stopMongod(conn);
     return;
 }
@@ -39,10 +39,10 @@ function setupCollection() {
 //
 // Calls 'setupCollection' before each run.
 function runTestAgainstSbeAndClassicEngines(testToRun) {
-    return ["sbe", "classic"].map((engine) => {
+    return ["trySbeEngine", "forceClassicEngine"].map((engine) => {
         setupCollection();
-        assert.commandWorked(db.adminCommand(
-            {setParameter: 1, internalQueryForceClassicEngine: engine === "classic"}));
+        assert.commandWorked(
+            db.adminCommand({setParameter: 1, internalQueryFrameworkControl: engine}));
         return testToRun(engine);
     });
 }
@@ -89,8 +89,8 @@ function assertQueryHashAndPlanCacheKey(sbe, classic) {
 
     assert.neq(sbe, null);
     assert.neq(classic, null);
-    assert.eq(sbe.queryExecutionEngine, "sbe", sbe);
-    assert.eq(classic.queryExecutionEngine, "classic", classic);
+    assert.eq(sbe.queryFramework, "sbe", sbe);
+    assert.eq(classic.queryFramework, "classic", classic);
 
     assertQueryHashAndPlanCacheKey(sbe, classic);
 })();
@@ -159,8 +159,8 @@ function assertQueryHashAndPlanCacheKey(sbe, classic) {
 
     assert.neq(sbe, null);
     assert.neq(classic, null);
-    assert.eq(sbe.attr.queryExecutionEngine, "sbe", sbe);
-    assert.eq(classic.attr.queryExecutionEngine, "classic", classic);
+    assert.eq(sbe.attr.queryFramework, "sbe", sbe);
+    assert.eq(classic.attr.queryFramework, "classic", classic);
 
     assertQueryHashAndPlanCacheKey(sbe.attr, classic.attr);
 })();
@@ -193,7 +193,7 @@ function assertQueryHashAndPlanCacheKey(sbe, classic) {
     assert.eq(classic.explainVersion, "1", classic);
 
     // The query hashes and the plan cache keys ('the keys') are different now because
-    // 'internalQueryForceClassicEngine' flag is encoded into query shape, once this
+    // 'internalQueryFrameworkControl' flag is encoded into query shape, once this
     // flag is removed from the query shape encoding the keys will be different.
     assertQueryHashAndPlanCacheKey(sbe.queryPlanner, classic.stages[0]["$cursor"].queryPlanner);
 })();
@@ -218,7 +218,7 @@ function assertQueryHashAndPlanCacheKey(sbe, classic) {
     assert.eq(classic.explainVersion, "1", classic);
 
     // The query hashes and the plan cache keys ('the keys') are different now because
-    // 'internalQueryForceClassicEngine' flag is encoded into query shape, once this
+    // 'internalQueryFrameworkControl' flag is encoded into query shape, once this
     // flag is removed from the query shape encoding the keys will be different.
     assertQueryHashAndPlanCacheKey(sbe.queryPlanner, classic.stages[0]["$cursor"].queryPlanner);
 })();

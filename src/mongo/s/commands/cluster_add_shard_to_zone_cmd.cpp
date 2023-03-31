@@ -80,10 +80,10 @@ public:
         return "adds a shard to zone";
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const final {
-        auto* as = AuthorizationSession::get(client);
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName&,
+                                 const BSONObj&) const final {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
 
         if (as->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
                                                  ActionType::enableSharding)) {
@@ -101,7 +101,7 @@ public:
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         auto parsedRequest = uassertStatusOK(AddShardToZoneRequest::parseFromMongosCommand(cmdObj));

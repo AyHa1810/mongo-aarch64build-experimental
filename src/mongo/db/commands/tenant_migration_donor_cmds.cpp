@@ -64,8 +64,7 @@ public:
         Response typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::IllegalOperation,
                     "tenant migrations are not available on config servers",
-                    serverGlobalParams.clusterRole == ClusterRole::None ||
-                        serverGlobalParams.clusterRole == ClusterRole::ShardServer);
+                    !serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
 
             // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
             uassert(
@@ -75,16 +74,23 @@ public:
 
             const auto& cmd = request();
             const auto migrationProtocol = cmd.getProtocol().value_or(kDefaultMigrationProtocol);
+            const auto& tenantId = cmd.getTenantId();
+            const auto& tenantIds = cmd.getTenantIds();
 
-            uassertStatusOK(tenant_migration_util::protocolTenantIdCompatibilityCheck(
-                migrationProtocol, cmd.getTenantId().toString()));
+            tenant_migration_util::protocolTenantIdCompatibilityCheck(migrationProtocol, tenantId);
+            tenant_migration_util::protocolTenantIdsCompatibilityCheck(migrationProtocol,
+                                                                       tenantIds);
             tenant_migration_util::protocolStorageOptionsCompatibilityCheck(opCtx,
                                                                             migrationProtocol);
+            tenant_migration_util::protocolReadPreferenceCompatibilityCheck(
+                opCtx, migrationProtocol, cmd.getReadPreference());
 
+            // tenantId will be set to empty string for the "shard merge" protocol.
             TenantMigrationDonorDocument stateDoc(cmd.getMigrationId(),
                                                   cmd.getRecipientConnectionString().toString(),
                                                   cmd.getReadPreference(),
-                                                  cmd.getTenantId().toString());
+                                                  tenantId.value_or("").toString());
+            stateDoc.setTenantIds(tenantIds);
 
             if (!repl::tenantMigrationDisableX509Auth) {
                 uassert(ErrorCodes::InvalidOptions,
@@ -144,7 +150,7 @@ public:
             return false;
         }
         NamespaceString ns() const {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
     };
 
@@ -174,8 +180,7 @@ public:
         void typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::IllegalOperation,
                     "tenant migrations are not available on config servers",
-                    serverGlobalParams.clusterRole == ClusterRole::None ||
-                        serverGlobalParams.clusterRole == ClusterRole::ShardServer);
+                    !serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
 
             const auto& cmd = request();
 
@@ -191,7 +196,7 @@ public:
                     optionalDonor);
 
             // Retrieve the shared_ptr from boost::optional to improve readability
-            auto donorPtr = optionalDonor.get();
+            auto donorPtr = optionalDonor.value();
 
             // always ensure we wait for the initial state document to be inserted.
             donorPtr->getInitialStateDocumentDurableFuture().get(opCtx);
@@ -204,7 +209,7 @@ public:
                         durableState->state == TenantMigrationDonorStateEnum::kAborted);
 
             donorPtr->onReceiveDonorForgetMigration();
-            donorPtr->getCompletionFuture().get(opCtx);
+            donorPtr->getForgetMigrationDurableFuture().get(opCtx);
         }
 
     private:
@@ -220,7 +225,7 @@ public:
             return false;
         }
         NamespaceString ns() const {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
     };
 
@@ -249,8 +254,7 @@ public:
         void typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::IllegalOperation,
                     "tenant migrations are not available on config servers",
-                    serverGlobalParams.clusterRole == ClusterRole::None ||
-                        serverGlobalParams.clusterRole == ClusterRole::ShardServer);
+                    !serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
 
             const RequestType& cmd = request();
 
@@ -281,7 +285,7 @@ public:
             }
 
             // Retrieve the shared_ptr from boost::optional to improve readability
-            auto donorPtr = optionalDonor.get();
+            auto donorPtr = optionalDonor.value();
 
             donorPtr->onReceiveDonorAbortMigration();
             donorPtr->getDecisionFuture().get(opCtx);
@@ -305,7 +309,7 @@ public:
             return false;
         }
         NamespaceString ns() const {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
     };
 

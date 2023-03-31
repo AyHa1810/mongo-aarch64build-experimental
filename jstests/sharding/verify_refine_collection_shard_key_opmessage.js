@@ -1,8 +1,12 @@
 /**
  * Test that a special {op: 'n'} oplog event is created during refineCollectionShardKey command.
  *
- * @tags: [requires_fcv_60, __TEMPORARILY_DISABLED__]
+ * @tags: [requires_fcv_61]
  */
+
+// Cannot run the filtering metadata check on tests that run refineCollectionShardKey.
+TestData.skipCheckShardFilteringMetadata = true;
+
 (function() {
 "use strict";
 

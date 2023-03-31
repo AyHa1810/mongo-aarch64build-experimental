@@ -38,6 +38,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
+#include "mongo/db/pipeline/expression_dependencies.h"
 #include "mongo/db/query/classic_plan_cache.h"
 #include "mongo/db/query/index_bounds.h"
 #include "mongo/db/query/interval_evaluation_tree.h"
@@ -292,7 +293,7 @@ protected:
             other->children.push_back(this->children[i]->clone());
         }
         if (nullptr != this->filter) {
-            other->filter = this->filter->shallowClone();
+            other->filter = this->filter->clone();
         }
     }
 
@@ -403,11 +404,6 @@ public:
     // we would want to fall back on an alternate non-blocking solution.
     bool hasBlockingStage{false};
 
-    // Indicates whether this query solution represents an 'explode for sort' plan when an index
-    // scan over multiple point intervals is 'exploded' into a union of index scans in order to
-    // obtain an indexed sort.
-    bool hasExplodedForSort{false};
-
     // Runner executing this solution might be interested in knowing
     // if the planning process for this solution was based on filtered indices.
     bool indexFilterApplied{false};
@@ -488,12 +484,12 @@ struct CollectionScanNode : public QuerySolutionNodeWithSortSet {
     // Should we make a tailable cursor?
     bool tailable;
 
-    // Should we keep track of the timestamp of the latest oplog entry we've seen? This information
-    // is needed to merge cursors from the oplog in order of operation time when reading the oplog
-    // across a sharded cluster.
+    // Should we keep track of the timestamp of the latest oplog or change collection entry we've
+    // seen? This information is needed to merge cursors from the oplog in order of operation time
+    // when reading the oplog across a sharded cluster.
     bool shouldTrackLatestOplogTimestamp = false;
 
-    // Assert that the specified timestamp has not fallen off the oplog.
+    // Assert that the specified timestamp has not fallen off the oplog or change collection.
     boost::optional<Timestamp> assertTsHasNotFallenOff = boost::none;
 
     int direction{1};
@@ -507,14 +503,19 @@ struct CollectionScanNode : public QuerySolutionNodeWithSortSet {
 
     // Once the first matching document is found, assume that all documents after it must match.
     bool stopApplyingFilterAfterFirstMatch = false;
+
+    // Whether the collection scan should have low storage admission priority.
+    bool lowPriority = false;
 };
 
 struct ColumnIndexScanNode : public QuerySolutionNode {
     ColumnIndexScanNode(ColumnIndexEntry,
                         OrderedPathSet outputFields,
                         OrderedPathSet matchFields,
+                        OrderedPathSet allFields,
                         StringMap<std::unique_ptr<MatchExpression>> filtersByPath,
-                        std::unique_ptr<MatchExpression> postAssemblyFilter);
+                        std::unique_ptr<MatchExpression> postAssemblyFilter,
+                        bool extraFieldsPermitted = false);
 
     virtual StageType getType() const {
         return STAGE_COLUMN_SCAN;
@@ -540,13 +541,15 @@ struct ColumnIndexScanNode : public QuerySolutionNode {
     std::unique_ptr<QuerySolutionNode> clone() const final {
         StringMap<std::unique_ptr<MatchExpression>> clonedFiltersByPath;
         for (auto&& [path, filter] : filtersByPath) {
-            clonedFiltersByPath[path] = filter->shallowClone();
+            clonedFiltersByPath[path] = filter->clone();
         }
         return std::make_unique<ColumnIndexScanNode>(indexEntry,
                                                      outputFields,
                                                      matchFields,
+                                                     allFields,
                                                      std::move(clonedFiltersByPath),
-                                                     postAssemblyFilter->shallowClone());
+                                                     postAssemblyFilter->clone(),
+                                                     extraFieldsPermitted);
     }
 
     ColumnIndexEntry indexEntry;
@@ -557,6 +560,10 @@ struct ColumnIndexScanNode : public QuerySolutionNode {
     // The fields which are referenced by any and all filters - either in 'filtersByPath' or
     // 'postAssemblyFilter'.
     OrderedPathSet matchFields;
+
+    // A cached copy of the union of the above two field sets which we expect to be frequently asked
+    // for.
+    OrderedPathSet allFields;
 
     // A column scan can apply a filter to the columns directly while scanning, or to a document
     // assembled from the scanned columns.
@@ -569,9 +576,9 @@ struct ColumnIndexScanNode : public QuerySolutionNode {
     // example: {$or: [{a: 2}, {b: 2}]}.
     std::unique_ptr<MatchExpression> postAssemblyFilter;
 
-    // A cached copy of the union of the above two field sets which we expect to be frequently asked
-    // for.
-    OrderedPathSet allFields;
+    // If set to true, we can include extra fields rather than project them out because projection
+    // happens anyway in a later stage (such a group stage).
+    bool extraFieldsPermitted;
 };
 
 /**
@@ -807,6 +814,8 @@ struct IndexScanNode : public QuerySolutionNodeWithSortSet {
      * A vector of Interval Evaluation Trees (IETs) with the same ordering as the index key pattern.
      */
     std::vector<interval_evaluation_tree::IET> iets;
+
+    bool lowPriority = false;
 };
 
 struct ReturnKeyNode : public QuerySolutionNode {
@@ -1263,8 +1272,7 @@ struct DistinctNode : public QuerySolutionNodeWithSortSet {
 };
 
 /**
- * Some count queries reduce to counting how many keys are between two entries in a
- * Btree.
+ * Some count queries reduce to counting how many keys are between two entries in a Btree.
  */
 struct CountScanNode : public QuerySolutionNodeWithSortSet {
     CountScanNode(IndexEntry index) : index(std::move(index)) {}
@@ -1387,15 +1395,15 @@ struct GroupNode : public QuerySolutionNode {
           shouldProduceBson(shouldProduceBson) {
         // Use the DepsTracker to extract the fields that the 'groupByExpression' and accumulator
         // expressions depend on.
-        for (auto& groupByExprField : groupByExpression->getDependencies().fields) {
-            requiredFields.insert(groupByExprField);
-        }
+        DepsTracker deps;
+        expression::addDependencies(groupByExpression.get(), &deps);
         for (auto&& acc : accumulators) {
-            auto argExpr = acc.expr.argument;
-            for (auto& argExprField : argExpr->getDependencies().fields) {
-                requiredFields.insert(argExprField);
-            }
+            expression::addDependencies(acc.expr.argument.get(), &deps);
         }
+
+        requiredFields = deps.fields;
+        needWholeDocument = deps.needWholeDocument;
+        needsAnyMetadata = deps.getNeedsAnyMetadata();
     }
 
     StageType getType() const override {
@@ -1429,7 +1437,9 @@ struct GroupNode : public QuerySolutionNode {
     // Carries the fields this GroupNode depends on. Namely, 'requiredFields' contains the union of
     // the fields in the 'groupByExpressions' and the fields in the input Expressions of the
     // 'accumulators'.
-    StringSet requiredFields;
+    OrderedPathSet requiredFields;
+    bool needWholeDocument = false;
+    bool needsAnyMetadata = false;
 
     // If set to true, generated SBE plan will produce result as BSON object. If false,
     // 'sbe::Object' is produced instead.
@@ -1519,9 +1529,8 @@ struct EqLookupNode : public QuerySolutionNode {
     }
 
     const ProvidedSortSet& providedSorts() const final {
-        // TODO SERVER-62815: The ProvidedSortSet will need to be computed here in order to allow
-        // sort optimization. The "joinField" field overwrites the field in the result outer
-        // document, this can affect the provided sort. For now, use conservative kEmptySet.
+        // Right now, we conservatively return kEmptySet. A future optimization could theoretically
+        // take the "joinField" into account when deciding whether this provides a sort or not.
         return kEmptySet;
     }
 

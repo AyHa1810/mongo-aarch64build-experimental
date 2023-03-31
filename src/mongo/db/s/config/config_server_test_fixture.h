@@ -109,6 +109,23 @@ protected:
                                                   const NamespaceString& ns,
                                                   const BSONObj& filter,
                                                   const BSONObj& sort = {});
+    /**
+     * Reads a single document from a collection living on the config server and parses it into the
+     * specified type.
+     * Note: T must be a valid IDL type or any type that provides a static parse() method as defined
+     * for IDL types.
+     */
+    template <typename T>
+    T findOneOnConfigCollection(OperationContext* opCtx,
+                                const NamespaceString& ns,
+                                const BSONObj& filter,
+                                const BSONObj& sort = {}) {
+        auto result = findOneOnConfigCollection(opCtx, ns, filter, sort);
+        uassertStatusOK(result.getStatus());
+
+        IDLParserContext ctx("");
+        return T::parse(ctx, result.getValue());
+    }
 
     /**
      * Setup the config.shards collection to contain the given shards.
@@ -150,10 +167,10 @@ protected:
                                       const Timestamp& collTimestamp);
 
     /**
-     * Returns the collection version.
+     * Returns the collection placement version.
      */
-    StatusWith<ChunkVersion> getCollectionVersion(OperationContext* opCtx,
-                                                  const NamespaceString& nss);
+    StatusWith<ChunkVersion> getCollectionPlacementVersion(OperationContext* opCtx,
+                                                           const NamespaceString& nss);
 
     /**
      * Inserts a document for the database into the config.databases collection.
@@ -186,16 +203,7 @@ protected:
     std::vector<KeysCollectionDocument> getKeys(OperationContext* opCtx);
 
     /**
-     * Sets this node up and locks the config db in _setUp() before calling
-     * initializeGlobalShardingStateForMongodForTest(). The RAII object for the database lock is
-     * returned so that the caller can perform other operations on the config db before releasing
-     * the lock.
-     */
-    std::unique_ptr<AutoGetDb> setUpAndLockConfigDb();
-
-    /**
      * Sets this node up and initialized the collections and indexes in the config db.
-     * Uses setUpAndLockConfigDb() above.
      */
     void setUpAndInitializeConfigDb();
 
@@ -209,12 +217,6 @@ protected:
     void setupOpObservers() override;
 
 private:
-    /**
-     * 'onPreInitGlobalStateFn' is invoked near the end of _setUp() before calling
-     * initializeGlobalShardingStateForMongodForTest().
-     */
-    void _setUp(std::function<void()> onPreInitGlobalStateFn);
-
     // Since these are currently private members of the real ShardingCatalogManager, we store a raw
     // pointer to them here.
     executor::NetworkInterfaceMock* _mockNetworkForAddShard;

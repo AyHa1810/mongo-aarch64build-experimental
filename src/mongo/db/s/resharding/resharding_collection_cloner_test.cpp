@@ -72,6 +72,16 @@ public:
         return pipeline;
     }
 
+    std::unique_ptr<Pipeline, PipelineDeleter> attachCursorSourceToPipeline(
+        const AggregateCommandRequest& aggRequest,
+        Pipeline* pipeline,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        boost::optional<BSONObj> shardCursorsSortSpec = boost::none,
+        ShardTargetingPolicy shardTargetingPolicy = ShardTargetingPolicy::kAllowed,
+        boost::optional<BSONObj> readConcern = boost::none) final {
+        return attachCursorSourceToPipeline(pipeline, shardTargetingPolicy, std::move(readConcern));
+    }
+
 private:
     std::deque<DocumentSource::GetNextResult> _mockResults;
 };
@@ -101,9 +111,9 @@ protected:
 
         getCatalogCacheMock()->setChunkManagerReturnValue(
             createChunkManager(newShardKeyPattern, configCacheChunksData));
-
-        _pipeline = _cloner->makePipeline(
+        auto [rawPipeline, expCtx] = _cloner->makeRawPipeline(
             operationContext(), std::make_shared<MockMongoInterface>(configCacheChunksData));
+        _pipeline = Pipeline::parse(std::move(rawPipeline), std::move(expCtx));
 
         _pipeline->addInitialSource(
             DocumentSourceMock::createForTest(sourceCollectionData, _pipeline->getContext()));
@@ -121,7 +131,7 @@ protected:
         OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE unsafeCreateCollection(
             operationContext());
         uassertStatusOK(createCollection(
-            operationContext(), tempNss.db().toString(), BSON("create" << tempNss.coll())));
+            operationContext(), tempNss.dbName(), BSON("create" << tempNss.coll())));
     }
 
     void tearDown() override {
@@ -152,8 +162,7 @@ protected:
                                                epoch,
                                                Timestamp(1, 1),
                                                boost::none /* timeseriesFields */,
-                                               boost::none,
-                                               boost::none /* chunkSizeBytes */,
+                                               boost::none /* reshardingFields */,
                                                false,
                                                chunks);
 
@@ -172,7 +181,7 @@ protected:
         std::function<void(std::unique_ptr<SeekableRecordCursor>)> verifyFunction) {
         initializePipelineTest(shardKey, recipientShard, collectionData, configData);
         auto opCtx = operationContext();
-        AutoGetCollection tempColl{opCtx, tempNss, MODE_IS};
+        AutoGetCollection tempColl{opCtx, tempNss, MODE_IX};
         while (_cloner->doOneBatch(operationContext(), *_pipeline)) {
             ASSERT_EQ(tempColl->numRecords(opCtx), _metrics->getDocumentsProcessedCount());
             ASSERT_EQ(tempColl->dataSize(opCtx), _metrics->getBytesWrittenCount());
@@ -185,7 +194,8 @@ protected:
     }
 
 protected:
-    const NamespaceString _sourceNss = NamespaceString("test"_sd, "collection_being_resharded"_sd);
+    const NamespaceString _sourceNss =
+        NamespaceString::createNamespaceString_forTest("test"_sd, "collection_being_resharded"_sd);
     const NamespaceString tempNss =
         resharding::constructTemporaryReshardingNss(_sourceNss.db(), _sourceUUID);
     const UUID _sourceUUID = UUID::gen();

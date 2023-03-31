@@ -62,7 +62,9 @@ public:
      */
     Value toValue() const {
         return stdx::visit(OverloadedVisitor{[&](Value unwrappedVal) { return unwrappedVal; },
-                                             [&](Date_t dateVal) { return Value(dateVal); }
+                                             [&](Date_t dateVal) {
+                                                 return Value(dateVal);
+                                             }
 
                            },
                            _value);
@@ -103,7 +105,9 @@ public:
 
     std::string toString() const {
         return stdx::visit(OverloadedVisitor{[&](Value v) { return v.toString(); },
-                                             [&](Date_t d) { return d.toString(); }},
+                                             [&](Date_t d) {
+                                                 return d.toString();
+                                             }},
                            _value);
     }
 
@@ -121,10 +125,11 @@ public:
      * Delegate to Value::getApproximateSize().
      */
     size_t getApproximateSize() const {
-        return stdx::visit(
-            OverloadedVisitor{[&](Value v) { return v.getApproximateSize(); },
-                              [&](Date_t d) { return Value(d).getApproximateSize(); }},
-            _value);
+        return stdx::visit(OverloadedVisitor{[&](Value v) { return v.getApproximateSize(); },
+                                             [&](Date_t d) {
+                                                 return Value(d).getApproximateSize();
+                                             }},
+                           _value);
     }
 
     /**
@@ -239,19 +244,20 @@ public:
 
     static RangeStatement parse(RangeSpec spec);
 
-    Value serialize() const {
+    Value serialize(SerializationOptions opts) const {
         MutableDocument spec;
-        spec[kArgStep] = _step;
+        spec[kArgStep] = opts.serializeLiteralValue(_step);
         spec[kArgBounds] = stdx::visit(
             OverloadedVisitor{[&](Full) { return Value(kValFull); },
                               [&](Partition) { return Value(kValPartition); },
                               [&](ExplicitBounds bounds) {
                                   return Value(std::vector<Value>(
-                                      {bounds.first.toValue(), bounds.second.toValue()}));
+                                      {opts.serializeLiteralValue(bounds.first.toValue()),
+                                       opts.serializeLiteralValue(bounds.second.toValue())}));
                               }},
             _bounds);
         if (_unit)
-            spec[kArgUnit] = Value(serializeTimeUnit(*_unit));
+            spec[kArgUnit] = opts.serializeLiteralValue(serializeTimeUnit(*_unit));
         return spec.freezeToValue();
     }
 
@@ -378,7 +384,7 @@ public:
         return kStageName.rawData();
     }
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
 
     DepsTracker::State getDependencies(DepsTracker* deps) const final {
         deps->fields.insert(_field.fullPath());
@@ -388,6 +394,11 @@ public:
             deps->fields.insert(field.fullPath());
         }
         return DepsTracker::State::SEE_NEXT;
+    }
+
+    void addVariableRefs(std::set<Variables::Id>* refs) const final {
+        // The partition expression cannot refer to any variables because it is internally generated
+        // based on a set of field paths.
     }
 
     boost::optional<DistributedPlanLogic> distributedPlanLogic() final {

@@ -27,9 +27,6 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/catalog/drop_indexes.h"
 
 #include <boost/algorithm/string/join.hpp>
@@ -54,7 +51,6 @@
 #include "mongo/util/overloaded_visitor.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
-
 
 namespace mongo {
 namespace {
@@ -160,20 +156,20 @@ bool containsClusteredIndex(const CollectionPtr& collection, const IndexArgument
                               // creation, it should always be filled in by default on the
                               // collection object.
                               auto clusteredIndexName = clusteredIndexSpec.getName();
-                              invariant(clusteredIndexName.is_initialized());
+                              invariant(clusteredIndexName.has_value());
 
-                              return clusteredIndexName.get() == indexName;
+                              return clusteredIndexName.value() == indexName;
                           },
                           [&](const std::vector<std::string>& indexNames) -> bool {
                               // While the clusteredIndex's name is optional during user
                               // creation, it should always be filled in by default on the
                               // collection object.
                               auto clusteredIndexName = clusteredIndexSpec.getName();
-                              invariant(clusteredIndexName.is_initialized());
+                              invariant(clusteredIndexName.has_value());
 
                               return std::find(indexNames.begin(),
                                                indexNames.end(),
-                                               clusteredIndexName.get()) != indexNames.end();
+                                               clusteredIndexName.value()) != indexNames.end();
                           },
                           [&](const BSONObj& indexKey) -> bool {
                               return clusteredIndexSpec.getKey().woCompare(indexKey) == 0;
@@ -298,7 +294,8 @@ void dropReadyIndexes(OperationContext* opCtx,
 
     IndexCatalog* indexCatalog = collection->getIndexCatalog();
     auto collDescription =
-        CollectionShardingState::get(opCtx, collection->ns())->getCollectionDescription(opCtx);
+        CollectionShardingState::assertCollectionLockedAndAcquire(opCtx, collection->ns())
+            ->getCollectionDescription(opCtx);
 
     if (indexNames.front() == "*") {
         if (collDescription.isSharded() && !forceDropShardKeyIndex) {
@@ -349,8 +346,8 @@ void dropReadyIndexes(OperationContext* opCtx,
             uassert(
                 ErrorCodes::CannotDropShardKeyIndex,
                 "Cannot drop the only compatible index for this collection's shard key",
-                !isLastShardKeyIndex(
-                    opCtx, collection, indexCatalog, indexName, collDescription.getKeyPattern()));
+                !isLastNonHiddenShardKeyIndex(
+                    opCtx, CollectionPtr(collection), indexName, collDescription.getKeyPattern()));
         }
 
         auto desc = indexCatalog->findIndexByName(opCtx,
@@ -366,21 +363,21 @@ void dropReadyIndexes(OperationContext* opCtx,
     }
 }
 
-void assertMovePrimaryInProgress(OperationContext* opCtx, const NamespaceString& ns) {
-    auto dss = DatabaseShardingState::get(opCtx, ns.db());
-    auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, dss);
-
+void assertNoMovePrimaryInProgress(OperationContext* opCtx, const NamespaceString& nss) {
     try {
-        const auto collDesc =
-            CollectionShardingState::get(opCtx, ns)->getCollectionDescription(opCtx);
-        if (!collDesc.isSharded()) {
-            auto mpsm = dss->getMovePrimarySourceManager(dssLock);
+        const auto scopedDss =
+            DatabaseShardingState::assertDbLockedAndAcquireShared(opCtx, nss.dbName());
+        auto scopedCss = CollectionShardingState::assertCollectionLockedAndAcquire(opCtx, nss);
 
-            if (mpsm) {
-                LOGV2(4976500, "assertMovePrimaryInProgress", "namespace"_attr = ns.toString());
+        auto collDesc = scopedCss->getCollectionDescription(opCtx);
+        collDesc.throwIfReshardingInProgress(nss);
+
+        if (!collDesc.isSharded()) {
+            if (scopedDss->isMovePrimaryInProgress()) {
+                LOGV2(4976500, "assertNoMovePrimaryInProgress", logAttrs(nss));
 
                 uasserted(ErrorCodes::MovePrimaryInProgress,
-                          "movePrimary is in progress for namespace " + ns.toString());
+                          "movePrimary is in progress for namespace " + nss.toString());
             }
         }
     } catch (const DBException& ex) {
@@ -401,25 +398,27 @@ DropIndexesReply dropIndexes(OperationContext* opCtx,
     // We only need to hold an intent lock to send abort signals to the active index builder(s) we
     // intend to abort.
     boost::optional<AutoGetCollection> collection;
-    collection.emplace(opCtx, nss, MODE_IX);
+    collection.emplace(
+        opCtx, nss, MODE_IX, AutoGetCollection::Options{}.expectedUUID(expectedUUID));
 
-    checkCollectionUUIDMismatch(opCtx, nss, collection->getCollection(), expectedUUID);
     uassertStatusOK(checkView(opCtx, nss, collection->getCollection()));
 
     const UUID collectionUUID = (*collection)->uuid();
-    const NamespaceStringOrUUID dbAndUUID = {nss.db().toString(), collectionUUID};
+    const NamespaceStringOrUUID dbAndUUID = {nss.dbName(), collectionUUID};
     uassertStatusOK(checkReplState(opCtx, dbAndUUID, collection->getCollection()));
     if (!serverGlobalParams.quiet.load()) {
         LOGV2(51806,
               "CMD: dropIndexes",
-              "namespace"_attr = nss,
+              logAttrs(nss),
               "uuid"_attr = collectionUUID,
               "indexes"_attr =
                   stdx::visit(OverloadedVisitor{[](const std::string& arg) { return arg; },
                                                 [](const std::vector<std::string>& arg) {
                                                     return boost::algorithm::join(arg, ",");
                                                 },
-                                                [](const BSONObj& arg) { return arg.toString(); }},
+                                                [](const BSONObj& arg) {
+                                                    return arg.toString();
+                                                }},
                               index));
     }
 
@@ -429,7 +428,7 @@ DropIndexesReply dropIndexes(OperationContext* opCtx,
     }
 
     DropIndexesReply reply;
-    reply.setNIndexesWas((*collection)->getIndexCatalog()->numIndexesTotal(opCtx));
+    reply.setNIndexesWas((*collection)->getIndexCatalog()->numIndexesTotal());
 
     const bool isWildcard =
         stdx::holds_alternative<std::string>(index) && stdx::get<std::string>(index) == "*";
@@ -492,10 +491,7 @@ DropIndexesReply dropIndexes(OperationContext* opCtx,
         }
 
         if (!abortAgain) {
-            assertMovePrimaryInProgress(opCtx, collNs);
-            CollectionShardingState::get(opCtx, collNs)
-                ->getCollectionDescription(opCtx)
-                .throwIfReshardingInProgress(collNs);
+            assertNoMovePrimaryInProgress(opCtx, collNs);
             break;
         }
     }
@@ -517,17 +513,16 @@ DropIndexesReply dropIndexes(OperationContext* opCtx,
             // abort phase, a new identical index was created.
             auto indexCatalog = collection->getWritableCollection(opCtx)->getIndexCatalog();
             for (const auto& indexName : indexNames) {
-                auto collDescription =
-                    CollectionShardingState::get(opCtx, nss)->getCollectionDescription(opCtx);
-
-                if (collDescription.isSharded()) {
+                auto collDesc =
+                    CollectionShardingState::assertCollectionLockedAndAcquire(opCtx, nss)
+                        ->getCollectionDescription(opCtx);
+                if (collDesc.isSharded()) {
                     uassert(ErrorCodes::CannotDropShardKeyIndex,
                             "Cannot drop the only compatible index for this collection's shard key",
-                            !isLastShardKeyIndex(opCtx,
-                                                 collection->getCollection(),
-                                                 indexCatalog,
-                                                 indexName,
-                                                 collDescription.getKeyPattern()));
+                            !isLastNonHiddenShardKeyIndex(opCtx,
+                                                          collection->getCollection(),
+                                                          indexName,
+                                                          collDesc.getKeyPattern()));
                 }
 
                 auto desc =
@@ -557,7 +552,7 @@ DropIndexesReply dropIndexes(OperationContext* opCtx,
         invariant(isWildcard);
         invariant(indexNames.size() == 1);
         invariant(indexNames.front() == "*");
-        invariant((*collection)->getIndexCatalog()->numIndexesInProgress(opCtx) == 0);
+        invariant((*collection)->getIndexCatalog()->numIndexesInProgress() == 0);
     }
 
     writeConflictRetry(
@@ -578,9 +573,10 @@ Status dropIndexesForApplyOps(OperationContext* opCtx,
                               const NamespaceString& nss,
                               const BSONObj& cmdObj) try {
     BSONObjBuilder bob(cmdObj);
-    bob.append("$db", nss.db());
+    bob.append("$db", nss.dbName().db());
     auto cmdObjWithDb = bob.obj();
-    auto parsed = DropIndexes::parse({"dropIndexes"}, cmdObjWithDb);
+    auto parsed = DropIndexes::parse(
+        IDLParserContext{"dropIndexes", false /* apiStrict */, nss.tenantId()}, cmdObjWithDb);
 
     return writeConflictRetry(opCtx, "dropIndexes", nss.db(), [opCtx, &nss, &cmdObj, &parsed] {
         AutoGetCollection collection(opCtx, nss, MODE_X);
@@ -594,7 +590,7 @@ Status dropIndexesForApplyOps(OperationContext* opCtx,
         if (!serverGlobalParams.quiet.load()) {
             LOGV2(20344,
                   "CMD: dropIndexes",
-                  "namespace"_attr = nss,
+                  logAttrs(nss),
                   "indexes"_attr = cmdObj[kIndexFieldName].toString(false));
         }
 

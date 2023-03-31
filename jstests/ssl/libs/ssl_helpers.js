@@ -115,15 +115,9 @@ function testShardedLookup(shardingTest) {
 function mixedShardTest(options1, options2, shouldSucceed) {
     let authSucceeded = false;
     try {
+        // TODO SERVER-14017 is fixed the "enableBalancer" line can be removed.
         // Start ShardingTest with enableBalancer because ShardingTest attempts to turn
         // off the balancer otherwise, which it will not be authorized to do if auth is enabled.
-        //
-        // Also, the autosplitter will be turned on automatically with 'enableBalancer: true'. We
-        // then want to disable the autosplitter, but cannot do so here with 'enableAutoSplit:
-        // false' because ShardingTest will attempt to call disableAutoSplit(), which it will not be
-        // authorized to do if auth is enabled.
-        //
-        // Once SERVER-14017 is fixed the "enableBalancer" line can be removed.
 
         // The mongo shell cannot authenticate as the internal __system user in tests that use x509
         // for cluster authentication. Choosing the default value for wcMajorityJournalDefault in
@@ -155,7 +149,6 @@ function mixedShardTest(options1, options2, shouldSucceed) {
         authSucceeded = true;
 
         st.stopBalancer();
-        st.disableAutoSplit();
 
         // Test that $lookup works because it causes outgoing connections to be opened
         testShardedLookup(st);
@@ -324,6 +317,11 @@ function sslProviderSupportsTLS1_0() {
         const cryptoPolicy = cat("/etc/crypto-policies/config");
         return cryptoPolicy.includes("LEGACY");
     }
+
+    if (isOpenSSL3orGreater()) {
+        return false;
+    }
+
     return !isDebian10() && !isUbuntu2004();
 }
 
@@ -332,7 +330,22 @@ function sslProviderSupportsTLS1_1() {
         const cryptoPolicy = cat("/etc/crypto-policies/config");
         return cryptoPolicy.includes("LEGACY");
     }
+
+    if (isOpenSSL3orGreater()) {
+        return false;
+    }
+
     return !isDebian10() && !isUbuntu2004();
+}
+
+function isOpenSSL3orGreater() {
+    // Windows and macOS do not have "openssl.compiled" in buildInfo but they do have "running"
+    const opensslCompiledIn = getBuildInfo().openssl.compiled !== undefined;
+    if (!opensslCompiledIn) {
+        return false;
+    }
+
+    return opensslVersionAsInt() >= 0x3000000;
 }
 
 function opensslVersionAsInt() {

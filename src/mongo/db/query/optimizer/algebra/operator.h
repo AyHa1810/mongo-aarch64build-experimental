@@ -29,7 +29,7 @@
 
 #pragma once
 
-#include <stddef.h>
+#include <cstddef>
 #include <utility>
 #include <vector>
 
@@ -58,17 +58,17 @@ template <typename T>
 struct OpNodeStorage<T, 0> {};
 
 /**
- * Nodes which have a specific arity (number of children) should derive from this class. The 'Slot'
+ * Nodes which have a fixed arity (number of children) should derive from this class. The 'Slot'
  * determines the generic type to hold for each child.
  */
 template <typename Slot, int Arity>
-class OpSpecificArity : public OpNodeStorage<Slot, Arity> {
+class OpFixedArity : public OpNodeStorage<Slot, Arity> {
     using Base = OpNodeStorage<Slot, Arity>;
 
 public:
     TEMPLATE(typename... Ts)
     REQUIRES(sizeof...(Ts) == Arity)
-    OpSpecificArity(Ts&&... vals) : Base({std::forward<Ts>(vals)...}) {}
+    OpFixedArity(Ts&&... vals) : Base({std::forward<Ts>(vals)...}) {}
 
     TEMPLATE(int I)
     REQUIRES(I >= 0 && I < Arity)
@@ -84,17 +84,17 @@ public:
 };
 
 /**
- * Nodes which have a known, minimum arity but may optionally contain more children.
+ * Nodes which have dynamic arity with an optional minimum number of children.
  */
 template <typename Slot, int Arity>
-class OpSpecificDynamicArity : public OpSpecificArity<Slot, Arity> {
-    using Base = OpSpecificArity<Slot, Arity>;
+class OpDynamicArity : public OpFixedArity<Slot, Arity> {
+    using Base = OpFixedArity<Slot, Arity>;
 
     std::vector<Slot> _dyNodes;
 
 public:
     template <typename... Ts>
-    OpSpecificDynamicArity(std::vector<Slot>&& nodes, Ts&&... vals)
+    OpDynamicArity(std::vector<Slot>&& nodes, Ts&&... vals)
         : Base({std::forward<Ts>(vals)...}), _dyNodes(std::move(nodes)) {}
 
     auto& nodes() {
@@ -114,8 +114,8 @@ using call_prepare_t =
     decltype(std::declval<D>().prepare(std::declval<T&>(), std::declval<Args>()...));
 
 template <typename N, typename D, typename T, typename... Args>
-using call_prepare_slot_t = decltype(
-    std::declval<D>().prepare(std::declval<N&>(), std::declval<T&>(), std::declval<Args>()...));
+using call_prepare_slot_t = decltype(std::declval<D>().prepare(
+    std::declval<N&>(), std::declval<T&>(), std::declval<Args>()...));
 
 template <typename Void, template <class...> class Op, class... Args>
 struct has_prepare : std::false_type {};
@@ -130,17 +130,17 @@ inline constexpr auto has_prepare_v =
                        has_prepare<void, call_prepare_t, D, T, Args...>>::value;
 
 template <typename Slot, int Arity>
-inline constexpr int get_arity(const OpSpecificArity<Slot, Arity>*) {
+inline constexpr int get_arity(const OpFixedArity<Slot, Arity>*) {
     return Arity;
 }
 
 template <typename Slot, int Arity>
-inline constexpr bool is_dynamic(const OpSpecificArity<Slot, Arity>*) {
+inline constexpr bool is_dynamic(const OpFixedArity<Slot, Arity>*) {
     return false;
 }
 
 template <typename Slot, int Arity>
-inline constexpr bool is_dynamic(const OpSpecificDynamicArity<Slot, Arity>*) {
+inline constexpr bool is_dynamic(const OpDynamicArity<Slot, Arity>*) {
     return true;
 }
 
@@ -351,6 +351,7 @@ public:
  *
  *      int transport(const NodeType&, int childResult0, int childResult1)
  *
+ * This method guarantees depth-first, left-to-right order.
  */
 template <bool withSlot = false, typename D, typename N, typename... Args>
 auto transport(N&& node, D& domain, Args&&... args) {

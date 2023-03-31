@@ -46,13 +46,12 @@ protected:
     void runTest(const BSONObj& obj, const std::function<void(const BSONObj&)>& test) {
         test(obj);
 
-        NamespaceString nss{"test"};
-        auto compressionResult =
-            timeseries::compressBucket(obj, "time", nss, /*eligibleForReopening=*/false, true);
+        NamespaceString nss = NamespaceString::createNamespaceString_forTest("test");
+        auto compressionResult = timeseries::compressBucket(obj, "time", nss, true);
         ASSERT_TRUE(compressionResult.compressedBucket.has_value());
         ASSERT_FALSE(compressionResult.decompressionFailed);
 
-        test(compressionResult.compressedBucket.get());
+        test(compressionResult.compressedBucket.value());
     }
 };
 

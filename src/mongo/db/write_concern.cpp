@@ -33,6 +33,7 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/server_status_metric.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/repl/optime.h"
@@ -71,8 +72,6 @@ bool commandSpecifiesWriteConcern(const BSONObj& cmdObj) {
 StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* opCtx,
                                                     const BSONObj& cmdObj,
                                                     bool isInternalClient) {
-    // The default write concern if empty is {w:1}. Specifying {w:0} is/was allowed, but is
-    // interpreted identically to {w:1}.
     auto wcResult = WriteConcernOptions::extractWCFromCommand(cmdObj);
     if (!wcResult.isOK()) {
         return wcResult.getStatus();
@@ -83,17 +82,22 @@ StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* opCtx,
     // This is the WC extracted from the command object, so the CWWC or implicit default hasn't been
     // applied yet, which is why "usedDefaultConstructedWC" flag can be used an indicator of whether
     // the client supplied a WC or not.
+    // If the user supplied write concern from the command is empty (writeConcern: {}),
+    // usedDefaultConstructedWC will be true so we will then use the CWWC or implicit default.
+    // Note that specifying writeConcern: {w:0} is not the same as empty. {w:0} differs from {w:1}
+    // in that the client will not expect a command reply/acknowledgement at all, even in the case
+    // of errors.
     bool clientSuppliedWriteConcern = !writeConcern.usedDefaultConstructedWC;
     bool customDefaultWasApplied = false;
 
     // If no write concern is specified in the command, then use the cluster-wide default WC (if
-    // there is one), or else the default WC {w:1}.
+    // there is one), or else the default implicit WC:
+    // (if [(#arbiters > 0) AND (#arbiters >= ½(#voting nodes) - 1)] then {w:1} else {w:majority}).
     if (!clientSuppliedWriteConcern) {
         writeConcern = ([&]() {
             // WriteConcern defaults can only be applied on regular replica set members.  Operations
             // received by shard and config servers should always have WC explicitly specified.
-            if (serverGlobalParams.clusterRole != ClusterRole::ShardServer &&
-                serverGlobalParams.clusterRole != ClusterRole::ConfigServer &&
+            if (serverGlobalParams.clusterRole.has(ClusterRole::None) &&
                 repl::ReplicationCoordinator::get(opCtx)->isReplEnabled() &&
                 (!opCtx->inMultiDocumentTransaction() ||
                  isTransactionCommand(cmdObj.firstElementFieldName())) &&
@@ -120,11 +124,6 @@ StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* opCtx,
             }
             return writeConcern;
         })();
-
-        if (writeConcern.isUnacknowledged()) {
-            writeConcern.w = 1;
-        }
-
         writeConcern.notExplicitWValue = true;
     }
 
@@ -143,23 +142,9 @@ StatusWith<WriteConcernOptions> extractWriteConcern(OperationContext* opCtx,
         }
     }
 
-    if (!clientSuppliedWriteConcern &&
-        serverGlobalParams.clusterRole == ClusterRole::ConfigServer &&
-        !opCtx->getClient()->isInDirectClient() &&
-        (opCtx->getClient()->session() &&
-         (opCtx->getClient()->session()->getTags() & transport::Session::kInternalClient))) {
-        // Upconvert the writeConcern of any incoming requests from internal connections (i.e.,
-        // from other nodes in the cluster) to "majority." This protects against internal code that
-        // does not specify writeConcern when writing to the config server.
-        writeConcern = WriteConcernOptions{
-            WriteConcernOptions::kMajority, WriteConcernOptions::SyncMode::UNSET, Seconds(30)};
-        writeConcern.getProvenance().setSource(
-            ReadWriteConcernProvenance::Source::internalWriteDefault);
-    } else {
-        Status wcStatus = validateWriteConcern(opCtx, writeConcern);
-        if (!wcStatus.isOK()) {
-            return wcStatus;
-        }
+    Status wcStatus = validateWriteConcern(opCtx, writeConcern);
+    if (!wcStatus.isOK()) {
+        return wcStatus;
     }
 
     return writeConcern;
@@ -261,6 +246,10 @@ Status waitForWriteConcern(OperationContext* opCtx,
                 "replOpTime"_attr = replOpTime,
                 "writeConcern"_attr = writeConcern.toBSON());
 
+    // Add time waiting for write concern to CurOp.
+    CurOp::get(opCtx)->beginWaitForWriteConcernTimer();
+    ScopeGuard finishTiming([&] { CurOp::get(opCtx)->stopWaitForWriteConcernTimer(); });
+
     auto* const storageEngine = opCtx->getServiceContext()->getStorageEngine();
     auto const replCoord = repl::ReplicationCoordinator::get(opCtx);
 
@@ -270,8 +259,7 @@ Status waitForWriteConcern(OperationContext* opCtx,
         // This fail point pauses with an open snapshot on the oplog. Some tests pause on this fail
         // point prior to running replication rollback. This prevents the operation from being
         // killed and the snapshot being released. Hence, we release the snapshot here.
-        auto recoveryUnit = opCtx->releaseAndReplaceRecoveryUnit();
-        recoveryUnit.reset();
+        opCtx->replaceRecoveryUnit();
 
         hangBeforeWaitingForWriteConcern.pauseWhileSet();
     }

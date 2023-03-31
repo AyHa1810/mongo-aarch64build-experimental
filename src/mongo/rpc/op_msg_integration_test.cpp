@@ -112,7 +112,7 @@ TEST(OpMsg, UnknownOptionalFlagIsIgnored) {
 TEST(OpMsg, FireAndForgetInsertWorks) {
     auto conn = getIntegrationTestConnection();
 
-    conn->dropCollection("test.collection");
+    conn->dropCollection(NamespaceString("test.collection"));
 
     conn->runFireAndForgetCommand(OpMsgRequest::fromDBAndBody("test", fromjson(R"({
         insert: "collection",
@@ -122,13 +122,13 @@ TEST(OpMsg, FireAndForgetInsertWorks) {
         ]
     })")));
 
-    ASSERT_EQ(conn->count(NamespaceString("test.collection")), 1u);
+    ASSERT_EQ(conn->count(NamespaceString::createNamespaceString_forTest("test.collection")), 1u);
 }
 
 TEST(OpMsg, DocumentSequenceLargeDocumentMultiInsertWorks) {
     auto conn = getIntegrationTestConnection();
 
-    conn->dropCollection("test.collection");
+    conn->dropCollection(NamespaceString("test.collection"));
 
     OpMsgBuilder msgBuilder;
 
@@ -152,14 +152,14 @@ TEST(OpMsg, DocumentSequenceLargeDocumentMultiInsertWorks) {
     Message reply;
     conn->call(request, reply);
 
-    ASSERT_EQ(conn->count(NamespaceString("test.collection")), 3u);
-    conn->dropCollection("test.collection");
+    ASSERT_EQ(conn->count(NamespaceString::createNamespaceString_forTest("test.collection")), 3u);
+    conn->dropCollection(NamespaceString::createNamespaceString_forTest("test.collection"));
 }
 
 TEST(OpMsg, DocumentSequenceMaxWriteBatchWorks) {
     auto conn = getIntegrationTestConnection();
 
-    conn->dropCollection("test.collection");
+    conn->dropCollection(NamespaceString("test.collection"));
 
     OpMsgBuilder msgBuilder;
 
@@ -185,8 +185,9 @@ TEST(OpMsg, DocumentSequenceMaxWriteBatchWorks) {
     Message reply;
     conn->call(request, reply);
 
-    ASSERT_EQ(conn->count(NamespaceString("test.collection")), write_ops::kMaxWriteBatchSize);
-    conn->dropCollection("test.collection");
+    ASSERT_EQ(conn->count(NamespaceString::createNamespaceString_forTest("test.collection")),
+              write_ops::kMaxWriteBatchSize);
+    conn->dropCollection(NamespaceString::createNamespaceString_forTest("test.collection"));
 }
 
 TEST(OpMsg, CloseConnectionOnFireAndForgetNotWritablePrimaryError) {
@@ -239,7 +240,7 @@ TEST(OpMsg, CloseConnectionOnFireAndForgetNotWritablePrimaryError) {
         // Disable eager checking of primary to simulate a stepdown occurring after the check. This
         // should respect w:0.
         BSONObj output;
-        ASSERT(conn.runCommand("admin",
+        ASSERT(conn.runCommand({boost::none, "admin"},
                                fromjson(R"({
                                    configureFailPoint: 'skipCheckingForNotPrimaryInCommandDispatch',
                                    mode: 'alwaysOn'
@@ -248,7 +249,7 @@ TEST(OpMsg, CloseConnectionOnFireAndForgetNotWritablePrimaryError) {
             << output;
         ON_BLOCK_EXIT([&] {
             uassertStatusOK(conn.connect(host, "integration_test-cleanup", boost::none));
-            ASSERT(conn.runCommand("admin",
+            ASSERT(conn.runCommand({boost::none, "admin"},
                                    fromjson(R"({
                                           configureFailPoint:
                                               'skipCheckingForNotPrimaryInCommandDispatch',
@@ -331,13 +332,13 @@ void exhaustGetMoreTest(bool enableChecksum) {
 
     ON_BLOCK_EXIT([&] { enableClientChecksum(); });
 
-    NamespaceString nss("test", "coll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "coll");
 
-    conn->dropCollection(nss.toString());
+    conn->dropCollection(nss);
 
     // Insert a few documents.
     for (int i = 0; i < 5; i++) {
-        conn->insert(nss.toString(), BSON("_id" << i));
+        conn->insert(nss, BSON("_id" << i));
     }
 
     // Issue a find request to open a cursor but return 0 documents. Specify a sort in order to
@@ -418,13 +419,13 @@ TEST(OpMsg, FindIgnoresExhaust) {
         return;
     }
 
-    NamespaceString nss("test", "coll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "coll");
 
-    conn->dropCollection(nss.toString());
+    conn->dropCollection(nss);
 
     // Insert a few documents.
     for (int i = 0; i < 5; i++) {
-        conn->insert(nss.toString(), BSON("_id" << i));
+        conn->insert(nss, BSON("_id" << i));
     }
 
     // Issue a find request with exhaust flag. Returns 0 documents.
@@ -450,13 +451,13 @@ TEST(OpMsg, ServerDoesNotSetMoreToComeOnErrorInGetMore) {
         return;
     }
 
-    NamespaceString nss("test", "coll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "coll");
 
-    conn->dropCollection(nss.toString());
+    conn->dropCollection(nss);
 
     // Insert a few documents.
     for (int i = 0; i < 5; i++) {
-        conn->insert(nss.toString(), BSON("_id" << i));
+        conn->insert(nss, BSON("_id" << i));
     }
 
     // Issue a find request to open a cursor but return 0 documents.
@@ -472,7 +473,7 @@ TEST(OpMsg, ServerDoesNotSetMoreToComeOnErrorInGetMore) {
     ASSERT(!OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
 
     // Drop the collection, so that the next getMore will error.
-    conn->dropCollection(nss.toString());
+    conn->dropCollection(nss);
 
     // Construct getMore request with exhaust flag.
     int batchSize = 2;
@@ -497,13 +498,13 @@ TEST(OpMsg, MongosIgnoresExhaustForGetMore) {
         return;
     }
 
-    NamespaceString nss("test", "coll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "coll");
 
-    conn->dropCollection(nss.toString());
+    conn->dropCollection(nss);
 
     // Insert a few documents.
     for (int i = 0; i < 5; i++) {
-        conn->insert(nss.toString(), BSON("_id" << i));
+        conn->insert(nss, BSON("_id" << i));
     }
 
     // Issue a find request to open a cursor but return 0 documents. Specify a sort in order to
@@ -548,14 +549,14 @@ TEST(OpMsg, ExhaustWorksForAggCursor) {
         return;
     }
 
-    NamespaceString nss("test", "coll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "coll");
 
-    conn->dropCollection(nss.toString());
+    conn->dropCollection(nss);
 
     // Insert 5 documents so that a cursor using a batchSize of 2 requires three batches to get all
     // the results.
     for (int i = 0; i < 5; i++) {
-        conn->insert(nss.toString(), BSON("_id" << i));
+        conn->insert(nss, BSON("_id" << i));
     }
 
     // Issue an agg request to open a cursor but return 0 documents. Specify a sort in order to
@@ -779,7 +780,7 @@ void serverStatusCorrectlyShowsExhaustMetrics(std::string commandName) {
     ASSERT(waitForCondition([&] {
         auto serverStatusCmd = BSON("serverStatus" << 1);
         BSONObj serverStatusReply;
-        ASSERT(conn->runCommand("admin", serverStatusCmd, serverStatusReply));
+        ASSERT(conn->runCommand({boost::none, "admin"}, serverStatusCmd, serverStatusReply));
         return serverStatusReply["connections"]["exhaustIsMaster"].numberInt() == 0 &&
             serverStatusReply["connections"]["exhaustHello"].numberInt() == 0;
     }));
@@ -814,7 +815,7 @@ void serverStatusCorrectlyShowsExhaustMetrics(std::string commandName) {
 
     auto serverStatusCmd = BSON("serverStatus" << 1);
     BSONObj serverStatusReply;
-    ASSERT(conn2->runCommand("admin", serverStatusCmd, serverStatusReply));
+    ASSERT(conn2->runCommand({boost::none, "admin"}, serverStatusCmd, serverStatusReply));
     if (useLegacyCommandName) {
         ASSERT_EQUALS(1, serverStatusReply["connections"]["exhaustIsMaster"].numberInt());
         ASSERT_EQUALS(0, serverStatusReply["connections"]["exhaustHello"].numberInt());
@@ -853,7 +854,7 @@ void exhaustMetricSwitchingCommandNames(bool useLegacyCommandNameAtStart) {
     ASSERT(waitForCondition([&] {
         auto serverStatusCmd = BSON("serverStatus" << 1);
         BSONObj serverStatusReply;
-        ASSERT(conn1->runCommand("admin", serverStatusCmd, serverStatusReply));
+        ASSERT(conn1->runCommand({boost::none, "admin"}, serverStatusCmd, serverStatusReply));
         return serverStatusReply["connections"]["exhaustIsMaster"].numberInt() == 0 &&
             serverStatusReply["connections"]["exhaustHello"].numberInt() == 0;
     }));
@@ -900,7 +901,7 @@ void exhaustMetricSwitchingCommandNames(bool useLegacyCommandNameAtStart) {
 
     auto serverStatusCmd = BSON("serverStatus" << 1);
     BSONObj serverStatusReply;
-    ASSERT(conn2->runCommand("admin", serverStatusCmd, serverStatusReply));
+    ASSERT(conn2->runCommand({boost::none, "admin"}, serverStatusCmd, serverStatusReply));
     if (useLegacyCommandNameAtStart) {
         ASSERT_EQUALS(1, serverStatusReply["connections"]["exhaustIsMaster"].numberInt());
         ASSERT_EQUALS(0, serverStatusReply["connections"]["exhaustHello"].numberInt());
@@ -927,7 +928,7 @@ void exhaustMetricSwitchingCommandNames(bool useLegacyCommandNameAtStart) {
     }));
 
     // Terminating the exhaust stream should not decrement the number of exhaust connections.
-    ASSERT(conn2->runCommand("admin", serverStatusCmd, serverStatusReply));
+    ASSERT(conn2->runCommand({boost::none, "admin"}, serverStatusCmd, serverStatusReply));
     if (useLegacyCommandNameAtStart) {
         ASSERT_EQUALS(1, serverStatusReply["connections"]["exhaustIsMaster"].numberInt());
         ASSERT_EQUALS(0, serverStatusReply["connections"]["exhaustHello"].numberInt());
@@ -955,7 +956,7 @@ void exhaustMetricSwitchingCommandNames(bool useLegacyCommandNameAtStart) {
 
     // exhaust metric should decrease for the exhaust type that was closed, and increase for the
     // exhaust type that was just opened.
-    ASSERT(conn2->runCommand("admin", serverStatusCmd, serverStatusReply));
+    ASSERT(conn2->runCommand({boost::none, "admin"}, serverStatusCmd, serverStatusReply));
     if (useLegacyCommandNameAtStart) {
         ASSERT_EQUALS(0, serverStatusReply["connections"]["exhaustIsMaster"].numberInt());
         ASSERT_EQUALS(1, serverStatusReply["connections"]["exhaustHello"].numberInt());
@@ -990,7 +991,7 @@ void exhaustMetricDecrementsOnNewOpAfterTerminatingExhaustStream(bool useLegacyC
     ASSERT(waitForCondition([&] {
         auto serverStatusCmd = BSON("serverStatus" << 1);
         BSONObj serverStatusReply;
-        ASSERT(conn1->runCommand("admin", serverStatusCmd, serverStatusReply));
+        ASSERT(conn1->runCommand({boost::none, "admin"}, serverStatusCmd, serverStatusReply));
         return serverStatusReply["connections"]["exhaustIsMaster"].numberInt() == 0 &&
             serverStatusReply["connections"]["exhaustHello"].numberInt() == 0;
     }));
@@ -1036,7 +1037,7 @@ void exhaustMetricDecrementsOnNewOpAfterTerminatingExhaustStream(bool useLegacyC
 
     auto serverStatusCmd = BSON("serverStatus" << 1);
     BSONObj serverStatusReply;
-    ASSERT(conn2->runCommand("admin", serverStatusCmd, serverStatusReply));
+    ASSERT(conn2->runCommand({boost::none, "admin"}, serverStatusCmd, serverStatusReply));
     if (useLegacyCommandName) {
         ASSERT_EQUALS(1, serverStatusReply["connections"]["exhaustIsMaster"].numberInt());
         ASSERT_EQUALS(0, serverStatusReply["connections"]["exhaustHello"].numberInt());
@@ -1063,7 +1064,7 @@ void exhaustMetricDecrementsOnNewOpAfterTerminatingExhaustStream(bool useLegacyC
     }));
 
     // Terminating the exhaust stream should not decrement the number of exhaust connections.
-    ASSERT(conn2->runCommand("admin", serverStatusCmd, serverStatusReply));
+    ASSERT(conn2->runCommand({boost::none, "admin"}, serverStatusCmd, serverStatusReply));
     if (useLegacyCommandName) {
         ASSERT_EQUALS(1, serverStatusReply["connections"]["exhaustIsMaster"].numberInt());
         ASSERT_EQUALS(0, serverStatusReply["connections"]["exhaustHello"].numberInt());
@@ -1074,7 +1075,7 @@ void exhaustMetricDecrementsOnNewOpAfterTerminatingExhaustStream(bool useLegacyC
 
     // exhaust metric should now decrement after calling serverStatus on the connection that used
     // to have the exhaust stream.
-    ASSERT(conn1->runCommand("admin", serverStatusCmd, serverStatusReply));
+    ASSERT(conn1->runCommand({boost::none, "admin"}, serverStatusCmd, serverStatusReply));
     ASSERT_EQUALS(0, serverStatusReply["connections"]["exhaustIsMaster"].numberInt());
     ASSERT_EQUALS(0, serverStatusReply["connections"]["exhaustHello"].numberInt());
 }
@@ -1103,7 +1104,7 @@ void exhaustMetricOnNewExhaustAfterTerminatingExhaustStream(bool useLegacyComman
     ASSERT(waitForCondition([&] {
         auto serverStatusCmd = BSON("serverStatus" << 1);
         BSONObj serverStatusReply;
-        ASSERT(conn1->runCommand("admin", serverStatusCmd, serverStatusReply));
+        ASSERT(conn1->runCommand({boost::none, "admin"}, serverStatusCmd, serverStatusReply));
         return serverStatusReply["connections"]["exhaustIsMaster"].numberInt() == 0 &&
             serverStatusReply["connections"]["exhaustHello"].numberInt() == 0;
     }));
@@ -1149,7 +1150,7 @@ void exhaustMetricOnNewExhaustAfterTerminatingExhaustStream(bool useLegacyComman
 
     auto serverStatusCmd = BSON("serverStatus" << 1);
     BSONObj serverStatusReply;
-    ASSERT(conn2->runCommand("admin", serverStatusCmd, serverStatusReply));
+    ASSERT(conn2->runCommand({boost::none, "admin"}, serverStatusCmd, serverStatusReply));
     if (useLegacyCommandName) {
         ASSERT_EQUALS(1, serverStatusReply["connections"]["exhaustIsMaster"].numberInt());
         ASSERT_EQUALS(0, serverStatusReply["connections"]["exhaustHello"].numberInt());
@@ -1176,7 +1177,7 @@ void exhaustMetricOnNewExhaustAfterTerminatingExhaustStream(bool useLegacyComman
     }));
 
     // Terminating the exhaust stream should not decrement the number of exhaust connections.
-    ASSERT(conn2->runCommand("admin", serverStatusCmd, serverStatusReply));
+    ASSERT(conn2->runCommand({boost::none, "admin"}, serverStatusCmd, serverStatusReply));
     if (useLegacyCommandName) {
         ASSERT_EQUALS(1, serverStatusReply["connections"]["exhaustIsMaster"].numberInt());
         ASSERT_EQUALS(0, serverStatusReply["connections"]["exhaustHello"].numberInt());
@@ -1196,7 +1197,7 @@ void exhaustMetricOnNewExhaustAfterTerminatingExhaustStream(bool useLegacyComman
     ASSERT_OK(getStatusFromCommandResult(res));
 
     // exhaust metric should not increment or decrement after initiating a new exhaust stream.
-    ASSERT(conn2->runCommand("admin", serverStatusCmd, serverStatusReply));
+    ASSERT(conn2->runCommand({boost::none, "admin"}, serverStatusCmd, serverStatusReply));
     if (useLegacyCommandName) {
         ASSERT_EQUALS(1, serverStatusReply["connections"]["exhaustIsMaster"].numberInt());
         ASSERT_EQUALS(0, serverStatusReply["connections"]["exhaustHello"].numberInt());
@@ -1226,14 +1227,14 @@ TEST(OpMsg, ExhaustWithDBClientCursorBehavesCorrectly) {
         return;
     }
 
-    NamespaceString nss("test", "coll");
-    conn->dropCollection(nss.toString());
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "coll");
+    conn->dropCollection(nss);
 
     const int nDocs = 5;
     LOGV2(22634, "Inserting {nDocs} documents.", "nDocs"_attr = nDocs);
     for (int i = 0; i < nDocs; i++) {
         auto doc = BSON("_id" << i);
-        conn->insert(nss.toString(), doc);
+        conn->insert(nss, doc);
     }
 
     ASSERT_EQ(conn->count(nss), size_t(nDocs));
@@ -1333,7 +1334,7 @@ public:
 
         auto uri = swURI.getValue();
         if (helloOk.has_value()) {
-            uri.setHelloOk(helloOk.get());
+            uri.setHelloOk(helloOk.value());
         }
 
         auto swConn = connStr.connect(_appName, 0, &uri);

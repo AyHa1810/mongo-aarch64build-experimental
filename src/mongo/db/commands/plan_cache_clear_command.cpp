@@ -43,8 +43,8 @@
 #include "mongo/db/query/plan_cache_callbacks.h"
 #include "mongo/db/query/plan_cache_key_factory.h"
 #include "mongo/db/query/plan_ranker.h"
+#include "mongo/db/query/query_utils.h"
 #include "mongo/db/query/sbe_plan_cache.h"
-#include "mongo/db/query/sbe_utils.h"
 #include "mongo/logv2/log.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
@@ -90,11 +90,8 @@ Status clear(OperationContext* opCtx,
             canonical_query_encoder::encodeForPlanCacheCommand(*cq))};
         plan_cache_commands::removePlanCacheEntriesByPlanCacheCommandKeys(planCacheCommandKeys,
                                                                           planCache);
-
-        if (feature_flags::gFeatureFlagSbeFull.isEnabledAndIgnoreFCV()) {
-            plan_cache_commands::removePlanCacheEntriesByPlanCacheCommandKeys(
-                planCacheCommandKeys, collection->uuid(), &sbe::getPlanCache(opCtx));
-        }
+        plan_cache_commands::removePlanCacheEntriesByPlanCacheCommandKeys(
+            planCacheCommandKeys, collection->uuid(), &sbe::getPlanCache(opCtx));
 
         return Status::OK();
     }
@@ -109,13 +106,11 @@ Status clear(OperationContext* opCtx,
 
     planCache->clear();
 
-    if (feature_flags::gFeatureFlagSbeFull.isEnabledAndIgnoreFCV()) {
-        auto version = CollectionQueryInfo::get(collection).getPlanCacheInvalidatorVersion();
-        sbe::clearPlanCacheEntriesWith(opCtx->getServiceContext(),
-                                       collection->uuid(),
-                                       version,
-                                       false /*matchSecondaryCollections*/);
-    }
+    auto version = CollectionQueryInfo::get(collection).getPlanCacheInvalidatorVersion();
+    sbe::clearPlanCacheEntriesWith(opCtx->getServiceContext(),
+                                   collection->uuid(),
+                                   version,
+                                   false /*matchSecondaryCollections*/);
 
     LOGV2_DEBUG(
         23908, 1, "{namespace}: Cleared plan cache", "Cleared plan cache", "namespace"_attr = ns);
@@ -142,7 +137,7 @@ public:
     PlanCacheClearCommand() : BasicCommand("planCacheClear") {}
 
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override;
 
@@ -154,20 +149,20 @@ public:
         return AllowedOnSecondary::kOptIn;
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override;
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override;
 
     std::string help() const override {
         return "Drops one or all plan cache entries in a collection.";
     }
 } planCacheClearCommand;
 
-Status PlanCacheClearCommand::checkAuthForCommand(Client* client,
-                                                  const std::string& dbname,
-                                                  const BSONObj& cmdObj) const {
-    AuthorizationSession* authzSession = AuthorizationSession::get(client);
-    ResourcePattern pattern = parseResourcePattern(dbname, cmdObj);
+Status PlanCacheClearCommand::checkAuthForOperation(OperationContext* opCtx,
+                                                    const DatabaseName& dbName,
+                                                    const BSONObj& cmdObj) const {
+    AuthorizationSession* authzSession = AuthorizationSession::get(opCtx->getClient());
+    ResourcePattern pattern = parseResourcePattern(dbName, cmdObj);
 
     if (authzSession->isAuthorizedForActionsOnResource(pattern, ActionType::planCacheWrite)) {
         return Status::OK();
@@ -177,10 +172,10 @@ Status PlanCacheClearCommand::checkAuthForCommand(Client* client,
 }
 
 bool PlanCacheClearCommand::run(OperationContext* opCtx,
-                                const std::string& dbname,
+                                const DatabaseName& dbName,
                                 const BSONObj& cmdObj,
                                 BSONObjBuilder& result) {
-    const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
+    const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
 
     // This is a read lock. The query cache is owned by the collection.
     AutoGetCollectionForReadCommand ctx(opCtx, nss);

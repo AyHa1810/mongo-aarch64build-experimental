@@ -80,9 +80,9 @@ class test_tiered12(wttest.WiredTigerTestCase, TieredConfigMixin):
         c["0"] = "0"
         self.check(c, 0, 1)
         c.close()
-        self.session.checkpoint()
-
-        self.session.flush_tier(None)
+        # Use force to make sure the new object is created. Otherwise there is no
+        # existing checkpoint yet and the flush will think there is no work to do.
+        self.session.checkpoint('flush_tier=(enabled,force=true)')
 
         # On directory store, the bucket object should exist.
         if self.ss_name == 'dir_store':
@@ -92,8 +92,9 @@ class test_tiered12(wttest.WiredTigerTestCase, TieredConfigMixin):
         # Sleep more than the one second stress timing amount and give the thread time to run.
         time.sleep(2)
         # After sleeping, the internal thread should have created the cached object.
-        cache_obj = os.path.join(cache, self.bucket_prefix + self.obj1file)
-        self.assertTrue(os.path.exists(cache_obj))
+        if self.has_cache:
+            cache_obj = os.path.join(cache, self.bucket_prefix + self.obj1file)
+            self.assertTrue(os.path.exists(cache_obj))
 
 if __name__ == '__main__':
     wttest.run()

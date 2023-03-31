@@ -36,11 +36,11 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/logical_session_id.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/repl/hello_auth.h"
 #include "mongo/db/repl/hello_gen.h"
+#include "mongo/db/session/logical_session_id.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/metadata/client_metadata.h"
@@ -104,14 +104,18 @@ public:
         return "Status information for clients negotiating a connection with this server";
     }
 
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const final {
-        // No auth required
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        return Status::OK();  // No auth required
     }
 
     bool requiresAuth() const final {
         return false;
+    }
+
+    HandshakeRole handshakeRole() const final {
+        return HandshakeRole::kHello;
     }
 
     bool runWithReplyBuilder(OperationContext* opCtx,
@@ -122,7 +126,19 @@ public:
         const bool apiStrict = APIParameters::get(opCtx).getAPIStrict().value_or(false);
         auto cmd = HelloCommand::parse({"hello", apiStrict}, cmdObj);
 
-        waitInHello.execute([&](const BSONObj&) {
+        waitInHello.execute([&](const BSONObj& args) {
+            if (args.hasElement("delayMillis")) {
+                Milliseconds delay{args["delayMillis"].safeNumberLong()};
+                LOGV2(6724103,
+                      "Fail point delays Hello processing",
+                      "cmd"_attr = cmdObj,
+                      "client"_attr = opCtx->getClient()->clientAddress(true),
+                      "desc"_attr = opCtx->getClient()->desc(),
+                      "delay"_attr = delay);
+                opCtx->sleepFor(delay);
+                return;
+            }
+
             LOGV2(6524600,
                   "Fail point blocks Hello response until removed",
                   "cmd"_attr = cmdObj,
@@ -218,7 +234,7 @@ public:
 
         if (auto sp = ServerParameterSet::getNodeParameterSet()->getIfExists(
                 kAutomationServiceDescriptorFieldName)) {
-            sp->append(opCtx, result, kAutomationServiceDescriptorFieldName);
+            sp->append(opCtx, &result, kAutomationServiceDescriptorFieldName, boost::none);
         }
 
         MessageCompressorManager::forSession(opCtx->getClient()->session())
@@ -269,11 +285,11 @@ public:
         auto ret = result->asTempObj();
         if (ret[ErrorReply::kErrmsgFieldName].eoo()) {
             // Nominal success case, parse the object as-is.
-            HelloCommandReply::parse({"hello.reply"}, ret);
+            HelloCommandReply::parse(IDLParserContext{"hello.reply"}, ret);
         } else {
             // Something went wrong, still try to parse, but accept a few ignorable fields.
             StringDataSet ignorable({ErrorReply::kCodeFieldName, ErrorReply::kErrmsgFieldName});
-            HelloCommandReply::parse({"hello.reply"}, ret.removeFields(ignorable));
+            HelloCommandReply::parse(IDLParserContext{"hello.reply"}, ret.removeFields(ignorable));
         }
     }
 

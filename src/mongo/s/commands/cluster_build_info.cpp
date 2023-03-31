@@ -64,7 +64,9 @@ ClusterBuildInfoExecutor* ClusterBuildInfoExecutor::get(ServiceContext* svc) {
 const auto clusterBuildInfoExecutorRegisterer = ServiceContext::ConstructorActionRegisterer{
     "ClusterBuildInfoExecutor",
     [](ServiceContext* ctx) { getClusterBuildInfoExecutor(ctx).start(); },
-    [](ServiceContext* ctx) { getClusterBuildInfoExecutor(ctx).stop(); }};
+    [](ServiceContext* ctx) {
+        getClusterBuildInfoExecutor(ctx).stop();
+    }};
 
 class ClusterCmdBuildInfo : public BasicCommand {
 public:
@@ -90,9 +92,11 @@ public:
         return false;
     }
 
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const final {}  // No auth required
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        return Status::OK();  // No auth required
+    }
 
     std::string help() const final {
         return "get version #, etc.\n"
@@ -100,7 +104,7 @@ public:
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName&,
              const BSONObj& jsobj,
              BSONObjBuilder& result) final {
         VersionInfoInterface::instance().appendBuildInfo(&result);

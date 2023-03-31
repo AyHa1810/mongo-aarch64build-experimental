@@ -5,6 +5,11 @@
 // test from running in the 'aggregation_facet_unwind_passthrough' suite.
 // @tags: [
 //   do_not_wrap_aggregations_in_facets,
+//
+//   # This test makes assertions about queries erroring or returning null depending on whether SBE
+//   # is used or not. SBE may be chosen if an implicit column index is created, so we ban this
+//   # tests from implicit index creation suites.
+//   assumes_no_implicit_index_creation,
 // ]
 (function() {
 "use strict";
@@ -130,7 +135,7 @@ runAndAssertThrows(["$dbl_arr", "$dbl_val"]);
 // Confirm edge case where if invalid input precedes null or missing inputs, the command fails.
 // Note that when the SBE engine is enabled, null will be returned before invalid input because
 // we check if any values are null before checking whether all values are arrays.
-let evalFn = checkSBEEnabled(db, ["featureFlagSbeFull"]) ? runAndAssertNull : runAndAssertThrows;
+let evalFn = checkSBEEnabled(db) ? runAndAssertNull : runAndAssertThrows;
 evalFn(["$int_arr", "$dbl_val", "$null_val"]);
 evalFn(["$int_arr", "some_string_value", "$null_val"]);
 evalFn(["$dbl_val", "$null_val"]);

@@ -32,30 +32,33 @@
 #include "mongo/db/change_streams_cluster_parameter.h"
 
 #include "mongo/base/status.h"
+#include "mongo/db/change_stream_serverless_helpers.h"
 #include "mongo/db/change_streams_cluster_parameter_gen.h"
-#include "mongo/logv2/log.h"
+#include "mongo/db/repl/replication_coordinator.h"
+
 namespace mongo {
 
 Status validateChangeStreamsClusterParameter(
-    const ChangeStreamsClusterParameterStorage& clusterParameter) {
-    LOGV2_DEBUG(6594801,
-                1,
-                "Validating change streams cluster parameter",
-                "enabled"_attr = clusterParameter.getEnabled(),
-                "expireAfterSeconds"_attr = clusterParameter.getExpireAfterSeconds());
-    if (clusterParameter.getEnabled()) {
-        if (clusterParameter.getExpireAfterSeconds() <= 0) {
-            return Status(ErrorCodes::BadValue,
-                          "Expected a positive integer for 'expireAfterSeconds' field if 'enabled' "
-                          "field is true");
-        }
-    } else {
-        if (clusterParameter.getExpireAfterSeconds() != 0) {
-            return Status(
-                ErrorCodes::BadValue,
-                "Expected a zero value for 'expireAfterSeconds' if 'enabled' field is false");
-        }
+    const ChangeStreamsClusterParameterStorage& clusterParameter,
+    const boost::optional<TenantId>& tenantId) {
+    auto* repl = repl::ReplicationCoordinator::get(getGlobalServiceContext());
+    bool isStandalone = repl &&
+        repl->getReplicationMode() == repl::ReplicationCoordinator::modeNone &&
+        serverGlobalParams.clusterRole.has(ClusterRole::None);
+    if (isStandalone) {
+        return {ErrorCodes::IllegalOperation,
+                "The 'changeStreams' parameter is unsupported in standalone."};
     }
+    if (!change_stream_serverless_helpers::canRunInTargetEnvironment()) {
+        return Status(
+            ErrorCodes::CommandNotSupported,
+            "The 'changeStreams' cluster-wide parameter is only available in serverless.");
+    }
+    if (clusterParameter.getExpireAfterSeconds() <= 0) {
+        return Status(ErrorCodes::BadValue,
+                      "Expected a positive integer for 'expireAfterSeconds' field");
+    }
+
     return Status::OK();
 }
 

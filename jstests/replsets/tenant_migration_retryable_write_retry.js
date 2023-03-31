@@ -15,19 +15,20 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    makeX509OptionsForTest,
+} from "jstests/replsets/libs/tenant_migration_util.js";
 
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 load("jstests/libs/fail_point_util.js");  // For configureFailPoint().
 load("jstests/libs/uuid_util.js");        // For extractUUIDFromObject().
 
-const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
+const migrationX509Options = makeX509OptionsForTest();
 
 const donorRst = new ReplSetTest({
     nodes: 1,
     name: "donor",
+    serverless: true,
     nodeOptions: Object.assign(migrationX509Options.donor, {
         setParameter: {
             // Allow non-timestamped reads on donor after migration completes for testing.
@@ -35,8 +36,8 @@ const donorRst = new ReplSetTest({
         }
     })
 });
-const recipientRst =
-    new ReplSetTest({nodes: 1, name: "recipient", nodeOptions: migrationX509Options.recipient});
+const recipientRst = new ReplSetTest(
+    {nodes: 1, name: "recipient", serverless: true, nodeOptions: migrationX509Options.recipient});
 
 donorRst.startSet();
 donorRst.initiate();
@@ -46,7 +47,7 @@ recipientRst.initiate();
 
 const tenantMigrationTest = new TenantMigrationTest({name: jsTestName(), donorRst, recipientRst});
 
-const kTenantId = "testTenantId";
+const kTenantId = ObjectId().str;
 const kDbName = tenantMigrationTest.tenantDB(kTenantId, "testDb");
 const kCollName = "testColl";
 const kNs = `${kDbName}.${kCollName}`;
@@ -197,7 +198,7 @@ sessionsOnDonor.push({
 //     },
 //     "txnNumber" : NumberLong(0),
 //     "op" : "n",
-//     "ns" : "testTenantId_testDb.testColl",
+//     "ns" : "<OID>_testDb.testColl",
 //     "ui" : UUID("1aa099b9-879f-4cd5-b58e-0a654abfeb58"),
 //     "o" : {
 //         "_id" : ObjectId("5fa4d04d04c649017b6558ff"),
@@ -221,7 +222,7 @@ sessionsOnDonor.push({
 //     },
 //     "txnNumber" : NumberLong(0),
 //     "op" : "d",
-//     "ns" : "testTenantId_testDb.testColl",
+//     "ns" : "<OID>_testDb.testColl",
 //     "ui" : UUID("1aa099b9-879f-4cd5-b58e-0a654abfeb58"),
 //     "o" : {
 //         "_id" : ObjectId("5fa4d04d04c649017b6558ff")
@@ -327,4 +328,3 @@ assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migration
 
 donorRst.stopSet();
 recipientRst.stopSet();
-})();

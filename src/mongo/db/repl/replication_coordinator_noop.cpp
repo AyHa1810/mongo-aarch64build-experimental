@@ -402,7 +402,8 @@ Status ReplicationCoordinatorNoOp::doOptimizedReconfig(OperationContext* opCtx,
 }
 
 Status ReplicationCoordinatorNoOp::awaitConfigCommitment(OperationContext* opCtx,
-                                                         bool waitForOplogCommitment) {
+                                                         bool waitForOplogCommitment,
+                                                         long long term) {
     MONGO_UNREACHABLE;
 }
 
@@ -580,8 +581,8 @@ ReplicationCoordinatorNoOp::getHelloResponseFuture(
     MONGO_UNREACHABLE;
 }
 
-StatusWith<OpTime> ReplicationCoordinatorNoOp::getLatestWriteOpTime(OperationContext* opCtx) const
-    noexcept {
+StatusWith<OpTime> ReplicationCoordinatorNoOp::getLatestWriteOpTime(
+    OperationContext* opCtx) const noexcept {
     return getMyLastAppliedOpTime();
 }
 
@@ -614,7 +615,14 @@ void ReplicationCoordinatorNoOp::recordIfCWWCIsSetOnConfigServerOnStartup(Operat
 ReplicationCoordinatorNoOp::WriteConcernTagChanges*
 ReplicationCoordinatorNoOp::getWriteConcernTagChanges() {
     MONGO_UNREACHABLE;
-    return nullptr;
+}
+
+SplitPrepareSessionManager* ReplicationCoordinatorNoOp::getSplitPrepareSessionManager() {
+    MONGO_UNREACHABLE;
+}
+
+bool ReplicationCoordinatorNoOp::isRetryableWrite(OperationContext* opCtx) const {
+    MONGO_UNREACHABLE;
 }
 
 }  // namespace repl

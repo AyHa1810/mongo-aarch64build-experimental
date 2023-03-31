@@ -36,7 +36,7 @@ using namespace test_harness;
  * mongod instance loading a large amount of data over a long period of time.
  */
 class burst_inserts : public test {
-    public:
+public:
     burst_inserts(const test_args &args) : test(args)
     {
         _burst_duration = _config->get_int("burst_duration");
@@ -146,10 +146,9 @@ class burst_inserts : public test {
             tc->sleep();
         }
         /* Make sure the last transaction is rolled back now the work is finished. */
-        if (tc->txn.active())
-            tc->txn.rollback();
+        tc->txn.try_rollback();
     }
 
-    private:
+private:
     int _burst_duration = 0;
 };

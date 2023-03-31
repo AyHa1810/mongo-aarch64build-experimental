@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-
 #include <functional>
 #include <memory>
 #include <string>
@@ -58,7 +57,6 @@
 #include "mongo/unittest/unittest.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
-
 
 namespace mongo {
 namespace {
@@ -263,11 +261,11 @@ public:
      * collection.
      */
     void onInserts(OperationContext* opCtx,
-                   const NamespaceString& nss,
-                   const UUID& uuid,
+                   const CollectionPtr& coll,
                    std::vector<InsertStatement>::const_iterator begin,
                    std::vector<InsertStatement>::const_iterator end,
-                   bool fromMigrate) override;
+                   std::vector<bool> fromMigrate,
+                   bool defaultFromMigrate) override;
 
     /**
      * Tracks the temporary collections mapReduces creates.
@@ -289,7 +287,8 @@ public:
 
     // Hook for onInserts. Defaults to a no-op function but may be overridden to inject exceptions
     // while mapReduce inserts its results into the temporary output collection.
-    std::function<void()> onInsertsFn = [] {};
+    std::function<void()> onInsertsFn = [] {
+    };
 
     // Holds indexes copied from existing output collection to the temporary collections.
     std::vector<BSONObj> indexesCreated;
@@ -320,11 +319,11 @@ void MapReduceOpObserver::onStartIndexBuild(OperationContext* opCtx,
 }
 
 void MapReduceOpObserver::onInserts(OperationContext* opCtx,
-                                    const NamespaceString& nss,
-                                    const UUID& uuid,
+                                    const CollectionPtr& coll,
                                     std::vector<InsertStatement>::const_iterator begin,
                                     std::vector<InsertStatement>::const_iterator end,
-                                    bool fromMigrate) {
+                                    std::vector<bool> fromMigrate,
+                                    bool defaultFromMigrate) {
     onInsertsFn();
 }
 
@@ -397,8 +396,10 @@ protected:
     MapReduceOpObserver* _opObserver = nullptr;
 };
 
-const NamespaceString MapReduceCommandTest::inputNss("myDB.myCollection");
-const NamespaceString MapReduceCommandTest::outputNss(inputNss.getSisterNS("outCollection"));
+const NamespaceString MapReduceCommandTest::inputNss =
+    NamespaceString::createNamespaceString_forTest("myDB.myCollection");
+const NamespaceString MapReduceCommandTest::outputNss =
+    NamespaceString::createNamespaceString_forTest(inputNss.getSisterNS("outCollection"));
 
 void MapReduceCommandTest::setUp() {
     ServiceContextMongoDTest::setUp();
@@ -496,7 +497,9 @@ TEST_F(MapReduceCommandTest, DropTemporaryCollectionsOnInsertError) {
     auto sourceDoc = BSON("_id" << 0);
     ASSERT_OK(_storage.insertDocument(_opCtx.get(), inputNss, {sourceDoc, Timestamp(0)}, 1LL));
 
-    _opObserver->onInsertsFn = [] { uasserted(ErrorCodes::OperationFailed, ""); };
+    _opObserver->onInsertsFn = [] {
+        uasserted(ErrorCodes::OperationFailed, "");
+    };
 
     auto mapCode = "function() { emit(this._id, this._id); }"_sd;
     auto reduceCode = "function(k, v) { return Array.sum(v); }"_sd;

@@ -51,7 +51,7 @@ public:
     }
 
     boost::intrusive_ptr<DocumentSource> clone(
-        const boost::intrusive_ptr<ExpressionContext>& newExpCtx = nullptr) const final {
+        const boost::intrusive_ptr<ExpressionContext>& newExpCtx) const final {
         return new DocumentSourceChangeStreamOplogMatch(*this, newExpCtx);
     }
 
@@ -74,7 +74,7 @@ public:
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final;
 
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const final;
+    Value serialize(SerializationOptions opts = SerializationOptions()) const final override;
 
 protected:
     Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,

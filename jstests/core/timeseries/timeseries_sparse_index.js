@@ -2,9 +2,13 @@
  * Tests that sparse indexes are not allowed on a time-series measurement field.
  *
  * @tags: [
- *     does_not_support_stepdowns,
- *     does_not_support_transactions,
- *     requires_find_command,
+ *   # This test makes assertions on listIndexes and on the order of the indexes returned.
+ *   assumes_no_implicit_index_creation,
+ *   # This test depends on certain writes ending up in the same bucket. Stepdowns may result in
+ *   # writes splitting between two primaries, and thus different buckets.
+ *   does_not_support_stepdowns,
+ *   # We need a timeseries collection.
+ *   requires_timeseries,
  * ]
  */
 (function() {
@@ -89,7 +93,7 @@ TimeseriesTest.run((insert) => {
         const coll = db.getCollection(collName);
         const bucketsColl = db.getCollection("system.buckets." + collName);
 
-        setup(viewDefinition, /*shouldSucceed=*/true);
+        setup(viewDefinition, /*shouldSucceed=*/ true);
 
         // Check definition on view
         let userIndexes = coll.getIndexes();
@@ -113,14 +117,14 @@ TimeseriesTest.run((insert) => {
     testIndex({[`${metaFieldName}.abc`]: 1}, {"meta.abc": 1}, 0);
 
     // Cannot create sparse indexes on time-series measurements.
-    setup({x: 1}, /*shouldSucceed=*/false);
-    setup({y: -1}, /*shouldSucceed=*/false);
-    setup({x: 1, y: 1}, /*shouldSucceed=*/false);
-    setup({z: 1}, /*shouldSucceed=*/false);
+    setup({x: 1}, /*shouldSucceed=*/ false);
+    setup({y: -1}, /*shouldSucceed=*/ false);
+    setup({x: 1, y: 1}, /*shouldSucceed=*/ false);
+    setup({z: 1}, /*shouldSucceed=*/ false);
 
     // Compound sparse indexes are not allowed if measurements are involved.
-    setup({x: 1, [`${metaFieldName}.loc`]: "2dsphere"}, /*shouldSucceed=*/false);
-    setup({[`${timeFieldName}`]: 1, x: 1}, /*shouldSucceed=*/false);
+    setup({x: 1, [`${metaFieldName}.loc`]: "2dsphere"}, /*shouldSucceed=*/ false);
+    setup({[`${timeFieldName}`]: 1, x: 1}, /*shouldSucceed=*/ false);
 
     // Test compound time and metadata sparse indexes.
     testIndex({[`${timeFieldName}`]: 1, [`${metaFieldName}.tag`]: 1},

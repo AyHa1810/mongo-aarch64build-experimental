@@ -1,8 +1,8 @@
 /**
  * Tests that the donor
- * - blocks reads with atClusterTime/afterClusterTime >= blockTimestamp that are executed while the
+ * - blocks reads with atClusterTime/afterClusterTime >= blockOpTime that are executed while the
  *   split is in the blocking state but does not block linearizable reads.
- * - does not reject reads with atClusterTime/afterClusterTime >= blockTimestamp and linearizable
+ * - does not reject reads with atClusterTime/afterClusterTime >= blockOpTime and linearizable
  *   reads after the split aborts.
  *
  * @tags: [
@@ -12,37 +12,29 @@
  *   requires_majority_read_concern,
  *   requires_persistence,
  *   serverless,
- *   requires_fcv_52,
- *   featureFlagShardSplit
+ *   requires_fcv_63
  * ]
  */
 
-(function() {
-'use strict';
+import {findSplitOperation, ShardSplitTest} from "jstests/serverless/libs/shard_split_test.js";
 
 load("jstests/libs/fail_point_util.js");
-load("jstests/libs/parallelTester.js");
-load("jstests/libs/uuid_util.js");
-load("jstests/serverless/libs/basic_serverless_test.js");
 load("jstests/serverless/shard_split_concurrent_reads_on_donor_util.js");
 
+const ktenantId = ObjectId();
+const tenantIds = [ktenantId];
 const kCollName = "testColl";
-const kTenantDefinedDbName = "0";
-
-function getTenantId(dbName) {
-    return dbName.split('_')[0];
-}
 
 /**
  * To be used to resume a split that is paused after entering the blocking state. Waits for the
  * number of blocked reads to reach 'targetNumBlockedReads' and unpauses the split.
  */
-function resumeMigrationAfterBlockingRead(host, tenantId, targetNumBlockedReads) {
+async function resumeMigrationAfterBlockingRead(host, tenantId, targetNumBlockedReads) {
+    const {ShardSplitTest} = await import("jstests/serverless/libs/shard_split_test.js");
     load("jstests/libs/fail_point_util.js");
-    load("jstests/serverless/libs/basic_serverless_test.js");
-    const primary = new Mongo(host);
 
-    assert.soon(() => BasicServerlessTest.getNumBlockedReads(primary, tenantId) ==
+    const primary = new Mongo(host);
+    assert.soon(() => ShardSplitTest.getNumBlockedReads(primary, eval(tenantId)) ==
                     targetNumBlockedReads);
 
     assert.commandWorked(
@@ -59,8 +51,7 @@ function testUnblockBlockedReadsAfterMigrationAborted(testCase, dbName, collName
         return;
     }
 
-    const tenantId = getTenantId(dbName);
-    const test = new BasicServerlessTest({
+    const test = new ShardSplitTest({
         recipientTagName: "recipientTag",
         recipientSetName: "recipientSet",
         quickGarbageCollection: true
@@ -72,13 +63,13 @@ function testUnblockBlockedReadsAfterMigrationAborted(testCase, dbName, collName
 
     let blockingFp = configureFailPoint(donorPrimary, "pauseShardSplitAfterBlocking");
     let abortFp = configureFailPoint(donorPrimary, "abortShardSplitBeforeLeavingBlockingState");
-    const operation = test.createSplitOperation([tenantId]);
+    const operation = test.createSplitOperation(tenantIds);
 
     // Run the commands after the split enters the blocking state.
     const splitThread = operation.commitAsync();
 
     let resumeMigrationThread =
-        new Thread(resumeMigrationAfterBlockingRead, donorPrimary.host, tenantId, 1);
+        new Thread(resumeMigrationAfterBlockingRead, donorPrimary.host, tojson(ktenantId), 1);
 
     // Run the commands after the split enters the blocking state.
     resumeMigrationThread.start();
@@ -86,12 +77,12 @@ function testUnblockBlockedReadsAfterMigrationAborted(testCase, dbName, collName
 
     // Wait for the last oplog entry on the primary to be visible in the committed snapshot view of
     // the oplog on all secondaries to ensure that snapshot reads on the secondaries with
-    // unspecified atClusterTime have read timestamp >= blockTimestamp.
+    // unspecified atClusterTime have read timestamp >= blockOpTime.
     donorRst.awaitLastOpCommitted();
 
     const donorDoc = findSplitOperation(donorPrimary, operation.migrationId);
     const command = testCase.requiresReadTimestamp
-        ? testCase.command(collName, donorDoc.blockTimestamp)
+        ? testCase.command(collName, donorDoc.blockOpTime.ts)
         : testCase.command(collName);
 
     // The split should unpause and abort after the read is blocked. Verify that the read
@@ -99,8 +90,8 @@ function testUnblockBlockedReadsAfterMigrationAborted(testCase, dbName, collName
     const db = donorPrimary.getDB(dbName);
     runCommandForConcurrentReadTest(db, command, null, testCase.isTransaction);
     if (testCase.isSupportedOnSecondaries) {
-        const primaryPort = String(donorPrimary).split(":")[1];
-        const secondaries = donorRst.nodes.filter(node => node.port != primaryPort);
+        const secondaries =
+            test.getDonorNodes().filter(node => node.adminCommand({hello: 1}).secondary);
         secondaries.forEach(node => {
             const db = node.getDB(dbName);
             runCommandForConcurrentReadTest(db, command, null, testCase.isTransaction);
@@ -108,7 +99,7 @@ function testUnblockBlockedReadsAfterMigrationAborted(testCase, dbName, collName
     }
 
     const shouldBlock = !testCase.isLinearizableRead;
-    BasicServerlessTest.checkShardSplitAccessBlocker(donorPrimary, tenantId, {
+    ShardSplitTest.checkShardSplitAccessBlocker(donorPrimary, ktenantId, {
         numBlockedReads: shouldBlock ? 1 : 0,
         // Reads just get unblocked if the split aborts.
         numTenantMigrationAbortedErrors: 0
@@ -127,7 +118,6 @@ const testCases = shardSplitConcurrentReadTestCases;
 
 for (const [testCaseName, testCase] of Object.entries(testCases)) {
     jsTest.log(`Testing inBlockingThenAborted with testCase ${testCaseName}`);
-    const dbName = `${testCaseName}-inBlockingThenAborted_${kTenantDefinedDbName}`;
+    const dbName = `${ktenantId.str}_${testCaseName}`;
     testUnblockBlockedReadsAfterMigrationAborted(testCase, dbName, kCollName);
 }
-})();

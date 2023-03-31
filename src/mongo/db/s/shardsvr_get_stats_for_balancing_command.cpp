@@ -119,13 +119,8 @@ public:
                 return 0LL;
             }
 
-            const long long numOrphanDocs = [&] {
-                if (!feature_flags::gOrphanTracking.isEnabled(
-                        serverGlobalParams.featureCompatibility)) {
-                    return 0LL;
-                }
-                return BalancerStatsRegistry::get(opCtx)->getCollNumOrphanDocs(*collUUID);
-            }();
+            const long long numOrphanDocs =
+                BalancerStatsRegistry::get(opCtx)->getCollNumOrphanDocs(*collUUID);
 
             if (numRecords <= numOrphanDocs) {
                 // The number of records and the number of orphans documents are not updated
@@ -139,7 +134,7 @@ public:
         }
 
         NamespaceString ns() const override {
-            return {request().getDbName(), ""};
+            return NamespaceString(request().getDbName());
         }
 
         bool supportsWriteConcern() const override {

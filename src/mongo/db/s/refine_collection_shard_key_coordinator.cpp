@@ -35,7 +35,6 @@
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/op_observer/op_observer.h"
-#include "mongo/db/s/dist_lock_manager.h"
 #include "mongo/db/s/shard_key_util.h"
 #include "mongo/db/s/sharding_ddl_util.h"
 #include "mongo/logv2/log.h"
@@ -111,7 +110,7 @@ ExecutorFuture<void> RefineCollectionShardKeyCoordinator::_runImpl(
     std::shared_ptr<executor::ScopedTaskExecutor> executor,
     const CancellationToken& token) noexcept {
     return ExecutorFuture<void>(**executor)
-        .then(_executePhase(
+        .then(_buildPhaseHandler(
             Phase::kRefineCollectionShardKey,
             [this, anchor = shared_from_this()] {
                 auto opCtxHolder = cc().makeOperationContext();
@@ -120,23 +119,28 @@ ExecutorFuture<void> RefineCollectionShardKeyCoordinator::_runImpl(
 
                 {
                     AutoGetCollection coll{
-                        opCtx, nss(), MODE_IS, AutoGetCollectionViewMode::kViewsPermitted};
-                    checkCollectionUUIDMismatch(opCtx, nss(), *coll, _request.getCollectionUUID());
+                        opCtx,
+                        nss(),
+                        MODE_IS,
+                        AutoGetCollection::Options{}
+                            .viewMode(auto_get_collection::ViewMode::kViewsPermitted)
+                            .expectedUUID(_request.getCollectionUUID())};
                 }
 
                 shardkeyutil::validateShardKeyIsNotEncrypted(
                     opCtx, nss(), ShardKeyPattern(_newShardKey.toBSON()));
 
-                const auto cm = uassertStatusOK(
-                    Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(
-                        opCtx, nss()));
+                const auto [cm, _] = uassertStatusOK(
+                    Grid::get(opCtx)
+                        ->catalogCache()
+                        ->getShardedCollectionRoutingInfoWithPlacementRefresh(opCtx, nss()));
 
                 _oldShardKey = cm.getShardKeyPattern().getKeyPattern();
                 _collectionUUID = cm.getUUID();
 
                 ConfigsvrRefineCollectionShardKey configsvrRefineCollShardKey(
                     nss(), _newShardKey.toBSON(), cm.getVersion().epoch());
-                configsvrRefineCollShardKey.setDbName(nss().db().toString());
+                configsvrRefineCollShardKey.setDbName(nss().dbName());
                 configsvrRefineCollShardKey.setEnforceUniquenessCheck(
                     _request.getEnforceUniquenessCheck());
                 auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
@@ -146,7 +150,7 @@ ExecutorFuture<void> RefineCollectionShardKeyCoordinator::_runImpl(
                 const auto cmdResponse = uassertStatusOK(configShard->runCommand(
                     opCtx,
                     ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                    NamespaceString::kAdminDb.toString(),
+                    DatabaseName::kAdmin.toString(),
                     CommandHelpers::appendMajorityWriteConcern(
                         configsvrRefineCollShardKey.toBSON({}), opCtx->getWriteConcern()),
                     Shard::RetryPolicy::kIdempotent));
@@ -156,7 +160,7 @@ ExecutorFuture<void> RefineCollectionShardKeyCoordinator::_runImpl(
         .onError([this, anchor = shared_from_this()](const Status& status) {
             LOGV2_ERROR(5277700,
                         "Error running refine collection shard key",
-                        "namespace"_attr = nss(),
+                        logAttrs(nss()),
                         "error"_attr = redact(status));
 
             return status;

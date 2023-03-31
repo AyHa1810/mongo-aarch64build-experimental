@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/s/forwardable_operation_metadata.h"
 
 #include "mongo/db/auth/authorization_session.h"
@@ -47,7 +45,17 @@ ForwardableOperationMetadata::ForwardableOperationMetadata(OperationContext* opC
         setComment(optComment->wrap());
     }
     if (const auto authMetadata = rpc::getImpersonatedUserMetadata(opCtx)) {
-        setImpersonatedUserMetadata({{authMetadata->getUsers(), authMetadata->getRoles()}});
+        if (authMetadata->getUser()) {
+            AuthenticationMetadata metadata;
+            metadata.setUser(authMetadata->getUser().get());
+            metadata.setRoles(authMetadata->getRoles());
+            setImpersonatedUserMetadata(metadata);
+        } else if (authMetadata->getUsers()) {
+            AuthenticationMetadata metadata;
+            metadata.setUsers(authMetadata->getUsers().get());
+            metadata.setRoles(authMetadata->getRoles());
+            setImpersonatedUserMetadata(metadata);
+        }
     }
 
     setMayBypassWriteBlocking(WriteBlockBypass::get(opCtx).isWriteBlockBypassEnabled());
@@ -57,15 +65,25 @@ void ForwardableOperationMetadata::setOn(OperationContext* opCtx) const {
     Client* client = opCtx->getClient();
     if (const auto& comment = getComment()) {
         stdx::lock_guard<Client> lk(*client);
-        opCtx->setComment(comment.get());
+        opCtx->setComment(comment.value());
     }
 
     if (const auto& optAuthMetadata = getImpersonatedUserMetadata()) {
-        const auto& authMetadata = optAuthMetadata.get();
-        const auto& users = authMetadata.getUsers();
-        if (!users.empty() || !authMetadata.getRoles().empty()) {
-            fassert(ErrorCodes::InternalError, users.size() == 1);
-            AuthorizationSession::get(client)->setImpersonatedUserData(users[0],
+        const auto& authMetadata = optAuthMetadata.value();
+        UserName username;
+
+        if (authMetadata.getUser()) {
+            fassert(ErrorCodes::InternalError, authMetadata.getUsers() == boost::none);
+
+            username = authMetadata.getUser().get();
+        } else if (authMetadata.getUsers()) {
+            // TODO SERVER-72448: Remove
+            fassert(ErrorCodes::InternalError, authMetadata.getUsers()->size() == 1);
+            username = authMetadata.getUsers().get()[0];
+        }
+
+        if (!authMetadata.getRoles().empty()) {
+            AuthorizationSession::get(client)->setImpersonatedUserData(username,
                                                                        authMetadata.getRoles());
         }
     }

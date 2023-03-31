@@ -135,7 +135,13 @@ CollectionScan::CollectionScan(ExpressionContext* expCtx,
 
 PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
     if (_commonStats.isEOF) {
+        _priority.reset();
         return PlanStage::IS_EOF;
+    }
+
+    if (_params.lowPriority && !_priority && opCtx()->getClient()->isFromUserConnection() &&
+        opCtx()->lockState()->shouldWaitForTicket()) {
+        _priority.emplace(opCtx()->lockState(), AdmissionContext::Priority::kLow);
     }
 
     boost::optional<Record> record;
@@ -206,8 +212,6 @@ PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
                                       << "recordId: " << recordIdToSeek);
                     }
                 }
-
-                return PlanStage::NEED_TIME;
             }
 
             if (_lastSeenId.isNull() && _params.direction == CollectionScanParams::FORWARD &&
@@ -248,6 +252,13 @@ PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
         } else {
             _commonStats.isEOF = true;
         }
+
+        // For change collections, advance '_latestOplogEntryTimestamp' to the current snapshot
+        // timestamp, i.e. the latest available timestamp in the global oplog.
+        if (_params.shouldTrackLatestOplogTimestamp && collection()->ns().isChangeCollection()) {
+            setLatestOplogEntryTimestampToReadTimestamp();
+        }
+        _priority.reset();
         return PlanStage::IS_EOF;
     }
 
@@ -266,6 +277,23 @@ PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
     _workingSet->transitionToRecordIdAndObj(id);
 
     return returnIfMatches(member, id, out);
+}
+
+void CollectionScan::setLatestOplogEntryTimestampToReadTimestamp() {
+    const auto readTimestamp = opCtx()->recoveryUnit()->getPointInTimeReadTimestamp(opCtx());
+
+    // If we don't have a read timestamp, we take no action here.
+    if (!readTimestamp) {
+        return;
+    }
+
+    // Otherwise, verify that it is equal to or greater than the last recorded timestamp, and
+    // advance it accordingly.
+    tassert(
+        6663000,
+        "The read timestamp must always be greater than or equal to the last recorded timestamp",
+        *readTimestamp >= _latestOplogEntryTimestamp);
+    _latestOplogEntryTimestamp = *readTimestamp;
 }
 
 void CollectionScan::setLatestOplogEntryTimestamp(const Record& record) {
@@ -302,7 +330,10 @@ void CollectionScan::assertTsHasNotFallenOff(const Record& record) {
     const bool tsHasNotFallenOff = oplogEntry.getTimestamp() <= *_params.assertTsHasNotFallenOff;
 
     uassert(ErrorCodes::OplogQueryMinTsMissing,
-            "Specified timestamp has already fallen off the oplog",
+            str::stream()
+                << "Specified timestamp has already fallen off the oplog for the input timestamp: "
+                << *_params.assertTsHasNotFallenOff
+                << ", oplog entry: " << oplogEntry.getEntry().toString(),
             isNewRS || tsHasNotFallenOff);
     // We don't need to check this assertion again after we've confirmed the first oplog event.
     _params.assertTsHasNotFallenOff = boost::none;
@@ -387,16 +418,24 @@ PlanStage::StageState CollectionScan::returnIfMatches(WorkingSetMember* member,
     // In the future, we could change seekNear() to always return a record after minRecord in the
     // direction of the scan. However, tailable scans depend on the current behavior in order to
     // mark their position for resuming the tailable scan later on.
-    if (!beforeStartOfRange(_params, *member) && Filter::passes(member, _filter)) {
-        if (_params.stopApplyingFilterAfterFirstMatch) {
-            _filter = nullptr;
-        }
-        *out = memberID;
-        return PlanStage::ADVANCED;
-    } else {
+    if (beforeStartOfRange(_params, *member)) {
         _workingSet->free(memberID);
         return PlanStage::NEED_TIME;
     }
+
+    if (!Filter::passes(member, _filter)) {
+        _workingSet->free(memberID);
+        if (_params.shouldReturnEofOnFilterMismatch) {
+            _commonStats.isEOF = true;
+            return PlanStage::IS_EOF;
+        }
+        return PlanStage::NEED_TIME;
+    }
+    if (_params.stopApplyingFilterAfterFirstMatch) {
+        _filter = nullptr;
+    }
+    *out = memberID;
+    return PlanStage::ADVANCED;
 }
 
 bool CollectionScan::isEOF() {
@@ -429,9 +468,15 @@ void CollectionScan::doRestoreStateRequiresCollection() {
 void CollectionScan::doDetachFromOperationContext() {
     if (_cursor)
         _cursor->detachFromOperationContext();
+
+    _priority.reset();
 }
 
 void CollectionScan::doReattachToOperationContext() {
+    if (_params.lowPriority && opCtx()->getClient()->isFromUserConnection() &&
+        opCtx()->lockState()->shouldWaitForTicket()) {
+        _priority.emplace(opCtx()->lockState(), AdmissionContext::Priority::kLow);
+    }
     if (_cursor)
         _cursor->reattachToOperationContext(opCtx());
 }
@@ -439,9 +484,7 @@ void CollectionScan::doReattachToOperationContext() {
 unique_ptr<PlanStageStats> CollectionScan::getStats() {
     // Add a BSON representation of the filter to the stats tree, if there is one.
     if (nullptr != _filter) {
-        BSONObjBuilder bob;
-        _filter->serialize(&bob);
-        _commonStats.filter = bob.obj();
+        _commonStats.filter = _filter->serialize();
     }
 
     unique_ptr<PlanStageStats> ret = std::make_unique<PlanStageStats>(_commonStats, STAGE_COLLSCAN);

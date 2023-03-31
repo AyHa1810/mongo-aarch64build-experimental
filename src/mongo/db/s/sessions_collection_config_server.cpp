@@ -27,10 +27,12 @@
  *    it in the license file.
  */
 
-
 #include "mongo/db/s/sessions_collection_config_server.h"
+#include "mongo/db/repl/replication_coordinator.h"
 
+#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/logv2/log.h"
+#include "mongo/s/chunk_constraints.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/cluster_ddl.h"
@@ -75,16 +77,16 @@ void SessionsCollectionConfigServer::_generateIndexesIfNeeded(OperationContext* 
         nss,
         "SessionsCollectionConfigServer::_generateIndexesIfNeeded",
         [&] {
-            const ChunkManager cm = [&]() {
+            const auto cri = [&]() {
                 // (SERVER-61214) wait for the catalog cache to acknowledge that the sessions
                 // collection is sharded in order to be sure to get a valid routing table
                 while (true) {
-                    auto cm = uassertStatusOK(
+                    auto [cm, sii] = uassertStatusOK(
                         Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfoWithRefresh(opCtx,
                                                                                               nss));
 
                     if (cm.isSharded()) {
-                        return cm;
+                        return CollectionRoutingInfo(std::move(cm), std::move(sii));
                     }
                 }
             }();
@@ -93,7 +95,7 @@ void SessionsCollectionConfigServer::_generateIndexesIfNeeded(OperationContext* 
                 opCtx,
                 nss.db(),
                 nss,
-                cm,
+                cri,
                 SessionsCollection::generateCreateIndexesCmd(),
                 ReadPreferenceSetting(ReadPreference::PrimaryOnly),
                 Shard::RetryPolicy::kNoRetry,
@@ -118,24 +120,26 @@ void SessionsCollectionConfigServer::setupSessionsCollection(OperationContext* o
 
     _shardCollectionIfNeeded(opCtx);
     _generateIndexesIfNeeded(opCtx);
-    static constexpr int64_t kAverageSessionDocSizeBytes = 200;
-    static constexpr int64_t kDesiredDocsInChunks = 1000;
-    static constexpr int64_t kMaxChunkSizeBytes =
-        kAverageSessionDocSizeBytes * kDesiredDocsInChunks;
-    auto filterQuery =
-        BSON("_id" << NamespaceString::kLogicalSessionsNamespace.ns()
-                   << CollectionType::kMaxChunkSizeBytesFieldName << BSON("$exists" << false));
-    auto updateQuery = BSON("$set" << BSON(CollectionType::kMaxChunkSizeBytesFieldName
-                                           << kMaxChunkSizeBytes
-                                           << CollectionType::kNoAutoSplitFieldName << true));
 
-    uassertStatusOK(Grid::get(opCtx)->catalogClient()->updateConfigDocument(
-        opCtx,
-        CollectionType::ConfigNS,
-        filterQuery,
-        updateQuery,
-        false,
-        ShardingCatalogClient::kMajorityWriteConcern));
+    Lock::GlobalLock lock(opCtx, MODE_IX);
+    if (const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+        replCoord->canAcceptWritesFor(opCtx, CollectionType::ConfigNS)) {
+        auto filterQuery =
+            BSON("_id" << NamespaceString::kLogicalSessionsNamespace.ns()
+                       << CollectionType::kMaxChunkSizeBytesFieldName << BSON("$exists" << false));
+        auto updateQuery = BSON("$set" << BSON(CollectionType::kMaxChunkSizeBytesFieldName
+                                               << logical_sessions::kMaxChunkSizeBytes
+                                               << CollectionType::kNoAutoSplitFieldName << true));
+
+        const auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
+        uassertStatusOK(
+            catalogClient->updateConfigDocument(opCtx,
+                                                CollectionType::ConfigNS,
+                                                filterQuery,
+                                                updateQuery,
+                                                false,
+                                                ShardingCatalogClient::kLocalWriteConcern));
+    }
 }
 
 }  // namespace mongo

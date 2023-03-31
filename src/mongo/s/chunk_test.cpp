@@ -27,17 +27,13 @@
  *    it in the license file.
  */
 
-#include "mongo/db/namespace_string.h"
-#include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/chunk.h"
-#include "mongo/s/chunk_version.h"
-#include "mongo/s/shard_id.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
 
-const NamespaceString kNss("test.foo");
+const NamespaceString kNss = NamespaceString::createNamespaceString_forTest("test.foo");
 const ShardId kShardOne("shardOne");
 const ShardId kShardTwo("shardTwo");
 const KeyPattern kShardKeyPattern(BSON("a" << 1));
@@ -51,8 +47,9 @@ TEST(ChunkTest, HasMovedSincePinnedTimestamp) {
                         ChunkRange{kShardKeyPattern.globalMin(), kShardKeyPattern.globalMax()},
                         version,
                         kShardOne);
-    chunkType.setHistory(
-        {ChunkHistory(Timestamp(101, 0), kShardOne), ChunkHistory(Timestamp(100, 0), kShardTwo)});
+    chunkType.setOnCurrentShardSince(Timestamp(101, 0));
+    chunkType.setHistory({ChunkHistory(*chunkType.getOnCurrentShardSince(), kShardOne),
+                          ChunkHistory(Timestamp(100, 0), kShardTwo)});
 
     ChunkInfo chunkInfo(chunkType);
     Chunk chunk(chunkInfo, Timestamp(100, 0));
@@ -68,7 +65,8 @@ TEST(ChunkTest, HasMovedAndReturnedSincePinnedTimestamp) {
                         ChunkRange{kShardKeyPattern.globalMin(), kShardKeyPattern.globalMax()},
                         version,
                         kShardOne);
-    chunkType.setHistory({ChunkHistory(Timestamp(102, 0), kShardOne),
+    chunkType.setOnCurrentShardSince(Timestamp(102, 0));
+    chunkType.setHistory({ChunkHistory(*chunkType.getOnCurrentShardSince(), kShardOne),
                           ChunkHistory(Timestamp(101, 0), kShardTwo),
                           ChunkHistory(Timestamp(100, 0), kShardOne)});
 
@@ -86,8 +84,9 @@ TEST(ChunkTest, HasNotMovedSincePinnedTimestamp) {
                         ChunkRange{kShardKeyPattern.globalMin(), kShardKeyPattern.globalMax()},
                         version,
                         kShardOne);
-    chunkType.setHistory(
-        {ChunkHistory(Timestamp(100, 0), kShardOne), ChunkHistory(Timestamp(99, 0), kShardTwo)});
+    chunkType.setOnCurrentShardSince(Timestamp(100, 0));
+    chunkType.setHistory({ChunkHistory(*chunkType.getOnCurrentShardSince(), kShardOne),
+                          ChunkHistory(Timestamp(99, 0), kShardTwo)});
 
     ChunkInfo chunkInfo(chunkType);
     Chunk chunk(chunkInfo, Timestamp(100, 0));
@@ -104,7 +103,8 @@ TEST(ChunkTest, HasNoHistoryValidForPinnedTimestamp_OneEntry) {
                         ChunkRange{kShardKeyPattern.globalMin(), kShardKeyPattern.globalMax()},
                         version,
                         kShardOne);
-    chunkType.setHistory({ChunkHistory(Timestamp(101, 0), kShardOne)});
+    chunkType.setOnCurrentShardSince(Timestamp(101, 0));
+    chunkType.setHistory({ChunkHistory(*chunkType.getOnCurrentShardSince(), kShardOne)});
 
     ChunkInfo chunkInfo(chunkType);
     Chunk chunk(chunkInfo, Timestamp(100, 0));
@@ -120,8 +120,9 @@ TEST(ChunkTest, HasNoHistoryValidForPinnedTimestamp_MoreThanOneEntry) {
                         ChunkRange{kShardKeyPattern.globalMin(), kShardKeyPattern.globalMax()},
                         version,
                         kShardOne);
-    chunkType.setHistory(
-        {ChunkHistory(Timestamp(102, 0), kShardOne), ChunkHistory(Timestamp(101, 0), kShardTwo)});
+    chunkType.setOnCurrentShardSince(Timestamp(102, 0));
+    chunkType.setHistory({ChunkHistory(*chunkType.getOnCurrentShardSince(), kShardOne),
+                          ChunkHistory(Timestamp(101, 0), kShardTwo)});
 
     ChunkInfo chunkInfo(chunkType);
     Chunk chunk(chunkInfo, Timestamp(100, 0));

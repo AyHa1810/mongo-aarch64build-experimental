@@ -64,7 +64,8 @@ bool isConfigServer(const ShardRegistry* sr, const HostAndPort& peer) {
 
 }  // namespace
 
-Status ShardingTaskExecutorPoolController::validateHostTimeout(const int& hostTimeoutMS) {
+Status ShardingTaskExecutorPoolController::validateHostTimeout(const int& hostTimeoutMS,
+                                                               const boost::optional<TenantId>&) {
     auto toRefreshTimeoutMS = gParameters.toRefreshTimeoutMS.load();
     auto pendingTimeoutMS = gParameters.pendingTimeoutMS.load();
     if (hostTimeoutMS >= (toRefreshTimeoutMS + pendingTimeoutMS)) {
@@ -78,7 +79,8 @@ Status ShardingTaskExecutorPoolController::validateHostTimeout(const int& hostTi
     return Status(ErrorCodes::BadValue, msg);
 }
 
-Status ShardingTaskExecutorPoolController::validatePendingTimeout(const int& pendingTimeoutMS) {
+Status ShardingTaskExecutorPoolController::validatePendingTimeout(
+    const int& pendingTimeoutMS, const boost::optional<TenantId>&) {
     auto toRefreshTimeoutMS = gParameters.toRefreshTimeoutMS.load();
     if (pendingTimeoutMS < toRefreshTimeoutMS) {
         return Status::OK();
@@ -250,7 +252,7 @@ auto ShardingTaskExecutorPoolController::updateHost(PoolId id, const HostState& 
                 "maxConns"_attr = maxConns);
 
     // Update the target for just the pool first
-    poolData.target = stats.requests + stats.active;
+    poolData.target = stats.requests + stats.active + stats.leased;
 
     if (poolData.target < minConns) {
         poolData.target = minConns;

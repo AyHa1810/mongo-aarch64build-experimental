@@ -148,11 +148,11 @@ class Fixture(object, metaclass=registry.make_registry_metaclass(_FIXTURES)):  #
         """
         pass
 
-    def is_running(self):  # pylint: disable=no-self-use
+    def is_running(self):
         """Return true if the fixture is still operating and more tests and can be run."""
         return True
 
-    def get_node_info(self):  # pylint: disable=no-self-use
+    def get_node_info(self):
         """Return a list of NodeInfo objects."""
         return []
 
@@ -403,13 +403,15 @@ def create_fixture_table(fixture):
     return "Fixture status:\n" + table
 
 
-def authenticate(client, auth_options=None):
+def build_client(node, auth_options=None, read_preference=pymongo.ReadPreference.PRIMARY):
     """Authenticate client for the 'authenticationDatabase' and return the client."""
     if auth_options is not None:
-        auth_db = client[auth_options["authenticationDatabase"]]
-        auth_db.authenticate(auth_options["username"], password=auth_options["password"],
-                             mechanism=auth_options["authenticationMechanism"])
-    return client
+        return node.mongo_client(
+            username=auth_options["username"], password=auth_options["password"],
+            authSource=auth_options["authenticationDatabase"],
+            authMechanism=auth_options["authenticationMechanism"], read_preference=read_preference)
+    else:
+        return node.mongo_client(read_preference=read_preference)
 
 
 # Represents a row in a node info table.

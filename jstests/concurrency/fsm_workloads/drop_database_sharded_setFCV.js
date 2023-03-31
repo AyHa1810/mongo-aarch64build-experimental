@@ -12,7 +12,6 @@
 
 load('jstests/concurrency/fsm_libs/extend_workload.js');
 load('jstests/concurrency/fsm_workloads/drop_database_sharded.js');
-load("jstests/libs/override_methods/mongos_manual_intervention_actions.js");
 
 var $config = extendWorkload($config, function($config, $super) {
     $config.states.setFCV = function(db, collName) {
@@ -28,9 +27,40 @@ var $config = extendWorkload($config, function($config, $super) {
                 jsTestLog('setFCV: Invalid transition');
                 return;
             }
+            if (e.code === 7428200) {
+                // Cannot upgrade FCV if a previous FCV downgrade stopped in the middle of cleaning
+                // up internal server metadata.
+                assertAlways.eq(latestFCV, targetFCV);
+                jsTestLog(
+                    'setFCV: Cannot upgrade FCV if a previous FCV downgrade stopped in the middle \
+                    of cleaning up internal server metadata');
+                return;
+            }
             throw e;
         }
         jsTestLog('setFCV state finished');
+    };
+
+    // Inherithed methods get overridden to tolerate the interruption of
+    // internal transactions on the config server during the execution of setFCV.
+    $config.states.enableSharding = function(db, collName) {
+        try {
+            $super.states.enableSharding.apply(this, arguments);
+        } catch (err) {
+            if (err.code !== ErrorCodes.Interrupted) {
+                throw err;
+            }
+        }
+    };
+
+    $config.states.shardCollection = function(db, collName) {
+        try {
+            $super.states.shardCollection.apply(this, arguments);
+        } catch (err) {
+            if (err.code !== ErrorCodes.Interrupted) {
+                throw err;
+            }
+        }
     };
 
     $config.transitions = {

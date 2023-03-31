@@ -30,6 +30,8 @@
 
 #include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
 
+#include "mongo/db/catalog/index_catalog_impl.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/matcher/expression_algo.h"
 #include "mongo/db/matcher/expression_parser.h"
@@ -387,7 +389,7 @@ boost::optional<BSONObj> createTimeseriesIndexFromBucketsIndex(
             // exists, and modifies the kKeyFieldName field to timeseriesKeyValue.
             BSONObj intermediateObj =
                 bucketsIndex.removeFields(StringDataSet{kOriginalSpecFieldName});
-            return intermediateObj.addFields(BSON(kKeyFieldName << timeseriesKeyValue.get()),
+            return intermediateObj.addFields(BSON(kKeyFieldName << timeseriesKeyValue.value()),
                                              StringDataSet{kKeyFieldName});
         }
     }
@@ -501,6 +503,49 @@ bool isHintIndexKey(const BSONObj& obj) {
         return false;
 
     return true;
+}
+
+bool collectionHasIndexSupportingReopeningQuery(OperationContext* opCtx,
+                                                const IndexCatalog* indexCatalog,
+                                                const TimeseriesOptions& tsOptions) {
+    const std::string controlTimeField =
+        timeseries::kControlMinFieldNamePrefix.toString() + tsOptions.getTimeField();
+
+    // Populate a vector of index key fields which we check against existing indexes.
+    boost::container::small_vector<std::string, 2> expectedPrefix;
+    if (tsOptions.getMetaField().has_value()) {
+        expectedPrefix.push_back(kBucketMetaFieldName.toString());
+    }
+    expectedPrefix.push_back(controlTimeField);
+
+    auto indexIt = indexCatalog->getIndexIterator(opCtx, IndexCatalog::InclusionPolicy::kReady);
+    while (indexIt->more()) {
+        auto indexEntry = indexIt->next();
+        auto indexDesc = indexEntry->descriptor();
+
+        // We cannot use a partial index when querying buckets to reopen.
+        if (indexDesc->isPartial()) {
+            continue;
+        }
+
+        auto indexKey = indexDesc->keyPattern();
+        size_t index = 0;
+        for (auto& elem : indexKey) {
+            // The index must include the meta and time field (in that order), but may have
+            // additional fields included.
+            //
+            // In cases where there collections do not have a meta field specified, an index on time
+            // suffices.
+            if (elem.fieldName() != expectedPrefix.at(index)) {
+                break;
+            }
+            index++;
+            if (index == expectedPrefix.size()) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 }  // namespace mongo::timeseries

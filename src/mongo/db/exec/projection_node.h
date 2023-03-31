@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <list>
+
 #include "mongo/db/exec/projection_executor.h"
 
 #include "mongo/db/query/projection_policies.h"
@@ -128,10 +130,26 @@ public:
 
     void optimize();
 
-    Document serialize(boost::optional<ExplainOptions::Verbosity> explain) const;
+    Document serialize(boost::optional<ExplainOptions::Verbosity> explain,
+                       SerializationOptions options) const;
 
     void serialize(boost::optional<ExplainOptions::Verbosity> explain,
-                   MutableDocument* output) const;
+                   MutableDocument* output,
+                   SerializationOptions options) const;
+
+    /**
+     * Append the variables referred to by this projection to the set 'refs', without clearing any
+     * pre-existing references. Should not include $$ROOT or field path expressions.
+     */
+    void addVariableRefs(std::set<Variables::Id>* refs) const {
+        for (auto&& expressionPair : _expressions) {
+            expression::addVariableRefs(expressionPair.second.get(), refs);
+        }
+
+        for (auto&& childPair : _children) {
+            childPair.second->addVariableRefs(refs);
+        }
+    }
 
 protected:
     /**
@@ -162,7 +180,14 @@ protected:
 
     StringMap<std::unique_ptr<ProjectionNode>> _children;
     StringMap<boost::intrusive_ptr<Expression>> _expressions;
-    StringSet _projectedFields;
+
+    // List of the projected fields in the order in which they were specified.
+    std::list<std::string> _projectedFields;
+
+    // Set of projected fields. Note that the _projectedFields list actually owns the strings, and
+    // this StringDataSet simply holds views of those strings.
+    StringDataSet _projectedFieldsSet;
+
     ProjectionPolicies _policies;
     std::string _pathToNode;
 

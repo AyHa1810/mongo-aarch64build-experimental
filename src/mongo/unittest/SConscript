@@ -3,6 +3,19 @@
 Import("env")
 
 env = env.Clone()
+env.InjectThirdParty(libraries=['yaml'])
+env.Library(
+    target="golden_test_base",
+    source=[
+        'golden_test_base.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/third_party/shim_yaml',
+    ],
+)
 
 utEnv = env.Clone()
 utEnv.InjectThirdParty(libraries=['yaml'])
@@ -13,16 +26,17 @@ utEnv.Library(
         'bson_test_util.cpp',
         'death_test.cpp',
         'golden_test.cpp',
+        'inline_auto_update.cpp',
         'matcher.cpp',
-        'matcher_core.cpp',
+        'stringify.cpp',
         'temp_dir.cpp',
         'unittest.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
+        'golden_test_base',
     ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/server_options_core',
+        '$BUILD_DIR/mongo/db/server_base',
         '$BUILD_DIR/mongo/util/options_parser/options_parser',
         '$BUILD_DIR/mongo/util/pcre_util',
         '$BUILD_DIR/mongo/util/pcre_wrapper',
@@ -79,12 +93,14 @@ bmEnv.Library(
     target='benchmark_main',
     source=[
         'benchmark_main.cpp',
+        'benchmark_options.idl',
     ],
     LIBDEPS=[
         # benchmark_main must not be made to depend on additional libraries.
         # Additional requirements should be handled by the benchmark itself.
         # Examples can be found in fail_point_bm and commands_bm. See SERVER-60691.
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/util/options_parser/options_parser',
         '$BUILD_DIR/third_party/shim_benchmark',
     ],
     AIB_COMPONENT='benchmarks',
@@ -110,6 +126,8 @@ env.CppUnitTest(
         'temp_dir_test.cpp',
         'thread_assertion_monitor_test.cpp',
         'assert_that_test.cpp',
+        'inline_auto_update_test.cpp',
+        'bson_test_util_test.cpp',
     ],
 )
 

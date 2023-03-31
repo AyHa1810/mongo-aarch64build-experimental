@@ -28,6 +28,7 @@
  */
 
 #include "mongo/bson/bsonmisc.h"
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/persistent_task_store.h"
 #include "mongo/db/query/collation/collator_factory_mock.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
@@ -83,7 +84,6 @@ public:
                                                Timestamp(1, 1),
                                                boost::none /* timeseriesFields */,
                                                boost::none /* reshardingFields */,
-                                               boost::none /* chunkSizeBytes */,
                                                true /* allowMigrations */,
                                                chunks);
 
@@ -111,7 +111,8 @@ private:
 
     const StringData _currentShardKey = "sk";
 
-    const NamespaceString _sourceNss{"test_crud", "collection_being_resharded"};
+    const NamespaceString _sourceNss =
+        NamespaceString::createNamespaceString_forTest("test_crud", "collection_being_resharded");
     const UUID _sourceUUID = UUID::gen();
 
     const ShardId _myDonorId{"myDonorId"};
@@ -219,8 +220,8 @@ TEST_F(ReshardingDataReplicationTest, GetOplogFetcherResumeId) {
 
         AutoGetCollection oplogBufferColl(opCtx.get(), oplogBufferNss, MODE_IX);
         WriteUnitOfWork wuow(opCtx.get());
-        ASSERT_OK(oplogBufferColl->insertDocument(
-            opCtx.get(), InsertStatement{oplogEntry.toBSON()}, nullptr));
+        ASSERT_OK(collection_internal::insertDocument(
+            opCtx.get(), *oplogBufferColl, InsertStatement{oplogEntry.toBSON()}, nullptr));
         wuow.commit();
     };
 

@@ -65,10 +65,10 @@ void notifyChangeStreamsOnReshardCollectionComplete(OperationContext* opCtx,
 
     cmdBuilder.append("unique", doc.getUnique().get_value_or(false));
     if (doc.getNumInitialChunks()) {
-        cmdBuilder.append("numInitialChunks", doc.getNumInitialChunks().get());
+        cmdBuilder.append("numInitialChunks", doc.getNumInitialChunks().value());
     }
     if (doc.getCollation()) {
-        cmdBuilder.append("collation", doc.getCollation().get());
+        cmdBuilder.append("collation", doc.getCollation().value());
     }
 
     if (doc.getZones()) {
@@ -129,7 +129,7 @@ ExecutorFuture<void> ReshardCollectionCoordinator::_runImpl(
     std::shared_ptr<executor::ScopedTaskExecutor> executor,
     const CancellationToken& token) noexcept {
     return ExecutorFuture<void>(**executor)
-        .then(_executePhase(
+        .then(_buildPhaseHandler(
             Phase::kReshard,
             [this, anchor = shared_from_this()] {
                 auto opCtxHolder = cc().makeOperationContext();
@@ -138,13 +138,20 @@ ExecutorFuture<void> ReshardCollectionCoordinator::_runImpl(
 
                 {
                     AutoGetCollection coll{
-                        opCtx, nss(), MODE_IS, AutoGetCollectionViewMode::kViewsPermitted};
-                    checkCollectionUUIDMismatch(opCtx, nss(), *coll, _doc.getCollectionUUID());
+                        opCtx,
+                        nss(),
+                        MODE_IS,
+                        AutoGetCollection::Options{}
+                            .viewMode(auto_get_collection::ViewMode::kViewsPermitted)
+                            .expectedUUID(_doc.getCollectionUUID())};
                 }
 
-                const auto cmOld = uassertStatusOK(
-                    Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(
-                        opCtx, nss()));
+                const auto cmOld =
+                    uassertStatusOK(
+                        Grid::get(opCtx)
+                            ->catalogCache()
+                            ->getShardedCollectionRoutingInfoWithPlacementRefresh(opCtx, nss()))
+                        .cm;
 
                 StateDoc newDoc(_doc);
                 newDoc.setOldShardKey(cmOld.getShardKeyPattern().getKeyPattern().toBSON());
@@ -166,16 +173,19 @@ ExecutorFuture<void> ReshardCollectionCoordinator::_runImpl(
                     uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
                         opCtx,
                         ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                        NamespaceString::kAdminDb.toString(),
+                        DatabaseName::kAdmin.toString(),
                         CommandHelpers::appendMajorityWriteConcern(
                             configsvrReshardCollection.toBSON({}), opCtx->getWriteConcern()),
                         Shard::RetryPolicy::kIdempotent));
                 uassertStatusOK(Shard::CommandResponse::getEffectiveStatus(std::move(cmdResponse)));
 
                 // Report command completion to the oplog.
-                const auto cm = uassertStatusOK(
-                    Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(
-                        opCtx, nss()));
+                const auto cm =
+                    uassertStatusOK(
+                        Grid::get(opCtx)
+                            ->catalogCache()
+                            ->getShardedCollectionRoutingInfoWithPlacementRefresh(opCtx, nss()))
+                        .cm;
 
                 if (_doc.getOldCollectionUUID() && _doc.getOldCollectionUUID() != cm.getUUID()) {
                     notifyChangeStreamsOnReshardCollectionComplete(
@@ -185,7 +195,7 @@ ExecutorFuture<void> ReshardCollectionCoordinator::_runImpl(
         .onError([this, anchor = shared_from_this()](const Status& status) {
             LOGV2_ERROR(6206401,
                         "Error running reshard collection",
-                        "namespace"_attr = nss(),
+                        logAttrs(nss()),
                         "error"_attr = redact(status));
             return status;
         });

@@ -37,6 +37,7 @@
 #include "mongo/db/commands/fle2_compact_gen.h"
 #include "mongo/db/s/compact_structured_encryption_data_coordinator.h"
 #include "mongo/db/s/compact_structured_encryption_data_coordinator_gen.h"
+#include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/cluster_commands_helpers.h"
 
@@ -77,19 +78,33 @@ public:
         using InvocationBase::InvocationBase;
 
         Reply typedRun(OperationContext* opCtx) {
-            FixedFCVRegion fixedFcvRegion(opCtx);
+            bool usePreview = !gFeatureFlagFLE2ProtocolVersion2.isEnabled(
+                serverGlobalParams.featureCompatibility);
 
-            auto compact = makeRequest(opCtx);
-            if (!compact) {
+            auto compactCoordinator =
+                [&]() -> std::shared_ptr<CompactStructuredEncryptionDataCoordinator> {
+                FixedFCVRegion fixedFcvRegion(opCtx);
+
+                auto compact = makeRequest(opCtx);
+                if (!compact) {
+                    return nullptr;
+                }
+                return checked_pointer_cast<CompactStructuredEncryptionDataCoordinator>(
+                    ShardingDDLCoordinatorService::getService(opCtx)->getOrCreateInstance(
+                        opCtx, compact->toBSON()));
+            }();
+
+            if (!compactCoordinator) {
                 // Nothing to do.
                 LOGV2(6548305, "Skipping compaction as there is no ECOC collection to compact");
-                return CompactStats({}, {}, {});
+                CompactStats stats({}, {});
+                if (usePreview) {
+                    stats.setEcc(ECStats{});
+                }
+                return stats;
             }
 
-            return checked_pointer_cast<CompactStructuredEncryptionDataCoordinator>(
-                       ShardingDDLCoordinatorService::getService(opCtx)->getOrCreateInstance(
-                           opCtx, compact->toBSON()))
-                ->getResponse(opCtx);
+            return compactCoordinator->getResponse(opCtx);
         }
 
     private:
@@ -116,6 +131,14 @@ public:
             }
 
             CompactStructuredEncryptionDataState compact;
+            auto coordinatorType = DDLCoordinatorTypeEnum::kCompactStructuredEncryptionData;
+
+            if (!gFeatureFlagUseNewCompactStructuredEncryptionDataCoordinator.isEnabled(
+                    serverGlobalParams.featureCompatibility)) {
+                // TODO SERVER-68373 remove once 7.0 becomes last LTS
+                coordinatorType =
+                    DDLCoordinatorTypeEnum::kCompactStructuredEncryptionDataPre61Compatible;
+            }
 
             if (ecocColl.getCollection()) {
                 compact.setEcocUuid(ecocColl->uuid());
@@ -124,8 +147,7 @@ public:
                 compact.setEcocRenameUuid(ecocTempColl->uuid());
             }
 
-            compact.setShardingDDLCoordinatorMetadata(
-                {{nss, DDLCoordinatorTypeEnum::kCompactStructuredEncryptionData}});
+            compact.setShardingDDLCoordinatorMetadata({{nss, coordinatorType}});
             compact.setEscNss(namespaces.escNss);
             compact.setEccNss(namespaces.eccNss);
             compact.setEcocNss(namespaces.ecocNss);

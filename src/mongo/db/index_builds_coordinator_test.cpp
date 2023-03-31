@@ -27,12 +27,11 @@
  *    it in the license file.
  */
 
+#include "mongo/db/catalog/catalog_test_fixture.h"
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/index_builds_coordinator.h"
 
-#include "mongo/db/catalog/catalog_test_fixture.h"
-
 namespace mongo {
-
 namespace {
 
 class IndexBuildsCoordinatorTest : public CatalogTestFixture {
@@ -57,22 +56,23 @@ void IndexBuildsCoordinatorTest::createCollectionWithDuplicateDocs(OperationCont
     OpDebug* const nullOpDebug = nullptr;
     for (int i = 0; i < 10; i++) {
         WriteUnitOfWork wuow(opCtx);
-        ASSERT_OK(collection->insertDocument(
-            opCtx, InsertStatement(BSON("_id" << i << "a" << 1)), nullOpDebug));
+        ASSERT_OK(collection_internal::insertDocument(
+            opCtx, *collection, InsertStatement(BSON("_id" << i << "a" << 1)), nullOpDebug));
         wuow.commit();
     }
 
-    ASSERT_EQ(collection->getIndexCatalog()->numIndexesTotal(opCtx), 1);
+    ASSERT_EQ(collection->getIndexCatalog()->numIndexesTotal(), 1);
 }
 
 // Helper to refetch the Collection from the catalog in order to see any changes made to it
 CollectionPtr coll(OperationContext* opCtx, const NamespaceString& nss) {
-    return CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
+    return CollectionPtr(CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss));
 }
 
 TEST_F(IndexBuildsCoordinatorTest, ForegroundUniqueEnforce) {
     auto opCtx = operationContext();
-    NamespaceString nss("IndexBuildsCoordinatorTest.ForegroundUniqueEnforce");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest(
+        "IndexBuildsCoordinatorTest.ForegroundUniqueEnforce");
     createCollectionWithDuplicateDocs(opCtx, nss);
 
     AutoGetCollection collection(opCtx, nss, MODE_X);
@@ -88,12 +88,13 @@ TEST_F(IndexBuildsCoordinatorTest, ForegroundUniqueEnforce) {
                            opCtx, collection->uuid(), spec, indexConstraints, fromMigrate),
                        AssertionException,
                        ErrorCodes::DuplicateKey);
-    ASSERT_EQ(coll(opCtx, nss)->getIndexCatalog()->numIndexesTotal(opCtx), 1);
+    ASSERT_EQ(coll(opCtx, nss)->getIndexCatalog()->numIndexesTotal(), 1);
 }
 
 TEST_F(IndexBuildsCoordinatorTest, ForegroundUniqueRelax) {
     auto opCtx = operationContext();
-    NamespaceString nss("IndexBuildsCoordinatorTest.ForegroundUniqueRelax");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest(
+        "IndexBuildsCoordinatorTest.ForegroundUniqueRelax");
     createCollectionWithDuplicateDocs(opCtx, nss);
 
     AutoGetCollection collection(opCtx, nss, MODE_X);
@@ -107,12 +108,13 @@ TEST_F(IndexBuildsCoordinatorTest, ForegroundUniqueRelax) {
     auto fromMigrate = false;
     ASSERT_DOES_NOT_THROW(indexBuildsCoord->createIndex(
         opCtx, collection->uuid(), spec, indexConstraints, fromMigrate));
-    ASSERT_EQ(coll(opCtx, nss)->getIndexCatalog()->numIndexesTotal(opCtx), 2);
+    ASSERT_EQ(coll(opCtx, nss)->getIndexCatalog()->numIndexesTotal(), 2);
 }
 
 TEST_F(IndexBuildsCoordinatorTest, ForegroundIndexAlreadyExists) {
     auto opCtx = operationContext();
-    NamespaceString nss("IndexBuildsCoordinatorTest.ForegroundIndexAlreadyExists");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest(
+        "IndexBuildsCoordinatorTest.ForegroundIndexAlreadyExists");
     createCollectionWithDuplicateDocs(opCtx, nss);
 
     AutoGetCollection collection(opCtx, nss, MODE_X);
@@ -126,17 +128,18 @@ TEST_F(IndexBuildsCoordinatorTest, ForegroundIndexAlreadyExists) {
     auto uuid = collection->uuid();
     ASSERT_DOES_NOT_THROW(
         indexBuildsCoord->createIndex(opCtx, uuid, spec, indexConstraints, fromMigrate));
-    ASSERT_EQ(coll(opCtx, nss)->getIndexCatalog()->numIndexesTotal(opCtx), 2);
+    ASSERT_EQ(coll(opCtx, nss)->getIndexCatalog()->numIndexesTotal(), 2);
 
     // Should silently return if the index already exists.
     ASSERT_DOES_NOT_THROW(
         indexBuildsCoord->createIndex(opCtx, uuid, spec, indexConstraints, fromMigrate));
-    ASSERT_EQ(coll(opCtx, nss)->getIndexCatalog()->numIndexesTotal(opCtx), 2);
+    ASSERT_EQ(coll(opCtx, nss)->getIndexCatalog()->numIndexesTotal(), 2);
 }
 
 TEST_F(IndexBuildsCoordinatorTest, ForegroundIndexOptionsConflictEnforce) {
     auto opCtx = operationContext();
-    NamespaceString nss("IndexBuildsCoordinatorTest.ForegroundIndexOptionsConflictEnforce");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest(
+        "IndexBuildsCoordinatorTest.ForegroundIndexOptionsConflictEnforce");
     createCollectionWithDuplicateDocs(opCtx, nss);
 
     AutoGetCollection collection(opCtx, nss, MODE_X);
@@ -152,18 +155,19 @@ TEST_F(IndexBuildsCoordinatorTest, ForegroundIndexOptionsConflictEnforce) {
     auto uuid = collection->uuid();
     ASSERT_DOES_NOT_THROW(
         indexBuildsCoord->createIndex(opCtx, uuid, spec1, indexConstraints, fromMigrate));
-    ASSERT_EQ(coll(opCtx, nss)->getIndexCatalog()->numIndexesTotal(opCtx), 2);
+    ASSERT_EQ(coll(opCtx, nss)->getIndexCatalog()->numIndexesTotal(), 2);
 
     ASSERT_THROWS_CODE(
         indexBuildsCoord->createIndex(opCtx, uuid, spec2, indexConstraints, fromMigrate),
         AssertionException,
         ErrorCodes::IndexOptionsConflict);
-    ASSERT_EQ(coll(opCtx, nss)->getIndexCatalog()->numIndexesTotal(opCtx), 2);
+    ASSERT_EQ(coll(opCtx, nss)->getIndexCatalog()->numIndexesTotal(), 2);
 }
 
 TEST_F(IndexBuildsCoordinatorTest, ForegroundIndexOptionsConflictRelax) {
     auto opCtx = operationContext();
-    NamespaceString nss("IndexBuildsCoordinatorTest.ForegroundIndexOptionsConflictRelax");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest(
+        "IndexBuildsCoordinatorTest.ForegroundIndexOptionsConflictRelax");
     createCollectionWithDuplicateDocs(opCtx, nss);
 
     AutoGetCollection collection(opCtx, nss, MODE_X);
@@ -179,12 +183,12 @@ TEST_F(IndexBuildsCoordinatorTest, ForegroundIndexOptionsConflictRelax) {
     auto uuid = collection->uuid();
     ASSERT_DOES_NOT_THROW(
         indexBuildsCoord->createIndex(opCtx, uuid, spec1, indexConstraints, fromMigrate));
-    ASSERT_EQ(coll(opCtx, nss)->getIndexCatalog()->numIndexesTotal(opCtx), 2);
+    ASSERT_EQ(coll(opCtx, nss)->getIndexCatalog()->numIndexesTotal(), 2);
 
     // Should silently return in relax mode even if there are index option conflicts.
     ASSERT_DOES_NOT_THROW(
         indexBuildsCoord->createIndex(opCtx, uuid, spec2, indexConstraints, fromMigrate));
-    ASSERT_EQ(coll(opCtx, nss)->getIndexCatalog()->numIndexesTotal(opCtx), 2);
+    ASSERT_EQ(coll(opCtx, nss)->getIndexCatalog()->numIndexesTotal(), 2);
 }
 
 }  // namespace

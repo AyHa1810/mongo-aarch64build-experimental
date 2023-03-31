@@ -27,7 +27,6 @@
  *    it in the license file.
  */
 
-
 #include "mongo/db/commands/run_aggregate.h"
 
 #include <boost/optional.hpp>
@@ -39,9 +38,10 @@
 #include "mongo/db/catalog/collection_uuid_mismatch.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/external_data_source_scope_guard.h"
 #include "mongo/db/change_stream_change_collection_manager.h"
-#include "mongo/db/commands/cqf/cqf_aggregate.h"
-#include "mongo/db/commands/cqf/cqf_command_utils.h"
+#include "mongo/db/change_stream_pre_images_collection_manager.h"
+#include "mongo/db/change_stream_serverless_helpers.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
@@ -65,38 +65,40 @@
 #include "mongo/db/pipeline/search_helper.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/collection_query_info.h"
+#include "mongo/db/query/cqf_command_utils.h"
+#include "mongo/db/query/cqf_get_executor.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/get_executor.h"
+#include "mongo/db/query/optimizer/defs.h"
 #include "mongo/db/query/plan_executor_factory.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_planner_common.h"
+#include "mongo/db/query/telemetry.h"
 #include "mongo/db/read_concern.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/speculative_majority_read_info.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/s/query_analysis_writer.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/resource_consumption_metrics.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/db/views/view.h"
 #include "mongo/db/views/view_catalog_helpers.h"
 #include "mongo/logv2/log.h"
+#include "mongo/s/query_analysis_sampler_util.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/string_map.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 namespace mongo {
-
-// A fail point that provides the collection name upon which the change stream should be opened.
-// This is used to assert that the change stream is getting opened on the required namespace.
-// TODO SERVER-67594 remove the failpoint.
-MONGO_FAIL_POINT_DEFINE(assertChangeStreamNssCollection);
 
 using boost::intrusive_ptr;
 using std::shared_ptr;
@@ -153,7 +155,7 @@ bool handleCursorCommand(OperationContext* opCtx,
 
             BSONObjBuilder cursorResult;
             appendCursorResponseObject(cursors[idx]->cursorid(),
-                                       nsForCursor.ns(),
+                                       nsForCursor,
                                        BSONArray(),
                                        cursors[idx]->getExecutor()->getExecutorType(),
                                        &cursorResult);
@@ -287,7 +289,7 @@ bool handleCursorCommand(OperationContext* opCtx,
     }
 
     const CursorId cursorId = cursor ? cursor->cursorid() : 0LL;
-    responseBuilder.done(cursorId, nsForCursor.ns());
+    responseBuilder.done(cursorId, nsForCursor);
 
     auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
     metricsCollector.incrementDocUnitsReturned(curOp->getNS(), docUnitsReturned);
@@ -372,7 +374,8 @@ StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNames
                 // collection name references a view on the aggregation request's database. Note
                 // that the inverse scenario (mistaking a view for a collection) is not an issue
                 // because $merge/$out cannot target a view.
-                auto nssToCheck = NamespaceString(request.getNamespace().db(), involvedNs.coll());
+                auto nssToCheck = NamespaceStringUtil::parseNamespaceFromRequest(
+                    request.getNamespace().dbName(), involvedNs.coll());
                 if (catalog->lookupView(opCtx, nssToCheck)) {
                     auto status = resolveViewDefinition(nssToCheck);
                     if (!status.isOK()) {
@@ -434,7 +437,8 @@ boost::intrusive_ptr<ExpressionContext> makeExpressionContext(
     const AggregateCommandRequest& request,
     std::unique_ptr<CollatorInterface> collator,
     boost::optional<UUID> uuid,
-    ExpressionContext::CollationMatchesDefault collationMatchesDefault) {
+    ExpressionContext::CollationMatchesDefault collationMatchesDefault,
+    boost::optional<CollectionOptions> collectionOptions = boost::none) {
     boost::intrusive_ptr<ExpressionContext> expCtx =
         new ExpressionContext(opCtx,
                               request,
@@ -442,15 +446,10 @@ boost::intrusive_ptr<ExpressionContext> makeExpressionContext(
                               MongoProcessInterface::create(opCtx),
                               uassertStatusOK(resolveInvolvedNamespaces(opCtx, request)),
                               uuid,
-                              CurOp::get(opCtx)->dbProfileLevel() > 0);
+                              CurOp::get(opCtx)->dbProfileLevel() > 0,
+                              allowDiskUseByDefault.load());
     expCtx->tempDir = storageGlobalParams.dbpath + "/_tmp";
     expCtx->collationMatchesDefault = collationMatchesDefault;
-    expCtx->forPerShardCursor = request.getPassthroughToShard().has_value();
-    expCtx->allowDiskUse = request.getAllowDiskUse().value_or(allowDiskUseByDefault.load());
-    if (opCtx->readOnly()) {
-        // Disallow disk use if in read-only mode.
-        expCtx->allowDiskUse = false;
-    }
 
     // If the request explicitly specified NOT to use v2 resume tokens for change streams, set this
     // on the expCtx. This can happen if a the request originated from 6.0 mongos, or in test mode.
@@ -459,6 +458,9 @@ boost::intrusive_ptr<ExpressionContext> makeExpressionContext(
         uassert(6528200, "Invalid request for v2 tokens", !request.getGenerateV2ResumeTokens());
         expCtx->changeStreamTokenVersion = 1;
     }
+
+    // Set the value of $$USER_ROLES for the aggregation.
+    expCtx->setUserRoles();
 
     return expCtx;
 }
@@ -492,7 +494,7 @@ void _adjustChangeStreamReadConcern(OperationContext* opCtx) {
     }
 
     // Wait for read concern again since we changed the original read concern.
-    uassertStatusOK(waitForReadConcern(opCtx, readConcernArgs, StringData(), true));
+    uassertStatusOK(waitForReadConcern(opCtx, readConcernArgs, DatabaseName(), true));
     setPrepareConflictBehaviorForReadConcern(
         opCtx, readConcernArgs, PrepareConflictBehavior::kIgnoreConflicts);
 }
@@ -512,7 +514,7 @@ std::vector<std::unique_ptr<Pipeline, PipelineDeleter>> createExchangePipelinesI
 
     if (request.getExchange() && !expCtx->explain) {
         boost::intrusive_ptr<Exchange> exchange =
-            new Exchange(request.getExchange().get(), std::move(pipeline));
+            new Exchange(request.getExchange().value(), std::move(pipeline));
 
         for (size_t idx = 0; idx < exchange->getConsumers(); ++idx) {
             // For every new pipeline we have create a new ExpressionContext as the context
@@ -575,17 +577,20 @@ std::vector<std::unique_ptr<Pipeline, PipelineDeleter>> createAdditionalPipeline
 }
 
 /**
- * Performs validations related to API versioning and time-series stages.
+ * Performs validations related to API versioning, time-series stages, and general command
+ * validation.
  * Throws UserAssertion if any of the validations fails
  *     - validation of API versioning on each stage on the pipeline
  *     - validation of API versioning on 'AggregateCommandRequest' request
  *     - validation of time-series related stages
+ *     - validation of command parameters
  */
 void performValidationChecks(const OperationContext* opCtx,
                              const AggregateCommandRequest& request,
                              const LiteParsedPipeline& liteParsedPipeline) {
     liteParsedPipeline.validate(opCtx);
     aggregation_request_helper::validateRequestForAPIVersion(opCtx, request);
+    aggregation_request_helper::validateRequestFromClusterQueryWithoutShardKey(request);
 }
 
 std::vector<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createLegacyExecutor(
@@ -613,9 +618,6 @@ std::vector<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createLegacyEx
                                 request,
                                 hasGeoNearStage,
                                 liteParsedPipeline.hasChangeStream())) {
-        // Mark that this query does not use DocumentSource.
-        curOp->debug().documentSourceUsed = false;
-
         // This pipeline is currently empty, but once completed it will have only one source,
         // which is a DocumentSourceCursor. Instead of creating a whole pipeline to do nothing
         // more than forward the results of its cursor document source, we can use the
@@ -623,12 +625,8 @@ std::vector<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createLegacyEx
         // have gotten from find command.
         execs.emplace_back(std::move(attachExecutorCallback.second));
     } else {
-        // Mark that this query uses DocumentSource.
-        curOp->debug().documentSourceUsed = true;
-
         getSearchHelpers(expCtx->opCtx->getServiceContext())
             ->injectSearchShardFiltererIfNeeded(pipeline.get());
-
         // Complete creation of the initial $cursor stage, if needed.
         PipelineD::attachInnerQueryExecutorToPipeline(collections,
                                                       attachExecutorCallback.first,
@@ -641,7 +639,6 @@ std::vector<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createLegacyEx
             // There are separate ExpressionContexts for each exchange pipeline, so make sure to
             // pass the pipeline's ExpressionContext to the plan executor factory.
             auto pipelineExpCtx = pipelineIt->getContext();
-
             execs.emplace_back(
                 plan_executor_factory::make(std::move(pipelineExpCtx),
                                             std::move(pipelineIt),
@@ -667,7 +664,7 @@ Status runAggregate(OperationContext* opCtx,
                     const BSONObj& cmdObj,
                     const PrivilegeVector& privileges,
                     rpc::ReplyBuilderInterface* result) {
-    return runAggregate(opCtx, nss, request, {request}, cmdObj, privileges, result);
+    return runAggregate(opCtx, nss, request, {request}, cmdObj, privileges, result, {});
 }
 
 Status runAggregate(OperationContext* opCtx,
@@ -676,11 +673,32 @@ Status runAggregate(OperationContext* opCtx,
                     const LiteParsedPipeline& liteParsedPipeline,
                     const BSONObj& cmdObj,
                     const PrivilegeVector& privileges,
-                    rpc::ReplyBuilderInterface* result) {
+                    rpc::ReplyBuilderInterface* result,
+                    ExternalDataSourceScopeGuard externalDataSourceGuard) {
 
     // Perform some validations on the LiteParsedPipeline and request before continuing with the
     // aggregation command.
     performValidationChecks(opCtx, request, liteParsedPipeline);
+
+    // If we are running a retryable write without shard key, check if the write was applied on this
+    // shard, and if so, return early with an empty cursor with $_wasStatementExecuted
+    // set to true. The isRetryableWrite() check here is to check that the client executed write was
+    // a retryable write (which would've spawned an internal session for a retryable write to
+    // execute the two phase write without shard key protocol), otherwise we skip the retryable
+    // write check.
+    auto isClusterQueryWithoutShardKeyCmd = request.getIsClusterQueryWithoutShardKeyCmd();
+    if (opCtx->isRetryableWrite() && isClusterQueryWithoutShardKeyCmd) {
+        auto stmtId = request.getStmtId();
+        tassert(7058100, "StmtId must be set for a retryable write without shard key", stmtId);
+        if (TransactionParticipant::get(opCtx).checkStatementExecuted(opCtx, *stmtId)) {
+            CursorResponseBuilder::Options options;
+            options.isInitialResponse = true;
+            CursorResponseBuilder responseBuilder(result, options);
+            responseBuilder.setWasStatementExecuted(true);
+            responseBuilder.done(0LL, origNss);
+            return Status::OK();
+        }
+    }
 
     // For operations on views, this will be the underlying namespace.
     NamespaceString nss = request.getNamespace();
@@ -698,19 +716,34 @@ Status runAggregate(OperationContext* opCtx,
     // The UUID of the collection for the execution namespace of this aggregation.
     boost::optional<UUID> uuid;
 
+    // All cursors share the ownership to 'extDataSrcGuard'. Once all cursors are destroyed,
+    // 'extDataSrcGuard' will also be destroyed and any virtual collections will be dropped by
+    // the destructor of ExternalDataSourceScopeGuard. We obtain a reference before taking locks so
+    // that the virtual collections will be dropped after releasing our read locks, avoiding a lock
+    // upgrade.
+    std::shared_ptr<ExternalDataSourceScopeGuard> extDataSrcGuard =
+        std::make_shared<ExternalDataSourceScopeGuard>(std::move(externalDataSourceGuard));
+
     // If emplaced, AutoGetCollectionForReadCommand will throw if the sharding version for this
     // connection is out of date. If the namespace is a view, the lock will be released before
     // re-running the expanded aggregation.
     boost::optional<AutoGetCollectionForReadCommandMaybeLockFree> ctx;
     MultipleCollectionAccessor collections;
 
-    auto initContext = [&](AutoGetCollectionViewMode m) -> void {
-        ctx.emplace(opCtx,
-                    nss,
-                    m,
-                    Date_t::max(),
-                    AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
-                    secondaryExecNssList);
+    // Going forward this operation must never ignore interrupt signals while waiting for lock
+    // acquisition. This InterruptibleLockGuard will ensure that waiting for lock re-acquisition
+    // after yielding will not ignore interrupt signals. This is necessary to avoid deadlocking with
+    // replication rollback, which at the storage layer waits for all cursors to be closed under the
+    // global MODE_X lock, after having sent interrupt signals to read operations. This operation
+    // must never hold open storage cursors while ignoring interrupt.
+    InterruptibleLockGuard interruptibleLockAcquisition(opCtx->lockState());
+
+    auto initContext = [&](auto_get_collection::ViewMode m) -> void {
+        ctx.emplace(
+            opCtx,
+            nss,
+            AutoGetCollection::Options{}.viewMode(m).secondaryNssOrUUIDs(secondaryExecNssList),
+            AutoStatsTracker::LogMode::kUpdateTopAndCurOp);
         collections = MultipleCollectionAccessor(opCtx,
                                                  &ctx->getCollection(),
                                                  ctx->getNss(),
@@ -721,6 +754,15 @@ Status runAggregate(OperationContext* opCtx,
     auto resetContext = [&]() -> void {
         ctx.reset();
         collections.clear();
+    };
+
+    auto registerTelemetry = [&]() -> void {
+        // Register telemetry. Exclude queries against collections with encrypted fields.
+        // We still collect telemetry on collection-less aggregations.
+        if (!(ctx && ctx->getCollection() &&
+              ctx->getCollection()->getCollectionOptions().encryptedFieldConfig)) {
+            telemetry::registerAggRequest(request, opCtx);
+        }
     };
 
     std::vector<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> execs;
@@ -752,33 +794,29 @@ Status runAggregate(OperationContext* opCtx,
             // Replace the execution namespace with the oplog.
             nss = NamespaceString::kRsOplogNamespace;
 
-            // In case of serverless the change stream will be opened on the change collection. We
-            // should first check if the change collection for the particular tenant exists and then
-            // replace the namespace with the change collection.
-            if (ChangeStreamChangeCollectionManager::isChangeCollectionsModeActive()) {
-                auto& changeCollectionManager = ChangeStreamChangeCollectionManager::get(opCtx);
+            // In case of serverless the change stream will be opened on the change collection.
+            if (change_stream_serverless_helpers::isChangeCollectionsModeActive()) {
+                const auto tenantId =
+                    change_stream_serverless_helpers::resolveTenantId(origNss.tenantId());
+
+                uassert(ErrorCodes::BadValue,
+                        "Change streams cannot be used without tenant id",
+                        tenantId);
+
                 uassert(ErrorCodes::ChangeStreamNotEnabled,
                         "Change streams must be enabled before being used.",
-                        changeCollectionManager.hasChangeCollection(opCtx, origNss.tenantId()));
+                        change_stream_serverless_helpers::isChangeStreamEnabled(opCtx, *tenantId));
 
-                nss = NamespaceString::makeChangeCollectionNSS(origNss.tenantId());
+
+                nss = NamespaceString::makeChangeCollectionNSS(tenantId);
             }
 
-            // If the 'assertChangeStreamNssCollection' failpoint is active then ensure that we are
-            // opening the change stream on the correct namespace.
-            if (auto scopedFp = assertChangeStreamNssCollection.scoped();
-                MONGO_unlikely(scopedFp.isActive())) {
-                tassert(6689201,
-                        str::stream()
-                            << "Change stream was opened on the namespace with collection name: "
-                            << nss.coll() << ", expected: " << scopedFp.getData()["collectionName"],
-                        scopedFp.getData()["collectionName"].String() == nss.coll());
-
-                LOGV2_INFO(6689200,
-                           "Opening change stream on the namespace: {nss}",
-                           "Opening change stream",
-                           "nss"_attr = nss.toString());
-            }
+            // Assert that a change stream on the config server is always opened on the oplog.
+            tassert(
+                6763400,
+                str::stream() << "Change stream was unexpectedly opened on the namespace: " << nss
+                              << " in the config server",
+                !serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer) || nss.isOplog());
 
             // Upgrade and wait for read concern if necessary.
             _adjustChangeStreamReadConcern(opCtx);
@@ -801,12 +839,13 @@ Status runAggregate(OperationContext* opCtx,
             // collation. We do not inherit the collection's default collation or UUID, since
             // the stream may be resuming from a point before the current UUID existed.
             auto [collator, match] = PipelineD::resolveCollator(
-                opCtx, request.getCollation().get_value_or(BSONObj()), nullptr);
+                opCtx, request.getCollation().get_value_or(BSONObj()), CollectionPtr());
             collatorToUse.emplace(std::move(collator));
             collatorToUseMatchesDefault = match;
 
             // Obtain collection locks on the execution namespace; that is, the oplog.
-            initContext(AutoGetCollectionViewMode::kViewsForbidden);
+            initContext(auto_get_collection::ViewMode::kViewsForbidden);
+            registerTelemetry();
         } else if (nss.isCollectionlessAggregateNS() && pipelineInvolvedNamespaces.empty()) {
             uassert(4928901,
                     str::stream() << AggregateCommandRequest::kCollectionUUIDFieldName
@@ -820,15 +859,17 @@ Status runAggregate(OperationContext* opCtx,
                                  AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
                                  0);
             auto [collator, match] = PipelineD::resolveCollator(
-                opCtx, request.getCollation().get_value_or(BSONObj()), nullptr);
+                opCtx, request.getCollation().get_value_or(BSONObj()), CollectionPtr());
             collatorToUse.emplace(std::move(collator));
             collatorToUseMatchesDefault = match;
             tassert(6235101,
                     "A collection-less aggregate should not take any locks",
                     ctx == boost::none);
+            registerTelemetry();
         } else {
             // This is a regular aggregation. Lock the collection or view.
-            initContext(AutoGetCollectionViewMode::kViewsPermitted);
+            initContext(auto_get_collection::ViewMode::kViewsPermitted);
+            registerTelemetry();
             auto [collator, match] =
                 PipelineD::resolveCollator(opCtx,
                                            request.getCollation().get_value_or(BSONObj()),
@@ -884,11 +925,13 @@ Status runAggregate(OperationContext* opCtx,
 
             // Set this operation's shard version for the underlying collection to unsharded.
             // This is prerequisite for future shard versioning checks.
-            ScopedSetShardRole scopedSetShardRole(opCtx,
-                                                  resolvedView.getNamespace(),
-                                                  ChunkVersion::UNSHARDED() /* shardVersion */,
-                                                  boost::none /* databaseVersion */);
-
+            boost::optional<ScopedSetShardRole> scopeSetShardRole;
+            if (!serverGlobalParams.clusterRole.has(ClusterRole::None)) {
+                scopeSetShardRole.emplace(opCtx,
+                                          resolvedView.getNamespace(),
+                                          ShardVersion::UNSHARDED() /* shardVersion */,
+                                          boost::none /* databaseVersion */);
+            };
             uassert(std::move(resolvedView),
                     "Explain of a resolved view must be executed by mongos",
                     !ShardingState::get(opCtx)->enabled() || !request.getExplain());
@@ -919,7 +962,7 @@ Status runAggregate(OperationContext* opCtx,
                 // Set the namespace of the curop back to the view namespace so ctx records
                 // stats on this view namespace on destruction.
                 stdx::lock_guard<Client> lk(*opCtx->getClient());
-                curOp->setNS_inlock(nss.ns());
+                curOp->setNS_inlock(nss);
             }
 
             return status;
@@ -930,11 +973,25 @@ Status runAggregate(OperationContext* opCtx,
             opCtx, nss, collections.getMainCollection(), request.getCollectionUUID());
 
         invariant(collatorToUse);
-        expCtx = makeExpressionContext(
-            opCtx, request, std::move(*collatorToUse), uuid, collatorToUseMatchesDefault);
+        expCtx = makeExpressionContext(opCtx,
+                                       request,
+                                       std::move(*collatorToUse),
+                                       uuid,
+                                       collatorToUseMatchesDefault,
+                                       collections.getMainCollection()
+                                           ? collections.getMainCollection()->getCollectionOptions()
+                                           : boost::optional<CollectionOptions>(boost::none));
+
+        // If any involved collection contains extended-range data, set a flag which individual
+        // DocumentSource parsers can check.
+        collections.forEach([&](const CollectionPtr& coll) {
+            if (coll->getRequiresTimeseriesExtendedRangeSupport())
+                expCtx->setRequiresTimeseriesExtendedRangeSupport(true);
+        });
 
         expCtx->startExpressionCounters();
         auto pipeline = Pipeline::parse(request.getPipeline(), expCtx);
+        curOp->beginQueryPlanningTimer();
         expCtx->stopExpressionCounters();
 
         if (!request.getAllowDiskUse().value_or(true)) {
@@ -954,10 +1011,14 @@ Status runAggregate(OperationContext* opCtx,
         // If the aggregate command supports encrypted collections, do rewrites of the pipeline to
         // support querying against encrypted fields.
         if (shouldDoFLERewrite(request)) {
+            CurOp::get(opCtx)->debug().shouldOmitDiagnosticInformation = true;
             // After this rewriting, the encryption info does not need to be kept around.
             pipeline = processFLEPipelineD(
-                opCtx, nss, request.getEncryptionInformation().get(), std::move(pipeline));
+                opCtx, nss, request.getEncryptionInformation().value(), std::move(pipeline));
             request.setEncryptionInformation(boost::none);
+            // Set the telemetryStoreKey to none so telemetry isn't collected when we've done a FLE
+            // rewrite.
+            CurOp::get(opCtx)->debug().telemetryStoreKey = boost::none;
         }
 
         pipeline->optimizePipeline();
@@ -965,19 +1026,75 @@ Status runAggregate(OperationContext* opCtx,
         constexpr bool alreadyOptimized = true;
         pipeline->validateCommon(alreadyOptimized);
 
-        if (isEligibleForBonsai(request, *pipeline, opCtx, collections.getMainCollection())) {
+        if (auto sampleId = analyze_shard_key::getOrGenerateSampleId(
+                opCtx,
+                expCtx->ns,
+                analyze_shard_key::SampledCommandNameEnum::kAggregate,
+                request)) {
+            analyze_shard_key::QueryAnalysisWriter::get(opCtx)
+                ->addAggregateQuery(*sampleId,
+                                    expCtx->ns,
+                                    pipeline->getInitialQuery(),
+                                    expCtx->getCollatorBSON(),
+                                    request.getLet())
+                .getAsync([](auto) {});
+        }
+
+        const bool bonsaiEligible =
+            isEligibleForBonsai(request, *pipeline, opCtx, collections.getMainCollection());
+        bool bonsaiExecSuccess = true;
+        if (bonsaiEligible) {
             uassert(6624344,
                     "Exchanging is not supported in the Cascades optimizer",
                     !request.getExchange().has_value());
+            uassert(ErrorCodes::InternalErrorNotSupported,
+                    "let unsupported in CQF",
+                    !request.getLet() || request.getLet()->isEmpty());
+            uassert(ErrorCodes::InternalErrorNotSupported,
+                    "runtimeConstants unsupported in CQF",
+                    !request.getLegacyRuntimeConstants());
+            uassert(ErrorCodes::InternalErrorNotSupported,
+                    "$_requestReshardingResumeToken in CQF",
+                    !request.getRequestReshardingResumeToken());
+            uassert(ErrorCodes::InternalErrorNotSupported,
+                    "collation unsupported in CQF",
+                    !request.getCollation() || request.getCollation()->isEmpty() ||
+                        SimpleBSONObjComparator::kInstance.evaluate(*request.getCollation() ==
+                                                                    CollationSpec::kSimpleSpec));
 
+            optimizer::QueryHints queryHints = getHintsFromQueryKnobs();
+            const bool fastIndexNullHandling = queryHints._fastIndexNullHandling;
             auto timeBegin = Date_t::now();
-            execs.emplace_back(getSBEExecutorViaCascadesOptimizer(
-                opCtx, expCtx, nss, collections.getMainCollection(), request.getHint(), *pipeline));
+            auto maybeExec = getSBEExecutorViaCascadesOptimizer(opCtx,
+                                                                expCtx,
+                                                                nss,
+                                                                collections.getMainCollection(),
+                                                                std::move(queryHints),
+                                                                request.getHint(),
+                                                                pipeline.get());
+            if (maybeExec) {
+                execs.emplace_back(
+                    uassertStatusOK(makeExecFromParams(nullptr, std::move(*maybeExec))));
+            } else {
+                // If we had an optimization failure, only error if we're not in tryBonsai.
+                bonsaiExecSuccess = false;
+                const auto queryControl =
+                    ServerParameterSet::getNodeParameterSet()->get<QueryFrameworkControl>(
+                        "internalQueryFrameworkControl");
+                tassert(7319401,
+                        "Optimization failed either without tryBonsai set, or without a hint.",
+                        queryControl->_data.get() == QueryFrameworkControlEnum::kTryBonsai &&
+                            request.getHint() && !request.getHint()->isEmpty() &&
+                            !fastIndexNullHandling);
+            }
+
             auto elapsed =
                 (Date_t::now().toMillisSinceEpoch() - timeBegin.toMillisSinceEpoch()) / 1000.0;
             OPTIMIZER_DEBUG_LOG(
                 6264804, 5, "Cascades optimization time elapsed", "time"_attr = elapsed);
-        } else {
+        }
+
+        if (!bonsaiEligible || !bonsaiExecSuccess) {
             execs = createLegacyExecutor(std::move(pipeline),
                                          liteParsedPipeline,
                                          nss,
@@ -988,10 +1105,12 @@ Status runAggregate(OperationContext* opCtx,
         }
         tassert(6624353, "No executors", !execs.empty());
 
+
         {
             auto planSummary = execs[0]->getPlanExplainer().getPlanSummary();
             stdx::lock_guard<Client> lk(*opCtx->getClient());
             curOp->setPlanSummary_inlock(std::move(planSummary));
+            curOp->debug().queryFramework = execs[0]->getQueryFramework();
         }
     }
 
@@ -1026,6 +1145,7 @@ Status runAggregate(OperationContext* opCtx,
 
         pin->incNBatches();
         cursors.emplace_back(pin.getCursor());
+        ExternalDataSourceScopeGuard::get(pin.getCursor()) = extDataSrcGuard;
         pins.emplace_back(std::move(pin));
     }
 
@@ -1065,7 +1185,12 @@ Status runAggregate(OperationContext* opCtx,
         PlanSummaryStats stats;
         planExplainer.getSummaryStats(&stats);
         curOp->debug().setPlanSummaryMetrics(stats);
-        curOp->debug().nreturned = stats.nReturned;
+
+        if (keepCursor) {
+            collectTelemetryMongod(opCtx, pins[0], stats.nReturned);
+        } else {
+            collectTelemetryMongod(opCtx, cmdObj, stats.nReturned);
+        }
 
         // For an optimized away pipeline, signal the cache that a query operation has completed.
         // For normal pipelines this is done in DocumentSourceCursor.
@@ -1100,7 +1225,7 @@ Status runAggregate(OperationContext* opCtx,
     // create a temp collection, changing the curop namespace to the name of this temp collection.
     {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
-        curOp->setNS_inlock(origNss.ns());
+        curOp->setNS_inlock(origNss);
     }
 
     return Status::OK();

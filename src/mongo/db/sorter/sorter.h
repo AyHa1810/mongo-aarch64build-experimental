@@ -29,7 +29,7 @@
 
 #pragma once
 
-#include <third_party/murmurhash3/MurmurHash3.h>
+#include <MurmurHash3.h>
 
 #include <boost/filesystem/path.hpp>
 #include <deque>
@@ -126,6 +126,11 @@ struct SortOptions {
     // If set, allows us to observe aggregate Sorter behaviors.
     SorterTracker* sorterTracker;
 
+    // When set, this sorter will own a memory pool that callers should used to allocate memory for
+    // the keys we are sorting. If enabled, any values returned by memUsageForSorter() will be
+    // ignored.
+    bool useMemPool;
+
     // If set to true and sorted data fits into memory, sorted data will be moved into iterator
     // instead of copying.
     bool moveSortedDataIntoIterator;
@@ -136,6 +141,7 @@ struct SortOptions {
           extSortAllowed(false),
           sorterFileStats(nullptr),
           sorterTracker(nullptr),
+          useMemPool(false),
           moveSortedDataIntoIterator(false) {}
 
     // Fluent API to support expressions like SortOptions().Limit(1000).ExtSortAllowed(true)
@@ -179,6 +185,11 @@ struct SortOptions {
         moveSortedDataIntoIterator = newMoveSortedDataIntoIterator;
         return *this;
     }
+
+    SortOptions& UseMemoryPool(bool usePool) {
+        useMemPool = usePool;
+        return *this;
+    }
 };
 
 /**
@@ -199,6 +210,7 @@ public:
     NullValue getOwned() const {
         return {};
     }
+    void makeOwned() {}
 };
 
 /**
@@ -277,6 +289,7 @@ class Sorter : public SorterBase {
 
 public:
     typedef std::pair<Key, Value> Data;
+    typedef std::function<Value()> ValueProducer;
     typedef SortIteratorInterface<Key, Value> Iterator;
     typedef std::pair<typename Key::SorterDeserializeSettings,
                       typename Value::SorterDeserializeSettings>
@@ -366,9 +379,8 @@ public:
                                           const Settings& settings = Settings());
 
     virtual void add(const Key&, const Value&) = 0;
-    virtual void emplace(Key&& k, Value&& v) {
-        add(k, v);
-    }
+    virtual void emplace(Key&&, ValueProducer) = 0;
+
     /**
      * Cannot add more data after calling done().
      */
@@ -376,27 +388,23 @@ public:
 
     virtual ~Sorter() {}
 
-    size_t numSorted() const {
-        return _numSorted;
-    }
-
-    uint64_t totalDataSizeSorted() const {
-        return _totalDataSizeSorted;
-    }
-
     PersistedState persistDataForShutdown();
+
+    SharedBufferFragmentBuilder& memPool() {
+        invariant(_memPool);
+        return _memPool.get();
+    }
 
 protected:
     virtual void spill() = 0;
-
-    size_t _numSorted = 0;              // Keeps track of the number of keys sorted.
-    uint64_t _totalDataSizeSorted = 0;  // Keeps track of the total size of data sorted.
 
     SortOptions _opts;
 
     std::shared_ptr<File> _file;
 
     std::vector<std::shared_ptr<Iterator>> _iters;  // Data that has already been spilled.
+
+    boost::optional<SharedBufferFragmentBuilder> _memPool;
 };
 
 
@@ -445,7 +453,6 @@ public:
     // Serialize the bound for explain output
     virtual Document serializeBound() const = 0;
 
-    virtual size_t totalDataSizeBytes() const = 0;
     virtual size_t limit() const = 0;
 
     // By default, uassert that the input meets our assumptions of being almost-sorted.
@@ -527,10 +534,6 @@ public:
         return {makeBound.serialize()};
     };
 
-    size_t totalDataSizeBytes() const {
-        return _totalDataSizeSorted;
-    }
-
     size_t limit() const {
         return _opts.limit;
     }
@@ -544,19 +547,10 @@ public:
 
 private:
     using SpillIterator = SortIteratorInterface<Key, Value>;
-    struct PairComparator {
-        int operator()(const std::pair<Key, Value>& p1, const std::pair<Key, Value>& p2) const;
-        const Comparator& compare;
-    };
 
     void _spill();
 
-    const PairComparator _comparePairs;
-
     bool _checkInput;
-
-    size_t _numSorted = 0;              // Keeps track of the number of keys sorted.
-    uint64_t _totalDataSizeSorted = 0;  // Keeps track of the total size of data sorted.
 
     const SortOptions _opts;
 
@@ -568,7 +562,6 @@ private:
 
     boost::optional<Key> _min;
     bool _done = false;
-    size_t _memUsed = 0;
 };
 
 /**
@@ -609,6 +602,14 @@ public:
      */
     void writeChunk();
 
+    static std::shared_ptr<Iterator> createFileIteratorForResume(
+        std::shared_ptr<typename Sorter<Key, Value>::File> file,
+        std::streamoff fileStartOffset,
+        std::streamoff fileEndOffset,
+        const Settings& settings,
+        const boost::optional<std::string>& dbName,
+        uint32_t checksum);
+
 private:
     const Settings _settings;
     std::shared_ptr<typename Sorter<Key, Value>::File> _file;
@@ -622,7 +623,7 @@ private:
     // be given to the Iterator in done().
     std::streamoff _fileStartOffset;
 
-    boost::optional<std::string> _dbName;
+    SortOptions _opts;
 };
 }  // namespace mongo
 

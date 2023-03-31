@@ -54,7 +54,7 @@ namespace {
 ShardsvrSetUserWriteBlockMode makeShardsvrSetUserWriteBlockModeCommand(
     bool block, ShardsvrSetUserWriteBlockModePhaseEnum phase) {
     ShardsvrSetUserWriteBlockMode shardsvrSetUserWriteBlockModeCmd;
-    shardsvrSetUserWriteBlockModeCmd.setDbName(NamespaceString::kAdminDb);
+    shardsvrSetUserWriteBlockModeCmd.setDbName(DatabaseName::kAdmin);
     SetUserWriteBlockModeRequest setUserWriteBlockModeRequest(block /* global */);
     shardsvrSetUserWriteBlockModeCmd.setSetUserWriteBlockModeRequest(
         std::move(setUserWriteBlockModeRequest));
@@ -74,7 +74,7 @@ void sendSetUserWriteBlockModeCmdToAllShards(OperationContext* opCtx,
         makeShardsvrSetUserWriteBlockModeCommand(block, phase);
 
     sharding_util::sendCommandToShards(opCtx,
-                                       shardsvrSetUserWriteBlockModeCmd.getDbName(),
+                                       shardsvrSetUserWriteBlockModeCmd.getDbName().db(),
                                        CommandHelpers::appendMajorityWriteConcern(
                                            shardsvrSetUserWriteBlockModeCmd.toBSON(osi.toBSON())),
                                        allShards,
@@ -145,7 +145,7 @@ ExecutorFuture<void> SetUserWriteBlockModeCoordinator::_runImpl(
     std::shared_ptr<executor::ScopedTaskExecutor> executor,
     const CancellationToken& token) noexcept {
     return ExecutorFuture<void>(**executor)
-        .then(_executePhase(
+        .then(_buildPhaseHandler(
             Phase::kPrepare,
             [this, anchor = shared_from_this()] {
                 auto opCtxHolder = cc().makeOperationContext();
@@ -195,7 +195,7 @@ ExecutorFuture<void> SetUserWriteBlockModeCoordinator::_runImpl(
                                                     WriteConcerns::kMajorityWriteConcernNoTimeout,
                                                     &ignoreResult));
             }))
-        .then(_executePhase(Phase::kComplete, [this, anchor = shared_from_this()] {
+        .then(_buildPhaseHandler(Phase::kComplete, [this, anchor = shared_from_this()] {
             auto opCtxHolder = cc().makeOperationContext();
             auto* opCtx = opCtxHolder.get();
             auto executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();

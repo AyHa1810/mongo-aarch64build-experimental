@@ -138,7 +138,10 @@ function assertNumMatchingOplogEventsForShard(stats, shardName, expectedTotalRet
     assert(stats.shards.hasOwnProperty(shardName), stats);
     assert.eq(Object.keys(stats.shards[shardName].stages[0])[0], "$cursor", stats);
     const executionStats = stats.shards[shardName].stages[0].$cursor.executionStats;
-    assert.eq(executionStats.nReturned, expectedTotalReturned, executionStats);
+    assert.eq(executionStats.nReturned,
+              expectedTotalReturned,
+              () => `Expected ${expectedTotalReturned} events on shard ${shardName} but got ` +
+                  `${executionStats.nReturned}. Execution stats:\n${tojson(executionStats)}`);
 }
 
 // Returns a newly created sharded collection sharded by caller provided shard key.
@@ -165,12 +168,19 @@ function createShardedCollection(shardingTest, shardKey, dbName, collName, split
 
 // A helper that opens a change stream on the whole cluster with the user supplied match expression
 // 'userMatchExpr' and 'changeStreamSpec'. The helper validates that:
-// 1. for each shard, the events are seen in that order as specified in 'expectedResult'.
+// 1. for each shard, the events are seen in the order specified by 'expectedResult' which structure
+//    is { collOrDbName : { operationType : [eventIdentifier1, eventIdentifier2, ..], ... }, .. }.
 // 2. There are no additional events being returned other than the ones in the 'expectedResult'.
 // 3. the filtering is been done at oplog level, and each of the shard read only the
 // 'expectedOplogNReturnedPerShard' documents.
-function verifyChangeStreamOnWholeCluster(
-    {st, changeStreamSpec, userMatchExpr, expectedResult, expectedOplogNReturnedPerShard}) {
+function verifyChangeStreamOnWholeCluster({
+    st,
+    changeStreamSpec,
+    userMatchExpr,
+    expectedResult,
+    expectedOplogNReturnedPerShard,
+    expectedChangeStreamDocsReturnedPerShard
+}) {
     changeStreamSpec["allChangesForCluster"] = true;
     const adminDB = st.s.getDB("admin");
     const cursor = adminDB.aggregate([{$changeStream: changeStreamSpec}, userMatchExpr]);
@@ -180,11 +190,14 @@ function verifyChangeStreamOnWholeCluster(
             eventIdentifierList.forEach(eventIdentifier => {
                 assert.soon(() => cursor.hasNext(), {op: op, eventIdentifier: eventIdentifier});
                 const event = cursor.next();
-                assert.eq(event.operationType, op, event);
+                assert.eq(event.operationType,
+                          op,
+                          () => `Expected "${op}" but got "${event.operationType}". Full event: ` +
+                              `${tojson(event)}`);
 
                 if (op == "dropDatabase") {
                     assert.eq(event.ns.db, eventIdentifier, event);
-                } else if (op == "insert") {
+                } else if (op == "insert" || op == "update" || op == "replace" || op == "delete") {
                     assert.eq(event.documentKey._id, eventIdentifier, event);
                 } else if (op == "rename") {
                     assert.eq(event.to.coll, eventIdentifier, event);
@@ -224,4 +237,11 @@ function verifyChangeStreamOnWholeCluster(
 
     assertNumMatchingOplogEventsForShard(stats, st.rs0.name, expectedOplogNReturnedPerShard[0]);
     assertNumMatchingOplogEventsForShard(stats, st.rs1.name, expectedOplogNReturnedPerShard[1]);
+
+    if (expectedChangeStreamDocsReturnedPerShard !== undefined) {
+        assertNumChangeStreamDocsReturnedFromShard(
+            stats, st.rs0.name, expectedChangeStreamDocsReturnedPerShard[0]);
+        assertNumChangeStreamDocsReturnedFromShard(
+            stats, st.rs1.name, expectedChangeStreamDocsReturnedPerShard[1]);
+    }
 }

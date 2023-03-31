@@ -9,6 +9,8 @@ import uuid
 import bson
 import pymongo.errors
 
+from bson.objectid import ObjectId
+
 from buildscripts.resmokelib import errors
 from buildscripts.resmokelib.testing.fixtures import shard_split
 from buildscripts.resmokelib.testing.fixtures.replicaset import ReplicaSetFixture
@@ -16,7 +18,7 @@ from buildscripts.resmokelib.testing.hooks import interface
 from buildscripts.resmokelib.testing.hooks import dbhash_tenant_migration
 
 
-class ContinuousShardSplit(interface.Hook):  # pylint: disable=too-many-instance-attributes
+class ContinuousShardSplit(interface.Hook):
     """Starts a shard split thread at the beginning of each test."""
 
     DESCRIPTION = ("Continuous shard split operations")
@@ -154,8 +156,8 @@ class ShardSplitLifeCycle(object):
 
 
 class _ShardSplitOptions:
-    def __init__(  # pylint: disable=too-many-arguments
-            self, logger, shard_split_fixture, tenant_ids, recipient_tag_name, recipient_set_name):
+    def __init__(self, logger, shard_split_fixture, tenant_ids, recipient_tag_name,
+                 recipient_set_name):
         self.logger = logger
         self.migration_id = uuid.uuid4()
         self.shard_split_fixture = shard_split_fixture
@@ -197,7 +199,7 @@ class _ShardSplitOptions:
         return str(opts)
 
 
-class _ShardSplitThread(threading.Thread):  # pylint: disable=too-many-instance-attributes
+class _ShardSplitThread(threading.Thread):
     THREAD_NAME = "ShardSplitThread"
 
     WAIT_SECS_RANGES = [[0.05, 0.1], [0.1, 0.5], [1, 5], [5, 15]]
@@ -212,7 +214,9 @@ class _ShardSplitThread(threading.Thread):  # pylint: disable=too-many-instance-
         self.daemon = True
         self.logger = logger
         self._shard_split_fixture = shard_split_fixture
-        self._tenant_ids = shell_options["global_vars"]["TestData"]["tenantIds"]
+        self._tenant_ids = []
+        for tenant_id in shell_options["global_vars"]["TestData"]["tenantIds"]:
+            self._tenant_ids.append(ObjectId(tenant_id))
         self._auth_options = shell_options["global_vars"]["TestData"]["authOptions"]
         self._test = None
         self._test_report = test_report

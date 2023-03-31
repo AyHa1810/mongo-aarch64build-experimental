@@ -27,18 +27,15 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/mongod_main.h"
 
 #include <boost/filesystem/operations.hpp>
 #include <boost/optional.hpp>
+#include <csignal>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
-#include <signal.h>
 #include <string>
 
 #include "mongo/base/init.h"
@@ -51,17 +48,19 @@
 #include "mongo/db/auth/auth_op_observer.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/sasl_options.h"
-#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_impl.h"
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/catalog/create_collection.h"
-#include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder_impl.h"
 #include "mongo/db/catalog/health_log.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_key_validate.h"
+#include "mongo/db/catalog_shard_feature_flag_gen.h"
+#include "mongo/db/change_collection_expired_documents_remover.h"
 #include "mongo/db/change_stream_change_collection_manager.h"
 #include "mongo/db/change_stream_options_manager.h"
+#include "mongo/db/change_stream_serverless_helpers.h"
 #include "mongo/db/client.h"
 #include "mongo/db/client_metadata_propagation_egress_hook.h"
 #include "mongo/db/clientcursor.h"
@@ -84,20 +83,15 @@
 #include "mongo/db/ftdc/ftdc_mongod.h"
 #include "mongo/db/ftdc/util.h"
 #include "mongo/db/global_settings.h"
-#include "mongo/db/index/index_access_method_factory_impl.h"
 #include "mongo/db/index_builds_coordinator_mongod.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/initialize_server_global_state.h"
-#include "mongo/db/internal_transactions_reap_service.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/json.h"
 #include "mongo/db/keys_collection_client_direct.h"
 #include "mongo/db/keys_collection_client_sharded.h"
 #include "mongo/db/keys_collection_manager.h"
-#include "mongo/db/kill_sessions.h"
-#include "mongo/db/kill_sessions_local.h"
 #include "mongo/db/log_process_details.h"
-#include "mongo/db/logical_session_cache.h"
 #include "mongo/db/logical_session_cache_factory_mongod.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/mirror_maestro.h"
@@ -114,6 +108,8 @@
 #include "mongo/db/pipeline/change_stream_expired_pre_image_remover.h"
 #include "mongo/db/pipeline/process_interface/replica_set_node_process_interface.h"
 #include "mongo/db/query/internal_plans.h"
+#include "mongo/db/query/stats/stats_cache_loader_impl.h"
+#include "mongo/db/query/stats/stats_catalog.h"
 #include "mongo/db/read_write_concern_defaults_cache_lookup_mongod.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/initial_syncer_factory.h"
@@ -129,6 +125,8 @@
 #include "mongo/db/repl/replication_coordinator_impl_gen.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/replication_recovery.h"
+#include "mongo/db/repl/shard_merge_recipient_op_observer.h"
+#include "mongo/db/repl/shard_merge_recipient_service.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/repl/tenant_migration_donor_op_observer.h"
 #include "mongo/db/repl/tenant_migration_donor_service.h"
@@ -143,8 +141,10 @@
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/config_server_op_observer.h"
 #include "mongo/db/s/migration_util.h"
+#include "mongo/db/s/move_primary/move_primary_recipient_service.h"
 #include "mongo/db/s/op_observer_sharding_impl.h"
 #include "mongo/db/s/periodic_sharded_index_consistency_checker.h"
+#include "mongo/db/s/query_analysis_op_observer.h"
 #include "mongo/db/s/rename_collection_participant_service.h"
 #include "mongo/db/s/resharding/resharding_coordinator_service.h"
 #include "mongo/db/s/resharding/resharding_donor_service.h"
@@ -160,13 +160,19 @@
 #include "mongo/db/serverless/shard_split_donor_service.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_entry_point_mongod.h"
-#include "mongo/db/session_catalog.h"
-#include "mongo/db/session_killer.h"
+#include "mongo/db/session/kill_sessions.h"
+#include "mongo/db/session/kill_sessions_local.h"
+#include "mongo/db/session/logical_session_cache.h"
+#include "mongo/db/session/session_catalog.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/session/session_killer.h"
+#include "mongo/db/set_change_stream_state_coordinator.h"
 #include "mongo/db/startup_recovery.h"
 #include "mongo/db/startup_warnings_mongod.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/backup_cursor_hooks.h"
 #include "mongo/db/storage/control/storage_control.h"
+#include "mongo/db/storage/disk_space_monitor.h"
 #include "mongo/db/storage/durable_history_pin.h"
 #include "mongo/db/storage/encryption_hooks.h"
 #include "mongo/db/storage/flow_control.h"
@@ -177,7 +183,9 @@
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/db/system_index.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/transaction/internal_transactions_reap_service.h"
+#include "mongo/db/transaction/session_catalog_mongod_transaction_interface_impl.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/db/ttl.h"
 #include "mongo/db/vector_clock_metadata_hook.h"
 #include "mongo/db/wire_version.h"
@@ -186,17 +194,21 @@
 #include "mongo/executor/network_interface_thread_pool.h"
 #include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/idl/cluster_server_parameter_gen.h"
+#include "mongo/idl/cluster_server_parameter_initializer.h"
 #include "mongo/idl/cluster_server_parameter_op_observer.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/platform/random.h"
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
+#include "mongo/s/catalog/sharding_catalog_client_impl.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/query_analysis_sampler.h"
 #include "mongo/scripting/dbdirectclient_factory.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/stdx/future.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/transport/ingress_handshake_metrics.h"
 #include "mongo/transport/transport_layer_manager.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/background.h"
@@ -249,8 +261,6 @@ MONGO_FAIL_POINT_DEFINE(hangDuringQuiesceMode);
 MONGO_FAIL_POINT_DEFINE(pauseWhileKillingOperationsAtShutdown);
 MONGO_FAIL_POINT_DEFINE(hangBeforeShutdown);
 
-const NamespaceString startupLogCollectionName("local.startup_log");
-
 #ifdef _WIN32
 const ntservice::NtServiceDefaultStrings defaultServiceStrings = {
     L"MongoDB", L"MongoDB", L"MongoDB Server"};
@@ -278,24 +288,25 @@ void logStartup(OperationContext* opCtx) {
     BSONObj o = toLog.obj();
 
     Lock::GlobalWrite lk(opCtx);
-    AutoGetDb autoDb(opCtx, startupLogCollectionName.dbName(), mongo::MODE_X);
+    AutoGetDb autoDb(opCtx, NamespaceString::kStartupLogNamespace.dbName(), mongo::MODE_X);
     auto db = autoDb.ensureDbExists(opCtx);
-    CollectionPtr collection =
-        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, startupLogCollectionName);
+    auto collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
+        opCtx, NamespaceString::kStartupLogNamespace);
     WriteUnitOfWork wunit(opCtx);
     if (!collection) {
         BSONObj options = BSON("capped" << true << "size" << 10 * 1024 * 1024);
         repl::UnreplicatedWritesBlock uwb(opCtx);
         CollectionOptions collectionOptions = uassertStatusOK(
             CollectionOptions::parse(options, CollectionOptions::ParseKind::parseForCommand));
-        uassertStatusOK(db->userCreateNS(opCtx, startupLogCollectionName, collectionOptions));
+        uassertStatusOK(
+            db->userCreateNS(opCtx, NamespaceString::kStartupLogNamespace, collectionOptions));
         collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
-            opCtx, startupLogCollectionName);
+            opCtx, NamespaceString::kStartupLogNamespace);
     }
     invariant(collection);
 
-    OpDebug* const nullOpDebug = nullptr;
-    uassertStatusOK(collection->insertDocument(opCtx, InsertStatement(o), nullOpDebug, false));
+    uassertStatusOK(collection_internal::insertDocument(
+        opCtx, CollectionPtr(collection), InsertStatement(o), nullptr /* OpDebug */, false));
     wunit.commit();
 }
 
@@ -314,15 +325,41 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(WireSpec, ("EndStartupOptionHandling"))(Ini
 
 void initializeCommandHooks(ServiceContext* serviceContext) {
     class MongodCommandInvocationHooks final : public CommandInvocationHooks {
-        void onBeforeRun(OperationContext*, const OpMsgRequest&, CommandInvocation*) {}
+    public:
+        void onBeforeRun(OperationContext* opCtx,
+                         const OpMsgRequest& request,
+                         CommandInvocation* invocation) override {
+            _nextHook.onBeforeRun(opCtx, request, invocation);
+        }
 
-        void onAfterRun(OperationContext* opCtx, const OpMsgRequest&, CommandInvocation*) {
+        void onBeforeAsyncRun(std::shared_ptr<RequestExecutionContext> rec,
+                              CommandInvocation* invocation) override {
+            _nextHook.onBeforeAsyncRun(rec, invocation);
+        }
+
+        void onAfterRun(OperationContext* opCtx,
+                        const OpMsgRequest& request,
+                        CommandInvocation* invocation,
+                        rpc::ReplyBuilderInterface* response) override {
+            _nextHook.onAfterRun(opCtx, request, invocation, response);
+            _onAfterRunImpl(opCtx);
+        }
+
+        void onAfterAsyncRun(std::shared_ptr<RequestExecutionContext> rec,
+                             CommandInvocation* invocation) override {
+            _nextHook.onAfterAsyncRun(rec, invocation);
+            _onAfterRunImpl(rec->getOpCtx());
+        }
+
+    private:
+        void _onAfterRunImpl(OperationContext* opCtx) const {
             MirrorMaestro::tryMirrorRequest(opCtx);
             MirrorMaestro::onReceiveMirroredRead(opCtx);
         }
+
+        transport::IngressHandshakeMetricsCommandHooks _nextHook{};
     };
 
-    MirrorMaestro::init(serviceContext);
     CommandInvocationHooks::set(serviceContext, std::make_unique<MongodCommandInvocationHooks>());
 }
 
@@ -331,22 +368,36 @@ void registerPrimaryOnlyServices(ServiceContext* serviceContext) {
 
     std::vector<std::unique_ptr<repl::PrimaryOnlyService>> services;
 
-    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+    if (serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
         services.push_back(std::make_unique<ReshardingCoordinatorService>(serviceContext));
         services.push_back(std::make_unique<ConfigsvrCoordinatorService>(serviceContext));
-    } else if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+    }
+
+    if (serverGlobalParams.clusterRole.has(ClusterRole::ShardServer)) {
         services.push_back(std::make_unique<RenameCollectionParticipantService>(serviceContext));
         services.push_back(std::make_unique<ShardingDDLCoordinatorService>(serviceContext));
         services.push_back(std::make_unique<ReshardingDonorService>(serviceContext));
         services.push_back(std::make_unique<ReshardingRecipientService>(serviceContext));
         services.push_back(std::make_unique<TenantMigrationDonorService>(serviceContext));
         services.push_back(std::make_unique<repl::TenantMigrationRecipientService>(serviceContext));
-    } else {
+        services.push_back(std::make_unique<MovePrimaryRecipientService>(serviceContext));
+        if (getGlobalReplSettings().isServerless()) {
+            services.push_back(std::make_unique<repl::ShardMergeRecipientService>(serviceContext));
+        }
+    }
+
+    if (serverGlobalParams.clusterRole.has(ClusterRole::None)) {
         services.push_back(std::make_unique<TenantMigrationDonorService>(serviceContext));
         services.push_back(std::make_unique<repl::TenantMigrationRecipientService>(serviceContext));
         if (getGlobalReplSettings().isServerless()) {
             services.push_back(std::make_unique<ShardSplitDonorService>(serviceContext));
+            services.push_back(std::make_unique<repl::ShardMergeRecipientService>(serviceContext));
         }
+    }
+
+    if (change_stream_serverless_helpers::canInitializeServices()) {
+        services.push_back(
+            std::make_unique<SetChangeStreamStateCoordinatorService>(serviceContext));
     }
 
     for (auto& service : services) {
@@ -356,6 +407,11 @@ void registerPrimaryOnlyServices(ServiceContext* serviceContext) {
 
 MONGO_FAIL_POINT_DEFINE(shutdownAtStartup);
 
+// Important:
+// _initAndListen among its other tasks initializes the storage subsystem.
+// File Copy Based Initial Sync will restart the storage subsystem and may need to repeat some
+// of the initialization steps within.  If you add or change any of these steps, make sure
+// any necessary changes are also made to File Copy Based Initial Sync.
 ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     Client::initThread("initandlisten");
 
@@ -389,6 +445,8 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
 #endif
 
     logProcessDetails(nullptr);
+
+    initializeCommandHooks(serviceContext);
 
     serviceContext->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongod>(serviceContext));
 
@@ -512,9 +570,23 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
         exitCleanly(ExitCode::needDowngrade);
     }
 
+    // If we are on standalone, load cluster parameters from disk. If we are replicated, this is not
+    // a concern as the cluster parameter initializer runs automatically.
+    auto replCoord = repl::ReplicationCoordinator::get(startupOpCtx.get());
+    invariant(replCoord);
+    if (!replCoord->isReplEnabled()) {
+        ClusterServerParameterInitializer::synchronizeAllParametersFromDisk(startupOpCtx.get());
+    }
+
     // Ensure FCV document exists and is initialized in-memory. Fatally asserts if there is an
     // error.
     FeatureCompatibilityVersion::fassertInitializedAfterStartup(startupOpCtx.get());
+
+    // TODO (SERVER-74847): Remove this function call once we remove testing around downgrading from
+    // latest to last continuous.
+    if (!mongo::repl::disableTransitionFromLatestToLastContinuous) {
+        FeatureCompatibilityVersion::addTransitionFromLatestToLastContinuous();
+    }
 
     if (gFlowControlEnabled.load()) {
         LOGV2(20536, "Flow Control is enabled on this deployment");
@@ -536,6 +608,9 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     startMongoDFTDC();
 
     if (mongodGlobalParams.scriptingEnabled) {
+        uassert(ErrorCodes::InvalidOptions,
+                "Scripting engine not supported in the serverless environment",
+                !gMultitenancySupport);
         ScriptEngine::setup();
     }
 
@@ -545,7 +620,8 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     }
 
     // Start up health log writer thread.
-    HealthLog::get(startupOpCtx.get()).startup();
+    HealthLogInterface::set(serviceContext, std::make_unique<HealthLog>());
+    HealthLogInterface::get(startupOpCtx.get())->startup();
 
     auto const globalAuthzManager = AuthorizationManager::get(serviceContext);
     uassertStatusOK(globalAuthzManager->initialize(startupOpCtx.get()));
@@ -555,7 +631,7 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     }
 
     // This is for security on certain platforms (nonce generation)
-    srand((unsigned)(curTimeMicros64()) ^ (unsigned(uintptr_t(&startupOpCtx))));
+    srand((unsigned)(curTimeMicros64()) ^ (unsigned(uintptr_t(&startupOpCtx))));  // NOLINT
 
     if (globalAuthzManager->shouldValidateAuthSchemaOnStartup()) {
         Status status = verifySystemIndexes(startupOpCtx.get());
@@ -621,20 +697,16 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
 
     WaitForMajorityService::get(serviceContext).startup(serviceContext);
 
-    // This function may take the global lock.
-    auto shardingInitialized = ShardingInitializationMongoD::get(startupOpCtx.get())
-                                   ->initializeShardingAwarenessIfNeeded(startupOpCtx.get());
-    if (shardingInitialized) {
-        auto status = loadGlobalSettingsFromConfigServer(startupOpCtx.get());
-        if (!status.isOK()) {
-            LOGV2(20545,
-                  "Error loading global settings from config server at startup",
-                  "error"_attr = redact(status));
-        }
+    if (!serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
+        // A catalog shard initializes sharding awareness after setting up its config server state.
+
+        // This function may take the global lock.
+        initializeShardingAwarenessIfNeededAndLoadGlobalSettings(startupOpCtx.get());
     }
 
     try {
-        if (serverGlobalParams.clusterRole != ClusterRole::ShardServer &&
+        if ((serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer) ||
+             serverGlobalParams.clusterRole.has(ClusterRole::None)) &&
             replSettings.usingReplSets()) {
             ReadWriteConcernDefaults::get(startupOpCtx.get()->getServiceContext())
                 .refreshIfNecessary(startupOpCtx.get());
@@ -662,13 +734,13 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
                               << "startupRecoveryForRestore at the same time",
                 !repl::startupRecoveryForRestore);
 
-        auto replCoord = repl::ReplicationCoordinator::get(startupOpCtx.get());
-        invariant(replCoord);
         uassert(ErrorCodes::BadValue,
                 str::stream() << "Cannot use queryableBackupMode in a replica set",
                 !replCoord->isReplEnabled());
         replCoord->startup(startupOpCtx.get(), lastShutdownState);
     }
+
+    MirrorMaestro::init(serviceContext);
 
     if (!storageGlobalParams.queryableBackupMode) {
 
@@ -678,27 +750,30 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
 
         startFreeMonitoring(serviceContext);
 
-        auto replCoord = repl::ReplicationCoordinator::get(startupOpCtx.get());
-        invariant(replCoord);
-
-        if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+        if (serverGlobalParams.clusterRole.has(ClusterRole::ShardServer)) {
             // Note: For replica sets, ShardingStateRecovery happens on transition to primary.
             if (!replCoord->isReplEnabled()) {
                 if (ShardingState::get(startupOpCtx.get())->enabled()) {
-                    uassertStatusOK(ShardingStateRecovery::recover(startupOpCtx.get()));
+                    uassertStatusOK(ShardingStateRecovery_DEPRECATED::recover(startupOpCtx.get()));
                 }
             }
-        } else if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-            initializeGlobalShardingStateForMongoD(
-                startupOpCtx.get(), ShardId::kConfigServerId, ConnectionString::forLocal());
+        }
 
-            ShardingCatalogManager::create(
-                startupOpCtx->getServiceContext(),
-                makeShardingTaskExecutor(executor::makeNetworkInterface("AddShard-TaskExecutor")));
+        if (serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
+            initializeGlobalShardingStateForConfigServerIfNeeded(startupOpCtx.get());
 
-            Grid::get(startupOpCtx.get())->setShardingInitialized();
-        } else if (replSettings.usingReplSets()) {  // standalone replica set
-            auto keysCollectionClient = std::make_unique<KeysCollectionClientDirect>();
+            // This function may take the global lock.
+            initializeShardingAwarenessIfNeededAndLoadGlobalSettings(startupOpCtx.get());
+        }
+
+        if (serverGlobalParams.clusterRole.has(ClusterRole::None) &&
+            replSettings.usingReplSets()) {  // standalone replica set
+            // The keys client must use local read concern if the storage engine can't support
+            // majority read concern.
+            auto keysClientMustUseLocalReads =
+                !serviceContext->getStorageEngine()->supportsReadConcernMajority();
+            auto keysCollectionClient =
+                std::make_unique<KeysCollectionClientDirect>(keysClientMustUseLocalReads);
             auto keyManager = std::make_shared<KeysCollectionManager>(
                 KeysCollectionManager::kKeyManagerPurposeString,
                 std::move(keysCollectionClient),
@@ -750,6 +825,11 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
         storageEngine->startTimestampMonitor();
 
         startFLECrud(serviceContext);
+
+        DiskSpaceMonitor::start(serviceContext);
+        auto diskMonitor = DiskSpaceMonitor::get(serviceContext);
+        diskMonitor->registerAction(
+            IndexBuildsCoordinator::get(serviceContext)->makeKillIndexBuildOnLowDiskSpaceAction());
     }
 
     startClientCursorMonitor();
@@ -777,28 +857,62 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
         }
     }
 
-    // Start a background task to periodically remove expired pre-images from the 'system.preimages'
-    // collection if not in standalone mode.
+    // If not in standalone mode, start background tasks to:
+    //  * Periodically remove expired pre-images from the 'system.preimages'
+    //  * Periodically remove expired documents from change collections
     const auto isStandalone =
         repl::ReplicationCoordinator::get(serviceContext)->getReplicationMode() ==
         repl::ReplicationCoordinator::modeNone;
     if (!isStandalone) {
         startChangeStreamExpiredPreImagesRemover(serviceContext);
+        startChangeCollectionExpiredDocumentsRemover(serviceContext);
+    }
+
+    if (computeModeEnabled) {
+        if (!isStandalone || !serverGlobalParams.clusterRole.has(ClusterRole::None)) {
+            LOGV2_ERROR(6968200, "'enableComputeMode' can be used only in standalone server");
+            exitCleanly(ExitCode::badOptions);
+        }
+        if (externalPipeDir != "" && externalPipeDir.find("..") != std::string::npos) {
+            LOGV2_ERROR(7001102, "'externalPipeDir' must not have '..'");
+            exitCleanly(ExitCode::badOptions);
+        }
+
+        LOGV2_WARNING_OPTIONS(
+            6968201,
+            {logv2::LogTag::kStartupWarnings},
+            "There could be security risks in using 'enableComputeMode'. It is recommended to use "
+            "this mode under an isolated environment and execute the server under a user with "
+            "restricted access permissions");
+    } else {
+        if (externalPipeDir != "") {
+            LOGV2_WARNING_OPTIONS(
+                7001103,
+                {logv2::LogTag::kStartupWarnings},
+                "'externalPipeDir' is effective only when enableComputeMode=true");
+        }
     }
 
     // Set up the logical session cache
     LogicalSessionCacheServer kind = LogicalSessionCacheServer::kStandalone;
-    if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
-        kind = LogicalSessionCacheServer::kSharded;
-    } else if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+    if (serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
         kind = LogicalSessionCacheServer::kConfigServer;
+    } else if (serverGlobalParams.clusterRole.has(ClusterRole::ShardServer)) {
+        kind = LogicalSessionCacheServer::kSharded;
     } else if (replSettings.usingReplSets()) {
         kind = LogicalSessionCacheServer::kReplicaSet;
     }
 
     LogicalSessionCache::set(serviceContext, makeLogicalSessionCacheD(kind));
 
-    initializeCommandHooks(serviceContext);
+    if (analyze_shard_key::supportsSamplingQueries(serviceContext, true /* ignoreFCV */) &&
+        serverGlobalParams.clusterRole.has(ClusterRole::None)) {
+        analyze_shard_key::QueryAnalysisSampler::get(serviceContext).onStartup();
+    }
+
+    auto cacheLoader = std::make_unique<stats::StatsCacheLoaderImpl>();
+    auto catalog = std::make_unique<stats::StatsCatalog>(serviceContext, std::move(cacheLoader));
+    stats::StatsCatalog::set(serviceContext, std::move(catalog));
 
     // MessageServer::run will return when exit code closes its socket and we don't need the
     // operation context anymore
@@ -846,6 +960,13 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     if (MONGO_unlikely(shutdownAtStartup.shouldFail())) {
         LOGV2(20556, "Starting clean exit via failpoint");
         exitCleanly(ExitCode::clean);
+    }
+
+    if (storageGlobalParams.magicRestore) {
+        if (getMagicRestoreMain() == nullptr) {
+            LOGV2_FATAL_NOTRACE(7180701, "--magicRestore cannot be used with a community build");
+        }
+        return getMagicRestoreMain()(serviceContext);
     }
 
     MONGO_IDLE_THREAD_BLOCK;
@@ -1010,7 +1131,7 @@ void startupConfigActions(const std::vector<std::string>& args) {
 }
 
 void setUpCollectionShardingState(ServiceContext* serviceContext) {
-    if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+    if (serverGlobalParams.clusterRole.has(ClusterRole::ShardServer)) {
         CollectionShardingStateFactory::set(
             serviceContext, std::make_unique<CollectionShardingStateFactoryShard>(serviceContext));
     } else {
@@ -1022,7 +1143,6 @@ void setUpCollectionShardingState(ServiceContext* serviceContext) {
 
 void setUpCatalog(ServiceContext* serviceContext) {
     DatabaseHolder::set(serviceContext, std::make_unique<DatabaseHolderImpl>());
-    IndexAccessMethodFactory::set(serviceContext, std::make_unique<IndexAccessMethodFactoryImpl>());
     Collection::Factory::set(serviceContext, std::make_unique<CollectionImpl::FactoryImpl>());
 }
 
@@ -1091,11 +1211,16 @@ void setUpReplication(ServiceContext* serviceContext) {
         SecureRandom().nextInt64());
     // Only create a ReplicaSetNodeExecutor if sharding is disabled and replication is enabled.
     // Note that sharding sets up its own executors for scheduling work to remote nodes.
-    if (serverGlobalParams.clusterRole == ClusterRole::None && replCoord->isReplEnabled())
+    if (serverGlobalParams.clusterRole.has(ClusterRole::None) && replCoord->isReplEnabled())
         ReplicaSetNodeProcessInterface::setReplicaSetNodeExecutor(
             serviceContext, makeReplicaSetNodeExecutor(serviceContext));
 
     repl::ReplicationCoordinator::set(serviceContext, std::move(replCoord));
+
+    MongoDSessionCatalog::set(
+        serviceContext,
+        std::make_unique<MongoDSessionCatalog>(
+            std::make_unique<MongoDSessionCatalogTransactionInterfaceImpl>()));
 
     IndexBuildsCoordinator::set(serviceContext, std::make_unique<IndexBuildsCoordinatorMongod>());
 
@@ -1106,7 +1231,7 @@ void setUpReplication(ServiceContext* serviceContext) {
 
 void setUpObservers(ServiceContext* serviceContext) {
     auto opObserverRegistry = std::make_unique<OpObserverRegistry>();
-    if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+    if (serverGlobalParams.clusterRole.has(ClusterRole::ShardServer)) {
         DurableHistoryRegistry::get(serviceContext)
             ->registerPin(std::make_unique<ReshardingHistoryHook>());
         opObserverRegistry->addObserver(std::make_unique<OpObserverShardingImpl>(
@@ -1119,13 +1244,22 @@ void setUpObservers(ServiceContext* serviceContext) {
         opObserverRegistry->addObserver(std::make_unique<UserWriteBlockModeOpObserver>());
         if (getGlobalReplSettings().isServerless()) {
             opObserverRegistry->addObserver(std::make_unique<ShardSplitDonorOpObserver>());
+            opObserverRegistry->addObserver(
+                std::make_unique<repl::ShardMergeRecipientOpObserver>());
         }
-    } else if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-        opObserverRegistry->addObserver(
-            std::make_unique<OpObserverImpl>(std::make_unique<OplogWriterImpl>()));
+    }
+
+    if (serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
+        if (!gFeatureFlagCatalogShard.isEnabledAndIgnoreFCV()) {
+            opObserverRegistry->addObserver(
+                std::make_unique<OpObserverImpl>(std::make_unique<OplogWriterImpl>()));
+        }
+
         opObserverRegistry->addObserver(std::make_unique<ConfigServerOpObserver>());
         opObserverRegistry->addObserver(std::make_unique<ReshardingOpObserver>());
-    } else {
+    }
+
+    if (serverGlobalParams.clusterRole.has(ClusterRole::None)) {
         opObserverRegistry->addObserver(
             std::make_unique<OpObserverImpl>(std::make_unique<OplogWriterImpl>()));
         opObserverRegistry->addObserver(std::make_unique<repl::TenantMigrationDonorOpObserver>());
@@ -1134,13 +1268,17 @@ void setUpObservers(ServiceContext* serviceContext) {
         opObserverRegistry->addObserver(std::make_unique<UserWriteBlockModeOpObserver>());
         if (getGlobalReplSettings().isServerless()) {
             opObserverRegistry->addObserver(std::make_unique<ShardSplitDonorOpObserver>());
+            opObserverRegistry->addObserver(
+                std::make_unique<repl::ShardMergeRecipientOpObserver>());
         }
     }
+
     opObserverRegistry->addObserver(std::make_unique<AuthOpObserver>());
     opObserverRegistry->addObserver(
         std::make_unique<repl::PrimaryOnlyServiceOpObserver>(serviceContext));
     opObserverRegistry->addObserver(std::make_unique<FcvOpObserver>());
     opObserverRegistry->addObserver(std::make_unique<ClusterServerParameterOpObserver>());
+    opObserverRegistry->addObserver(std::make_unique<analyze_shard_key::QueryAnalysisOpObserver>());
 
     setupFreeMonitoringOpObserver(opObserverRegistry.get());
 
@@ -1236,6 +1374,8 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
         LOGV2_OPTIONS(4695103, {LogComponent::kReplication}, "Exiting quiesce mode for shutdown");
     }
 
+    DiskSpaceMonitor::stop(serviceContext);
+
     LOGV2_OPTIONS(6371601, {LogComponent::kDefault}, "Shutting down the FLE Crud thread pool");
     stopFLECrud();
 
@@ -1249,6 +1389,11 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
     if (auto lsc = LogicalSessionCache::get(serviceContext)) {
         LOGV2(4784903, "Shutting down the LogicalSessionCache");
         lsc->joinOnShutDown();
+    }
+
+    if (analyze_shard_key::supportsSamplingQueries(serviceContext, true /* ignoreFCV */)) {
+        LOGV2_OPTIONS(7350601, {LogComponent::kDefault}, "Shutting down the QueryAnalysisSampler");
+        analyze_shard_key::QueryAnalysisSampler::get(serviceContext).onShutdown();
     }
 
     // Shutdown the TransportLayer so that new connections aren't accepted
@@ -1288,7 +1433,10 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
             uniqueOpCtx = client->makeOperationContext();
             opCtx = uniqueOpCtx.get();
         }
-        opCtx->setIsExecutingShutdown();
+        {
+            stdx::lock_guard lg(*client);
+            opCtx->setIsExecutingShutdown();
+        }
 
         // This can wait a long time while we drain the secondary's apply queue, especially if
         // it is building an index.
@@ -1297,7 +1445,7 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
         repl::ReplicationCoordinator::get(serviceContext)->shutdown(opCtx);
 
         // Terminate the index consistency check.
-        if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+        if (serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
             LOGV2_OPTIONS(4784904,
                           {LogComponent::kSharding},
                           "Shutting down the PeriodicShardedIndexConsistencyChecker");
@@ -1404,14 +1552,18 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
     LOGV2(4784925, "Shutting down free monitoring");
     stopFreeMonitoring();
 
-    LOGV2(4784927, "Shutting down the HealthLog");
-    HealthLog::get(serviceContext).shutdown();
+    if (auto* healthLog = HealthLogInterface::get(serviceContext)) {
+        LOGV2(4784927, "Shutting down the HealthLog");
+        healthLog->shutdown();
+    }
 
     LOGV2(4784928, "Shutting down the TTL monitor");
     shutdownTTLMonitor(serviceContext);
 
     LOGV2(6278511, "Shutting down the Change Stream Expired Pre-images Remover");
     shutdownChangeStreamExpiredPreImagesRemover(serviceContext);
+
+    shutdownChangeCollectionExpiredDocumentsRemover(serviceContext);
 
     // We should always be able to acquire the global lock at shutdown.
     // An OperationContext is not necessary to call lockGlobal() during shutdown, as it's only used
@@ -1468,7 +1620,7 @@ int mongod_main(int argc, char* argv[]) {
 
     setupSignalHandlers();
 
-    srand(static_cast<unsigned>(curTimeMicros64()));
+    srand(static_cast<unsigned>(curTimeMicros64()));  // NOLINT
 
     Status status = mongo::runGlobalInitializers(std::vector<std::string>(argv, argv + argc));
     if (!status.isOK()) {
@@ -1549,7 +1701,9 @@ int mongod_main(int argc, char* argv[]) {
     ReadWriteConcernDefaults::create(service, readWriteConcernDefaultsCacheLookupMongoD);
     ChangeStreamOptionsManager::create(service);
 
-    ChangeStreamChangeCollectionManager::create(service);
+    if (change_stream_serverless_helpers::canInitializeServices()) {
+        ChangeStreamChangeCollectionManager::create(service);
+    }
 
 #if defined(_WIN32)
     if (ntservice::shouldStartService()) {
@@ -1557,6 +1711,10 @@ int mongod_main(int argc, char* argv[]) {
         // exits directly and so never reaches here either.
     }
 #endif
+
+    LOGV2_OPTIONS(
+        7091600, {LogComponent::kTenantMigration}, "Starting TenantMigrationAccessBlockerRegistry");
+    TenantMigrationAccessBlockerRegistry::get(service).startup();
 
     ExitCode exitCode = initAndListen(service, serverGlobalParams.port);
     exitCleanly(exitCode);

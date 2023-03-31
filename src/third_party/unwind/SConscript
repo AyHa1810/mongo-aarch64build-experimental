@@ -19,7 +19,9 @@ env = env.Clone(
     # breaks that. It also seems to interfere with building with the
     # sanitizers, which use linker maps that reference backtrace. This
     # may be an ld.gold bug.
-    DISALLOW_VISHIDDEN=True, )
+    DISALLOW_VISHIDDEN=True,
+    NINJA_GENSOURCE_INDEPENDENT=True,
+)
 
 unwind_root = env.Dir(".").srcnode()
 unwind_platform = unwind_root.Dir("platform/${TARGET_OS}_${TARGET_ARCH}")
@@ -129,6 +131,11 @@ env.Append(CCFLAGS=[
     '-Wno-unused-variable',
 ])
 
+if env.ToolchainIs('gcc'):
+    env.Append(CCFLAGS=[
+        '-Wno-uninitialized',
+    ])
+
 if env['TARGET_ARCH'] == 'ppc64le':
     env.Append(CCFLAGS=[
         '-Wno-unused-value',
@@ -136,6 +143,8 @@ if env['TARGET_ARCH'] == 'ppc64le':
 
 if env.ToolchainIs('clang'):
     env.Append(CCFLAGS=['-Wno-header-guard'])
+    if env['TARGET_ARCH'] == 'aarch64':
+        env.Append(CCFLAGS=['-Wno-absolute-value'])
 
 env.Append(CPPPATH=[
     unwind_platform.Dir("build/include"),

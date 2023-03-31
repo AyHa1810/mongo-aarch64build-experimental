@@ -151,11 +151,15 @@ private:
     }
 
     void onStartup(OperationContext* opCtx) override final {}
+    void onSetCurrentConfig(OperationContext* opCtx) override final {}
     void onShutdown() override final {}
     void onStepUpBegin(OperationContext* opCtx, long long term) override final {}
     void onStepUpComplete(OperationContext* opCtx, long long term) override final {}
     void onStepDown() override final {}
     void onBecomeArbiter() override final {}
+    inline std::string getServiceName() const override final {
+        return "UserWritesRecoverableCriticalSectionService";
+    }
 };
 
 }  // namespace mongo

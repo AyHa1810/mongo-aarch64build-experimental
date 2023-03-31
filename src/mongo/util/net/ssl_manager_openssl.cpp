@@ -47,6 +47,7 @@
 #include "mongo/base/secure_allocator.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/config.h"
+#include "mongo/db/connection_health_metrics_parameter_gen.h"
 #include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/atomic_word.h"
@@ -771,6 +772,10 @@ Future<UniqueOCSPResponse> retrieveOCSPResponse(const std::string& host,
         return getSSLFailure("Could not convert type OCSP Response to DER encoded object.");
     }
 
+    if (!OCSPManager::get(getGlobalServiceContext())) {
+        return getSSLFailure("OCSP fetch could not complete, server is in shutdown mode.");
+    }
+
     // Query the OCSP responder
     return OCSPManager::get(getGlobalServiceContext())
         ->requestStatus(buffer, host, purpose)
@@ -990,7 +995,7 @@ Future<OCSPFetchResponse> dispatchOCSPRequests(SSL_CTX* context,
     std::vector<Future<UniqueOCSPResponse>> futureResponses{};
     std::vector<OCSPCertIDSet*> requestedCertIDSets{};
 
-    for (auto host : leafResponders) {
+    for (auto& host : leafResponders) {
         auto& ocspRequestAndIDs = ocspRequestMap[host];
         Future<UniqueOCSPResponse> futureResponse =
             retrieveOCSPResponse(host, ocspRequestAndIDs, purpose);
@@ -1003,14 +1008,30 @@ Future<OCSPFetchResponse> dispatchOCSPRequests(SSL_CTX* context,
                                                        std::move(pf.promise),
                                                        std::move(intermediateCerts),
                                                        std::move(ocspContext));
-
+    auto startTimer = std::make_shared<Timer>();
     for (size_t i = 0; i < futureResponses.size(); i++) {
         auto futureResponse = std::move(futureResponses[i]);
         auto requestedCertIDs = requestedCertIDSets[i];
 
         std::move(futureResponse)
-            .getAsync([context, ca, state, requestedCertIDs](
+            .getAsync([context, ca, state, requestedCertIDs, startTimer, purpose](
                           StatusWith<UniqueOCSPResponse> swResponse) mutable {
+                auto requestLatency = startTimer->millis();
+                // We use a scope guard because we only want to log the metrics once we have come to
+                // a resolution on the status of the connection. This happens on the event of:
+                // 1. The first OCSP response that we get that indicates the certificate is valid or
+                //    has been revoked.
+                // 2. The last OCSP response returns and the status of the certificate is still
+                //    unknown.
+                ScopeGuard logLatencyGuard([requestLatency, purpose]() {
+                    if (purpose != OCSPPurpose::kClientVerify ||
+                        !gEnableDetailedConnectionHealthMetricLogLines) {
+                        return;
+                    }
+                    LOGV2_INFO(6840101,
+                               "Completed client-side verification of OCSP request",
+                               "verificationTimeMillis"_attr = requestLatency);
+                });
                 if (!swResponse.isOK()) {
                     if (state->finishLine.arriveWeakly()) {
                         state->promise.setError(
@@ -1056,6 +1077,9 @@ Future<OCSPFetchResponse> dispatchOCSPRequests(SSL_CTX* context,
                         return;
                     }
                 }
+                // Don't log any metrics if we haven't come to a decision on the validity of the
+                // certificate yet.
+                logLatencyGuard.dismiss();
             });
     }
 
@@ -1163,13 +1187,10 @@ private:
 const ServiceContext::Decoration<boost::optional<OCSPCache>> OCSPCache::getOCSPCache =
     ServiceContext::declareDecoration<boost::optional<OCSPCache>>();
 
-ServiceContext::ConstructorActionRegisterer OCSPCacheRegisterer("CreateOCSPCache",
-                                                                [](ServiceContext* context) {
-                                                                    OCSPCache::create(context);
-                                                                },
-                                                                [](ServiceContext* context) {
-                                                                    OCSPCache::destroy(context);
-                                                                });
+ServiceContext::ConstructorActionRegisterer OCSPCacheRegisterer(
+    "CreateOCSPCache",
+    [](ServiceContext* context) { OCSPCache::create(context); },
+    [](ServiceContext* context) { OCSPCache::destroy(context); });
 
 using OCSPCacheVal = OCSPCache::ValueHandle;
 
@@ -3290,11 +3311,13 @@ Future<SSLPeerInfo> SSLManagerOpenSSL::parseAndValidatePeerCertificate(
 
     // TODO: check optional cipher restriction, using cert.
     auto peerSubject = getCertificateSubjectX509Name(peerCert.get());
-    LOGV2_DEBUG(23229,
-                2,
-                "Accepted TLS connection from peer: {peerSubject}",
-                "Accepted TLS connection from peer",
-                "peerSubject"_attr = peerSubject);
+    const auto cipher = SSL_get_current_cipher(conn);
+    if (!serverGlobalParams.quiet.load() && gEnableDetailedConnectionHealthMetricLogLines) {
+        LOGV2_INFO(6723801,
+                   "Accepted TLS connection from peer",
+                   "peerSubject"_attr = peerSubject,
+                   "cipher"_attr = SSL_CIPHER_get_name(cipher));
+    }
 
     StatusWith<stdx::unordered_set<RoleName>> swPeerCertificateRoles =
         _parsePeerRoles(peerCert.get());

@@ -1,19 +1,13 @@
 /**
  * Prove that it's possible to run reconfigs during a shard split.
  *
- * @tags: [requires_fcv_52, featureFlagShardSplit]
+ * @tags: [requires_fcv_63, serverless]
  */
 
-load("jstests/serverless/libs/basic_serverless_test.js");
+import {ShardSplitTest} from "jstests/serverless/libs/shard_split_test.js";
 
-(function() {
-"use strict";
-
-const recipientTagName = "recipientNode";
-const recipientSetName = "recipientSetName";
-const tenantIds = ["tenant1", "tenant2"];
-const test =
-    new BasicServerlessTest({recipientTagName, recipientSetName, quickGarbageCollection: true});
+const tenantIds = [ObjectId(), ObjectId()];
+const test = new ShardSplitTest({quickGarbageCollection: true});
 
 test.addRecipientNodes();
 test.donor.awaitSecondaryNodes();
@@ -38,4 +32,3 @@ split.forget();
 
 test.cleanupSuccesfulAborted(split.migrationId, tenantIds);
 test.stop();
-})();

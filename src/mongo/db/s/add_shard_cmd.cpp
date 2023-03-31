@@ -62,7 +62,7 @@ public:
         void typedRun(OperationContext* opCtx) {
             uassert(50876,
                     "Cannot run addShard on a node started without --shardsvr",
-                    serverGlobalParams.clusterRole == ClusterRole::ShardServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ShardServer));
             tassert(5624104,
                     "Cannot run addShard on a node that contains customized getLastErrorDefaults, "
                     "which has been deprecated and is now ignored. Use setDefaultRWConcern instead "
@@ -72,14 +72,14 @@ public:
                          .containsCustomizedGetLastErrorDefaults());
 
             auto addShardCmd = request();
-            auto shardIdUpsertCmd =
-                add_shard_util::createShardIdentityUpsertForAddShard(addShardCmd);
+            auto shardIdUpsertCmd = add_shard_util::createShardIdentityUpsertForAddShard(
+                addShardCmd, ShardingCatalogClient::kMajorityWriteConcern);
             DBDirectClient localClient(opCtx);
             BSONObj res;
 
-            localClient.runCommand(NamespaceString::kAdminDb.toString(), shardIdUpsertCmd, res);
+            localClient.runCommand(DatabaseName::kAdmin, shardIdUpsertCmd, res);
 
-            uassertStatusOK(getStatusFromCommandResult(res));
+            uassertStatusOK(getStatusFromWriteCommandReply(res));
 
             const auto balancerConfig = Grid::get(opCtx)->getBalancerConfiguration();
             invariant(balancerConfig);
@@ -95,7 +95,7 @@ public:
         // The command parameter happens to be string so it's historically been interpreted
         // by parseNs as a collection. Continuing to do so here for unexamined compatibility.
         NamespaceString ns() const override {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const override {

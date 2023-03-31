@@ -53,18 +53,26 @@ bool SetClusterParameterInvocation::invoke(OperationContext* opCtx,
     BSONObj cmdParamObj = cmd.getCommandParameter();
     StringData parameterName = cmdParamObj.firstElement().fieldName();
     ServerParameter* serverParameter = _sps->get(parameterName);
+    auto tenantId = cmd.getDbName().tenantId();
 
     auto [query, update] =
-        normalizeParameter(opCtx, cmdParamObj, paramTime, serverParameter, parameterName);
+        normalizeParameter(opCtx,
+                           cmdParamObj,
+                           paramTime,
+                           serverParameter,
+                           parameterName,
+                           tenantId,
+                           serverGlobalParams.clusterRole.exclusivelyHasShardRole());
 
     BSONObjBuilder oldValueBob;
-    serverParameter->append(opCtx, oldValueBob, parameterName.toString());
-    audit::logSetClusterParameter(opCtx->getClient(), oldValueBob.obj(), update);
+    serverParameter->append(opCtx, &oldValueBob, parameterName.toString(), tenantId);
+    audit::logSetClusterParameter(opCtx->getClient(), oldValueBob.obj(), update, tenantId);
 
     LOGV2_DEBUG(
         6432603, 2, "Updating cluster parameter on-disk", "clusterParameter"_attr = parameterName);
 
-    return uassertStatusOK(_dbService.updateParameterOnDisk(opCtx, query, update, writeConcern));
+    return uassertStatusOK(
+        _dbService.updateParameterOnDisk(opCtx, query, update, writeConcern, tenantId));
 }
 
 std::pair<BSONObj, BSONObj> SetClusterParameterInvocation::normalizeParameter(
@@ -72,11 +80,17 @@ std::pair<BSONObj, BSONObj> SetClusterParameterInvocation::normalizeParameter(
     BSONObj cmdParamObj,
     const boost::optional<Timestamp>& paramTime,
     ServerParameter* sp,
-    StringData parameterName) {
+    StringData parameterName,
+    const boost::optional<TenantId>& tenantId,
+    bool skipValidation) {
     BSONElement commandElement = cmdParamObj.firstElement();
-    uassert(ErrorCodes::IllegalOperation,
+    uassert(ErrorCodes::BadValue,
             "Cluster parameter value must be an object",
             BSONType::Object == commandElement.type());
+
+    uassert(ErrorCodes::BadValue,
+            str::stream() << "Server parameter: '" << sp->name() << "' is disabled",
+            skipValidation || sp->isEnabled());
 
     Timestamp clusterTime = paramTime ? *paramTime : _dbService.getUpdateClusterTime(opCtx);
 
@@ -87,7 +101,9 @@ std::pair<BSONObj, BSONObj> SetClusterParameterInvocation::normalizeParameter(
     BSONObj query = BSON("_id" << parameterName);
     BSONObj update = updateBuilder.obj();
 
-    uassertStatusOK(sp->validate(update));
+    if (!skipValidation) {
+        uassertStatusOK(sp->validate(update, tenantId));
+    }
 
     return {query, update};
 }
@@ -101,7 +117,8 @@ StatusWith<bool> ClusterParameterDBClientService::updateParameterOnDisk(
     OperationContext* opCtx,
     BSONObj query,
     BSONObj update,
-    const WriteConcernOptions& writeConcern) {
+    const WriteConcernOptions& writeConcern,
+    const boost::optional<TenantId>& tenantId) {
     BSONObj res;
 
     BSONObjBuilder set;
@@ -112,11 +129,10 @@ StatusWith<bool> ClusterParameterDBClientService::updateParameterOnDisk(
         BSON(WriteConcernOptions::kWriteConcernField << writeConcern.toBSON());
 
     try {
-        _dbClient.runCommand(
-            NamespaceString::kConfigDb.toString(),
-            [&] {
+        auto opMsgRequest = OpMsgRequestBuilder::create(
+            NamespaceString::makeClusterParametersNSS(tenantId).dbName(), [&] {
                 write_ops::UpdateCommandRequest updateOp(
-                    NamespaceString::kClusterParametersNamespace);
+                    NamespaceString::makeClusterParametersNSS(tenantId));
                 updateOp.setUpdates({[&] {
                     write_ops::UpdateOpEntry entry;
                     entry.setQ(query);
@@ -127,8 +143,8 @@ StatusWith<bool> ClusterParameterDBClientService::updateParameterOnDisk(
                 }()});
 
                 return updateOp.toBSON(writeConcernObj);
-            }(),
-            res);
+            }());
+        res = _dbClient.runCommand(opMsgRequest)->getCommandReply();
     } catch (const DBException& ex) {
         return ex.toStatus();
     }

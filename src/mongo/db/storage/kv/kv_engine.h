@@ -164,7 +164,7 @@ public:
      */
     virtual Status dropIdent(RecoveryUnit* ru,
                              StringData ident,
-                             StorageEngine::DropIdentCallback&& onDrop = nullptr) = 0;
+                             const StorageEngine::DropIdentCallback& onDrop = nullptr) = 0;
 
     /**
      * Removes any knowledge of the ident from the storage engines metadata without removing the
@@ -239,7 +239,14 @@ public:
                       "The current storage engine doesn't support backup mode");
     }
 
-    virtual void checkpoint() {}
+    /**
+     * Returns whether the KVEngine supports checkpoints.
+     */
+    virtual bool supportsCheckpoints() const {
+        return false;
+    }
+
+    virtual void checkpoint(OperationContext* opCtx) {}
 
     /**
      * Returns true if the KVEngine is ephemeral -- that is, it is NOT persistent and all data is
@@ -379,9 +386,9 @@ public:
     }
 
     /**
-     * See `StorageEngine::supportsOplogStones`
+     * See `StorageEngine::supportsOplogTruncateMarkers`
      */
-    virtual bool supportsOplogStones() const {
+    virtual bool supportsOplogTruncateMarkers() const {
         return false;
     }
 
@@ -433,6 +440,30 @@ public:
     virtual StatusWith<BSONObj> getStorageMetadata(StringData ident) const {
         return BSONObj{};
     };
+
+    /**
+     * Returns the 'KeyFormat' tied to 'ident'.
+     */
+    virtual KeyFormat getKeyFormat(OperationContext* opCtx, StringData ident) const {
+        MONGO_UNREACHABLE;
+    }
+
+    /**
+     * Returns the cache size in MB.
+     */
+    virtual size_t getCacheSizeMB() const {
+        return 0;
+    }
+
+    /**
+     * Returns the input storage engine options, sanitized to remove options that may not apply to
+     * this node, such as encryption. Might be called for both collection and index options. See
+     * SERVER-68122.
+     */
+    virtual StatusWith<BSONObj> getSanitizedStorageOptionsForSecondaryReplication(
+        const BSONObj& options) const {
+        return options;
+    }
 
     /**
      * The destructor will never be called from mongod, but may be called from tests.

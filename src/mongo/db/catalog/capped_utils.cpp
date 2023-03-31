@@ -31,6 +31,7 @@
 
 #include "mongo/base/error_codes.h"
 #include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/drop_collection.h"
@@ -53,7 +54,6 @@
 #include "mongo/util/scopeguard.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
-
 
 namespace mongo {
 
@@ -101,12 +101,13 @@ Status emptyCapped(OperationContext* opCtx, const NamespaceString& collectionNam
         return status;
     }
 
-    opCtx->recoveryUnit()->onCommit([writableCollection](auto commitTime) {
-        // Ban reading from this collection on snapshots before now.
-        if (commitTime) {
-            writableCollection->setMinimumVisibleSnapshot(commitTime.get());
-        }
-    });
+    opCtx->recoveryUnit()->onCommit(
+        [writableCollection](OperationContext*, boost::optional<Timestamp> commitTime) {
+            // Ban reading from this collection on snapshots before now.
+            if (commitTime) {
+                writableCollection->setMinimumVisibleSnapshot(commitTime.value());
+            }
+        });
 
     const auto service = opCtx->getServiceContext();
     service->getOpObserver()->onEmptyCapped(opCtx, collection->ns(), collection->uuid());
@@ -122,8 +123,8 @@ void cloneCollectionAsCapped(OperationContext* opCtx,
                              const NamespaceString& toNss,
                              long long size,
                              bool temp) {
-    CollectionPtr fromCollection =
-        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, fromNss);
+    CollectionPtr fromCollection(
+        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, fromNss));
     if (!fromCollection) {
         uassert(ErrorCodes::CommandNotSupportedOnView,
                 str::stream() << "cloneCollectionAsCapped not supported for views: " << fromNss,
@@ -161,11 +162,11 @@ void cloneCollectionAsCapped(OperationContext* opCtx,
         BSONObjBuilder cmd;
         cmd.append("create", toNss.coll());
         cmd.appendElements(options.toBSON());
-        uassertStatusOK(createCollection(opCtx, toNss.db().toString(), cmd.done()));
+        uassertStatusOK(createCollection(opCtx, toNss.dbName(), cmd.done()));
     }
 
-    CollectionPtr toCollection =
-        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, toNss);
+    CollectionPtr toCollection(
+        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, toNss));
     invariant(toCollection);  // we created above
 
     // how much data to ignore because it won't fit anyway
@@ -230,7 +231,6 @@ void cloneCollectionAsCapped(OperationContext* opCtx,
             }
 
             WriteUnitOfWork wunit(opCtx);
-            OpDebug* const nullOpDebug = nullptr;
 
             InsertStatement insertStmt(objToClone);
 
@@ -245,8 +245,8 @@ void cloneCollectionAsCapped(OperationContext* opCtx,
                 insertStmt.oplogSlot = oplogSlots.front();
             }
 
-            uassertStatusOK(toCollection->insertDocument(
-                opCtx, InsertStatement(objToClone), nullOpDebug, true));
+            uassertStatusOK(collection_internal::insertDocument(
+                opCtx, toCollection, InsertStatement(objToClone), nullptr /* OpDebug */, true));
             wunit.commit();
 
             // Go to the next document
@@ -272,7 +272,8 @@ void convertToCapped(OperationContext* opCtx, const NamespaceString& ns, long lo
     StringData shortSource = ns.coll();
 
     AutoGetCollection coll(opCtx, ns, MODE_X);
-    CollectionShardingState::get(opCtx, ns)->checkShardVersionOrThrow(opCtx);
+    CollectionShardingState::assertCollectionLockedAndAcquire(opCtx, ns)->checkShardVersionOrThrow(
+        opCtx);
 
     bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
         !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, ns);

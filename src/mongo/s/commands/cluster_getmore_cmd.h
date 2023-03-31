@@ -78,11 +78,12 @@ public:
     public:
         Invocation(Command* cmd, const OpMsgRequest& request)
             : CommandInvocation(cmd),
-              _cmd(GetMoreCommandRequest::parse({Impl::kName}, request.body)) {}
+              _cmd(GetMoreCommandRequest::parse(IDLParserContext{Impl::kName}, request.body)) {}
 
     private:
         NamespaceString ns() const override {
-            return NamespaceString(_cmd.getDbName(), _cmd.getCollection());
+            return NamespaceStringUtil::parseNamespaceFromRequest(_cmd.getDbName(),
+                                                                  _cmd.getCollection());
         }
 
         bool supportsWriteConcern() const override {
@@ -115,7 +116,8 @@ public:
         }
 
         void validateResult(const BSONObj& replyObj) {
-            CursorGetMoreReply::parse({"CursorGetMoreReply"}, replyObj.removeField("ok"));
+            CursorGetMoreReply::parse(IDLParserContext{"CursorGetMoreReply"},
+                                      replyObj.removeField("ok"));
         }
 
         const GetMoreCommandRequest _cmd;
@@ -138,6 +140,10 @@ public:
      */
     bool shouldAffectCommandCounter() const override {
         return false;
+    }
+
+    ReadWriteType getReadWriteType() const override {
+        return ReadWriteType::kRead;
     }
 
     std::string help() const override {

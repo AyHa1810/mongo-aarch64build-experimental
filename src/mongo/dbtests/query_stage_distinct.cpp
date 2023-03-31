@@ -58,7 +58,7 @@ public:
         : _expCtx(make_intrusive<ExpressionContext>(&_opCtx, nullptr, nss)), _client(&_opCtx) {}
 
     virtual ~DistinctBase() {
-        _client.dropCollection(nss.ns());
+        _client.dropCollection(nss);
     }
 
     void addIndex(const BSONObj& obj) {
@@ -66,7 +66,7 @@ public:
     }
 
     void insert(const BSONObj& obj) {
-        _client.insert(nss.ns(), obj);
+        _client.insert(nss, obj);
     }
 
     /**

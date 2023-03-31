@@ -74,11 +74,12 @@ public:
         return true;
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), ActionType::internal)) {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                    ActionType::internal)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
 
@@ -86,7 +87,7 @@ public:
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbname_unused,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
 
@@ -95,7 +96,7 @@ public:
 
         uassert(ErrorCodes::IllegalOperation,
                 str::stream() << "_shardsvrCloneCatalogData can only be run on shard servers",
-                serverGlobalParams.clusterRole == ClusterRole::ShardServer);
+                serverGlobalParams.clusterRole.has(ClusterRole::ShardServer));
 
         CommandHelpers::uassertCommandRunWithMajority(getName(), opCtx->getWriteConcern());
 
@@ -110,8 +111,8 @@ public:
 
         uassert(ErrorCodes::InvalidOptions,
                 str::stream() << "Can't clone catalog data for " << dbname << " database",
-                dbname != NamespaceString::kAdminDb && dbname != NamespaceString::kConfigDb &&
-                    dbname != NamespaceString::kLocalDb);
+                dbname != DatabaseName::kAdmin.db() && dbname != DatabaseName::kConfig.db() &&
+                    dbname != DatabaseName::kLocal.db());
 
         auto from = cloneCatalogDataRequest.getFrom();
 

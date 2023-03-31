@@ -97,9 +97,9 @@
 
 #else /* _WIN32 */
 
-#include <signal.h>
-#include <stdlib.h>
-#include <string.h>
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <termios.h>
@@ -110,15 +110,16 @@
 #include "linenoise.h"
 #include "linenoise_utf8.h"
 #include "mk_wcwidth.h"
+#include <cerrno>
+#include <cstdio>
 #include <cwctype>
-#include <errno.h>
 #include <fcntl.h>
 #include <memory>
 #include <sstream>
-#include <stdio.h>
 #include <string>
 #include <vector>
 
+#include "mongo/base/data_view.h"
 #include "mongo/util/errno_util.h"
 
 using std::string;
@@ -352,7 +353,7 @@ public:
         }
         Utf32String killedText(text, textLen);
         if (lastAction == actionKill && size > 0) {
-            int slot = indexToSlot[0];
+            int slot = mongo::ConstDataView(&indexToSlot[0]).read<uint8_t>();
             int currentLen = theRing[slot].length();
             int resultLen = currentLen + textLen;
             Utf32String temp(resultLen + 1);
@@ -375,7 +376,7 @@ public:
                 size++;
                 theRing.push_back(killedText);
             } else {
-                int slot = indexToSlot[capacity - 1];
+                int slot = mongo::ConstDataView(&indexToSlot[capacity - 1]).read<uint8_t>();
                 theRing[slot] = killedText;
                 memmove(&indexToSlot[1], &indexToSlot[0], capacity - 1);
                 indexToSlot[0] = slot;

@@ -11,25 +11,13 @@
  *   requires_majority_read_concern,
  *   requires_persistence,
  *   serverless,
- *   requires_fcv_52,
- *   featureFlagShardSplit
+ *   requires_fcv_63
  * ]
  */
 
-function assertAsyncCommitted(splitThread) {
-    const data = splitThread.returnData();
-
-    assert.commandWorked(data);
-    assert.eq(data.state, "committed");
-}
-
-(function() {
-'use strict';
-
+import {assertMigrationState, ShardSplitTest} from "jstests/serverless/libs/shard_split_test.js";
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/parallelTester.js");
-load("jstests/libs/uuid_util.js");
-load("jstests/serverless/libs/basic_serverless_test.js");
 
 const kMaxBatchSize = 2;
 const kCollName = "testColl";
@@ -39,14 +27,9 @@ const kNumWriteBatchesWithoutMigrationConflict =
     2;  // num of write batches we allow to complete before split blocks writes.
 const kNumUpdatesWithoutMigrationConflict = 2;
 const kMaxSleepTimeMS = 1000;
-const kBatchTypes = {
-    insert: 1,
-    update: 2,
-    remove: 3
-};
 
 function setup() {
-    const test = new BasicServerlessTest({
+    const test = new ShardSplitTest({
         recipientTagName: "recipientTag",
         recipientSetName: "recipientSet",
         quickGarbageCollection: true,
@@ -155,9 +138,9 @@ function bulkMultiUpdateDocsUnordered(primaryHost, dbName, collName, numDocs) {
 
     const test = setup();
 
-    const tenantId = "bulkUnorderedInserts-committed";
+    const tenantId = ObjectId();
 
-    const dbName = test.tenantDB(tenantId, kTenantDefinedDbName);
+    const dbName = test.tenantDB(tenantId.str, kTenantDefinedDbName);
     const primary = test.getDonorPrimary();
     const primaryDB = primary.getDB(dbName);
 
@@ -202,9 +185,9 @@ function bulkMultiUpdateDocsUnordered(primaryHost, dbName, collName, numDocs) {
 
     const test = setup();
 
-    const tenantId = "bulkUnorderedInserts-blocks-committed";
+    const tenantId = ObjectId();
 
-    const dbName = test.tenantDB(tenantId, kTenantDefinedDbName);
+    const dbName = test.tenantDB(tenantId.str, kTenantDefinedDbName);
     const primary = test.getDonorPrimary();
     const primaryDB = primary.getDB(dbName);
 
@@ -232,7 +215,7 @@ function bulkMultiUpdateDocsUnordered(primaryHost, dbName, collName, numDocs) {
     bulkWriteThread.join();
     splitThread.join();
 
-    assertAsyncCommitted(splitThread);
+    assert.commandWorked(splitThread.returnData());
 
     let bulkWriteRes = bulkWriteThread.returnData();
     let writeErrors = bulkWriteRes.res.writeErrors;
@@ -260,9 +243,9 @@ function bulkMultiUpdateDocsUnordered(primaryHost, dbName, collName, numDocs) {
 
     const test = setup();
 
-    const tenantId = "bulkUnorderedInserts-aborted";
+    const tenantId = ObjectId();
 
-    const dbName = test.tenantDB(tenantId, kTenantDefinedDbName);
+    const dbName = test.tenantDB(tenantId.str, kTenantDefinedDbName);
     const primary = test.getDonorPrimary();
     const primaryDB = primary.getDB(dbName);
 
@@ -322,9 +305,9 @@ function bulkMultiUpdateDocsUnordered(primaryHost, dbName, collName, numDocs) {
 
     const test = setup();
 
-    const tenantId = "bulkOrderedInserts-committed";
+    const tenantId = ObjectId();
 
-    const dbName = test.tenantDB(tenantId, kTenantDefinedDbName);
+    const dbName = test.tenantDB(tenantId.str, kTenantDefinedDbName);
     const primary = test.getDonorPrimary();
     const primaryDB = primary.getDB(dbName);
 
@@ -363,9 +346,9 @@ function bulkMultiUpdateDocsUnordered(primaryHost, dbName, collName, numDocs) {
 
     const test = setup();
 
-    const tenantId = "bulkOrderedInserts-blocks-committed";
+    const tenantId = ObjectId();
 
-    const dbName = test.tenantDB(tenantId, kTenantDefinedDbName);
+    const dbName = test.tenantDB(tenantId.str, kTenantDefinedDbName);
     const primary = test.getDonorPrimary();
     const primaryDB = primary.getDB(dbName);
 
@@ -394,7 +377,7 @@ function bulkMultiUpdateDocsUnordered(primaryHost, dbName, collName, numDocs) {
     bulkWriteThread.join();
     splitThread.join();
 
-    assertAsyncCommitted(splitThread);
+    assert.commandWorked(splitThread.returnData());
 
     const bulkWriteRes = bulkWriteThread.returnData();
     const writeErrors = bulkWriteRes.res.writeErrors;
@@ -415,9 +398,9 @@ function bulkMultiUpdateDocsUnordered(primaryHost, dbName, collName, numDocs) {
 
     const test = setup();
 
-    const tenantId = "bulkOrderedInserts-aborted";
+    const tenantId = ObjectId();
 
-    const dbName = test.tenantDB(tenantId, kTenantDefinedDbName);
+    const dbName = test.tenantDB(tenantId.str, kTenantDefinedDbName);
     const primary = test.getDonorPrimary();
     const primaryDB = primary.getDB(dbName);
 
@@ -474,9 +457,9 @@ function bulkMultiUpdateDocsUnordered(primaryHost, dbName, collName, numDocs) {
 
     const test = setup();
 
-    const tenantId = "bulkUnorderedMultiUpdates-blocks";
+    const tenantId = ObjectId();
 
-    const dbName = test.tenantDB(tenantId, kTenantDefinedDbName);
+    const dbName = test.tenantDB(tenantId.str, kTenantDefinedDbName);
     const primary = test.getDonorPrimary();
     const primaryDB = primary.getDB(dbName);
 
@@ -505,7 +488,7 @@ function bulkMultiUpdateDocsUnordered(primaryHost, dbName, collName, numDocs) {
     bulkWriteThread.join();
     splitThread.join();
 
-    assertAsyncCommitted(splitThread);
+    assert.commandWorked(splitThread.returnData());
 
     let bulkWriteRes = bulkWriteThread.returnData();
     assert.eq(bulkWriteRes.res.code, ErrorCodes.Interrupted, tojson(bulkWriteRes));
@@ -521,9 +504,9 @@ function bulkMultiUpdateDocsUnordered(primaryHost, dbName, collName, numDocs) {
 
     const test = setup();
 
-    const tenantId = "bulkOrderedMultiUpdates-blocks";
+    const tenantId = ObjectId();
 
-    const dbName = test.tenantDB(tenantId, kTenantDefinedDbName);
+    const dbName = test.tenantDB(tenantId.str, kTenantDefinedDbName);
     const primary = test.getDonorPrimary();
     const primaryDB = primary.getDB(dbName);
 
@@ -552,9 +535,9 @@ function bulkMultiUpdateDocsUnordered(primaryHost, dbName, collName, numDocs) {
     bulkWriteThread.join();
     splitThread.join();
 
-    assertAsyncCommitted(splitThread);
+    assert.commandWorked(splitThread.returnData());
 
-    let bulkWriteRes = bulkWriteThread.returnData();
+    const bulkWriteRes = bulkWriteThread.returnData();
     assert.eq(bulkWriteRes.res.code, ErrorCodes.Interrupted, tojson(bulkWriteRes));
     assert.eq(
         bulkWriteRes.res.errmsg,
@@ -567,9 +550,9 @@ function bulkMultiUpdateDocsUnordered(primaryHost, dbName, collName, numDocs) {
     jsTestLog("Testing unordered multi updates against a shard split that has completed.");
 
     const test = setup();
-    const tenantId = "bulkUnorderedMultiUpdates-completed";
+    const tenantId = ObjectId();
 
-    const dbName = test.tenantDB(tenantId, kTenantDefinedDbName);
+    const dbName = test.tenantDB(tenantId.str, kTenantDefinedDbName);
     const primary = test.getDonorPrimary();
     const primaryDB = primary.getDB(dbName);
 
@@ -602,9 +585,9 @@ function bulkMultiUpdateDocsUnordered(primaryHost, dbName, collName, numDocs) {
 
     const test = setup();
 
-    const tenantId = "bulkOrderedMultiUpdates-completed";
+    const tenantId = ObjectId();
 
-    const dbName = test.tenantDB(tenantId, kTenantDefinedDbName);
+    const dbName = test.tenantDB(tenantId.str, kTenantDefinedDbName);
     const primary = test.getDonorPrimary();
     const primaryDB = primary.getDB(dbName);
 
@@ -631,5 +614,4 @@ function bulkMultiUpdateDocsUnordered(primaryHost, dbName, collName, numDocs) {
         "Operation interrupted by an internal data migration and could not be automatically retried",
         tojson(bulkWriteRes));
     test.stop();
-})();
 })();

@@ -73,7 +73,7 @@ BSONObj addMetadata(DBClientBase* client, BSONObj command) {
 }
 
 Message assembleCommandRequest(DBClientBase* client,
-                               StringData database,
+                               const DatabaseName& dbName,
                                BSONObj commandObj,
                                const ReadPreferenceSetting& readPref) {
     // Add the $readPreference field to the request.
@@ -84,7 +84,7 @@ Message assembleCommandRequest(DBClientBase* client,
     }
 
     commandObj = addMetadata(client, std::move(commandObj));
-    auto opMsgRequest = OpMsgRequest::fromDBAndBody(database, commandObj);
+    auto opMsgRequest = OpMsgRequestBuilder::create(dbName, commandObj);
     return opMsgRequest.serialize();
 }
 }  // namespace
@@ -97,7 +97,7 @@ Message DBClientCursor::assembleInit() {
     // We haven't gotten a cursorId yet so we need to issue the initial find command.
     invariant(_findRequest);
     BSONObj findCmd = _findRequest->toBSON(BSONObj());
-    return assembleCommandRequest(_client, _ns.db(), std::move(findCmd), _readPref);
+    return assembleCommandRequest(_client, _ns.dbName(), std::move(findCmd), _readPref);
 }
 
 Message DBClientCursor::assembleGetMore() {
@@ -112,7 +112,7 @@ Message DBClientCursor::assembleGetMore() {
         getMoreRequest.setTerm(static_cast<std::int64_t>(*_term));
     }
     getMoreRequest.setLastKnownCommittedOpTime(_lastKnownCommittedOpTime);
-    auto msg = assembleCommandRequest(_client, _ns.db(), getMoreRequest.toBSON({}), _readPref);
+    auto msg = assembleCommandRequest(_client, _ns.dbName(), getMoreRequest.toBSON({}), _readPref);
 
     // Set the exhaust flag if needed.
     if (_isExhaust) {
@@ -215,7 +215,8 @@ void DBClientCursor::dataReceived(const Message& reply, bool& retry, string& hos
 
     const auto replyObj = commandDataReceived(reply);
     _cursorId = 0;  // Don't try to kill cursor if we get back an error.
-    auto cr = uassertStatusOK(CursorResponse::parseFromBSON(replyObj));
+
+    auto cr = uassertStatusOK(CursorResponse::parseFromBSON(replyObj, nullptr, _ns.tenantId()));
     _cursorId = cr.getCursorId();
     uassert(50935,
             "Received a getMore response with a cursor id of 0 and the moreToCome flag set.",
@@ -340,7 +341,7 @@ DBClientCursor::DBClientCursor(DBClientBase* client,
       _originalHost(_client->getServerAddress()),
       _nsOrUuid(nsOrUuid),
       _isInitialized(true),
-      _ns(nsOrUuid.nss() ? *nsOrUuid.nss() : NamespaceString(nsOrUuid.dbname())),
+      _ns(nsOrUuid.nss() ? *nsOrUuid.nss() : NamespaceString(nsOrUuid.dbName().value())),
       _cursorId(cursorId),
       _isExhaust(isExhaust),
       _operationTime(operationTime),
@@ -353,7 +354,7 @@ DBClientCursor::DBClientCursor(DBClientBase* client,
     : _client(client),
       _originalHost(_client->getServerAddress()),
       _nsOrUuid(findRequest.getNamespaceOrUUID()),
-      _ns(_nsOrUuid.nss() ? *_nsOrUuid.nss() : NamespaceString(_nsOrUuid.dbname())),
+      _ns(_nsOrUuid.nss() ? *_nsOrUuid.nss() : NamespaceString(_nsOrUuid.dbName().value())),
       _batchSize(findRequest.getBatchSize().value_or(0)),
       _findRequest(std::move(findRequest)),
       _readPref(readPref),
@@ -370,7 +371,7 @@ StatusWith<std::unique_ptr<DBClientCursor>> DBClientCursor::fromAggregationReque
     DBClientBase* client, AggregateCommandRequest aggRequest, bool secondaryOk, bool useExhaust) {
     BSONObj ret;
     try {
-        if (!client->runCommand(aggRequest.getNamespace().db().toString(),
+        if (!client->runCommand(aggRequest.getNamespace().dbName(),
                                 aggregation_request_helper::serializeToCommandObj(aggRequest),
                                 ret,
                                 secondaryOk ? QueryOption_SecondaryOk : 0)) {
@@ -414,7 +415,9 @@ DBClientCursor::~DBClientCursor() {
 void DBClientCursor::kill() {
     DESTRUCTOR_GUARD({
         if (_cursorId && !globalInShutdownDeprecated()) {
-            auto killCursor = [&](auto&& conn) { conn->killCursor(_ns, _cursorId); };
+            auto killCursor = [&](auto&& conn) {
+                conn->killCursor(_ns, _cursorId);
+            };
 
             // We only need to kill the cursor if there aren't pending replies. Pending replies
             // indicates that this is an exhaust cursor, so the connection must be closed and the

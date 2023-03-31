@@ -36,12 +36,13 @@
 #include "mongo/db/client.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/json.h"
-#include "mongo/db/logical_session_id.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/operation_context_group.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_test_fixture.h"
+#include "mongo/db/session/logical_session_id.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_debug.h"
 #include "mongo/stdx/future.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/transport/session.h"
@@ -79,7 +80,7 @@ public:
 class OperationContextTest : public ServiceContextTest {
 public:
     auto makeClient(std::string desc = "OperationContextTest",
-                    transport::SessionHandle session = nullptr) {
+                    std::shared_ptr<transport::Session> session = nullptr) {
         return getServiceContext()->makeClient(desc, session);
     }
 };
@@ -729,74 +730,6 @@ TEST_F(OperationDeadlineTests, DuringWaitMaxTimeExpirationDominatesUntilExpirati
     ASSERT_TRUE(opCtx->getCancellationToken().isCanceled());
 }
 
-TEST_F(OperationDeadlineTests,
-       MaxTimeExpirationIgnoredWhenIgnoringInterruptsExceptReplStateChange) {
-    auto opCtx = client->makeOperationContext();
-    opCtx->setDeadlineByDate(mockClock->now(), ErrorCodes::MaxTimeMSExpired);
-    auto m = MONGO_MAKE_LATCH();
-    stdx::condition_variable cv;
-    stdx::unique_lock<Latch> lk(m);
-    ASSERT_FALSE(opCtx->getCancellationToken().isCanceled());
-    opCtx->setIgnoreInterruptsExceptForReplStateChange(true);
-    // Advance the clock so the MaxTimeMS is hit before the timeout.
-    mockClock->advance(Milliseconds(100));
-    ASSERT_FALSE(
-        opCtx->waitForConditionOrInterruptUntil(cv, lk, mockClock->now(), [] { return false; }));
-    ASSERT_FALSE(opCtx->getCancellationToken().isCanceled());
-}
-
-TEST_F(OperationDeadlineTests,
-       AlreadyExpiredMaxTimeIgnoredWhenIgnoringInterruptsExceptReplStateChange) {
-    auto opCtx = client->makeOperationContext();
-    opCtx->setDeadlineByDate(mockClock->now(), ErrorCodes::MaxTimeMSExpired);
-    auto m = MONGO_MAKE_LATCH();
-    stdx::condition_variable cv;
-    stdx::unique_lock<Latch> lk(m);
-    ASSERT_FALSE(opCtx->getCancellationToken().isCanceled());
-    ASSERT_THROWS_CODE(opCtx->waitForConditionOrInterruptUntil(
-                           cv, lk, mockClock->now() + Seconds(1), [] { return false; }),
-                       DBException,
-                       ErrorCodes::MaxTimeMSExpired);
-
-    ASSERT_EQ(ErrorCodes::MaxTimeMSExpired, opCtx->checkForInterruptNoAssert());
-    ASSERT_TRUE(opCtx->getCancellationToken().isCanceled());
-    opCtx->setIgnoreInterruptsExceptForReplStateChange(true);
-    ASSERT_OK(opCtx->checkForInterruptNoAssert());
-    // Advance the clock so the MaxTimeMS is hit before the timeout.
-    mockClock->advance(Milliseconds(100));
-    ASSERT_FALSE(
-        opCtx->waitForConditionOrInterruptUntil(cv, lk, mockClock->now(), [] { return false; }));
-    ASSERT_TRUE(opCtx->getCancellationToken().isCanceled());
-}
-
-TEST_F(OperationDeadlineTests,
-       MaxTimeRespectedAfterReplStateChangeWhenIgnoringInterruptsExceptReplStateChange) {
-    auto opCtx = client->makeOperationContext();
-    opCtx->setDeadlineByDate(mockClock->now(), ErrorCodes::MaxTimeMSExpired);
-    auto m = MONGO_MAKE_LATCH();
-    stdx::condition_variable cv;
-    stdx::unique_lock<Latch> lk(m);
-    ASSERT_FALSE(opCtx->getCancellationToken().isCanceled());
-    ASSERT_THROWS_CODE(opCtx->waitForConditionOrInterruptUntil(
-                           cv, lk, mockClock->now() + Seconds(1), [] { return false; }),
-                       DBException,
-                       ErrorCodes::MaxTimeMSExpired);
-
-    ASSERT_EQ(ErrorCodes::MaxTimeMSExpired, opCtx->checkForInterruptNoAssert());
-    ASSERT_TRUE(opCtx->getCancellationToken().isCanceled());
-    opCtx->setIgnoreInterruptsExceptForReplStateChange(true);
-    ASSERT_OK(opCtx->checkForInterruptNoAssert());
-    opCtx->markKilled(ErrorCodes::InterruptedDueToReplStateChange);
-    ASSERT_EQ(ErrorCodes::MaxTimeMSExpired, opCtx->checkForInterruptNoAssert());
-    // Advance the clock so the MaxTimeMS is hit before the timeout.
-    mockClock->advance(Milliseconds(100));
-    ASSERT_THROWS_CODE(
-        opCtx->waitForConditionOrInterruptUntil(cv, lk, mockClock->now(), [] { return false; }),
-        DBException,
-        ErrorCodes::MaxTimeMSExpired);
-    ASSERT_TRUE(opCtx->getCancellationToken().isCanceled());
-}
-
 class ThreadedOperationDeadlineTests : public OperationDeadlineTests {
 public:
     using CvPred = std::function<bool()>;
@@ -1064,16 +997,19 @@ TEST_F(ThreadedOperationDeadlineTests, SleepForWithExpiredForDoesNotBlock) {
 }
 
 TEST_F(OperationContextTest, TestWaitForConditionOrInterruptUntilAPI) {
-    // `waitForConditionOrInterruptUntil` can have three outcomes:
+    // `waitForConditionOrInterruptUntil` can have four outcomes:
     //
     // 1) The condition is satisfied before any timeouts.
     // 2) The explicit `deadline` function argument is triggered.
     // 3) The operation context implicitly times out, or is interrupted from a killOp command or
     //    shutdown, etc.
+    // 4) The deadline supplied may overflow the conversion to the system clock's resolution, from
+    //    milliseconds to nanoseconds. This will not cancel the opCtx.
     //
     // Case (1) must return true.
     // Case (2) must return false.
-    // Case (3) must throw a DBException.
+    // Case (3) must throw a MaxTimeMSExpired DBException.
+    // Case (4) must throw a DurationOverflow DBException.
     //
     // Case (1) is the hardest to test. The condition variable must be notified by a second thread
     // when the client is waiting on it. Case (1) is also the least in need of having the API
@@ -1099,6 +1035,16 @@ TEST_F(OperationContextTest, TestWaitForConditionOrInterruptUntilAPI) {
         DBException,
         ErrorCodes::MaxTimeMSExpired);
     ASSERT_TRUE(opCtx->getCancellationToken().isCanceled());
+
+    // Case (4). Expect an error of 'DurationOverflow'.
+    auto secondClient = makeClient();
+    auto secondOpCtx = secondClient->makeOperationContext();
+    deadline = Date_t::max() - Milliseconds(1);
+    ASSERT_THROWS_CODE(
+        secondOpCtx->waitForConditionOrInterruptUntil(cv, lk, deadline, [] { return false; }),
+        DBException,
+        ErrorCodes::DurationOverflow);
+    ASSERT_FALSE(secondOpCtx->getCancellationToken().isCanceled());
 }
 
 TEST_F(OperationContextTest, TestIsWaitingForConditionOrInterrupt) {
@@ -1145,7 +1091,7 @@ TEST_F(OperationContextTest, TestActiveClientOperationsForClientsWithoutSession)
 
 TEST_F(OperationContextTest, TestActiveClientOperations) {
     transport::TransportLayerMock transportLayer;
-    transport::SessionHandle session = transportLayer.createSession();
+    std::shared_ptr<transport::Session> session = transportLayer.createSession();
 
     auto serviceCtx = getServiceContext();
     auto client = serviceCtx->makeClient("OperationContextTest", session);

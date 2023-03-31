@@ -27,13 +27,11 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/s/active_migrations_registry.h"
 
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
+#include "mongo/db/s/migration_destination_manager.h"
 #include "mongo/db/s/migration_session_id.h"
 #include "mongo/db/s/migration_source_manager.h"
 #include "mongo/db/service_context.h"
@@ -41,7 +39,6 @@
 #include "mongo/util/scopeguard.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kShardingMigration
-
 
 namespace mongo {
 namespace {
@@ -88,11 +85,11 @@ void ActiveMigrationsRegistry::lock(OperationContext* opCtx, StringData reason) 
     // request with a retriable error and allow the draining mode to invoke registerReceiveChunk()
     // as part of its recovery sequence.
     {
-        AutoGetDb autoDB(opCtx, NamespaceString::kAdminDb, MODE_IS);
+        AutoGetDb autoDB(opCtx, DatabaseName::kAdmin, MODE_IS);
         uassert(ErrorCodes::NotWritablePrimary,
                 "Cannot lock the registry while the node is in draining mode",
                 repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesForDatabase(
-                    opCtx, NamespaceString::kAdminDb));
+                    opCtx, DatabaseName::kAdmin.toString()));
     }
 
     unblockMigrationsOnError.dismiss();
@@ -222,21 +219,26 @@ BSONObj ActiveMigrationsRegistry::getActiveMigrationStatusReport(OperationContex
 
         if (_activeMoveChunkState) {
             nss = _activeMoveChunkState->args.getCommandParameter();
+        } else if (_activeReceiveChunkState) {
+            nss = _activeReceiveChunkState->nss;
         }
     }
 
-    // The state of the MigrationSourceManager could change between taking and releasing the mutex
-    // above and then taking the collection lock here, but that's fine because it isn't important to
-    // return information on a migration that just ended or started. This is just best effort and
-    // desireable for reporting, and then diagnosing, migrations that are stuck.
+    // The state of the MigrationSourceManager or the MigrationDestinationManager could change
+    // between taking and releasing the mutex above and then taking the collection lock here, but
+    // that's fine because it isn't important to return information on a migration that just ended
+    // or started. This is just best effort and desireable for reporting, and then diagnosing,
+    // migrations that are stuck.
     if (nss) {
         // Lock the collection so nothing changes while we're getting the migration report.
-        AutoGetCollection autoColl(opCtx, nss.get(), MODE_IS);
-        auto csr = CollectionShardingRuntime::get(opCtx, nss.get());
-        auto csrLock = CollectionShardingRuntime::CSRLock::lockShared(opCtx, csr);
+        AutoGetCollection autoColl(opCtx, nss.value(), MODE_IS);
+        const auto scopedCsr =
+            CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(opCtx, nss.value());
 
-        if (auto msm = MigrationSourceManager::get(csr, csrLock)) {
-            return msm->getMigrationStatusReport();
+        if (auto msm = MigrationSourceManager::get(*scopedCsr)) {
+            return msm->getMigrationStatusReport(scopedCsr);
+        } else if (auto mdm = MigrationDestinationManager::get(opCtx)) {
+            return mdm->getMigrationStatusReport(scopedCsr);
         }
     }
 

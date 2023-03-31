@@ -51,7 +51,8 @@ public:
     virtual StatusWith<bool> updateParameterOnDisk(OperationContext* opCtx,
                                                    BSONObj query,
                                                    BSONObj update,
-                                                   const WriteConcernOptions&) = 0;
+                                                   const WriteConcernOptions&,
+                                                   const boost::optional<TenantId>&) = 0;
     virtual Timestamp getUpdateClusterTime(OperationContext*) = 0;
     virtual ~DBClientService() = default;
 };
@@ -62,7 +63,8 @@ public:
     StatusWith<bool> updateParameterOnDisk(OperationContext* opCtx,
                                            BSONObj query,
                                            BSONObj update,
-                                           const WriteConcernOptions&) override;
+                                           const WriteConcernOptions&,
+                                           const boost::optional<TenantId>&) override;
     Timestamp getUpdateClusterTime(OperationContext*) override;
 
 private:
@@ -86,7 +88,9 @@ public:
                                                    BSONObj cmdParamObj,
                                                    const boost::optional<Timestamp>& paramTime,
                                                    ServerParameter* sp,
-                                                   StringData parameterName);
+                                                   StringData parameterName,
+                                                   const boost::optional<TenantId>& tenantId,
+                                                   bool skipValidation);
 
 private:
     std::unique_ptr<ServerParameterService> _sps;

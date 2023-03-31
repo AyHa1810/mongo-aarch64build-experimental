@@ -80,6 +80,7 @@
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/transport/service_entry_point.h"
+#include "mongo/util/database_name_util.h"
 #include "mongo/util/icu.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/password_digest.h"
@@ -138,7 +139,7 @@ Status getCurrentUserRoles(OperationContext* opCtx,
                            AuthorizationManager* authzManager,
                            const UserName& userName,
                            stdx::unordered_set<RoleName>* roles) {
-    auto swUser = authzManager->acquireUser(opCtx, userName);
+    auto swUser = authzManager->acquireUser(opCtx, UserRequest(userName, boost::none));
     if (!swUser.isOK()) {
         return swUser.getStatus();
     }
@@ -222,37 +223,19 @@ Status checkOkayToGrantPrivilegesToRole(const RoleName& role, const PrivilegeVec
     return Status::OK();
 }
 
-// TODO (SERVER-67423) Convert DBClient to accept DatabaseName type.
-// Currently tenant is lost on the way from DBDirectClient to runCommand.
-// For now, just mangle the NamespaceName into (`tenant_db`, `coll`) format.
-NamespaceString patchTenantNSS(const NamespaceString& nss) {
-    if (auto tenant = nss.tenantId()) {
-        return NamespaceString(
-            boost::none, str::stream() << *tenant << '_' << nss.dbName().db(), nss.coll());
-    } else {
-        return nss;
-    }
-}
-
-// TODO (SERVER-67423) Convert DBClient to accept DatabaseName type.
 NamespaceString usersNSS(const boost::optional<TenantId>& tenant) {
     if (tenant) {
-        return NamespaceString(boost::none,
-                               str::stream() << *tenant << '_' << NamespaceString::kAdminDb,
-                               NamespaceString::kSystemUsers);
+        return NamespaceString::makeTenantUsersCollection(tenant);
     } else {
-        return AuthorizationManager::usersCollectionNamespace;
+        return NamespaceString::kAdminUsersNamespace;
     }
 }
 
-// TODO (SERVER-67423) Convert DBClient to accept DatabaseName type.
 NamespaceString rolesNSS(const boost::optional<TenantId>& tenant) {
     if (tenant) {
-        return NamespaceString(boost::none,
-                               str::stream() << *tenant << '_' << NamespaceString::kAdminDb,
-                               NamespaceString::kSystemRoles);
+        return NamespaceString::makeTenantRolesCollection(tenant);
     } else {
-        return AuthorizationManager::rolesCollectionNamespace;
+        return NamespaceString::kAdminRolesNamespace;
     }
 }
 
@@ -267,8 +250,7 @@ Status insertAuthzDocument(OperationContext* opCtx,
                            const NamespaceString& nss,
                            const BSONObj& document) try {
     DBDirectClient client(opCtx);
-    write_ops::checkWriteErrors(
-        client.insert(write_ops::InsertCommandRequest(patchTenantNSS(nss), {document})));
+    write_ops::checkWriteErrors(client.insert(write_ops::InsertCommandRequest(nss, {document})));
     return Status::OK();
 } catch (const DBException& e) {
     return e.toStatus();
@@ -288,7 +270,7 @@ StatusWith<std::int64_t> updateAuthzDocuments(OperationContext* opCtx,
                                               bool multi) try {
     DBDirectClient client(opCtx);
     auto result = client.update([&] {
-        write_ops::UpdateCommandRequest updateOp(patchTenantNSS(nss));
+        write_ops::UpdateCommandRequest updateOp(nss);
         updateOp.setUpdates({[&] {
             write_ops::UpdateOpEntry entry;
             entry.setQ(query);
@@ -349,7 +331,7 @@ StatusWith<std::int64_t> removeAuthzDocuments(OperationContext* opCtx,
                                               const BSONObj& query) try {
     DBDirectClient client(opCtx);
     auto result = client.remove([&] {
-        write_ops::DeleteCommandRequest deleteOp(patchTenantNSS(nss));
+        write_ops::DeleteCommandRequest deleteOp(nss);
         deleteOp.setDeletes({[&] {
             write_ops::DeleteOpEntry entry;
             entry.setQ(query);
@@ -498,7 +480,7 @@ Status writeAuthSchemaVersionIfNeeded(OperationContext* opCtx,
                                       int foundSchemaVersion) {
     Status status = updateOneAuthzDocument(
         opCtx,
-        AuthorizationManager::versionCollectionNamespace,
+        NamespaceString::kServerConfigurationNamespace,
         AuthorizationManager::versionDocumentQuery,
         BSON("$set" << BSON(AuthorizationManager::schemaVersionFieldName << foundSchemaVersion)),
         true);  // upsert
@@ -754,11 +736,7 @@ public:
             as->grantInternalAuthorization(_client.get());
         }
 
-        if (tenant) {
-            _dbName = str::stream() << *tenant << '_' << kAdminDB;
-        } else {
-            _dbName = kAdminDB.toString();
-        }
+        _dbName = DatabaseNameUtil::deserialize(tenant, kAdminDB);
 
         AlternativeClientRegion clientRegion(_client);
         _sessionInfo.setStartTransaction(true);
@@ -819,20 +797,7 @@ public:
 
 private:
     static bool validNamespace(const NamespaceString& nss) {
-        if (nss.dbName().db() == kAdminDB) {
-            return true;
-        }
-        if (gMultitenancySupport && !nss.tenantId()) {
-            // TODO (SERVER-67423) Convert DBClient to accept DatabaseName type.
-            try {
-                auto parsed =
-                    NamespaceString::parseFromStringExpectTenantIdInMultitenancyMode(nss.ns());
-                return parsed.dbName().db() == kAdminDB;
-            } catch (const DBException&) {
-            }
-        }
-
-        return false;
+        return (nss.dbName().db() == kAdminDB);
     }
 
     StatusWith<std::uint32_t> doCrudOp(BSONObj op) try {
@@ -891,7 +856,7 @@ private:
 
         auto svcCtx = _client->getServiceContext();
         auto sep = svcCtx->getServiceEntryPoint();
-        auto opMsgRequest = OpMsgRequest::fromDBAndBody(_dbName, cmdBuilder->obj());
+        auto opMsgRequest = OpMsgRequestBuilder::create(_dbName, cmdBuilder->obj());
         auto requestMessage = opMsgRequest.serialize();
 
         // Switch to our local client and create a short-lived opCtx for this transaction op.
@@ -910,7 +875,7 @@ private:
 
     bool _isReplSet;
     ServiceContext::UniqueClient _client;
-    std::string _dbName;
+    DatabaseName _dbName;
     OperationSessionInfoFromClient _sessionInfo;
     TransactionState _state = TransactionState::kInit;
 };
@@ -989,9 +954,10 @@ public:
         NamespaceString ns() const final {
             const auto& cmd = request();
             if constexpr (hasGetCmdParamStringData<RequestT>) {
-                return NamespaceString(cmd.getDbName(), cmd.getCommandParameter());
+                return NamespaceStringUtil::parseNamespaceFromRequest(cmd.getDbName(),
+                                                                      cmd.getCommandParameter());
             }
-            return NamespaceString(cmd.getDbName(), "");
+            return NamespaceString(cmd.getDbName());
         }
     };
 
@@ -1035,13 +1001,12 @@ public:
 template <>
 void CmdUMCTyped<CreateUserCommand>::Invocation::typedRun(OperationContext* opCtx) {
     const auto& cmd = request();
-    // TODO (SERVER-67516) cmd.getDatabaseName()
-    DatabaseName dbname(getActiveTenant(opCtx), cmd.getDbName());
+    auto dbname = cmd.getDbName();
 
     // Validate input
     uassert(ErrorCodes::BadValue,
             "Cannot create users in the local database",
-            dbname.db() != NamespaceString::kLocalDb);
+            dbname != DatabaseName::kLocal);
 
     uassert(ErrorCodes::BadValue,
             "Username cannot contain NULL characters",
@@ -1063,9 +1028,10 @@ void CmdUMCTyped<CreateUserCommand>::Invocation::typedRun(OperationContext* opCt
             (cmd.getMechanisms() == boost::none) || !cmd.getMechanisms()->empty());
 
 #ifdef MONGO_CONFIG_SSL
-    auto configuration = opCtx->getClient()->session()->getSSLConfiguration();
+    auto& sslManager = opCtx->getClient()->session()->getSSLManager();
 
-    if (isExternal && configuration && configuration->isClusterMember(userName.getUser())) {
+    if (isExternal && sslManager &&
+        sslManager->getSSLConfiguration().isClusterMember(userName.getUser())) {
         if (gEnforceUserClusterSeparation) {
             uasserted(ErrorCodes::BadValue,
                       "Cannot create an x.509 user with a subjectname that would be "
@@ -1146,8 +1112,7 @@ public:
 template <>
 void CmdUMCTyped<UpdateUserCommand>::Invocation::typedRun(OperationContext* opCtx) {
     const auto& cmd = request();
-    // TODO (SERVER-67516) cmd.getDatabaseName()
-    DatabaseName dbname(getActiveTenant(opCtx), cmd.getDbName());
+    auto dbname = cmd.getDbName();
     UserName userName(cmd.getCommandParameter(), dbname);
 
     uassert(ErrorCodes::BadValue,
@@ -1245,8 +1210,7 @@ CmdUMCTyped<DropUserCommand> cmdDropUser;
 template <>
 void CmdUMCTyped<DropUserCommand>::Invocation::typedRun(OperationContext* opCtx) {
     const auto& cmd = request();
-    // TODO (SERVER-67516) cmd.getDatabaseName()
-    DatabaseName dbname(getActiveTenant(opCtx), cmd.getDbName());
+    auto dbname = cmd.getDbName();
     UserName userName(cmd.getCommandParameter(), dbname);
 
     auto* serviceContext = opCtx->getClient()->getServiceContext();
@@ -1275,8 +1239,7 @@ template <>
 DropAllUsersFromDatabaseReply CmdUMCTyped<DropAllUsersFromDatabaseCommand>::Invocation::typedRun(
     OperationContext* opCtx) {
     const auto& cmd = request();
-    // TODO (SERVER-67516) cmd.getDatabaseName()
-    DatabaseName dbname(getActiveTenant(opCtx), cmd.getDbName());
+    auto dbname = cmd.getDbName();
 
     auto* client = opCtx->getClient();
     auto* serviceContext = client->getServiceContext();
@@ -1300,8 +1263,7 @@ CmdUMCTyped<GrantRolesToUserCommand> cmdGrantRolesToUser;
 template <>
 void CmdUMCTyped<GrantRolesToUserCommand>::Invocation::typedRun(OperationContext* opCtx) {
     const auto& cmd = request();
-    // TODO (SERVER-67516) cmd.getDatabaseName()
-    DatabaseName dbname(getActiveTenant(opCtx), cmd.getDbName());
+    auto dbname = cmd.getDbName();
     UserName userName(cmd.getCommandParameter(), dbname);
 
     uassert(ErrorCodes::BadValue,
@@ -1336,8 +1298,7 @@ CmdUMCTyped<RevokeRolesFromUserCommand> cmdRevokeRolesFromUser;
 template <>
 void CmdUMCTyped<RevokeRolesFromUserCommand>::Invocation::typedRun(OperationContext* opCtx) {
     const auto& cmd = request();
-    // TODO (SERVER-67516) cmd.getDatabaseName()
-    DatabaseName dbname(getActiveTenant(opCtx), cmd.getDbName());
+    auto dbname = cmd.getDbName();
     UserName userName(cmd.getCommandParameter(), dbname);
 
     uassert(ErrorCodes::BadValue,
@@ -1374,8 +1335,7 @@ UsersInfoReply CmdUMCTyped<UsersInfoCommand, UMCInfoParams>::Invocation::typedRu
     OperationContext* opCtx) {
     const auto& cmd = request();
     const auto& arg = cmd.getCommandParameter();
-    // TODO (SERVER-67516) cmd.getDatabaseName()
-    DatabaseName dbname(getActiveTenant(opCtx), cmd.getDbName());
+    auto dbname = cmd.getDbName();
 
     auto* authzManager = AuthorizationManager::get(opCtx->getServiceContext());
     auto lk = uassertStatusOK(requireReadableAuthSchema26Upgrade(opCtx, authzManager));
@@ -1427,7 +1387,8 @@ UsersInfoReply CmdUMCTyped<UsersInfoCommand, UMCInfoParams>::Invocation::typedRu
             } else {
                 // Custom data is not required in the output, so it can be generated from a cached
                 // user object.
-                auto swUserHandle = authzManager->acquireUser(opCtx, userName);
+                auto swUserHandle =
+                    authzManager->acquireUser(opCtx, UserRequest(userName, boost::none));
                 if (swUserHandle.getStatus().code() == ErrorCodes::UserNotFound) {
                     continue;
                 }
@@ -1509,7 +1470,8 @@ UsersInfoReply CmdUMCTyped<UsersInfoCommand, UMCInfoParams>::Invocation::typedRu
         auto bodyBuilder = replyBuilder.getBodyBuilder();
         CommandHelpers::appendSimpleCommandStatus(bodyBuilder, true);
         bodyBuilder.doneFast();
-        auto response = CursorResponse::parseFromBSONThrowing(replyBuilder.releaseBody());
+        auto response =
+            CursorResponse::parseFromBSONThrowing(dbname.tenantId(), replyBuilder.releaseBody());
         DBClientCursor cursor(&client,
                               response.getNSS(),
                               response.getCursorId(),
@@ -1530,8 +1492,7 @@ CmdUMCTyped<CreateRoleCommand> cmdCreateRole;
 template <>
 void CmdUMCTyped<CreateRoleCommand>::Invocation::typedRun(OperationContext* opCtx) {
     const auto& cmd = request();
-    // TODO (SERVER-67516) cmd.getDatabaseName()
-    DatabaseName dbname(getActiveTenant(opCtx), cmd.getDbName());
+    auto dbname = cmd.getDbName();
 
     uassert(
         ErrorCodes::BadValue, "Role name must be non-empty", !cmd.getCommandParameter().empty());
@@ -1539,7 +1500,7 @@ void CmdUMCTyped<CreateRoleCommand>::Invocation::typedRun(OperationContext* opCt
 
     uassert(ErrorCodes::BadValue,
             "Cannot create roles in the local database",
-            dbname.db() != NamespaceString::kLocalDb);
+            dbname != DatabaseName::kLocal);
 
     uassert(ErrorCodes::BadValue,
             "Cannot create roles in the $external database",
@@ -1586,8 +1547,7 @@ CmdUMCTyped<UpdateRoleCommand> cmdUpdateRole;
 template <>
 void CmdUMCTyped<UpdateRoleCommand>::Invocation::typedRun(OperationContext* opCtx) {
     const auto& cmd = request();
-    // TODO (SERVER-67516) cmd.getDatabaseName()
-    DatabaseName dbname(getActiveTenant(opCtx), cmd.getDbName());
+    auto dbname = cmd.getDbName();
     RoleName roleName(cmd.getCommandParameter(), dbname);
 
     const bool hasRoles = cmd.getRoles() != boost::none;
@@ -1662,8 +1622,7 @@ CmdUMCTyped<GrantPrivilegesToRoleCommand> cmdGrantPrivilegesToRole;
 template <>
 void CmdUMCTyped<GrantPrivilegesToRoleCommand>::Invocation::typedRun(OperationContext* opCtx) {
     const auto& cmd = request();
-    // TODO (SERVER-67516) cmd.getDatabaseName()
-    DatabaseName dbname(getActiveTenant(opCtx), cmd.getDbName());
+    auto dbname = cmd.getDbName();
     RoleName roleName(cmd.getCommandParameter(), dbname);
 
     uassert(ErrorCodes::BadValue,
@@ -1712,8 +1671,7 @@ CmdUMCTyped<RevokePrivilegesFromRoleCommand> cmdRevokePrivilegesFromRole;
 template <>
 void CmdUMCTyped<RevokePrivilegesFromRoleCommand>::Invocation::typedRun(OperationContext* opCtx) {
     const auto& cmd = request();
-    // TODO (SERVER-67516) cmd.getDatabaseName()
-    DatabaseName dbname(getActiveTenant(opCtx), cmd.getDbName());
+    auto dbname = cmd.getDbName();
     RoleName roleName(cmd.getCommandParameter(), dbname);
 
     uassert(ErrorCodes::BadValue,
@@ -1767,8 +1725,7 @@ CmdUMCTyped<GrantRolesToRoleCommand> cmdGrantRolesToRole;
 template <>
 void CmdUMCTyped<GrantRolesToRoleCommand>::Invocation::typedRun(OperationContext* opCtx) {
     const auto& cmd = request();
-    // TODO (SERVER-67516) cmd.getDatabaseName()
-    DatabaseName dbname(getActiveTenant(opCtx), cmd.getDbName());
+    auto dbname = cmd.getDbName();
     RoleName roleName(cmd.getCommandParameter(), dbname);
 
     uassert(ErrorCodes::BadValue,
@@ -1808,8 +1765,7 @@ CmdUMCTyped<RevokeRolesFromRoleCommand> cmdRevokeRolesFromRole;
 template <>
 void CmdUMCTyped<RevokeRolesFromRoleCommand>::Invocation::typedRun(OperationContext* opCtx) {
     const auto& cmd = request();
-    // TODO (SERVER-67516) cmd.getDatabaseName()
-    DatabaseName dbname(getActiveTenant(opCtx), cmd.getDbName());
+    auto dbname = cmd.getDbName();
     RoleName roleName(cmd.getCommandParameter(), dbname);
 
     uassert(ErrorCodes::BadValue,
@@ -1915,8 +1871,7 @@ CmdUMCTyped<DropRoleCommand> cmdDropRole;
 template <>
 void CmdUMCTyped<DropRoleCommand>::Invocation::typedRun(OperationContext* opCtx) {
     const auto& cmd = request();
-    // TODO (SERVER-67516) cmd.getDatabaseName()
-    DatabaseName dbname(getActiveTenant(opCtx), cmd.getDbName());
+    auto dbname = cmd.getDbName();
     RoleName roleName(cmd.getCommandParameter(), dbname);
 
     uassert(ErrorCodes::BadValue,
@@ -1984,8 +1939,7 @@ template <>
 DropAllRolesFromDatabaseReply CmdUMCTyped<DropAllRolesFromDatabaseCommand>::Invocation::typedRun(
     OperationContext* opCtx) {
     const auto& cmd = request();
-    // TODO (SERVER-67516) cmd.getDatabaseName()
-    DatabaseName dbname(getActiveTenant(opCtx), cmd.getDbName());
+    auto dbname = cmd.getDbName();
 
     auto* client = opCtx->getClient();
     auto* serviceContext = client->getServiceContext();
@@ -2079,8 +2033,7 @@ RolesInfoReply CmdUMCTyped<RolesInfoCommand, UMCInfoParams>::Invocation::typedRu
     OperationContext* opCtx) {
     const auto& cmd = request();
     const auto& arg = cmd.getCommandParameter();
-    // TODO (SERVER-67516) cmd.getDatabaseName()
-    DatabaseName dbname(getActiveTenant(opCtx), cmd.getDbName());
+    auto dbname = cmd.getDbName();
 
     auto* authzManager = AuthorizationManager::get(opCtx->getServiceContext());
     auto lk = uassertStatusOK(requireReadableAuthSchema26Upgrade(opCtx, authzManager));
@@ -2130,8 +2083,7 @@ void CmdUMCTyped<InvalidateUserCacheCommand, UMCInvalidateUserCacheParams>::Invo
     OperationContext* opCtx) {
     auto* authzManager = AuthorizationManager::get(opCtx->getServiceContext());
     auto lk = requireReadableAuthSchema26Upgrade(opCtx, authzManager);
-    // TODO (SERVER-67516) cmd.getDatabaseName().tenantId()
-    authzManager->invalidateUsersByTenant(opCtx, getActiveTenant(opCtx));
+    authzManager->invalidateUsersByTenant(opCtx, request().getDbName().tenantId());
 }
 
 CmdUMCTyped<GetUserCacheGenerationCommand, UMCGetUserCacheGenParams> cmdGetUserCacheGeneration;
@@ -2142,7 +2094,7 @@ CmdUMCTyped<GetUserCacheGenerationCommand, UMCGetUserCacheGenParams>::Invocation
     OperationContext* opCtx) {
     uassert(ErrorCodes::IllegalOperation,
             "_getUserCacheGeneration can only be run on config servers",
-            serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+            serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
 
     cmdGetUserCacheGeneration.skipApiVersionCheck();
     GetUserCacheGenerationReply reply;
@@ -2180,7 +2132,7 @@ public:
         }
 
         NamespaceString ns() const final {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
     };
 
@@ -2313,7 +2265,7 @@ Status queryAuthzDocument(OperationContext* opCtx,
                           const BSONObj& projection,
                           const std::function<void(const BSONObj&)>& resultProcessor) try {
     DBDirectClient client(opCtx);
-    FindCommandRequest findRequest{patchTenantNSS(nss)};
+    FindCommandRequest findRequest{nss};
     findRequest.setFilter(query);
     findRequest.setProjection(projection);
     client.find(std::move(findRequest), resultProcessor);
@@ -2351,7 +2303,7 @@ void _processUsers(OperationContext* opCtx,
                               << 1 << AuthorizationManager::USER_DB_FIELD_NAME << 1);
 
         uassertStatusOK(queryAuthzDocument(opCtx,
-                                           AuthorizationManager::usersCollectionNamespace,
+                                           NamespaceString::kAdminUsersNamespace,
                                            query,
                                            fields,
                                            [&](const BSONObj& userObj) {
@@ -2479,7 +2431,7 @@ void _processRoles(OperationContext* opCtx,
                               << 1 << AuthorizationManager::ROLE_DB_FIELD_NAME << 1);
 
         uassertStatusOK(queryAuthzDocument(opCtx,
-                                           AuthorizationManager::rolesCollectionNamespace,
+                                           NamespaceString::kAdminRolesNamespace,
                                            query,
                                            fields,
                                            [&](const BSONObj& roleObj) {
@@ -2514,7 +2466,7 @@ void CmdMergeAuthzCollections::Invocation::typedRun(OperationContext* opCtx) {
 
     uassert(ErrorCodes::BadValue,
             "Must provide at least one of \"tempUsersCollection\" and \"tempRolescollection\"",
-            !tempUsersColl.empty() | !tempRolesColl.empty());
+            !tempUsersColl.empty() || !tempRolesColl.empty());
 
     auto* svcCtx = opCtx->getClient()->getServiceContext();
     auto* authzManager = AuthorizationManager::get(svcCtx);

@@ -1,11 +1,6 @@
 /*
  * Test that the balancer is redistributing data based on the actual amount of data
  * for a collection on each node, converging when the size difference becomes small.
- *
- * @tags: [
- *     featureFlagBalanceAccordingToDataSize,
- *     requires_fcv_61,
- * ]
  */
 
 (function() {
@@ -13,22 +8,17 @@
 
 load("jstests/sharding/libs/find_chunks_util.js");
 
-function getCollSizeMB(ns, node) {
-    let res;
-    let collections = [{ns: ns}];
-    assert.soon(() => {
-        res = assert.commandWorkedOrFailedWithCode(
-            node.adminCommand({_shardsvrGetStatsForBalancing: 1, collections: collections}),
-            [ErrorCodes.NotYetInitialized]);
-        return res.ok;
-    });
-
-    return res['stats'][0]['collSize'];
-}
-
 const maxChunkSizeMB = 1;
-const st = new ShardingTest(
-    {shards: 2, mongos: 1, other: {chunkSize: maxChunkSizeMB, enableBalancer: false}});
+const st = new ShardingTest({
+    shards: 2,
+    mongos: 1,
+    other: {
+        chunkSize: maxChunkSizeMB,
+        enableBalancer: false,
+        configOptions: {setParameter: {logComponentVerbosity: tojson({sharding: {verbosity: 2}})}}
+    }
+});
+
 const dbName = 'test';
 const coll = st.getDB(dbName).getCollection('foo');
 const ns = coll.getFullName();
@@ -75,21 +65,14 @@ jsTestLog("Printing sharding status before starting balancer");
 st.printShardingStatus();
 st.startBalancer();
 
-assert.soon(function() {
-    return assert.commandWorked(st.s0.adminCommand({balancerCollectionStatus: ns}))
-        .balancerCompliant;
-}, 'Timed out waiting for the collection to be balanced', 60000 /* timeout */, 1000 /* interval */);
-
-// Check that the collection size diff between shards is small (2 * maxChunkSize)
-const collSizeOnShard0BeforeNoopRounds = getCollSizeMB(ns, st.shard0.rs.getPrimary());
-const collSizeOnShard1BeforeNoopRounds = getCollSizeMB(ns, st.shard1.rs.getPrimary());
+st.awaitCollectionBalance(coll, 60000 /* timeout */, 1000 /* interval */);
 const chunksBeforeNoopRound = findChunksUtil.findChunksByNs(st.config, ns).toArray();
-var errMsg = '[BEFORE NOOP ROUND] Data on shard0 = ' + collSizeOnShard0BeforeNoopRounds +
-    ' and data on shard 1 = ' + collSizeOnShard1BeforeNoopRounds +
-    ' - chunks before noop round = ' + JSON.stringify(chunksBeforeNoopRound);
-assert.lte(collSizeOnShard0BeforeNoopRounds - collSizeOnShard1BeforeNoopRounds,
-           2 * maxChunkSizeMB,
-           errMsg);
+
+// Check that the collection is balanced
+st.verifyCollectionIsBalanced(coll);
+
+jsTestLog("Printing sharding status after waiting for collection balance");
+st.printShardingStatus();
 
 // Wait for some more rounds and then check the balancer is not wrongly moving around data
 st.forEachConfigServer((conn) => {

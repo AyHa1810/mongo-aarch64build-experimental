@@ -29,9 +29,18 @@
 #include "mongo/db/s/resharding/resharding_metrics.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/s/resharding/resharding_util.h"
+#include "mongo/util/optional_util.h"
 
 namespace mongo {
 namespace {
+
+using TimedPhase = ReshardingMetrics::TimedPhase;
+const auto kTimedPhaseNamesMap = [] {
+    return ReshardingMetrics::TimedPhaseNameMap{
+        {TimedPhase::kCloning, "totalCopyTimeElapsedSecs"},
+        {TimedPhase::kApplying, "totalApplyTimeElapsedSecs"},
+        {TimedPhase::kCriticalSection, "totalCriticalSectionTimeElapsedSecs"}};
+}();
 
 inline ReshardingMetrics::State getDefaultState(ReshardingMetrics::Role role) {
     using Role = ReshardingMetrics::Role;
@@ -62,13 +71,24 @@ BSONObj createOriginalCommand(const NamespaceString& nss, BSONObj shardKey) {
 
 Date_t readStartTime(const CommonReshardingMetadata& metadata, ClockSource* fallbackSource) {
     if (const auto& startTime = metadata.getStartTime()) {
-        return startTime.get();
+        return startTime.value();
     } else {
         return fallbackSource->now();
     }
 }
 
 }  // namespace
+
+void ReshardingMetrics::ExternallyTrackedRecipientFields::accumulateFrom(
+    const ReshardingOplogApplierProgress& progressDoc) {
+    auto setOrAdd = [](auto& opt, auto add) {
+        opt = opt.value_or(0) + add;
+    };
+    setOrAdd(insertsApplied, progressDoc.getInsertsApplied());
+    setOrAdd(updatesApplied, progressDoc.getUpdatesApplied());
+    setOrAdd(deletesApplied, progressDoc.getDeletesApplied());
+    setOrAdd(writesToStashCollections, progressDoc.getWritesToStashCollections());
+}
 
 ReshardingMetrics::ReshardingMetrics(UUID instanceId,
                                      BSONObj shardKey,
@@ -77,24 +97,50 @@ ReshardingMetrics::ReshardingMetrics(UUID instanceId,
                                      Date_t startTime,
                                      ClockSource* clockSource,
                                      ShardingDataTransformCumulativeMetrics* cumulativeMetrics)
-    : ShardingDataTransformInstanceMetrics{std::move(instanceId),
-                                           createOriginalCommand(nss, std::move(shardKey)),
-                                           nss,
-                                           role,
-                                           startTime,
-                                           clockSource,
-                                           cumulativeMetrics,
-                                           std::make_unique<ReshardingMetricsFieldNameProvider>()},
-      _state{getDefaultState(role)},
-      _deletesApplied{0},
-      _insertsApplied{0},
-      _updatesApplied{0},
-      _oplogEntriesApplied{0},
-      _oplogEntriesFetched{0},
-      _applyingStartTime{kNoDate},
-      _applyingEndTime{kNoDate},
-      _reshardingFieldNames{static_cast<ReshardingMetricsFieldNameProvider*>(_fieldNames.get())},
-      _scopedObserver(registerInstanceMetrics()) {}
+    : ReshardingMetrics{std::move(instanceId),
+                        shardKey,
+                        std::move(nss),
+                        std::move(role),
+                        std::move(startTime),
+                        clockSource,
+                        cumulativeMetrics,
+                        getDefaultState(role)} {}
+
+ReshardingMetrics::ReshardingMetrics(UUID instanceId,
+                                     BSONObj shardKey,
+                                     NamespaceString nss,
+                                     Role role,
+                                     Date_t startTime,
+                                     ClockSource* clockSource,
+                                     ShardingDataTransformCumulativeMetrics* cumulativeMetrics,
+                                     State state)
+    : Base{std::move(instanceId),
+           createOriginalCommand(nss, std::move(shardKey)),
+           nss,
+           role,
+           startTime,
+           clockSource,
+           cumulativeMetrics,
+           std::make_unique<ReshardingMetricsFieldNameProvider>()},
+      _ableToEstimateRemainingRecipientTime{!mustRestoreExternallyTrackedRecipientFields(state)},
+      _scopedObserver(registerInstanceMetrics()),
+      _reshardingFieldNames{static_cast<ReshardingMetricsFieldNameProvider*>(_fieldNames.get())} {
+    setState(state);
+}
+
+ReshardingMetrics::ReshardingMetrics(const CommonReshardingMetadata& metadata,
+                                     Role role,
+                                     ClockSource* clockSource,
+                                     ShardingDataTransformCumulativeMetrics* cumulativeMetrics,
+                                     State state)
+    : ReshardingMetrics{metadata.getReshardingUUID(),
+                        metadata.getReshardingKey().toBSON(),
+                        metadata.getSourceNss(),
+                        role,
+                        readStartTime(metadata, clockSource),
+                        clockSource,
+                        cumulativeMetrics,
+                        state} {}
 
 ReshardingMetrics::ReshardingMetrics(const CommonReshardingMetadata& metadata,
                                      Role role,
@@ -106,7 +152,8 @@ ReshardingMetrics::ReshardingMetrics(const CommonReshardingMetadata& metadata,
                         role,
                         readStartTime(metadata, clockSource),
                         clockSource,
-                        cumulativeMetrics} {}
+                        cumulativeMetrics,
+                        getDefaultState(role)} {}
 
 ReshardingMetrics::~ReshardingMetrics() {
     // Deregister the observer first to ensure that the observer will no longer be able to reach
@@ -120,18 +167,23 @@ std::string ReshardingMetrics::createOperationDescription() const noexcept {
                        _instanceId.toString());
 }
 
-Milliseconds ReshardingMetrics::getRecipientHighEstimateRemainingTimeMillis() const {
-    auto estimate = resharding::estimateRemainingRecipientTime(_applyingStartTime.load() != kNoDate,
-                                                               getBytesWrittenCount(),
-                                                               getApproxBytesToScanCount(),
-                                                               getCopyingElapsedTimeSecs(),
-                                                               _oplogEntriesApplied.load(),
-                                                               _oplogEntriesFetched.load(),
-                                                               getApplyingElapsedTimeSecs());
-    if (!estimate) {
-        return Milliseconds{0};
+ReshardingCumulativeMetrics* ReshardingMetrics::getReshardingCumulativeMetrics() {
+    return dynamic_cast<ReshardingCumulativeMetrics*>(getCumulativeMetrics());
+}
+
+boost::optional<Milliseconds> ReshardingMetrics::getRecipientHighEstimateRemainingTimeMillis()
+    const {
+    if (!_ableToEstimateRemainingRecipientTime.load()) {
+        return boost::none;
     }
-    return *estimate;
+    return resharding::estimateRemainingRecipientTime(
+        getStartFor(TimedPhase::kApplying).has_value(),
+        getBytesWrittenCount(),
+        getApproxBytesToScanCount(),
+        getElapsed<Seconds>(TimedPhase::kCloning, getClockSource()).value_or(Seconds{0}),
+        getOplogEntriesApplied(),
+        getOplogEntriesFetched(),
+        getElapsed<Seconds>(TimedPhase::kApplying, getClockSource()).value_or(Seconds{0}));
 }
 
 std::unique_ptr<ReshardingMetrics> ReshardingMetrics::makeInstance(UUID instanceId,
@@ -148,7 +200,8 @@ std::unique_ptr<ReshardingMetrics> ReshardingMetrics::makeInstance(UUID instance
                                                role,
                                                startTime,
                                                serviceContext->getFastClockSource(),
-                                               cumulativeMetrics);
+                                               cumulativeMetrics,
+                                               getDefaultState(role));
 }
 
 StringData ReshardingMetrics::getStateString() const noexcept {
@@ -156,44 +209,21 @@ StringData ReshardingMetrics::getStateString() const noexcept {
         OverloadedVisitor{
             [](CoordinatorStateEnum state) { return CoordinatorState_serializer(state); },
             [](RecipientStateEnum state) { return RecipientState_serializer(state); },
-            [](DonorStateEnum state) { return DonorState_serializer(state); }},
-        _state.load());
+            [](DonorStateEnum state) {
+                return DonorState_serializer(state);
+            }},
+        getState());
 }
 
 BSONObj ReshardingMetrics::reportForCurrentOp() const noexcept {
     BSONObjBuilder builder;
-    switch (_role) {
-        case Role::kCoordinator:
-            builder.append(_reshardingFieldNames->getForApplyTimeElapsed(),
-                           getApplyingElapsedTimeSecs().count());
-            break;
-        case Role::kDonor:
-            break;
-        case Role::kRecipient:
-            builder.append(_reshardingFieldNames->getForApplyTimeElapsed(),
-                           getApplyingElapsedTimeSecs().count());
-            builder.append(_reshardingFieldNames->getForInsertsApplied(), _insertsApplied.load());
-            builder.append(_reshardingFieldNames->getForUpdatesApplied(), _updatesApplied.load());
-            builder.append(_reshardingFieldNames->getForDeletesApplied(), _deletesApplied.load());
-            builder.append(_reshardingFieldNames->getForOplogEntriesApplied(),
-                           _oplogEntriesApplied.load());
-            builder.append(_reshardingFieldNames->getForOplogEntriesFetched(),
-                           _oplogEntriesFetched.load());
-            break;
-        default:
-            MONGO_UNREACHABLE;
+    reportDurationsForAllPhases<Seconds>(
+        kTimedPhaseNamesMap, getClockSource(), &builder, Seconds{0});
+    if (_role == Role::kRecipient) {
+        reportOplogApplicationCountMetrics(_reshardingFieldNames, &builder);
     }
-    builder.appendElementsUnique(ShardingDataTransformInstanceMetrics::reportForCurrentOp());
+    builder.appendElementsUnique(Base::reportForCurrentOp());
     return builder.obj();
-}
-
-void ReshardingMetrics::accumulateFrom(const ReshardingOplogApplierProgress& progressDoc) {
-    invariant(_role == Role::kRecipient);
-    _insertsApplied.fetchAndAdd(progressDoc.getInsertsApplied());
-    _updatesApplied.fetchAndAdd(progressDoc.getUpdatesApplied());
-    _deletesApplied.fetchAndAdd(progressDoc.getDeletesApplied());
-
-    accumulateWritesToStashCollections(progressDoc.getWritesToStashCollections());
 }
 
 void ReshardingMetrics::restoreRecipientSpecificFields(
@@ -220,193 +250,18 @@ void ReshardingMetrics::restoreCoordinatorSpecificFields(
     restorePhaseDurationFields(document);
 }
 
-ReshardingMetrics::DonorState::DonorState(DonorStateEnum enumVal) : _enumVal(enumVal) {}
-
-ShardingDataTransformCumulativeMetrics::DonorStateEnum ReshardingMetrics::DonorState::toMetrics()
-    const {
-    using MetricsEnum = ShardingDataTransformCumulativeMetrics::DonorStateEnum;
-
-    switch (_enumVal) {
-        case DonorStateEnum::kUnused:
-            return MetricsEnum::kUnused;
-
-        case DonorStateEnum::kPreparingToDonate:
-            return MetricsEnum::kPreparingToDonate;
-
-        case DonorStateEnum::kDonatingInitialData:
-            return MetricsEnum::kDonatingInitialData;
-
-        case DonorStateEnum::kDonatingOplogEntries:
-            return MetricsEnum::kDonatingOplogEntries;
-
-        case DonorStateEnum::kPreparingToBlockWrites:
-            return MetricsEnum::kPreparingToBlockWrites;
-
-        case DonorStateEnum::kError:
-            return MetricsEnum::kError;
-
-        case DonorStateEnum::kBlockingWrites:
-            return MetricsEnum::kBlockingWrites;
-
-        case DonorStateEnum::kDone:
-            return MetricsEnum::kDone;
-        default:
-            invariant(false,
-                      str::stream() << "Unexpected resharding coordinator state: "
-                                    << DonorState_serializer(_enumVal));
-            MONGO_UNREACHABLE;
-    }
-}
-
-DonorStateEnum ReshardingMetrics::DonorState::getState() const {
-    return _enumVal;
-}
-
-ReshardingMetrics::RecipientState::RecipientState(RecipientStateEnum enumVal) : _enumVal(enumVal) {}
-
-ShardingDataTransformCumulativeMetrics::RecipientStateEnum
-ReshardingMetrics::RecipientState::toMetrics() const {
-    using MetricsEnum = ShardingDataTransformCumulativeMetrics::RecipientStateEnum;
-
-    switch (_enumVal) {
-        case RecipientStateEnum::kUnused:
-            return MetricsEnum::kUnused;
-
-        case RecipientStateEnum::kAwaitingFetchTimestamp:
-            return MetricsEnum::kAwaitingFetchTimestamp;
-
-        case RecipientStateEnum::kCreatingCollection:
-            return MetricsEnum::kCreatingCollection;
-
-        case RecipientStateEnum::kCloning:
-            return MetricsEnum::kCloning;
-
-        case RecipientStateEnum::kApplying:
-            return MetricsEnum::kApplying;
-
-        case RecipientStateEnum::kError:
-            return MetricsEnum::kError;
-
-        case RecipientStateEnum::kStrictConsistency:
-            return MetricsEnum::kStrictConsistency;
-
-        case RecipientStateEnum::kDone:
-            return MetricsEnum::kDone;
-
-        default:
-            invariant(false,
-                      str::stream() << "Unexpected resharding coordinator state: "
-                                    << RecipientState_serializer(_enumVal));
-            MONGO_UNREACHABLE;
-    }
-}
-
-RecipientStateEnum ReshardingMetrics::RecipientState::getState() const {
-    return _enumVal;
-}
-
-ReshardingMetrics::CoordinatorState::CoordinatorState(CoordinatorStateEnum enumVal)
-    : _enumVal(enumVal) {}
-
-ShardingDataTransformCumulativeMetrics::CoordinatorStateEnum
-ReshardingMetrics::CoordinatorState::toMetrics() const {
-    switch (_enumVal) {
-        case CoordinatorStateEnum::kUnused:
-            return ShardingDataTransformCumulativeMetrics::CoordinatorStateEnum::kUnused;
-
-        case CoordinatorStateEnum::kInitializing:
-            return ShardingDataTransformCumulativeMetrics::CoordinatorStateEnum::kInitializing;
-
-        case CoordinatorStateEnum::kPreparingToDonate:
-            return ShardingDataTransformCumulativeMetrics::CoordinatorStateEnum::kPreparingToDonate;
-
-        case CoordinatorStateEnum::kCloning:
-            return ShardingDataTransformCumulativeMetrics::CoordinatorStateEnum::kCloning;
-
-        case CoordinatorStateEnum::kApplying:
-            return ShardingDataTransformCumulativeMetrics::CoordinatorStateEnum::kApplying;
-
-        case CoordinatorStateEnum::kBlockingWrites:
-            return ShardingDataTransformCumulativeMetrics::CoordinatorStateEnum::kBlockingWrites;
-
-        case CoordinatorStateEnum::kAborting:
-            return ShardingDataTransformCumulativeMetrics::CoordinatorStateEnum::kAborting;
-
-        case CoordinatorStateEnum::kCommitting:
-            return ShardingDataTransformCumulativeMetrics::CoordinatorStateEnum::kCommitting;
-
-        case CoordinatorStateEnum::kDone:
-            return ShardingDataTransformCumulativeMetrics::CoordinatorStateEnum::kDone;
-        default:
-            invariant(false,
-                      str::stream() << "Unexpected resharding coordinator state: "
-                                    << CoordinatorState_serializer(_enumVal));
-            MONGO_UNREACHABLE;
-    }
-}
-
-CoordinatorStateEnum ReshardingMetrics::CoordinatorState::getState() const {
-    return _enumVal;
-}
-
-void ReshardingMetrics::onDeleteApplied() {
-    _deletesApplied.addAndFetch(1);
-    getCumulativeMetrics()->onDeleteApplied();
-}
-
-void ReshardingMetrics::onInsertApplied() {
-    _insertsApplied.addAndFetch(1);
-    getCumulativeMetrics()->onInsertApplied();
-}
-
-void ReshardingMetrics::onUpdateApplied() {
-    _updatesApplied.addAndFetch(1);
-    getCumulativeMetrics()->onUpdateApplied();
-}
-
-void ReshardingMetrics::onOplogEntriesFetched(int64_t numEntries, Milliseconds elapsed) {
-    _oplogEntriesFetched.addAndFetch(numEntries);
-    getCumulativeMetrics()->onOplogEntriesFetched(numEntries, elapsed);
-}
-
-void ReshardingMetrics::restoreOplogEntriesFetched(int64_t numEntries) {
-    _oplogEntriesFetched.store(numEntries);
-}
-
-void ReshardingMetrics::onOplogEntriesApplied(int64_t numEntries) {
-    _oplogEntriesApplied.addAndFetch(numEntries);
-    getCumulativeMetrics()->onOplogEntriesApplied(numEntries);
-}
-
-void ReshardingMetrics::restoreOplogEntriesApplied(int64_t numEntries) {
-    _oplogEntriesApplied.store(numEntries);
-}
-
-void ReshardingMetrics::onApplyingBegin() {
-    _applyingStartTime.store(getClockSource()->now());
-}
-
-void ReshardingMetrics::onApplyingEnd() {
-    _applyingEndTime.store(getClockSource()->now());
-}
-
-void ReshardingMetrics::restoreApplyingBegin(Date_t date) {
-    _applyingStartTime.store(date);
-}
-
-void ReshardingMetrics::restoreApplyingEnd(Date_t date) {
-    _applyingEndTime.store(date);
-}
-
-Date_t ReshardingMetrics::getApplyingBegin() const {
-    return _applyingStartTime.load();
-}
-
-Date_t ReshardingMetrics::getApplyingEnd() const {
-    return _applyingEndTime.load();
-}
-
-Seconds ReshardingMetrics::getApplyingElapsedTimeSecs() const {
-    return getElapsed<Seconds>(_applyingStartTime, _applyingEndTime, getClockSource());
+void ReshardingMetrics::restoreExternallyTrackedRecipientFields(
+    const ExternallyTrackedRecipientFields& values) {
+    invokeIfAllSet(&ReshardingMetrics::restoreDocumentsProcessed,
+                   values.documentCountCopied,
+                   values.documentBytesCopied);
+    invokeIfAllSet(&ReshardingMetrics::restoreOplogEntriesFetched, values.oplogEntriesFetched);
+    invokeIfAllSet(&ReshardingMetrics::restoreOplogEntriesApplied, values.oplogEntriesApplied);
+    invokeIfAllSet(&ReshardingMetrics::restoreUpdatesApplied, values.updatesApplied);
+    invokeIfAllSet(&ReshardingMetrics::restoreInsertsApplied, values.insertsApplied);
+    invokeIfAllSet(&ReshardingMetrics::restoreDeletesApplied, values.deletesApplied);
+    invokeIfAllSet(&ReshardingMetrics::restoreWritesToStashCollections,
+                   values.writesToStashCollections);
+    _ableToEstimateRemainingRecipientTime.store(true);
 }
 }  // namespace mongo

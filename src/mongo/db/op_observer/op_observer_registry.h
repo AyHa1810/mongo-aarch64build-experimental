@@ -58,6 +58,32 @@ public:
         _observers.push_back(std::move(observer));
     }
 
+    void onModifyCollectionShardingIndexCatalog(OperationContext* opCtx,
+                                                const NamespaceString& nss,
+                                                const UUID& uuid,
+                                                BSONObj indexDoc) override {
+        ReservedTimes times{opCtx};
+        for (auto& o : _observers)
+            o->onModifyCollectionShardingIndexCatalog(opCtx, nss, uuid, indexDoc);
+    }
+
+    void onCreateGlobalIndex(OperationContext* opCtx,
+                             const NamespaceString& globalIndexNss,
+                             const UUID& globalIndexUUID) final {
+        ReservedTimes times{opCtx};
+        for (auto& o : _observers)
+            o->onCreateGlobalIndex(opCtx, globalIndexNss, globalIndexUUID);
+    };
+
+    void onDropGlobalIndex(OperationContext* opCtx,
+                           const NamespaceString& globalIndexNss,
+                           const UUID& globalIndexUUID,
+                           long long numKeys) final {
+        ReservedTimes times{opCtx};
+        for (auto& o : _observers)
+            o->onDropGlobalIndex(opCtx, globalIndexNss, globalIndexUUID, numKeys);
+    };
+
     void onCreateIndex(OperationContext* const opCtx,
                        const NamespaceString& nss,
                        const UUID& uuid,
@@ -122,14 +148,35 @@ public:
     }
 
     void onInserts(OperationContext* const opCtx,
-                   const NamespaceString& nss,
-                   const UUID& uuid,
+                   const CollectionPtr& coll,
                    std::vector<InsertStatement>::const_iterator begin,
                    std::vector<InsertStatement>::const_iterator end,
-                   bool fromMigrate) override {
+                   std::vector<bool> fromMigrate,
+                   bool defaultFromMigrate) override {
         ReservedTimes times{opCtx};
         for (auto& o : _observers)
-            o->onInserts(opCtx, nss, uuid, begin, end, fromMigrate);
+            o->onInserts(opCtx, coll, begin, end, fromMigrate, defaultFromMigrate);
+    }
+
+    void onInsertGlobalIndexKey(OperationContext* opCtx,
+                                const NamespaceString& globalIndexNss,
+                                const UUID& globalIndexUuid,
+                                const BSONObj& key,
+                                const BSONObj& docKey) override {
+
+        ReservedTimes times{opCtx};
+        for (auto& o : _observers)
+            o->onInsertGlobalIndexKey(opCtx, globalIndexNss, globalIndexUuid, key, docKey);
+    }
+
+    void onDeleteGlobalIndexKey(OperationContext* opCtx,
+                                const NamespaceString& globalIndexNss,
+                                const UUID& globalIndexUuid,
+                                const BSONObj& key,
+                                const BSONObj& docKey) override {
+        ReservedTimes times{opCtx};
+        for (auto& o : _observers)
+            o->onDeleteGlobalIndexKey(opCtx, globalIndexNss, globalIndexUuid, key, docKey);
     }
 
     void onUpdate(OperationContext* const opCtx, const OplogUpdateEntryArgs& args) override {
@@ -139,22 +186,20 @@ public:
     }
 
     void aboutToDelete(OperationContext* const opCtx,
-                       const NamespaceString& nss,
-                       const UUID& uuid,
+                       const CollectionPtr& coll,
                        const BSONObj& doc) override {
         ReservedTimes times{opCtx};
         for (auto& o : _observers)
-            o->aboutToDelete(opCtx, nss, uuid, doc);
+            o->aboutToDelete(opCtx, coll, doc);
     }
 
     void onDelete(OperationContext* const opCtx,
-                  const NamespaceString& nss,
-                  const UUID& uuid,
+                  const CollectionPtr& coll,
                   StmtId stmtId,
                   const OplogDeleteEntryArgs& args) override {
         ReservedTimes times{opCtx};
         for (auto& o : _observers)
-            o->onDelete(opCtx, nss, uuid, stmtId, args);
+            o->onDelete(opCtx, coll, stmtId, args);
     }
 
     void onInternalOpMessage(OperationContext* const opCtx,
@@ -367,12 +412,18 @@ public:
             o->onEmptyCapped(opCtx, collectionName, uuid);
     }
 
-    void onUnpreparedTransactionCommit(OperationContext* opCtx,
-                                       std::vector<repl::ReplOperation>* statements,
-                                       size_t numberOfPrePostImagesToWrite) override {
+    void onTransactionStart(OperationContext* opCtx) override {
+        ReservedTimes times{opCtx};
+        for (auto& o : _observers) {
+            o->onTransactionStart(opCtx);
+        }
+    }
+
+    void onUnpreparedTransactionCommit(
+        OperationContext* opCtx, const TransactionOperations& transactionOperations) override {
         ReservedTimes times{opCtx};
         for (auto& o : _observers)
-            o->onUnpreparedTransactionCommit(opCtx, statements, numberOfPrePostImagesToWrite);
+            o->onUnpreparedTransactionCommit(opCtx, transactionOperations);
     }
 
     void onPreparedTransactionCommit(
@@ -389,14 +440,13 @@ public:
     std::unique_ptr<ApplyOpsOplogSlotAndOperationAssignment> preTransactionPrepare(
         OperationContext* opCtx,
         const std::vector<OplogSlot>& reservedSlots,
-        size_t numberOfPrePostImagesToWrite,
-        Date_t wallClockTime,
-        std::vector<repl::ReplOperation>* statements) override {
+        const TransactionOperations& transactionOperations,
+        Date_t wallClockTime) override {
         std::unique_ptr<ApplyOpsOplogSlotAndOperationAssignment>
             applyOpsOplogSlotAndOperationAssignment;
         for (auto&& observer : _observers) {
             auto applyOpsAssignment = observer->preTransactionPrepare(
-                opCtx, reservedSlots, numberOfPrePostImagesToWrite, wallClockTime, statements);
+                opCtx, reservedSlots, transactionOperations, wallClockTime);
             tassert(6278501,
                     "More than one OpObserver returned operation to \"applyOps\" assignment",
                     !(applyOpsAssignment && applyOpsOplogSlotAndOperationAssignment));
@@ -410,18 +460,27 @@ public:
     void onTransactionPrepare(
         OperationContext* opCtx,
         const std::vector<OplogSlot>& reservedSlots,
-        std::vector<repl::ReplOperation>* statements,
-        const ApplyOpsOplogSlotAndOperationAssignment* applyOpsOperationAssignment,
+        const TransactionOperations& transactionOperations,
+        const ApplyOpsOplogSlotAndOperationAssignment& applyOpsOperationAssignment,
         size_t numberOfPrePostImagesToWrite,
         Date_t wallClockTime) override {
         ReservedTimes times{opCtx};
         for (auto& observer : _observers) {
             observer->onTransactionPrepare(opCtx,
                                            reservedSlots,
-                                           statements,
+                                           transactionOperations,
                                            applyOpsOperationAssignment,
                                            numberOfPrePostImagesToWrite,
                                            wallClockTime);
+        }
+    }
+
+    void onTransactionPrepareNonPrimary(OperationContext* opCtx,
+                                        const std::vector<repl::OplogEntry>& statements,
+                                        const repl::OpTime& prepareOpTime) override {
+        ReservedTimes times{opCtx};
+        for (auto& observer : _observers) {
+            observer->onTransactionPrepareNonPrimary(opCtx, statements, prepareOpTime);
         }
     }
 

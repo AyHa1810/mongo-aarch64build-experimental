@@ -84,29 +84,6 @@ void OplogBatcher::shutdown() {
     }
 }
 
-namespace {
-/**
- * Returns whether an oplog entry represents an implicit commit for a transaction which has not
- * been prepared.  An entry is an unprepared commit if it has a boolean "prepared" field set to
- * false and "isPartial" is not present.
- */
-bool isUnpreparedCommit(const OplogEntry& entry) {
-    if (entry.getCommandType() != OplogEntry::CommandType::kApplyOps) {
-        return false;
-    }
-
-    if (entry.isPartialTransaction()) {
-        return false;
-    }
-
-    if (entry.shouldPrepare()) {
-        return false;
-    }
-
-    return true;
-}
-}  // namespace
-
 /**
  * Returns true if this oplog entry must be processed in its own batch and cannot be grouped with
  * other entries.
@@ -117,8 +94,8 @@ bool isUnpreparedCommit(const OplogEntry& entry) {
  * CRUD operations, which can be safely batched with other CRUD operations. All other command oplog
  * entries, including unprepared applyOps/commitTransaction for transactions that contain commands,
  * must be processed in their own batch.
- * Note that 'unprepared applyOps' could mean a partial transaction oplog entry, an implicit commit
- * applyOps oplog entry, or an atomic applyOps oplog entry outside of a transaction.
+ * Note that 'unprepared applyOps' could mean a partial transaction oplog entry, or an implicit
+ * commit applyOps oplog entry.
  *
  * Command operations inside large transactions do not need to be processed individually as long as
  * the final oplog entry in the transaction is processed individually, since the operations are not
@@ -143,12 +120,20 @@ bool OplogBatcher::mustProcessIndividually(const OplogEntry& entry) {
 }
 
 std::size_t OplogBatcher::getOpCount(const OplogEntry& entry) {
-    if (isUnpreparedCommit(entry)) {
-        auto count = entry.getObject().getIntField(CommitTransactionOplogObject::kCountFieldName);
+    // Get the number of operations enclosed in 'applyOps'. The 'count' field only exists in
+    // the last applyOps oplog entry of a large transaction that has multiple oplog entries,
+    // and when not present, we fallback to get the count by using BSONObj::nFields() which
+    // could be slower.
+    if (entry.isTerminalApplyOps() || entry.shouldPrepare()) {
+        auto count = entry.getObject().getIntField(ApplyOpsCommandInfoBase::kCountFieldName);
         if (count > 0) {
             return std::size_t(count);
         }
+        auto size =
+            entry.getObject()[ApplyOpsCommandInfoBase::kOperationsFieldName].Obj().nFields();
+        return size > 0 ? std::size_t(size) : 1U;
     }
+
     return 1U;
 }
 
@@ -170,6 +155,12 @@ StatusWith<std::vector<OplogEntry>> OplogBatcher::getNextApplierBatch(
     while (_oplogBuffer->peek(opCtx, &op)) {
         oplogBatcherPauseAfterSuccessfulPeek.pauseWhileSet();
         auto entry = OplogEntry(op);
+
+        if (entry.shouldLogAsDDLOperation()) {
+            LOGV2(7360109,
+                  "Processing DDL command oplog entry in OplogBatcher",
+                  "oplogEntry"_attr = entry.toBSONForLogging());
+        }
 
         // Check for oplog version change.
         if (entry.getVersion() != OplogEntry::kOplogVersion) {
@@ -243,9 +234,9 @@ StatusWith<std::vector<OplogEntry>> OplogBatcher::getNextApplierBatch(
                         "totalBytes"_attr = totalBytes);
             try {
                 _oplogBuffer->waitForDataUntil(batchDeadline, opCtx);
-            } catch (const ExceptionForCat<ErrorCategory::Interruption>& e) {
+            } catch (const ExceptionForCat<ErrorCategory::CancellationError>& e) {
                 LOGV2(6572300,
-                      "Interrupted in oplog batching; returning current partial batch.",
+                      "Cancelled in oplog batching; returning current partial batch.",
                       "error"_attr = e);
             }
         }
@@ -300,7 +291,7 @@ void OplogBatcher::_run(StorageInterface* storageInterface) {
             // We do not want to serialize the OplogBatcher with oplog application, nor
             // do we want to take a WiredTiger read ticket.
             ShouldNotConflictWithSecondaryBatchApplicationBlock noConflict(opCtx->lockState());
-            opCtx->lockState()->skipAcquireTicket();
+            opCtx->lockState()->setAdmissionPriority(AdmissionContext::Priority::kImmediate);
 
             // During storage change operations, we may shut down storage under a global lock
             // and wait for any storage-using opCtxs to exit.  This results in a deadlock with
@@ -314,7 +305,7 @@ void OplogBatcher::_run(StorageInterface* storageInterface) {
             // UninterruptibleLockGuard in batch application because the only cause of
             // interruption would be shutdown, and the ReplBatcher thread has its own shutdown
             // handling.
-            UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+            UninterruptibleLockGuard noInterrupt(opCtx->lockState());  // NOLINT.
 
             // Locks the oplog to check its max size, do this in the UninterruptibleLockGuard.
             batchLimits.bytes = getBatchLimitOplogBytes(opCtx.get(), storageInterface);
@@ -325,10 +316,10 @@ void OplogBatcher::_run(StorageInterface* storageInterface) {
             for (const auto& oplogEntry : oplogEntries) {
                 ops.emplace_back(oplogEntry);
             }
-        } catch (const ExceptionForCat<ErrorCategory::Interruption>& e) {
+        } catch (const ExceptionForCat<ErrorCategory::CancellationError>& e) {
             LOGV2_DEBUG(6133400,
                         1,
-                        "Interrupted getting the global lock in Repl Batcher",
+                        "Cancelled getting the global lock in Repl Batcher",
                         "error"_attr = e.toStatus());
             invariant(ops.empty());
         }
@@ -360,7 +351,9 @@ void OplogBatcher::_run(StorageInterface* storageInterface) {
             // Draining state guarantees the producer has already been fully stopped and no more
             // operations will be pushed in to the oplog buffer until the applier state changes.
             auto isDraining =
-                replCoord->getApplierState() == ReplicationCoordinator::ApplierState::Draining;
+                replCoord->getApplierState() == ReplicationCoordinator::ApplierState::Draining ||
+                replCoord->getApplierState() ==
+                    ReplicationCoordinator::ApplierState::DrainingForShardSplit;
 
             // Check the oplog buffer after the applier state to ensure the producer is stopped.
             if (isDraining && _oplogBuffer->isEmpty()) {

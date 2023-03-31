@@ -28,14 +28,10 @@
  */
 
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
-#include "mongo/db/s/dist_lock_manager.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
 
@@ -58,7 +54,7 @@ public:
 
             uassert(ErrorCodes::IllegalOperation,
                     "_configsvrClearJumboFlag can only be run on config servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
 
@@ -67,15 +63,7 @@ public:
             repl::ReadConcernArgs::get(opCtx) =
                 repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
 
-            const auto catalogClient = Grid::get(opCtx)->catalogClient();
-
-            // Acquire distlocks on the namespace's database and collection.
-            DistLockManager::ScopedDistLock dbDistLock(
-                uassertStatusOK(DistLockManager::get(opCtx)->lock(
-                    opCtx, nss.db(), "clearJumboFlag", DistLockManager::kDefaultLockTimeout)));
-            DistLockManager::ScopedDistLock collDistLock(
-                uassertStatusOK(DistLockManager::get(opCtx)->lock(
-                    opCtx, nss.ns(), "clearJumboFlag", DistLockManager::kDefaultLockTimeout)));
+            const auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
 
             CollectionType collType;
             try {

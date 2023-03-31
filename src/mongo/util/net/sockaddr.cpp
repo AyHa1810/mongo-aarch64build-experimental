@@ -40,7 +40,7 @@
 
 #if !defined(_WIN32)
 #include <arpa/inet.h>
-#include <errno.h>
+#include <cerrno>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -291,6 +291,16 @@ unsigned SockAddr::getPort() const {
         default:
             massert(SOCK_FAMILY_UNKNOWN_ERROR, "unsupported address family", false);
             return 0;
+    }
+}
+
+void SockAddr::setPort(int port) {
+    if (auto type = getType(); type == AF_INET) {
+        as<sockaddr_in>().sin_port = htons(port);
+    } else if (type == AF_INET6) {
+        as<sockaddr_in6>().sin6_port = htons(port);
+    } else {
+        massert(SOCK_FAMILY_UNKNOWN_ERROR, "unsupported address family", false);
     }
 }
 

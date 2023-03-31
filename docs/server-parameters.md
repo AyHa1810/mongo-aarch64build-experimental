@@ -73,6 +73,8 @@ server_parameters:
       expr: # C++ bool expression, runtime evaled
       constexpr: # C++ bool expression, compile-time eval
       preprocessor: # C preprocessor condition
+      min_fcv: # string
+      feature_flag: # string
     validator: # Map containing one or more of the below
       lt: # string or expression map
       gt: # string or expression map
@@ -120,16 +122,24 @@ storage. Reading or writing a setting using this name will result in a warning i
 * `on_update`: C++ callback invoked after all validation rules have completed successfully and the 
 new value has been stored. Prototype: `Status(const cpp_vartype&);`
 
-* `condition`: Up to three conditional rules for deciding whether or not to apply this server 
+* `condition`: Up to five conditional rules for deciding whether or not to apply this server 
 parameter. `preprocessor` will be evaluated first, followed by `constexpr`, then finally `expr`. If 
-no provided setting evaluates to `false`, the server parameter will be registered.
+no provided setting evaluates to `false`, the server parameter will be registered. `feature_flag` and
+`min_fcv` are evaluated after the parameter is registered, and instead affect whether the parameter
+is enabled. `min_fcv` is a string of the form `X.Y`, representing the minimum FCV version for which
+this parameter should be enabled. `feature_flag` is the name of a feature flag variable upon which
+this server parameter depends -- if the feature flag is disabled, this parameter will be disabled.
+`feature_flag` should be removed when all other instances of that feature flag are deleted, which
+typically is done after the next LTS version of the server is branched. `min_fcv` should be removed
+after it is no longer possible to downgrade to a FCV lower than that version - this occurs when the
+next LTS version of the server is branched.
 
 * `validator`: Zero or many validation rules to impose on the setting. All specified rules must pass 
 to consider the new setting valid. `lt`, `gt`, `lte`, `gte` fields provide for simple numeric limits 
 or expression maps which evaluate to numeric values. For all other validation cases, specify 
 callback as a C++ function or static method. Note that validation rules (including callback) may run 
 in any order. To perform an action after all validation rules have completed, `on_update` should be 
-preferred instead. Callback prototype: `Status(const cpp_vartype&);`
+preferred instead. Callback prototype: `Status(const cpp_vartype&, const boost::optional<TenantId>&);`
 
 Any symbols such as global variables or callbacks used by a server parameter must be imported using 
 the usual IDL machinery via `globals.cpp_includes`. Similarly, all generated code will be nested 
@@ -168,7 +178,7 @@ to any other work, this custom constructor must invoke its parent's constructor.
 
 `override_set`: If `true`, the implementer must provide a `set` member function as:
 ```cpp
-Status {name}::set(const BSONElement& val);
+Status {name}::set(const BSONElement& val, const boost::optional<TenantId>& tenantId);
 ```
 Otherwise the base class implementation `ServerParameter::set` is used. It
 invokes `setFromString` using a string representation of `val`, if the `val` is
@@ -176,7 +186,7 @@ holding one of the supported types.
 
 `override_validate`: If `true`, the implementer must provide a `validate` member function as:
 ```cpp
-Status {name}::validate(const BSONElement& newValueElement);
+Status {name}::validate(const BSONElement& newValueElement, const boost::optional<TenantId>& tenantId);
 ```
 Otherwise, the base class implementation `ServerParameter::validate` is used. This simply returns
 `Status::OK()` without performing any kind of validation of the new BSON element.
@@ -186,13 +196,17 @@ injects a placeholder value. If `param.redact` was not specified as `true`, then
 must be provided with the following signature: 
 
 ```cpp
-Status {name}::append(OperationContext*, BSONObjBuidler&, const std::string&);
+Status {name}::append(OperationContext*, BSONObjBuilder*, StringData, const boost::optional<TenantId>& tenantId);
 ```
 
 Lastly, a `setFromString` method must always be provided with the following signature:
 ```cpp
-Status {name}::setFromString(const std::string& value);
+Status {name}::setFromString(StringData value, const boost::optional<TenantId>& tenantId);
 ```
+
+Note that by default, server parameters are not tenant aware and thus will always have `boost::none`
+provided as `tenantId`, unless defined as cluster server parameters (discussed
+[below](#cluster-server-parameters)).
 
 Each server parameter encountered will produce a block of code to run at process startup similar to 
 the following:
@@ -274,6 +288,23 @@ during runtime.
 the current version of the cluster server parameter.
 * `reset()` must be implemented and should update the cluster server parameter back to its default
 value.  
+
+All cluster server parameters are tenant-aware, meaning that on serverless clusters, each tenant has
+an isolated set of parameters. The `setClusterParameter` and `getClusterParameter` commands will pass
+the `tenantId` on the command request to the `ServerParameter`'s methods. On dedicated
+(non-serverless) clusters, `boost::none` will be passed. IDL-defined cluster server parameters will
+handle the passed-in `tenantId` automatically and store separate parameter values per-tenant.
+Specialized server parameters will have to take care to correctly handle the passed-in `tenantId` and
+to enforce tenant isolation.
+
+Like normal server parameters, cluster server parameters can be defined to be dependent on a minimum
+FCV version or a specific feature flag using the `condition: min_fcv/feature_flag:` syntax discussed
+above. During FCV downgrade, the cluster parameter's stored on-disk value will be deleted if either:
+(1) The downgraded FCV is lower than the cluster parameter's `min_fcv`, or (2) The cluster
+parameter's `feature_flag` is disabled on the downgraded FCV. While a cluster server parameter is
+disabled due to either of these conditions, `setClusterParameter` on it will always fail, and
+`getClusterParameter` will fail on `mongod`, and return the default value on `mongos` -- this
+difference in behavior is due to `mongos` being unaware of the current FCV.
 
 See [server_parameter_specialized_test.idl][specialized-cluster-server-param-test-idl] and 
 [server_parameter_specialized_test.h][specialized-cluster-server-param-test-data] for examples.

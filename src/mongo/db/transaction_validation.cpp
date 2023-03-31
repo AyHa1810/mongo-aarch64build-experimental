@@ -36,7 +36,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/commands/txn_two_phase_commit_cmds_gen.h"
-#include "mongo/db/logical_session_id.h"
+#include "mongo/db/session/logical_session_id.h"
 #include "mongo/db/write_concern_options.h"
 
 namespace mongo {
@@ -107,4 +107,17 @@ void validateSessionOptions(const OperationSessionInfoFromClient& sessionOptions
     }
 }
 
+void doTransactionValidationForWrites(OperationContext* opCtx, const NamespaceString& ns) {
+    if (!opCtx->inMultiDocumentTransaction())
+        return;
+    uassert(50791,
+            str::stream() << "Cannot write to system collection " << ns.toString()
+                          << " within a transaction.",
+            !ns.isSystem() || ns.isPrivilegeCollection() || ns.isTimeseriesBucketsCollection());
+    const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    uassert(50790,
+            str::stream() << "Cannot write to unreplicated collection " << ns.toString()
+                          << " within a transaction.",
+            !replCoord->isOplogDisabledFor(opCtx, ns));
+}
 }  // namespace mongo

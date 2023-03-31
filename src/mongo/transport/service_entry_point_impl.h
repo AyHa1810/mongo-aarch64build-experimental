@@ -36,6 +36,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/logv2/log_severity_suppressor.h"
 #include "mongo/stdx/variant.h"
 #include "mongo/transport/service_entry_point.h"
 #include "mongo/transport/session.h"
@@ -54,13 +55,15 @@ class ServiceContext;
  */
 class ServiceEntryPointImpl : public ServiceEntryPoint {
 public:
+    static constexpr Seconds kSlowSessionWorkflowLogSuppresionPeriod{5};
+
     explicit ServiceEntryPointImpl(ServiceContext* svcCtx);
     ~ServiceEntryPointImpl();
 
     ServiceEntryPointImpl(const ServiceEntryPointImpl&) = delete;
     ServiceEntryPointImpl& operator=(const ServiceEntryPointImpl&) = delete;
 
-    void startSession(transport::SessionHandle session) override;
+    void startSession(std::shared_ptr<transport::Session> session) override;
 
     void endAllSessions(transport::Session::TagMask tags) final;
     void endAllSessionsNoTagMask();
@@ -76,10 +79,17 @@ public:
 
     size_t maxOpenSessions() const final;
 
+    logv2::LogSeverity slowSessionWorkflowLogSeverity() final;
+
     void onClientDisconnect(Client* client) final;
 
     /** `onClientDisconnect` calls this before doing anything else. */
     virtual void derivedOnClientDisconnect(Client* client) {}
+
+protected:
+    /** Imbue the new Client with a ServiceExecutorContext. */
+    virtual void configureServiceExecutorContext(ServiceContext::UniqueClient& client,
+                                                 bool isPrivilegedSession);
 
 private:
     class Sessions;
@@ -87,14 +97,20 @@ private:
     ServiceContext* const _svcCtx;
 
     const size_t _maxSessions;
+    size_t _rejectedSessions;
 
     std::unique_ptr<Sessions> _sessions;
+
+    logv2::SeveritySuppressor _slowSessionWorkflowLogSuppressor{
+        kSlowSessionWorkflowLogSuppresionPeriod,
+        logv2::LogSeverity::Info(),
+        logv2::LogSeverity::Debug(2)};
 };
 
 /*
  * Returns true if a session with remote/local addresses should be exempted from maxConns
  */
-bool shouldOverrideMaxConns(const transport::SessionHandle& session,
+bool shouldOverrideMaxConns(const std::shared_ptr<transport::Session>& session,
                             const std::vector<stdx::variant<CIDR, std::string>>& exemptions);
 
 }  // namespace mongo

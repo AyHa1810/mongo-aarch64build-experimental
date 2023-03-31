@@ -61,7 +61,8 @@ bool SetClusterParameterCoordinator::hasSameOptions(const BSONObj& otherDocBSON)
     const auto otherDoc =
         StateDoc::parse(IDLParserContext("SetClusterParameterCoordinatorDocument"), otherDocBSON);
     return SimpleBSONObjComparator::kInstance.evaluate(_doc.getParameter() ==
-                                                       otherDoc.getParameter());
+                                                       otherDoc.getParameter()) &&
+        _doc.getTenantId() == otherDoc.getTenantId();
 }
 
 boost::optional<BSONObj> SetClusterParameterCoordinator::reportForCurrentOp(
@@ -74,6 +75,10 @@ boost::optional<BSONObj> SetClusterParameterCoordinator::reportForCurrentOp(
     bob.append("type", "op");
     bob.append("desc", "SetClusterParameterCoordinator");
     bob.append("op", "command");
+    auto tenantId = _doc.getTenantId();
+    if (tenantId.is_initialized()) {
+        bob.append("tenantId", tenantId->toString());
+    }
     bob.append("currentPhase", _doc.getPhase());
     bob.append("command", cmdBob.obj());
     bob.append("active", true);
@@ -117,16 +122,15 @@ bool SetClusterParameterCoordinator::_isClusterParameterSetAtTimestamp(Operation
     auto parameterElem = _doc.getParameter().firstElement();
     auto parameterName = parameterElem.fieldName();
     auto parameter = _doc.getParameter()[parameterName].Obj();
-    auto configsvrParameters =
-        uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
-            opCtx,
-            ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-            repl::ReadConcernLevel::kMajorityReadConcern,
-            NamespaceString::kClusterParametersNamespace,
-            BSON("_id" << parameterName << "clusterParameterTime"
-                       << *_doc.getClusterParameterTime()),
-            BSONObj(),
-            boost::none));
+    const auto& configShard = ShardingCatalogManager::get(opCtx)->localConfigShard();
+    auto configsvrParameters = uassertStatusOK(configShard->exhaustiveFindOnConfig(
+        opCtx,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+        repl::ReadConcernLevel::kMajorityReadConcern,
+        NamespaceString::makeClusterParametersNSS(_doc.getTenantId()),
+        BSON("_id" << parameterName << "clusterParameterTime" << *_doc.getClusterParameterTime()),
+        BSONObj(),
+        boost::none));
 
     dassert(configsvrParameters.docs.size() <= 1);
 
@@ -142,11 +146,11 @@ void SetClusterParameterCoordinator::_sendSetClusterParameterToAllShards(
     LOGV2_DEBUG(6387001, 1, "Sending setClusterParameter to shards:", "shards"_attr = shards);
 
     ShardsvrSetClusterParameter request(_doc.getParameter());
-    request.setDbName(NamespaceString::kAdminDb);
+    request.setDbName(DatabaseName(_doc.getTenantId(), DatabaseName::kAdmin.db()));
     request.setClusterParameterTime(*_doc.getClusterParameterTime());
     sharding_util::sendCommandToShards(
         opCtx,
-        NamespaceString::kAdminDb,
+        DatabaseName::kAdmin.db(),
         CommandHelpers::appendMajorityWriteConcern(request.toBSON(session.toBSON())),
         shards,
         **executor);
@@ -156,7 +160,8 @@ void SetClusterParameterCoordinator::_commit(OperationContext* opCtx) {
     LOGV2_DEBUG(6387002, 1, "Updating configsvr cluster parameter");
 
     SetClusterParameter setClusterParameterRequest(_doc.getParameter());
-    setClusterParameterRequest.setDbName(NamespaceString::kAdminDb);
+    setClusterParameterRequest.setDbName(
+        DatabaseName(_doc.getTenantId(), DatabaseName::kAdmin.db()));
     std::unique_ptr<ServerParameterService> parameterService =
         std::make_unique<ClusterParameterService>();
     DBDirectClient client(opCtx);
@@ -188,17 +193,20 @@ ExecutorFuture<void> SetClusterParameterCoordinator::_runImpl(
                 _doc.setClusterParameterTime(clusterParameterTime.asTimestamp());
             }
         })
-        .then(_executePhase(
+        .then(_buildPhaseHandler(
             Phase::kSetClusterParameter, [this, executor = executor, anchor = shared_from_this()] {
                 auto opCtxHolder = cc().makeOperationContext();
                 auto* opCtx = opCtxHolder.get();
 
+                auto catalogManager = ShardingCatalogManager::get(opCtx);
                 ShardingLogging::get(opCtx)->logChange(
                     opCtx,
                     "setClusterParameter.start",
                     NamespaceString::kClusterParametersNamespace.toString(),
                     _doc.getParameter(),
-                    kMajorityWriteConcern);
+                    kMajorityWriteConcern,
+                    catalogManager->localConfigShard(),
+                    catalogManager->localCatalogClient());
 
                 // If the parameter was already set on the config server, there is
                 // nothing else to do.
@@ -215,7 +223,7 @@ ExecutorFuture<void> SetClusterParameterCoordinator::_runImpl(
                     // persisted the cluster parameter on the configsvr so that new
                     // shards that get added will see the new cluster parameter.
                     Lock::SharedLock stableTopologyRegion =
-                        ShardingCatalogManager::get(opCtx)->enterStableTopologyRegion(opCtx);
+                        catalogManager->enterStableTopologyRegion(opCtx);
 
                     _sendSetClusterParameterToAllShards(opCtx, session, executor);
 
@@ -227,7 +235,9 @@ ExecutorFuture<void> SetClusterParameterCoordinator::_runImpl(
                     "setClusterParameter.end",
                     NamespaceString::kClusterParametersNamespace.toString(),
                     _doc.getParameter(),
-                    kMajorityWriteConcern);
+                    kMajorityWriteConcern,
+                    catalogManager->localConfigShard(),
+                    catalogManager->localCatalogClient());
             }));
 }
 

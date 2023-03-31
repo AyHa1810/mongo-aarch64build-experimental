@@ -29,8 +29,9 @@
 
 from __future__ import annotations
 from dataclasses import asdict, dataclass
-import json
 from typing import Sequence
+import bson.json_util as json
+from bson.objectid import ObjectId
 from data_generator import CollectionInfo
 from database_instance import DatabaseInstance, Pipeline
 from config import WorkloadExecutionConfig, WriteMode
@@ -43,7 +44,9 @@ class Query:
     """Query pipleline and related model input parameters."""
 
     pipeline: Pipeline
-    keys_length_in_bytes: int
+    keys_length_in_bytes: int = 0
+    number_of_fields: int = 0
+    note: any = None
 
 
 @dataclass
@@ -52,6 +55,8 @@ class QueryParameters:
 
     keys_length_in_bytes: int
     average_document_size_in_bytes: float
+    note: any
+    number_of_fields: int = 0
 
     def to_json(self) -> str:
         """Serialize the parameters to JSON."""
@@ -63,22 +68,16 @@ class QueryParameters:
         return QueryParameters(**json.loads(json_str))
 
 
-def execute(database: DatabaseInstance, config: WorkloadExecutionConfig,
-            collection_infos: Sequence[CollectionInfo], queries: Sequence[Query]):
+async def execute(database: DatabaseInstance, config: WorkloadExecutionConfig,
+                  collection_infos: Sequence[CollectionInfo], queries: Sequence[Query]):
     """Run the given queries and write the collected explain into collection."""
     if not config.enabled:
         return
 
     collector = WorkloadExecution(database, config)
-    # run with indexes enabled
-    for coll_info in collection_infos:
-        database.unhide_all_indexes(coll_info.name)
-    collector.collect(collection_infos, queries)
-
-    # run with indexes disabled
-    for coll_info in collection_infos:
-        database.hide_all_indexes(coll_info.name)
-    collector.collect(collection_infos, queries)
+    await collector.async_init()
+    print('>>> running queries')
+    await collector.collect(collection_infos, queries)
 
 
 class WorkloadExecution:
@@ -88,34 +87,41 @@ class WorkloadExecution:
         self.database = database
         self.config = config
 
-        self.database.enable_sbe(True)
-        self.database.enable_cascades(True)
+    async def async_init(self):
+        """Initialize the database settings."""
+        await self.database.enable_sbe(True)
+        await self.database.enable_cascades(True)
 
         if self.config.write_mode == WriteMode.REPLACE:
-            self.database.drop_collection(self.config.output_collection_name)
+            await self.database.drop_collection(self.config.output_collection_name)
 
-    def collect(self, collection_infos: Sequence[CollectionInfo], queries: Sequence[Query]):
+    async def collect(self, collection_infos: Sequence[CollectionInfo], queries: Sequence[Query]):
         """Run the given piplelines on the given collection to generate and collect execution statistics."""
         measurements = []
 
         for coll_info in collection_infos:
+            print(f'\n>>>>> running queries on collection {coll_info.name}')
             for query in queries:
-                self._run_query(coll_info, query, measurements)
+                print(f'>>>>>>> running query {query.pipeline}')
+                await self._run_query(coll_info, query, measurements)
 
-        self.database.insert_many(self.config.output_collection_name, measurements)
+        await self.database.insert_many(self.config.output_collection_name, measurements)
 
-    def _run_query(self, coll_info: CollectionInfo, query: Query, result: Sequence):
+    async def _run_query(self, coll_info: CollectionInfo, query: Query, result: Sequence):
         # warm up
         for _ in range(self.config.warmup_runs):
-            self.database.explain(coll_info.name, query.pipeline)
+            await self.database.explain(coll_info.name, query.pipeline)
 
-        avg_doc_size = self.database.get_average_document_size(coll_info.name)
+        run_id = ObjectId()
+        avg_doc_size = await self.database.get_average_document_size(coll_info.name)
         parameters = QueryParameters(keys_length_in_bytes=query.keys_length_in_bytes,
-                                     average_document_size_in_bytes=avg_doc_size)
+                                     number_of_fields=query.number_of_fields,
+                                     average_document_size_in_bytes=avg_doc_size, note=query.note)
         for _ in range(self.config.runs):
-            explain = self.database.explain(coll_info.name, query.pipeline)
+            explain = await self.database.explain(coll_info.name, query.pipeline)
             if explain['ok'] == 1:
                 result.append({
-                    'collection': coll_info.name, 'pipeline': json.dumps(query.pipeline),
-                    'explain': json.dumps(explain), 'query_parameters': parameters.to_json()
+                    'run_id': run_id, 'collection': coll_info.name,
+                    'pipeline': json.dumps(query.pipeline), 'explain': json.dumps(explain),
+                    'query_parameters': parameters.to_json()
                 })

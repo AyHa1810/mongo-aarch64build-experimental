@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <algorithm>
 #include <boost/optional.hpp>
 #include <memory>
@@ -36,6 +34,7 @@
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/db/catalog/clustered_collection_util.h"
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_catalog.h"
@@ -61,10 +60,9 @@
 #include "mongo/util/fail_point.h"
 #include "mongo/util/str.h"
 
+namespace mongo {
+namespace repl {
 namespace {
-
-using namespace mongo;
-using namespace mongo::repl;
 
 const auto kIndexVersion = IndexDescriptor::IndexVersion::kV2;
 
@@ -80,9 +78,10 @@ BSONObj makeIdIndexSpec(const NamespaceString& nss) {
  */
 template <typename T>
 NamespaceString makeNamespace(const T& t, const std::string& suffix = "") {
-    return NamespaceString(std::string("local." + t.getSuiteName() + "_" + t.getTestName())
-                               .substr(0, NamespaceString::MaxNsCollectionLen - suffix.length()) +
-                           suffix);
+    return NamespaceString::createNamespaceString_forTest(
+        std::string("local." + t.getSuiteName() + "_" + t.getTestName())
+            .substr(0, NamespaceString::MaxNsCollectionLen - suffix.length()) +
+        suffix);
 }
 
 /**
@@ -151,7 +150,7 @@ int _createIndexOnEmptyCollection(OperationContext* opCtx, NamespaceString nss, 
             .getStatus());
     wunit.commit();
 
-    return indexCatalog->numIndexesReady(opCtx);
+    return indexCatalog->numIndexesReady();
 }
 
 /**
@@ -165,16 +164,12 @@ TimestampedBSONObj makeOplogEntry(OpTime opTime) {
 }
 
 /**
- * Counts the number of keys in an index using an IndexAccessMethod::validate call.
+ * Counts the number of keys in an index.
  */
 int64_t getIndexKeyCount(OperationContext* opCtx,
                          const IndexCatalog* cat,
                          const IndexDescriptor* desc) {
-    auto idx = cat->getEntry(desc)->accessMethod();
-    int64_t numKeys;
-    IndexValidateResults fullRes;
-    idx->validate(opCtx, &numKeys, &fullRes);
-    return numKeys;
+    return cat->getEntry(desc)->accessMethod()->numKeys(opCtx);
 }
 
 std::vector<InsertStatement> transformInserts(std::vector<BSONObj> docs) {
@@ -264,7 +259,9 @@ TEST_F(StorageInterfaceImplTest, InitializeRollbackIDReturnsNamespaceExistsOnExi
     StorageInterfaceImpl storage;
     auto opCtx = getOperationContext();
 
-    createCollection(opCtx, NamespaceString(StorageInterfaceImpl::kDefaultRollbackIdNamespace));
+    createCollection(opCtx,
+                     NamespaceString::createNamespaceString_forTest(
+                         StorageInterfaceImpl::kDefaultRollbackIdNamespace));
     ASSERT_EQUALS(ErrorCodes::NamespaceExists, storage.initializeRollbackID(opCtx));
 }
 
@@ -306,7 +303,8 @@ void _assertDocumentsInCollectionEquals(OperationContext* opCtx,
 void _assertRollbackIDDocument(OperationContext* opCtx, int id) {
     _assertDocumentsInCollectionEquals(
         opCtx,
-        NamespaceString(StorageInterfaceImpl::kDefaultRollbackIdNamespace),
+        NamespaceString::createNamespaceString_forTest(
+            StorageInterfaceImpl::kDefaultRollbackIdNamespace),
         {BSON("_id" << StorageInterfaceImpl::kRollbackIdDocumentId
                     << StorageInterfaceImpl::kRollbackIdFieldName << id)});
 }
@@ -339,7 +337,8 @@ TEST_F(StorageInterfaceImplTest, RollbackIdInitializesIncrementsAndReadsProperly
 TEST_F(StorageInterfaceImplTest, IncrementRollbackIDRollsToOneWhenExceedingMaxInt) {
     StorageInterfaceImpl storage;
     auto opCtx = getOperationContext();
-    NamespaceString nss(StorageInterfaceImpl::kDefaultRollbackIdNamespace);
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest(
+        StorageInterfaceImpl::kDefaultRollbackIdNamespace);
     createCollection(opCtx, nss);
     TimestampedBSONObj maxDoc = {BSON("_id" << StorageInterfaceImpl::kRollbackIdDocumentId
                                             << StorageInterfaceImpl::kRollbackIdFieldName
@@ -367,7 +366,8 @@ TEST_F(StorageInterfaceImplTest, IncrementRollbackIDRollsToOneWhenExceedingMaxIn
 TEST_F(StorageInterfaceImplTest, GetRollbackIDReturnsBadStatusIfDocumentHasBadField) {
     StorageInterfaceImpl storage;
     auto opCtx = getOperationContext();
-    NamespaceString nss(StorageInterfaceImpl::kDefaultRollbackIdNamespace);
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest(
+        StorageInterfaceImpl::kDefaultRollbackIdNamespace);
 
     createCollection(opCtx, nss);
 
@@ -382,7 +382,8 @@ TEST_F(StorageInterfaceImplTest, GetRollbackIDReturnsBadStatusIfDocumentHasBadFi
 TEST_F(StorageInterfaceImplTest, GetRollbackIDReturnsBadStatusIfRollbackIDIsNotInt) {
     StorageInterfaceImpl storage;
     auto opCtx = getOperationContext();
-    NamespaceString nss(StorageInterfaceImpl::kDefaultRollbackIdNamespace);
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest(
+        StorageInterfaceImpl::kDefaultRollbackIdNamespace);
 
     createCollection(opCtx, nss);
 
@@ -446,8 +447,8 @@ TEST_F(StorageInterfaceImplTest,
         AutoGetCollection autoCollection(opCtx, nss, MODE_IX);
         WriteUnitOfWork wunit(opCtx);
         ASSERT_EQUALS(ErrorCodes::OperationCannotBeBatched,
-                      autoCollection.getCollection()->insertDocuments(
-                          opCtx, docs.cbegin(), docs.cend(), nullptr, false));
+                      collection_internal::insertDocuments(
+                          opCtx, *autoCollection, docs.cbegin(), docs.cend(), nullptr, false));
     }
     ASSERT_OK(storage.insertDocuments(opCtx, nss, docs));
 
@@ -567,17 +568,19 @@ TEST_F(StorageInterfaceImplTest, InsertMissingDocFailesIfCollectionIsMissing) {
 
 TEST_F(StorageInterfaceImplTest, CreateCollectionWithIDIndexCommits) {
     auto opCtx = getOperationContext();
-    StorageInterfaceImpl storage;
     auto nss = makeNamespace(_agent);
-    CollectionOptions opts = generateOptionsWithUuid();
-    std::vector<BSONObj> indexes;
-    auto loaderStatus =
-        storage.createCollectionForBulkLoading(nss, opts, makeIdIndexSpec(nss), indexes);
-    ASSERT_OK(loaderStatus.getStatus());
-    auto loader = std::move(loaderStatus.getValue());
-    std::vector<BSONObj> docs = {BSON("_id" << 1), BSON("_id" << 1), BSON("_id" << 2)};
-    ASSERT_OK(loader->insertDocuments(docs.begin(), docs.end()));
-    ASSERT_OK(loader->commit());
+    {
+        StorageInterfaceImpl storage;
+        CollectionOptions opts = generateOptionsWithUuid();
+        std::vector<BSONObj> indexes;
+        auto loaderStatus =
+            storage.createCollectionForBulkLoading(nss, opts, makeIdIndexSpec(nss), indexes);
+        ASSERT_OK(loaderStatus.getStatus());
+        auto loader = std::move(loaderStatus.getValue());
+        std::vector<BSONObj> docs = {BSON("_id" << 1), BSON("_id" << 1), BSON("_id" << 2)};
+        ASSERT_OK(loader->insertDocuments(docs.begin(), docs.end()));
+        ASSERT_OK(loader->commit());
+    }
 
     AutoGetCollectionForReadCommand coll(opCtx, nss);
     ASSERT(coll);
@@ -616,7 +619,7 @@ void _testDestroyUncommitedCollectionBulkLoader(
     // IndexCatalog::numIndexesTotal() includes unfinished indexes. We need to ensure that
     // the bulk loader drops the unfinished indexes.
     auto collIdxCat = coll->getIndexCatalog();
-    ASSERT_EQUALS(0, collIdxCat->numIndexesTotal(opCtx));
+    ASSERT_EQUALS(0, collIdxCat->numIndexesTotal());
 }
 
 TEST_F(StorageInterfaceImplTest, DestroyingUncommittedCollectionBulkLoaderDropsIndexes) {
@@ -657,7 +660,7 @@ TEST_F(StorageInterfaceImplTest,
 TEST_F(StorageInterfaceImplTest, CreateCollectionThatAlreadyExistsFails) {
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
-    NamespaceString nss("test.foo");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.foo");
     createCollection(opCtx, nss);
 
     const CollectionOptions opts = generateOptionsWithUuid();
@@ -670,7 +673,7 @@ TEST_F(StorageInterfaceImplTest, CreateCollectionThatAlreadyExistsFails) {
 TEST_F(StorageInterfaceImplTest, CreateOplogCreateCappedCollection) {
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
-    NamespaceString nss("local.oplog.X");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("local.oplog.X");
     {
         AutoGetCollectionForReadCommand autoColl(opCtx, nss);
         ASSERT_FALSE(autoColl.getCollection());
@@ -688,7 +691,7 @@ TEST_F(StorageInterfaceImplTest,
        CreateCollectionReturnsUserExceptionAsStatusIfCollectionCreationThrows) {
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
-    NamespaceString nss("local.oplog.Y");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("local.oplog.Y");
     {
         AutoGetCollectionForReadCommand autoColl(opCtx, nss);
         ASSERT_FALSE(autoColl.getCollection());
@@ -751,7 +754,7 @@ TEST_F(StorageInterfaceImplTest, DropCollectionWorksWithMissingCollection) {
 }
 
 TEST_F(StorageInterfaceImplTest, DropCollectionWorksWithSystemCollection) {
-    NamespaceString nss("local.system.mysyscoll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("local.system.mysyscoll");
     ASSERT_TRUE(nss.isSystem());
 
     // If we can create a system collection using the StorageInterface, we should be able to drop it
@@ -770,7 +773,7 @@ TEST_F(StorageInterfaceImplTest, RenameCollectionWorksWhenCollectionExists) {
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
     auto nss = makeNamespace(_agent);
-    auto toNss = NamespaceString("local.toNs");
+    auto toNss = NamespaceString::createNamespaceString_forTest("local.toNs");
     createCollection(opCtx, nss);
 
     ASSERT_OK(storage.renameCollection(opCtx, nss, toNss, false));
@@ -786,7 +789,7 @@ TEST_F(StorageInterfaceImplTest, RenameCollectionWithStayTempFalseMakesItNotTemp
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
     auto nss = makeNamespace(_agent);
-    auto toNss = NamespaceString("local.toNs");
+    auto toNss = NamespaceString::createNamespaceString_forTest("local.toNs");
     CollectionOptions opts = generateOptionsWithUuid();
     opts.temp = true;
     createCollection(opCtx, nss, opts);
@@ -805,7 +808,7 @@ TEST_F(StorageInterfaceImplTest, RenameCollectionWithStayTempTrueMakesItTemp) {
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
     auto nss = makeNamespace(_agent);
-    auto toNss = NamespaceString("local.toNs");
+    auto toNss = NamespaceString::createNamespaceString_forTest("local.toNs");
     CollectionOptions opts = generateOptionsWithUuid();
     opts.temp = true;
     createCollection(opCtx, nss, opts);
@@ -824,7 +827,7 @@ TEST_F(StorageInterfaceImplTest, RenameCollectionFailsBetweenDatabases) {
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
     auto nss = makeNamespace(_agent);
-    auto toNss = NamespaceString("notLocal.toNs");
+    auto toNss = NamespaceString::createNamespaceString_forTest("notLocal.toNs");
     createCollection(opCtx, nss);
 
     ASSERT_EQ(ErrorCodes::InvalidNamespace, storage.renameCollection(opCtx, nss, toNss, false));
@@ -840,7 +843,7 @@ TEST_F(StorageInterfaceImplTest, RenameCollectionFailsWhenToCollectionAlreadyExi
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
     auto nss = makeNamespace(_agent);
-    auto toNss = NamespaceString("local.toNs");
+    auto toNss = NamespaceString::createNamespaceString_forTest("local.toNs");
     createCollection(opCtx, nss);
     createCollection(opCtx, toNss);
 
@@ -857,7 +860,7 @@ TEST_F(StorageInterfaceImplTest, RenameCollectionFailsWhenFromCollectionDoesNotE
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
     auto nss = makeNamespace(_agent);
-    auto toNss = NamespaceString("local.toNs");
+    auto toNss = NamespaceString::createNamespaceString_forTest("local.toNs");
 
     ASSERT_EQ(ErrorCodes::NamespaceNotFound, storage.renameCollection(opCtx, nss, toNss, false));
 
@@ -907,14 +910,16 @@ TEST_F(StorageInterfaceImplTest, FindDocumentsReturnsIndexOptionsConflictIfIndex
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
     auto nss = makeNamespace(_agent);
-    std::vector<BSONObj> indexes = {BSON("v" << 1 << "key" << BSON("x" << 1) << "name"
-                                             << "x_1"
-                                             << "partialFilterExpression" << BSON("y" << 1))};
-    auto loader = unittest::assertGet(storage.createCollectionForBulkLoading(
-        nss, generateOptionsWithUuid(), makeIdIndexSpec(nss), indexes));
-    std::vector<BSONObj> docs = {BSON("_id" << 1), BSON("_id" << 1), BSON("_id" << 2)};
-    ASSERT_OK(loader->insertDocuments(docs.begin(), docs.end()));
-    ASSERT_OK(loader->commit());
+    {
+        std::vector<BSONObj> indexes = {BSON("v" << 1 << "key" << BSON("x" << 1) << "name"
+                                                 << "x_1"
+                                                 << "partialFilterExpression" << BSON("y" << 1))};
+        auto loader = unittest::assertGet(storage.createCollectionForBulkLoading(
+            nss, generateOptionsWithUuid(), makeIdIndexSpec(nss), indexes));
+        std::vector<BSONObj> docs = {BSON("_id" << 1), BSON("_id" << 1), BSON("_id" << 2)};
+        ASSERT_OK(loader->insertDocuments(docs.begin(), docs.end()));
+        ASSERT_OK(loader->commit());
+    }
     auto indexName = "x_1"_sd;
     ASSERT_EQUALS(ErrorCodes::IndexOptionsConflict,
                   storage
@@ -2338,16 +2343,17 @@ TEST_F(StorageInterfaceImplTest,
 TEST_F(StorageInterfaceImplTest, FindSingletonReturnsNamespaceNotFoundWhenDatabaseDoesNotExist) {
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
-    NamespaceString nss("nosuchdb.coll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("nosuchdb.coll");
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, storage.findSingleton(opCtx, nss).getStatus());
 }
 
 TEST_F(StorageInterfaceImplTest, FindSingletonReturnsNamespaceNotFoundWhenCollectionDoesNotExist) {
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
-    NamespaceString nss("db.coll1");
-    ASSERT_OK(
-        storage.createCollection(opCtx, NamespaceString("db.coll2"), generateOptionsWithUuid()));
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("db.coll1");
+    ASSERT_OK(storage.createCollection(opCtx,
+                                       NamespaceString::createNamespaceString_forTest("db.coll2"),
+                                       generateOptionsWithUuid()));
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, storage.findSingleton(opCtx, nss).getStatus());
 }
 
@@ -2388,7 +2394,7 @@ TEST_F(StorageInterfaceImplTest, FindSingletonReturnsDocumentWhenSingletonDocume
 TEST_F(StorageInterfaceImplTest, PutSingletonReturnsNamespaceNotFoundWhenDatabaseDoesNotExist) {
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
-    NamespaceString nss("nosuchdb.coll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("nosuchdb.coll");
 
     TimestampedBSONObj update;
     update.obj = BSON("$set" << BSON("_id" << 0 << "x" << 1));
@@ -2400,7 +2406,7 @@ TEST_F(StorageInterfaceImplTest, PutSingletonReturnsNamespaceNotFoundWhenDatabas
 TEST_F(StorageInterfaceImplTest, PutSingletonReturnsNamespaceNotFoundWhenCollectionDoesNotExist) {
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
-    NamespaceString nss("db.coll1");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("db.coll1");
     ASSERT_OK(storage.createCollection(opCtx, nss, generateOptionsWithUuid()));
 
     TimestampedBSONObj update;
@@ -2408,7 +2414,8 @@ TEST_F(StorageInterfaceImplTest, PutSingletonReturnsNamespaceNotFoundWhenCollect
     update.timestamp = Timestamp();
 
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound,
-                  storage.putSingleton(opCtx, NamespaceString("db.coll2"), update));
+                  storage.putSingleton(
+                      opCtx, NamespaceString::createNamespaceString_forTest("db.coll2"), update));
 }
 
 TEST_F(StorageInterfaceImplTest, PutSingletonUpsertsDocumentsWhenCollectionIsEmpty) {
@@ -2513,7 +2520,7 @@ TEST_F(StorageInterfaceImplTest, FindByIdThrowsIfUUIDNotInCatalog) {
 TEST_F(StorageInterfaceImplTest, FindByIdReturnsNamespaceNotFoundWhenDatabaseDoesNotExist) {
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
-    NamespaceString nss("nosuchdb.coll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("nosuchdb.coll");
     auto doc = BSON("_id" << 0 << "x" << 0);
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound,
                   storage.findById(opCtx, nss, doc["_id"]).getStatus());
@@ -2605,7 +2612,7 @@ TEST_F(StorageInterfaceImplTest, DeleteByIdThrowsIfUUIDNotInCatalog) {
 TEST_F(StorageInterfaceImplTest, DeleteByIdReturnsNamespaceNotFoundWhenDatabaseDoesNotExist) {
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
-    NamespaceString nss("nosuchdb.coll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("nosuchdb.coll");
     auto doc = BSON("_id" << 0 << "x" << 0);
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound,
                   storage.deleteById(opCtx, nss, doc["_id"]).getStatus());
@@ -2680,7 +2687,7 @@ TEST_F(StorageInterfaceImplTest,
        UpsertSingleDocumentReturnsNamespaceNotFoundWhenDatabaseDoesNotExist) {
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
-    NamespaceString nss("nosuchdb.coll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("nosuchdb.coll");
     auto doc = BSON("_id" << 0 << "x" << 1);
     auto status = storage.upsertById(opCtx, nss, doc["_id"], doc);
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, status);
@@ -2690,7 +2697,7 @@ TEST_F(StorageInterfaceImplTest,
        UpsertSingleDocumentReturnsNamespaceNotFoundWhenCollectionDoesNotExist) {
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
-    NamespaceString nss("mydb.coll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("mydb.coll");
     NamespaceString wrongColl(nss.db(), "wrongColl"_sd);
     ASSERT_OK(storage.createCollection(opCtx, nss, generateOptionsWithUuid()));
     auto doc = BSON("_id" << 0 << "x" << 1);
@@ -2773,7 +2780,8 @@ TEST_F(StorageInterfaceImplTest,
        UpsertSingleDocumentReplacesExistingDocumentInIllegalClientSystemNamespace) {
     // Checks that we can update collections with namespaces not considered "legal client system"
     // namespaces.
-    NamespaceString nss("local.system.rollback.docs");
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest("local.system.rollback.docs");
     ASSERT_FALSE(nss.isLegalClientSystemNS(serverGlobalParams.featureCompatibility));
 
     auto opCtx = getOperationContext();
@@ -2874,7 +2882,7 @@ TEST_F(StorageInterfaceImplTest,
 TEST_F(StorageInterfaceImplTest, DeleteByFilterReturnsNamespaceNotFoundWhenDatabaseDoesNotExist) {
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
-    NamespaceString nss("nosuchdb.coll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("nosuchdb.coll");
     auto filter = BSON("x" << 1);
     auto status = storage.deleteByFilter(opCtx, nss, filter);
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, status);
@@ -2916,7 +2924,7 @@ TEST_F(
     DeleteByFilterReturnsPrimarySteppedDownWhenCurrentMemberStateIsRollbackAndReplicatedWritesAreEnabled) {
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
-    NamespaceString nss("mydb.mycoll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("mydb.mycoll");
     ASSERT_OK(storage.createCollection(opCtx, nss, generateOptionsWithUuid()));
 
     auto doc = BSON("_id" << 0 << "x" << 0);
@@ -2942,7 +2950,7 @@ TEST_F(
     DeleteByFilterReturnsPrimarySteppedDownWhenReplicationCoordinatorCannotAcceptWritesAndReplicatedWritesAreEnabled) {
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
-    NamespaceString nss("mydb.mycoll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("mydb.mycoll");
     ASSERT_OK(storage.createCollection(opCtx, nss, generateOptionsWithUuid()));
 
     auto doc = BSON("_id" << 0 << "x" << 0);
@@ -2966,7 +2974,7 @@ TEST_F(
 TEST_F(StorageInterfaceImplTest, DeleteByFilterReturnsNamespaceNotFoundWhenCollectionDoesNotExist) {
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
-    NamespaceString nss("mydb.coll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("mydb.coll");
     NamespaceString wrongColl(nss.db(), "wrongColl"_sd);
     ASSERT_OK(storage.createCollection(opCtx, nss, generateOptionsWithUuid()));
     auto filter = BSON("x" << 1);
@@ -3065,7 +3073,8 @@ TEST_F(StorageInterfaceImplTest, DeleteByFilterUsesIdHackIfFilterContainsIdField
 TEST_F(StorageInterfaceImplTest, DeleteByFilterRemovesDocumentsInIllegalClientSystemNamespace) {
     // Checks that we can remove documents from collections with namespaces not considered "legal
     // client system" namespaces.
-    NamespaceString nss("local.system.rollback.docs");
+    NamespaceString nss =
+        NamespaceString::createNamespaceString_forTest("local.system.rollback.docs");
     ASSERT_FALSE(nss.isLegalClientSystemNS(serverGlobalParams.featureCompatibility));
 
     auto opCtx = getOperationContext();
@@ -3126,7 +3135,7 @@ TEST_F(StorageInterfaceImplTest,
        GetCollectionCountReturnsNamespaceNotFoundWhenDatabaseDoesNotExist) {
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
-    NamespaceString nss("nosuchdb.coll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("nosuchdb.coll");
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound,
                   storage.getCollectionCount(opCtx, nss).getStatus());
 }
@@ -3170,7 +3179,7 @@ TEST_F(StorageInterfaceImplTest,
        SetCollectionCountReturnsNamespaceNotFoundWhenDatabaseDoesNotExist) {
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
-    NamespaceString nss("nosuchdb.coll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("nosuchdb.coll");
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, storage.setCollectionCount(opCtx, nss, 3));
 }
 
@@ -3305,3 +3314,5 @@ TEST_F(StorageInterfaceImplTest, SetIndexIsMultikeySucceeds) {
 }
 
 }  // namespace
+}  // namespace repl
+}  // namespace mongo

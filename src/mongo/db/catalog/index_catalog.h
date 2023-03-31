@@ -215,7 +215,9 @@ public:
     virtual std::unique_ptr<IndexCatalog> clone() const = 0;
 
     // Must be called before used.
-    virtual Status init(OperationContext* opCtx, Collection* collection) = 0;
+    virtual void init(OperationContext* opCtx,
+                      Collection* collection,
+                      bool isPointInTimeRead = false) = 0;
 
     // ---- accessors -----
 
@@ -223,12 +225,15 @@ public:
 
     virtual bool haveAnyIndexesInProgress() const = 0;
 
-    virtual int numIndexesTotal(OperationContext* opCtx) const = 0;
+    virtual int numIndexesTotal() const = 0;
 
-    virtual int numIndexesReady(OperationContext* opCtx) const = 0;
+    virtual int numIndexesReady() const = 0;
 
-    virtual int numIndexesInProgress(OperationContext* opCtx) const = 0;
+    virtual int numIndexesInProgress() const = 0;
 
+    /**
+     * Returns true if the _id index exists.
+     */
     virtual bool haveIdIndex(OperationContext* opCtx) const = 0;
 
     /**
@@ -277,6 +282,16 @@ public:
         InclusionPolicy inclusionPolicy = InclusionPolicy::kReady) const = 0;
 
     /**
+     * Finds the index with the given ident. The ident uniquely identifies an index.
+     *
+     * Returns nullptr if the index is not found.
+     */
+    virtual const IndexDescriptor* findIndexByIdent(
+        OperationContext* opCtx,
+        StringData ident,
+        InclusionPolicy inclusionPolicy = InclusionPolicy::kReady) const = 0;
+
+    /**
      * Reload the index definition for 'oldDesc' from the CollectionCatalogEntry.  'oldDesc'
      * must be a ready index that is already registered with the index catalog.  Returns an
      * unowned pointer to the descriptor for the new index definition.
@@ -305,6 +320,7 @@ public:
      */
     virtual std::shared_ptr<const IndexCatalogEntry> getEntryShared(
         const IndexDescriptor*) const = 0;
+    virtual std::shared_ptr<IndexCatalogEntry> getEntryShared(const IndexDescriptor*) = 0;
 
     /**
      * Returns a vector of shared pointers to all index entries. Excludes unfinished indexes.
@@ -419,6 +435,16 @@ public:
                              const IndexDescriptor* desc) = 0;
 
     /**
+     * Resets the index given its descriptor.
+     *
+     * This can only be called during startup recovery as it involves recreating the index table to
+     * allow bulk cursors to be used again.
+     */
+    virtual Status resetUnfinishedIndexForRecovery(OperationContext* opCtx,
+                                                   Collection* collection,
+                                                   const IndexDescriptor* desc) = 0;
+
+    /**
      * Drops an unfinished index given its descriptor.
      *
      * The caller must hold the collection X lock.
@@ -472,6 +498,9 @@ public:
     /**
      * Both 'keysInsertedOut' and 'keysDeletedOut' are required and will be set to the number of
      * index keys inserted and deleted by this operation, respectively.
+     * The 'opDiff' argument specifies an optional document containing the differences between
+     * 'oldDoc' and 'newDoc' that can be used to decide which indexes have to be modified. If
+     * set to null, all indexes should be updated.
      *
      * This method may throw.
      */
@@ -479,6 +508,7 @@ public:
                                 const CollectionPtr& coll,
                                 const BSONObj& oldDoc,
                                 const BSONObj& newDoc,
+                                const BSONObj* opDiff,
                                 const RecordId& recordId,
                                 int64_t* keysInsertedOut,
                                 int64_t* keysDeletedOut) const = 0;

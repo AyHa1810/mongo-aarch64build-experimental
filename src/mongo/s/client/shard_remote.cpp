@@ -102,30 +102,7 @@ ShardRemote::ShardRemote(const ShardId& id,
 ShardRemote::~ShardRemote() = default;
 
 bool ShardRemote::isRetriableError(ErrorCodes::Error code, RetryPolicy options) {
-    if (gInternalProhibitShardOperationRetry.loadRelaxed()) {
-        return false;
-    }
-
-    switch (options) {
-        case RetryPolicy::kNoRetry: {
-            return false;
-        } break;
-
-        case RetryPolicy::kIdempotent: {
-            return isMongosRetriableError(code);
-        } break;
-
-        case RetryPolicy::kIdempotentOrCursorInvalidated: {
-            return isRetriableError(code, Shard::RetryPolicy::kIdempotent) ||
-                ErrorCodes::isCursorInvalidatedError(code);
-        } break;
-
-        case RetryPolicy::kNotIdempotent: {
-            return ErrorCodes::isNotPrimaryError(code);
-        } break;
-    }
-
-    MONGO_UNREACHABLE;
+    return remoteIsRetriableError(code, options);
 }
 
 // Any error code changes should possibly also be made to Shard::shouldErrorBePropagated!
@@ -287,8 +264,14 @@ StatusWith<Shard::QueryResponse> ShardRemote::_runExhaustiveCursorCommand(
         getMoreBob->append("collection", data.nss.coll());
     };
 
-    const Milliseconds requestTimeout =
-        std::min(opCtx->getRemainingMaxTimeMillis(), maxTimeMSOverride);
+    const Milliseconds requestTimeout = [&] {
+        auto minMaxTimeMS = std::min(opCtx->getRemainingMaxTimeMillis(), maxTimeMSOverride);
+        if (minMaxTimeMS < Milliseconds::max()) {
+            return minMaxTimeMS;
+        }
+        // The Fetcher expects kNoTimeout when there is no maxTimeMS instead of Milliseconds::max().
+        return RemoteCommandRequest::kNoTimeout;
+    }();
 
     auto executor = Grid::get(opCtx)->getExecutorPool()->getFixedExecutor();
     Fetcher fetcher(executor.get(),
@@ -330,6 +313,17 @@ StatusWith<Shard::QueryResponse> ShardRemote::_runExhaustiveCursorCommand(
     return response;
 }
 
+Milliseconds getExhaustiveFindOnConfigMaxTimeMS(OperationContext* opCtx,
+                                                const NamespaceString& nss) {
+    if (serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
+        // Don't use a timeout on the config server to guarantee it can always refresh.
+        return Milliseconds::max();
+    }
+
+    return std::min(opCtx->getRemainingMaxTimeMillis(),
+                    nss == ChunkType::ConfigNS ? Milliseconds(gFindChunksOnConfigTimeoutMS.load())
+                                               : Shard::kDefaultConfigCommandTimeout);
+}
 
 StatusWith<Shard::QueryResponse> ShardRemote::_exhaustiveFindOnConfig(
     OperationContext* opCtx,
@@ -364,10 +358,7 @@ StatusWith<Shard::QueryResponse> ShardRemote::_exhaustiveFindOnConfig(
         return bob.done().getObjectField(repl::ReadConcernArgs::kReadConcernFieldName).getOwned();
     }();
 
-    const Milliseconds maxTimeMS =
-        std::min(opCtx->getRemainingMaxTimeMillis(),
-                 nss == ChunkType::ConfigNS ? Milliseconds(gFindChunksOnConfigTimeoutMS.load())
-                                            : kDefaultConfigCommandTimeout);
+    const Milliseconds maxTimeMS = getExhaustiveFindOnConfigMaxTimeMS(opCtx, nss);
 
     BSONObjBuilder findCmdBuilder;
 
@@ -513,7 +504,9 @@ StatusWith<ShardRemote::AsyncCmdHandle> ShardRemote::_scheduleCommand(
     const TaskExecutor::RemoteCommandCallbackFn& cb) {
 
     const auto readPrefWithConfigTime = [&]() -> ReadPreferenceSetting {
-        if (isConfig()) {
+        // TODO SERVER-74281: Append this higher up when we know we're targeting the config to read
+        // metadata or use a better filter to avoid matching logical sessions collection.
+        if (isConfig() && (dbName == DatabaseName::kConfig || dbName == DatabaseName::kAdmin)) {
             const auto vcTime = VectorClock::get(opCtx)->getTime();
             ReadPreferenceSetting readPrefToReturn{readPref};
             readPrefToReturn.minClusterTime = vcTime.configTime().asTimestamp();

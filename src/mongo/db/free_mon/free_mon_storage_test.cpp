@@ -109,14 +109,16 @@ TEST_F(FreeMonStorageTest, TestStorage) {
     // Validate no collection works
     {
         auto emptyDoc = FreeMonStorage::read(_opCtx.get());
-        ASSERT_FALSE(emptyDoc.is_initialized());
+        ASSERT_FALSE(emptyDoc.has_value());
     }
 
     // Create collection with one document.
     CollectionOptions collectionOptions;
     collectionOptions.uuid = UUID::gen();
     auto statusCC = _storage->createCollection(
-        _opCtx.get(), NamespaceString("admin", "system.version"), collectionOptions);
+        _opCtx.get(),
+        NamespaceString::createNamespaceString_forTest("admin", "system.version"),
+        collectionOptions);
     ASSERT_OK(statusCC);
 
 
@@ -135,7 +137,7 @@ TEST_F(FreeMonStorageTest, TestStorage) {
 
     {
         auto emptyDoc = FreeMonStorage::read(_opCtx.get());
-        ASSERT_FALSE(emptyDoc.is_initialized());
+        ASSERT_FALSE(emptyDoc.has_value());
     }
 
     FreeMonStorage::replace(_opCtx.get(), initialState);
@@ -143,7 +145,7 @@ TEST_F(FreeMonStorageTest, TestStorage) {
     {
         auto persistedDoc = FreeMonStorage::read(_opCtx.get());
 
-        ASSERT_TRUE(persistedDoc.is_initialized());
+        ASSERT_TRUE(persistedDoc.has_value());
 
         ASSERT_TRUE(persistedDoc == initialState);
     }
@@ -152,7 +154,7 @@ TEST_F(FreeMonStorageTest, TestStorage) {
 
     {
         auto emptyDoc = FreeMonStorage::read(_opCtx.get());
-        ASSERT_FALSE(emptyDoc.is_initialized());
+        ASSERT_FALSE(emptyDoc.has_value());
     }
 
     // Verfiy delete of nothing succeeds
@@ -167,7 +169,9 @@ TEST_F(FreeMonStorageTest, TestSecondary) {
     CollectionOptions collectionOptions;
     collectionOptions.uuid = UUID::gen();
     auto statusCC = _storage->createCollection(
-        _opCtx.get(), NamespaceString("admin", "system.version"), collectionOptions);
+        _opCtx.get(),
+        NamespaceString::createNamespaceString_forTest("admin", "system.version"),
+        collectionOptions);
     ASSERT_OK(statusCC);
 
 
@@ -189,7 +193,7 @@ TEST_F(FreeMonStorageTest, TestSecondary) {
     {
         auto persistedDoc = FreeMonStorage::read(_opCtx.get());
 
-        ASSERT_TRUE(persistedDoc.is_initialized());
+        ASSERT_TRUE(persistedDoc.has_value());
 
         ASSERT_TRUE(persistedDoc == initialState);
     }
@@ -214,7 +218,7 @@ TEST_F(FreeMonStorageTest, TestSecondary) {
     {
         auto persistedDoc = FreeMonStorage::read(_opCtx.get());
 
-        ASSERT_TRUE(persistedDoc.is_initialized());
+        ASSERT_TRUE(persistedDoc.has_value());
 
         ASSERT_TRUE(persistedDoc == initialState);
     }
@@ -223,7 +227,7 @@ TEST_F(FreeMonStorageTest, TestSecondary) {
 
     {
         auto persistedDoc = FreeMonStorage::read(_opCtx.get());
-        ASSERT_TRUE(persistedDoc.is_initialized());
+        ASSERT_TRUE(persistedDoc.has_value());
     }
 
     // Verfiy delete of nothing succeeds
@@ -244,10 +248,11 @@ void insertDoc(OperationContext* optCtx, const NamespaceString nss, StringData i
 
 // Positive: Test local.clustermanager
 TEST_F(FreeMonStorageTest, TestClusterManagerStorage) {
-    const NamespaceString localClusterManagerNss("local.clustermanager");
+    const NamespaceString localClusterManagerNss =
+        NamespaceString::createNamespaceString_forTest("local.clustermanager");
 
     // Verify read of non-existent collection works
-    ASSERT_FALSE(FreeMonStorage::readClusterManagerState(_opCtx.get()).is_initialized());
+    ASSERT_FALSE(FreeMonStorage::readClusterManagerState(_opCtx.get()).has_value());
 
     CollectionOptions collectionOptions;
     collectionOptions.uuid = UUID::gen();
@@ -256,17 +261,17 @@ TEST_F(FreeMonStorageTest, TestClusterManagerStorage) {
     ASSERT_OK(statusCC);
 
     // Verify read of empty collection works
-    ASSERT_FALSE(FreeMonStorage::readClusterManagerState(_opCtx.get()).is_initialized());
+    ASSERT_FALSE(FreeMonStorage::readClusterManagerState(_opCtx.get()).has_value());
 
     insertDoc(_opCtx.get(), localClusterManagerNss, "foo1");
 
     // Verify read of singleton collection works
-    ASSERT_TRUE(FreeMonStorage::readClusterManagerState(_opCtx.get()).is_initialized());
+    ASSERT_TRUE(FreeMonStorage::readClusterManagerState(_opCtx.get()).has_value());
 
     insertDoc(_opCtx.get(), localClusterManagerNss, "bar1");
 
     // Verify read of two doc collection fails
-    ASSERT_FALSE(FreeMonStorage::readClusterManagerState(_opCtx.get()).is_initialized());
+    ASSERT_FALSE(FreeMonStorage::readClusterManagerState(_opCtx.get()).has_value());
 }
 }  // namespace
 }  // namespace mongo

@@ -27,10 +27,9 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/repl/oplog_applier_impl_test_fixture.h"
 
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/curop.h"
@@ -47,17 +46,19 @@
 #include "mongo/db/repl/replication_recovery_mock.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/transaction/session_catalog_mongod_transaction_interface_impl.h"
 #include "mongo/db/vector_clock_mutable.h"
 
 namespace mongo {
 namespace repl {
 
 void OplogApplierImplOpObserver::onInserts(OperationContext* opCtx,
-                                           const NamespaceString& nss,
-                                           const UUID& uuid,
+                                           const CollectionPtr& coll,
                                            std::vector<InsertStatement>::const_iterator begin,
                                            std::vector<InsertStatement>::const_iterator end,
-                                           bool fromMigrate) {
+                                           std::vector<bool> fromMigrate,
+                                           bool defaultFromMigrate) {
     if (!onInsertsFn) {
         return;
     }
@@ -66,18 +67,17 @@ void OplogApplierImplOpObserver::onInserts(OperationContext* opCtx,
         const InsertStatement& insertStatement = *it;
         docs.push_back(insertStatement.doc.getOwned());
     }
-    onInsertsFn(opCtx, nss, docs);
+    onInsertsFn(opCtx, coll->ns(), docs);
 }
 
 void OplogApplierImplOpObserver::onDelete(OperationContext* opCtx,
-                                          const NamespaceString& nss,
-                                          const UUID& uuid,
+                                          const CollectionPtr& coll,
                                           StmtId stmtId,
                                           const OplogDeleteEntryArgs& args) {
     if (!onDeleteFn) {
         return;
     }
-    onDeleteFn(opCtx, nss, uuid, stmtId, args);
+    onDeleteFn(opCtx, coll, stmtId, args);
 }
 
 void OplogApplierImplOpObserver::onUpdate(OperationContext* opCtx,
@@ -149,6 +149,15 @@ void OplogApplierImplOpObserver::onCollMod(OperationContext* opCtx,
     onCollModFn(opCtx, nss, uuid, collModCmd, oldCollOptions, indexInfo);
 }
 
+std::unique_ptr<OpObserver::ApplyOpsOplogSlotAndOperationAssignment>
+OplogApplierImplOpObserver::preTransactionPrepare(
+    OperationContext* opCtx,
+    const std::vector<OplogSlot>& reservedSlots,
+    const TransactionOperations& transactionOperations,
+    Date_t wallClockTime) {
+    return std::make_unique<ApplyOpsOplogSlotAndOperationAssignment>(/*prepare=*/true);
+}
+
 void OplogApplierImplTest::setUp() {
     ServiceContextMongoDTest::setUp();
 
@@ -160,6 +169,11 @@ void OplogApplierImplTest::setUp() {
     ASSERT_OK(ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY));
 
     StorageInterface::set(serviceContext, std::make_unique<StorageInterfaceImpl>());
+
+    MongoDSessionCatalog::set(
+        serviceContext,
+        std::make_unique<MongoDSessionCatalog>(
+            std::make_unique<MongoDSessionCatalogTransactionInterfaceImpl>()));
 
     DropPendingCollectionReaper::set(
         serviceContext, std::make_unique<DropPendingCollectionReaper>(getStorageInterface()));
@@ -213,17 +227,17 @@ Status OplogApplierImplTest::_applyOplogEntryOrGroupedInsertsWrapper(
 }
 
 void OplogApplierImplTest::_testApplyOplogEntryOrGroupedInsertsCrudOperation(
-    ErrorCodes::Error expectedError, const OplogEntry& op, bool expectedApplyOpCalled) {
+    ErrorCodes::Error expectedError,
+    const OplogEntry& op,
+    const NamespaceString& targetNss,
+    bool expectedApplyOpCalled) {
     bool applyOpCalled = false;
 
-    auto checkOpCtx = [](OperationContext* opCtx) {
+    auto checkOpCtx = [&targetNss](OperationContext* opCtx) {
         ASSERT_TRUE(opCtx);
-        ASSERT_TRUE(
-            opCtx->lockState()->isDbLockedForMode(DatabaseName(boost::none, "test"), MODE_IX));
-        ASSERT_FALSE(
-            opCtx->lockState()->isDbLockedForMode(DatabaseName(boost::none, "test"), MODE_X));
-        ASSERT_TRUE(
-            opCtx->lockState()->isCollectionLockedForMode(NamespaceString("test.t"), MODE_IX));
+        ASSERT_TRUE(opCtx->lockState()->isDbLockedForMode(targetNss.dbName(), MODE_IX));
+        ASSERT_FALSE(opCtx->lockState()->isDbLockedForMode(targetNss.dbName(), MODE_X));
+        ASSERT_TRUE(opCtx->lockState()->isCollectionLockedForMode(targetNss, MODE_IX));
         ASSERT_FALSE(opCtx->writesAreReplicated());
         ASSERT_TRUE(DocumentValidationSettings::get(opCtx).isSchemaValidationDisabled());
     };
@@ -232,7 +246,7 @@ void OplogApplierImplTest::_testApplyOplogEntryOrGroupedInsertsCrudOperation(
         [&](OperationContext* opCtx, const NamespaceString& nss, const std::vector<BSONObj>& docs) {
             applyOpCalled = true;
             checkOpCtx(opCtx);
-            ASSERT_EQUALS(NamespaceString("test.t"), nss);
+            ASSERT_EQUALS(targetNss, nss);
             ASSERT_EQUALS(1U, docs.size());
             // For upserts we don't know the intended value of the document.
             if (op.getOpType() == repl::OpTypeEnum::kInsert) {
@@ -242,13 +256,12 @@ void OplogApplierImplTest::_testApplyOplogEntryOrGroupedInsertsCrudOperation(
         };
 
     _opObserver->onDeleteFn = [&](OperationContext* opCtx,
-                                  const NamespaceString& nss,
-                                  const boost::optional<UUID>& uuid,
+                                  const CollectionPtr& coll,
                                   StmtId stmtId,
                                   const OplogDeleteEntryArgs& args) {
         applyOpCalled = true;
         checkOpCtx(opCtx);
-        ASSERT_EQUALS(NamespaceString("test.t"), nss);
+        ASSERT_EQUALS(targetNss, coll->ns());
         ASSERT(args.deletedDoc);
         ASSERT_BSONOBJ_EQ(op.getObject(), *(args.deletedDoc));
         return Status::OK();
@@ -257,12 +270,12 @@ void OplogApplierImplTest::_testApplyOplogEntryOrGroupedInsertsCrudOperation(
     _opObserver->onUpdateFn = [&](OperationContext* opCtx, const OplogUpdateEntryArgs& args) {
         applyOpCalled = true;
         checkOpCtx(opCtx);
-        ASSERT_EQUALS(NamespaceString("test.t"), args.nss);
+        ASSERT_EQUALS(targetNss, args.coll->ns());
         return Status::OK();
     };
 
     ASSERT_EQ(_applyOplogEntryOrGroupedInsertsWrapper(
-                  _opCtx.get(), &op, OplogApplication::Mode::kSecondary),
+                  _opCtx.get(), ApplierOperation{&op}, OplogApplication::Mode::kSecondary),
               expectedError);
     ASSERT_EQ(applyOpCalled, expectedApplyOpCalled);
 }
@@ -283,9 +296,9 @@ Status OplogApplierImplTest::runOpsSteadyState(std::vector<OplogEntry> ops) {
         getConsistencyMarkers(),
         getStorageInterface(),
         repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary));
-    std::vector<const OplogEntry*> opsPtrs;
+    std::vector<ApplierOperation> opsPtrs;
     for (auto& op : ops) {
-        opsPtrs.push_back(&op);
+        opsPtrs.emplace_back(&op);
     }
     WorkerMultikeyPathInfo pathInfo;
     const bool dataIsConsistent = true;
@@ -418,7 +431,6 @@ OplogEntry makeOplogEntry(OpTime opTime,
                           boost::optional<BSONObj> o2,
                           boost::optional<bool> fromMigrate) {
     return {DurableOplogEntry(opTime,                     // optime
-                              boost::none,                // hash
                               opType,                     // opType
                               std::move(nss),             // namespace
                               uuid,                       // uuid
@@ -450,9 +462,9 @@ CollectionOptions createOplogCollectionOptions() {
     return options;
 }
 
-CollectionOptions createRecordPreImageCollectionOptions() {
+CollectionOptions createRecordChangeStreamPreAndPostImagesCollectionOptions() {
     CollectionOptions options;
-    options.recordPreImages = true;
+    options.changeStreamPreAndPostImagesOptions.setEnabled(true);
     return options;
 }
 
@@ -478,7 +490,7 @@ UUID createCollectionWithUuid(OperationContext* opCtx, const NamespaceString& ns
     CollectionOptions options;
     options.uuid = UUID::gen();
     createCollection(opCtx, nss, options);
-    return options.uuid.get();
+    return options.uuid.value();
 }
 
 void createDatabase(OperationContext* opCtx, StringData dbName) {
@@ -492,7 +504,7 @@ void createDatabase(OperationContext* opCtx, StringData dbName) {
 }
 
 bool collectionExists(OperationContext* opCtx, const NamespaceString& nss) {
-    return AutoGetCollectionForRead(opCtx, nss).getCollection() != nullptr;
+    return static_cast<bool>(AutoGetCollectionForRead(opCtx, nss).getCollection());
 }
 
 void createIndex(OperationContext* opCtx,

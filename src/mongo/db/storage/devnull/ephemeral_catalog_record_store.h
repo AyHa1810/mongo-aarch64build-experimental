@@ -32,12 +32,9 @@
 #include <boost/shared_array.hpp>
 #include <map>
 
-#include "mongo/db/concurrency/d_concurrency.h"
-#include "mongo/db/storage/capped_callback.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/util/concurrency/with_lock.h"
-
 
 namespace mongo {
 
@@ -49,10 +46,10 @@ namespace mongo {
 class EphemeralForTestRecordStore : public RecordStore {
 public:
     explicit EphemeralForTestRecordStore(StringData ns,
+                                         boost::optional<UUID> uuid,
                                          StringData identName,
                                          std::shared_ptr<void>* dataInOut,
-                                         bool isCapped = false,
-                                         CappedCallback* cappedCallback = nullptr);
+                                         bool isCapped = false);
 
     virtual const char* name() const;
 
@@ -83,16 +80,24 @@ public:
                                                const char* damageSource,
                                                const mutablebson::DamageVector& damages) override;
 
-    virtual void printRecordMetadata(OperationContext* opCtx, const RecordId& recordId) const {}
+    virtual void printRecordMetadata(OperationContext* opCtx,
+                                     const RecordId& recordId,
+                                     std::set<Timestamp>* recordTimestamps) const {}
 
     std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext* opCtx,
                                                     bool forward) const final;
 
     Status doTruncate(OperationContext* opCtx) override;
+    Status doRangeTruncate(OperationContext* opCtx,
+                           const RecordId& minRecordId,
+                           const RecordId& maxRecordId,
+                           int64_t hintDataSizeDiff,
+                           int64_t hintNumRecordsDiff) override;
 
     void doCappedTruncateAfter(OperationContext* opCtx,
                                const RecordId& end,
-                               bool inclusive) override;
+                               bool inclusive,
+                               const AboutToDeleteRecordCallback& aboutToDelete) override;
 
     virtual void appendNumericCustomStats(OperationContext* opCtx,
                                           BSONObjBuilder* result,
@@ -116,6 +121,14 @@ public:
         stdx::lock_guard<stdx::recursive_mutex> lock(_data->recordsMutex);
         invariant(_data->records.size() == size_t(numRecords));
         _data->dataSize = dataSize;
+    }
+
+    virtual void reserveRecordIds(OperationContext* opCtx,
+                                  std::vector<RecordId>* out,
+                                  size_t nRecords) final{};
+
+    std::string ns(OperationContext* opCtx) const final {
+        return _data->ns;
     }
 
 protected:
@@ -146,9 +159,6 @@ public:
     bool isCapped() const {
         return _isCapped;
     }
-    void setCappedCallback(CappedCallback* cb) {
-        _cappedCallback = cb;
-    }
 
 private:
     class RemoveChange;
@@ -163,17 +173,17 @@ private:
     void deleteRecord(WithLock lk, OperationContext* opCtx, const RecordId& dl);
 
     const bool _isCapped;
-    CappedCallback* _cappedCallback;
 
     // This is the "persistent" data.
     struct Data {
-        Data(StringData ns, bool isOplog)
-            : dataSize(0), recordsMutex(), nextId(1), isOplog(isOplog) {}
+        Data(StringData nss, bool isOplog)
+            : dataSize(0), recordsMutex(), nextId(1), ns(nss), isOplog(isOplog) {}
 
         int64_t dataSize;
         stdx::recursive_mutex recordsMutex;
         Records records;
         int64_t nextId;
+        std::string ns;
         const bool isOplog;
     };
 

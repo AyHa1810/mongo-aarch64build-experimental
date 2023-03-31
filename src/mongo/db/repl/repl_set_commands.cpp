@@ -93,17 +93,19 @@ public:
     std::string help() const override {
         return "Just for tests.\n";
     }
+
     // No auth needed because it only works when enabled via command line.
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const {
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
         return Status::OK();
     }
+
     CmdReplSetTest() : ReplSetCommand("replSetTest") {}
-    virtual bool run(OperationContext* opCtx,
-                     const string&,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
+    bool run(OperationContext* opCtx,
+             const DatabaseName&,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
         LOGV2(21573,
               "replSetTest command received: {cmdObj}",
               "replSetTest command received",
@@ -140,26 +142,30 @@ public:
                 // application.
                 ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(
                     opCtx->lockState());
-                opCtx->lockState()->skipAcquireTicket();
+                opCtx->lockState()->setAdmissionPriority(AdmissionContext::Priority::kImmediate);
                 // We need to hold the lock so that we don't run when storage is being shutdown.
                 Lock::GlobalLock lk(opCtx,
                                     MODE_IS,
                                     Date_t::now() + Milliseconds(5),
                                     Lock::InterruptBehavior::kLeaveUnlocked,
-                                    true /* skipRSTLLock */);
+                                    [] {
+                                        Lock::GlobalLockSkipOptions options;
+                                        options.skipRSTLLock = true;
+                                        return options;
+                                    }());
                 if (lk.isLocked()) {
                     boost::optional<Timestamp> ts =
                         StorageInterface::get(getGlobalServiceContext())
                             ->getLastStableRecoveryTimestamp(getGlobalServiceContext());
                     if (ts) {
-                        result.append("lastStableRecoveryTimestamp", ts.get());
+                        result.append("lastStableRecoveryTimestamp", ts.value());
                     }
                 } else {
                     LOGV2_WARNING(6100700,
                                   "Failed to get last stable recovery timestamp due to {error}",
                                   "error"_attr = "lock acquire timeout"_sd);
                 }
-            } catch (const ExceptionForCat<ErrorCategory::Interruption>& ex) {
+            } catch (const ExceptionForCat<ErrorCategory::CancellationError>& ex) {
                 LOGV2_WARNING(6100701,
                               "Failed to get last stable recovery timestamp due to {error}",
                               "error"_attr = redact(ex));
@@ -186,7 +192,7 @@ class CmdReplSetGetRBID : public ReplSetCommand {
 public:
     CmdReplSetGetRBID() : ReplSetCommand("replSetGetRBID") {}
     virtual bool run(OperationContext* opCtx,
-                     const string&,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
@@ -206,7 +212,7 @@ public:
     }
     CmdReplSetGetConfig() : ReplSetCommand("replSetGetConfig") {}
     virtual bool run(OperationContext* opCtx,
-                     const string&,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
@@ -338,7 +344,7 @@ public:
                "http://dochub.mongodb.org/core/replicasetcommands";
     }
     virtual bool run(OperationContext* opCtx,
-                     const string&,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         BSONObj configObj;
@@ -433,7 +439,7 @@ public:
     }
 
     bool run(OperationContext* opCtx,
-             const string&,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         const auto replCoord = ReplicationCoordinator::get(opCtx);
@@ -453,8 +459,9 @@ public:
         // of concurrent reconfigs.
         if (!parsedArgs.force) {
             // Skip the waiting if the current config is from a force reconfig.
-            auto oplogWait = replCoord->getConfigTerm() != OpTime::kUninitializedTerm;
-            auto status = replCoord->awaitConfigCommitment(opCtx, oplogWait);
+            auto configTerm = replCoord->getConfigTerm();
+            auto oplogWait = configTerm != OpTime::kUninitializedTerm;
+            auto status = replCoord->awaitConfigCommitment(opCtx, oplogWait, configTerm);
             status.addContext("New config is rejected");
             if (status == ErrorCodes::MaxTimeMSExpired) {
                 // Convert the error code to be more specific.
@@ -472,8 +479,9 @@ public:
         // Now that the new config has been persisted and installed in memory, wait for the new
         // config to become replicated. For force reconfigs we don't need to do this waiting.
         if (!parsedArgs.force) {
-            auto status =
-                replCoord->awaitConfigCommitment(opCtx, false /* waitForOplogCommitment */);
+            auto configTerm = replCoord->getConfigTerm();
+            auto status = replCoord->awaitConfigCommitment(
+                opCtx, false /* waitForOplogCommitment */, configTerm);
             uassertStatusOK(
                 status.withContext("Reconfig finished but failed to propagate to a majority"));
         }
@@ -501,7 +509,7 @@ public:
     }
     CmdReplSetFreeze() : ReplSetCommand("replSetFreeze") {}
     virtual bool run(OperationContext* opCtx,
-                     const string&,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
@@ -536,7 +544,7 @@ public:
     CmdReplSetStepDown() : ReplSetCommand("replSetStepDown") {}
 
     virtual bool run(OperationContext* opCtx,
-                     const string&,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         const bool force = cmdObj["force"].trueValue();
@@ -616,7 +624,7 @@ public:
     }
     CmdReplSetMaintenance() : ReplSetCommand("replSetMaintenance") {}
     virtual bool run(OperationContext* opCtx,
-                     const string&,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
@@ -642,7 +650,7 @@ public:
     }
     CmdReplSetSyncFrom() : ReplSetCommand("replSetSyncFrom") {}
     virtual bool run(OperationContext* opCtx,
-                     const string&,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
@@ -667,7 +675,7 @@ class CmdReplSetUpdatePosition : public ReplSetCommand {
 public:
     CmdReplSetUpdatePosition() : ReplSetCommand("replSetUpdatePosition") {}
     virtual bool run(OperationContext* opCtx,
-                     const string&,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         auto replCoord = repl::ReplicationCoordinator::get(opCtx->getClient()->getServiceContext());
@@ -744,7 +752,7 @@ class CmdReplSetHeartbeat : public ReplSetCommand {
 public:
     CmdReplSetHeartbeat() : ReplSetCommand("replSetHeartbeat") {}
     virtual bool run(OperationContext* opCtx,
-                     const string&,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         rsDelayHeartbeatResponse.execute(
@@ -795,7 +803,7 @@ public:
     CmdReplSetStepUp() : ReplSetCommand("replSetStepUp") {}
 
     virtual bool run(OperationContext* opCtx,
-                     const string&,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
@@ -834,7 +842,7 @@ public:
     CmdReplSetAbortPrimaryCatchUp() : ReplSetCommand("replSetAbortPrimaryCatchUp") {}
 
     virtual bool run(OperationContext* opCtx,
-                     const string&,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) override {
         Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);

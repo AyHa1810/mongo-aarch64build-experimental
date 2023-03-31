@@ -37,7 +37,7 @@
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/drop_collection_coordinator.h"
 #include "mongo/db/s/sharding_state.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
 
@@ -86,21 +86,14 @@ public:
 
             opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
 
-            try {
-                DropCollectionCoordinator::dropCollectionLocally(opCtx, ns());
-            } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
-                LOGV2_DEBUG(5280920,
-                            1,
-                            "Namespace not found while trying to delete local collection",
-                            "namespace"_attr = ns());
-            }
-
+            bool fromMigrate = request().getFromMigrate().value_or(false);
+            DropCollectionCoordinator::dropCollectionLocally(opCtx, ns(), fromMigrate);
 
             // Since no write that generated a retryable write oplog entry with this sessionId and
             // txnNumber happened, we need to make a dummy write so that the session gets durably
             // persisted on the oplog. This must be the last operation done on this command.
             DBDirectClient client(opCtx);
-            client.update(NamespaceString::kServerConfigurationNamespace.ns(),
+            client.update(NamespaceString::kServerConfigurationNamespace,
                           BSON("_id" << Request::kCommandName),
                           BSON("$inc" << BSON("count" << 1)),
                           true /* upsert */,
@@ -124,7 +117,7 @@ public:
                                                            ActionType::internal));
         }
     };
-} sharsvrdDropCollectionParticipantCommand;
+} shardsvrDropCollectionParticipantCommand;
 
 }  // namespace
 }  // namespace mongo

@@ -30,21 +30,22 @@
 import dataclasses
 import os
 import csv
-import json
+import asyncio
 from typing import Mapping, Sequence
-from cost_estimator import ExecutionStats, ModelParameters
-from data_generator import DataGenerator
+from config import WriteMode
+from cost_estimator import ExecutionStats, CostModelParameters
+from data_generator import CollectionInfo, DataGenerator
 from database_instance import DatabaseInstance
-from config import Config
 import abt_calibrator
 import workload_execution
 from workload_execution import Query, QueryParameters
 import parameters_extractor
+from calibration_settings import distributions, main_config
 
 __all__ = []
 
 
-def save_to_csv(parameters: Mapping[str, Sequence[ModelParameters]], filepath: str) -> None:
+def save_to_csv(parameters: Mapping[str, Sequence[CostModelParameters]], filepath: str) -> None:
     """Save model input parameters to a csv file."""
     abt_type_name = 'abt_type'
     fieldnames = [
@@ -62,51 +63,190 @@ def save_to_csv(parameters: Mapping[str, Sequence[ModelParameters]], filepath: s
                 writer.writerow(fields)
 
 
-def main():
+async def execute_index_scan_queries(database: DatabaseInstance,
+                                     collections: Sequence[CollectionInfo]):
+    collection = [ci for ci in collections if ci.name.startswith('index_scan')][0]
+    fields = [f for f in collection.fields if f.name == 'choice']
+
+    requests = []
+
+    for field in fields:
+        for val in field.distribution.get_values():
+            if val.startswith('_'):
+                continue
+            keys_length = len(val) + 2
+            requests.append(
+                Query(pipeline=[{'$match': {field.name: val}}], keys_length_in_bytes=keys_length,
+                      note='IndexScan'))
+
+    await workload_execution.execute(database, main_config.workload_execution, [collection],
+                                     requests)
+
+
+async def execute_physical_scan_queries(database: DatabaseInstance,
+                                        collections: Sequence[CollectionInfo]):
+    collections = [ci for ci in collections if ci.name.startswith('physical_scan')]
+    fields = [f for f in collections[0].fields if f.name == 'choice']
+    requests = []
+    for field in fields:
+        for val in field.distribution.get_values()[::3]:
+            if val.startswith('_'):
+                continue
+            keys_length = len(val) + 2
+            requests.append(
+                Query(pipeline=[{'$match': {field.name: val}}, {"$limit": 10}],
+                      keys_length_in_bytes=keys_length, note='PhysicalScan'))
+
+    await workload_execution.execute(database, main_config.workload_execution, collections,
+                                     requests)
+
+
+async def execute_index_intersections_with_requests(database: DatabaseInstance,
+                                                    collections: Sequence[CollectionInfo],
+                                                    requests: Sequence[Query]):
+    try:
+        await database.set_parameter('internalCostModelCoefficients',
+                                     '{"filterIncrementalCost": 10000.0}')
+        await database.set_parameter('internalCascadesOptimizerDisableMergeJoinRIDIntersect', False)
+        await database.set_parameter('internalCascadesOptimizerDisableHashJoinRIDIntersect', False)
+
+        await workload_execution.execute(database, main_config.workload_execution, collections,
+                                         requests)
+
+        await database.set_parameter('internalCascadesOptimizerDisableMergeJoinRIDIntersect', True)
+        await database.set_parameter('internalCascadesOptimizerDisableHashJoinRIDIntersect', True)
+
+        main_config.workload_execution.write_mode = WriteMode.APPEND
+        await workload_execution.execute(database, main_config.workload_execution, collections,
+                                         requests[::4])
+
+    finally:
+        await database.set_parameter('internalCascadesOptimizerDisableMergeJoinRIDIntersect', False)
+        await database.set_parameter('internalCascadesOptimizerDisableHashJoinRIDIntersect', False)
+        await database.set_parameter('internalCostModelCoefficients', '')
+
+
+async def execute_index_intersections(database: DatabaseInstance,
+                                      collections: Sequence[CollectionInfo]):
+    collections = [ci for ci in collections if ci.name.startswith('c_int')]
+
+    requests = []
+
+    for i in range(0, 1000, 100):
+        requests.append(Query(pipeline=[{'$match': {'in1': i, 'in2': i}}], keys_length_in_bytes=1))
+
+        requests.append(
+            Query(pipeline=[{'$match': {'in1': i, 'in2': 1000 - i}}], keys_length_in_bytes=1))
+
+        requests.append(
+            Query(pipeline=[{'$match': {'in1': {'$lte': i}, 'in2': 1000 - i}}],
+                  keys_length_in_bytes=1))
+
+        requests.append(
+            Query(pipeline=[{'$match': {'in1': i, 'in2': {'$gt': 1000 - i}}}],
+                  keys_length_in_bytes=1))
+
+    await execute_index_intersections_with_requests(database, collections, requests)
+
+
+async def execute_evaluation(database: DatabaseInstance, collections: Sequence[CollectionInfo]):
+    collections = [ci for ci in collections if ci.name.startswith('c_int_05')]
+    requests = []
+
+    for i in [100, 500, 1000]:
+        requests.append(
+            Query(pipeline=[{'$project': {'uniform1': 1, 'mixed2': 1}}, {"$limit": i}],
+                  keys_length_in_bytes=1, number_of_fields=1, note='Evaluation'))
+
+    await workload_execution.execute(database, main_config.workload_execution, collections,
+                                     requests)
+
+
+async def execute_unwind(database: DatabaseInstance, collections: Sequence[CollectionInfo]):
+    collections = [ci for ci in collections if ci.name.startswith('c_arr_01')]
+    requests = []
+    # average size of arrays in the collection
+    average_size_of_arrays = 10
+
+    for _ in range(500, 1000, 100):
+        requests.append(
+            Query(pipeline=[{"$unwind": "$as"}], number_of_fields=average_size_of_arrays))
+
+    await workload_execution.execute(database, main_config.workload_execution, collections,
+                                     requests)
+
+
+async def execute_unique(database: DatabaseInstance, collections: Sequence[CollectionInfo]):
+    collections = [ci for ci in collections if ci.name.startswith('c_arr_01')]
+    requests = []
+
+    for i in range(500, 1000, 200):
+        requests.append(Query(pipeline=[{"$match": {"as": {"$gt": i}}}]))
+
+    await workload_execution.execute(database, main_config.workload_execution, collections,
+                                     requests)
+
+
+async def execute_limitskip(database: DatabaseInstance, collections: Sequence[CollectionInfo]):
+    collection = [ci for ci in collections if ci.name.startswith('index_scan')][0]
+    limits = [5, 10, 15, 20]
+    skips = [5, 10, 15, 20]
+    requests = []
+
+    for limit in limits:
+        for skip in skips:
+            requests.append(Query(pipeline=[{"$skip": skip}, {"$limit": limit}], note="LimitSkip"))
+
+    await workload_execution.execute(database, main_config.workload_execution, [collection],
+                                     requests)
+
+
+async def main():
     """Entry point function."""
     script_directory = os.path.abspath(os.path.dirname(__file__))
     os.chdir(script_directory)
 
-    with open("config.json") as config_file:
-        config = Config.create(json.load(config_file))
-
     # 1. Database Instance provides connectivity to a MongoDB instance, it loads data optionally
     # from the dump on creating and stores data optionally to the dump on closing.
-    with DatabaseInstance(config.database) as database:
+    with DatabaseInstance(main_config.database) as database:
 
         # 2. Data generation (optional), generates random data and populates collections with it.
-        generator = DataGenerator(database, config.data_generator)
-        generator.populate_collections()
+        generator = DataGenerator(database, main_config.data_generator)
+        await generator.populate_collections()
 
         # 3. Collecting data for calibration (optional).
         # It runs the pipelines and stores explains to the database.
-        requests = [
-            Query(pipeline=[{'$match': {'f_5': 7}}], keys_length_in_bytes=2),
-            Query(pipeline=[{'$match': {'f_1': 5}}], keys_length_in_bytes=2),
-            Query(pipeline=[{'$match': {'f_7': 4}}], keys_length_in_bytes=2),
-            Query(pipeline=[{'$match': {'f_5': 7}}], keys_length_in_bytes=2),
-            Query(pipeline=[{'$match': {'f_1': 5}}], keys_length_in_bytes=2),
-            Query(pipeline=[{'$match': {'f_2': generator.gen_random_string()}}],
-                  keys_length_in_bytes=generator.config.string_length + 2),
-            Query(pipeline=[{'$match': {'f_5': generator.gen_random_string()}}],
-                  keys_length_in_bytes=generator.config.string_length + 2),
+        execution_query_functions = [
+            execute_index_scan_queries,
+            execute_physical_scan_queries,
+            execute_index_intersections,
+            execute_evaluation,
+            execute_unwind,
+            execute_unique,
+            execute_limitskip,
         ]
-        workload_execution.execute(database, config.workload_execution, generator.collection_infos,
-                                   requests)
+        for execute_query in execution_query_functions:
+            await execute_query(database, generator.collection_infos)
+            main_config.workload_execution.write_mode = WriteMode.APPEND
 
         # Calibration phase (optional).
         # Reads the explains stored on the previous step (this run and/or previous runs),
         # aparses the explains, nd calibrates the cost model for the ABT nodes.
-        models = abt_calibrator.calibrate(
-            config.abt_calibrator, database,
-            ['IndexScan', 'Seek', 'PhysicalScan', 'ValueScan', 'CoScan', 'Scan'])
+        models = await abt_calibrator.calibrate(main_config.abt_calibrator, database)
         for abt, model in models.items():
-            print(abt)
-            print(model)
+            print(f'{abt}\t\t{model}')
 
-        parameters = parameters_extractor.extract_parameters(config.abt_calibrator, database, [])
+        parameters = await parameters_extractor.extract_parameters(main_config.abt_calibrator,
+                                                                   database, [])
         save_to_csv(parameters, 'parameters.csv')
+
+    print("DONE!")
 
 
 if __name__ == '__main__':
-    main()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

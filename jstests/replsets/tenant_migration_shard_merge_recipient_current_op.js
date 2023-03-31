@@ -2,7 +2,7 @@
  * Tests the currentOp command during a shard merge protocol. A tenant migration is started, and the
  * currentOp command is tested as the recipient moves through below state sequence.
  *
- * kStarted ---> kLearnedFilenames ---> kConsistent ---> kDone.
+ * kStarted ---> kLearnedFilenames ---> kConsistent ---> kCommitted.
  *
  * @tags: [
  *   featureFlagShardMerge,
@@ -10,31 +10,42 @@
  *   incompatible_with_windows_tls,
  *   requires_majority_read_concern,
  *   requires_persistence,
- *   requires_fcv_61,
  *   serverless,
  * ]
  */
 
-(function() {
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    forgetMigrationAsync,
+    isShardMergeEnabled,
+} from "jstests/replsets/libs/tenant_migration_util.js";
 
-"use strict";
 load("jstests/libs/uuid_util.js");        // For extractUUIDFromObject().
 load("jstests/libs/fail_point_util.js");  // For configureFailPoint().
 load("jstests/libs/parallelTester.js");   // For the Thread().
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
+load('jstests/replsets/rslib.js');        // For 'createRstArgs'
 
 const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
 
+// Note: including this explicit early return here due to the fact that multiversion
+// suites will execute this test without featureFlagShardMerge enabled (despite the
+// presence of the featureFlagShardMerge tag above), which means the test will attempt
+// to run a multi-tenant migration and fail.
+if (!isShardMergeEnabled(tenantMigrationTest.getDonorPrimary().getDB("admin"))) {
+    tenantMigrationTest.stop();
+    jsTestLog("Skipping Shard Merge-specific test");
+    quit();
+}
+
 const kMigrationId = UUID();
-const kTenantId = 'testTenantId';
+const kTenantId = ObjectId().str;
 const kReadPreference = {
     mode: "primary"
 };
 const migrationOpts = {
     migrationIdString: extractUUIDFromObject(kMigrationId),
-    tenantId: kTenantId,
-    readPreference: kReadPreference
+    readPreference: kReadPreference,
+    tenantIds: [ObjectId(kTenantId)]
 };
 
 const recipientPrimary = tenantMigrationTest.getRecipientPrimary();
@@ -57,10 +68,6 @@ function checkStandardFieldsOK(res) {
     assert.eq(bsonWoCompare(res.inprog[0].instanceID, kMigrationId), 0, res);
     assert.eq(res.inprog[0].donorConnectionString, tenantMigrationTest.getDonorRst().getURL(), res);
     assert.eq(bsonWoCompare(res.inprog[0].readPreference, kReadPreference), 0, res);
-    // We don't test failovers in this test so we don't expect these counters to be incremented.
-    assert.eq(res.inprog[0].numRestartsDueToDonorConnectionFailure, 0, res);
-    assert.eq(res.inprog[0].numRestartsDueToRecipientFailure, 0, res);
-    assert.eq(bsonWoCompare(res.inprog[0].tenantId, kTenantId), 0, res);
 }
 
 // Check currentOp fields' expected value once the recipient is in state "consistent" or later.
@@ -75,8 +82,6 @@ function checkPostConsistentFieldsOK(res) {
     assert(currOp.hasOwnProperty("cloneFinishedRecipientOpTime") &&
                checkOptime(currOp.cloneFinishedRecipientOpTime),
            res);
-    // Not applicable to shard merge protocol.
-    assert(!currOp.hasOwnProperty("dataConsistentStopDonorOpTime"));
 }
 
 // Validates the fields of an optime object.
@@ -101,33 +106,29 @@ const fpAfterDataConsistent = configureFailPoint(
 const fpAfterForgetMigration = configureFailPoint(
     recipientPrimary, "fpAfterReceivingRecipientForgetMigration", {action: "hang"});
 
-jsTestLog("Starting tenant migration with migrationId: " + kMigrationId +
-          ", tenantId: " + kTenantId);
-assert.commandWorked(
-    tenantMigrationTest.startMigration(migrationOpts, {enableDonorStartMigrationFsync: true}));
+jsTestLog(`Starting tenant migration with migrationId: ${kMigrationId}`);
+assert.commandWorked(tenantMigrationTest.startMigration(migrationOpts));
 
 const fpBeforePersistingRejectReadsBeforeTimestamp = configureFailPoint(
     recipientPrimary, "fpBeforePersistingRejectReadsBeforeTimestamp", {action: "hang"});
 
 {
-    // Wait until a current operation corresponding to "tenant recipient migration" with state
+    // Wait until a current operation corresponding to "shard merge recipient" with state
     // kStarted is visible on the recipientPrimary.
     jsTestLog("Waiting until current operation with state kStarted is visible.");
     fpAfterPersistingStateDoc.wait();
 
-    let res = recipientPrimary.adminCommand({currentOp: true, desc: "tenant recipient migration"});
+    let res = recipientPrimary.adminCommand({currentOp: true, desc: "shard merge recipient"});
     checkStandardFieldsOK(res);
     let currOp = res.inprog[0];
-    assert.eq(currOp.state, TenantMigrationTest.RecipientStateEnum.kStarted, res);
+    assert.eq(currOp.state, TenantMigrationTest.ShardMergeRecipientState.kStarted, res);
+    assert.eq(currOp.garbageCollectable, false, res);
     assert.eq(currOp.migrationCompleted, false, res);
-    assert.eq(currOp.dataSyncCompleted, false, res);
     assert(!currOp.hasOwnProperty("startFetchingDonorOpTime"), res);
     assert(!currOp.hasOwnProperty("startApplyingDonorOpTime"), res);
     assert(!currOp.hasOwnProperty("expireAt"), res);
     assert(!currOp.hasOwnProperty("donorSyncSource"), res);
     assert(!currOp.hasOwnProperty("cloneFinishedRecipientOpTime"), res);
-    // Not applicable to shard merge protocol.
-    assert(!currOp.hasOwnProperty("dataConsistentStopDonorOpTime"), res);
 
     fpAfterPersistingStateDoc.off();
 }
@@ -138,15 +139,13 @@ const fpBeforePersistingRejectReadsBeforeTimestamp = configureFailPoint(
     jsTestLog("Waiting for startFetchingDonorOpTime to exist.");
     fpAfterRetrievingStartOpTime.wait();
 
-    let res = recipientPrimary.adminCommand({currentOp: true, desc: "tenant recipient migration"});
+    let res = recipientPrimary.adminCommand({currentOp: true, desc: "shard merge recipient"});
     checkStandardFieldsOK(res);
     let currOp = res.inprog[0];
     assert.gt(new Date(), currOp.receiveStart, tojson(res));
-
-    assert.eq(currOp.state, TenantMigrationTest.RecipientStateEnum.kLearnedFilenames, res);
-
+    assert.eq(currOp.state, TenantMigrationTest.ShardMergeRecipientState.kLearnedFilenames, res);
+    assert.eq(currOp.garbageCollectable, false, res);
     assert.eq(currOp.migrationCompleted, false, res);
-    assert.eq(currOp.dataSyncCompleted, false, res);
     assert(!currOp.hasOwnProperty("expireAt"), res);
     assert(!currOp.hasOwnProperty("cloneFinishedRecipientOpTime"), res);
     assert(currOp.hasOwnProperty("startFetchingDonorOpTime") &&
@@ -157,8 +156,6 @@ const fpBeforePersistingRejectReadsBeforeTimestamp = configureFailPoint(
            res);
     assert(currOp.hasOwnProperty("donorSyncSource") && typeof currOp.donorSyncSource === 'string',
            res);
-    // Not applicable to shard merge protocol.
-    assert(!currOp.hasOwnProperty("dataConsistentStopDonorOpTime"), res);
 
     fpAfterRetrievingStartOpTime.off();
 }
@@ -168,28 +165,28 @@ const fpBeforePersistingRejectReadsBeforeTimestamp = configureFailPoint(
     jsTestLog("Waiting for the kConsistent state to be reached.");
     fpAfterDataConsistent.wait();
 
-    let res = recipientPrimary.adminCommand({currentOp: true, desc: "tenant recipient migration"});
+    let res = recipientPrimary.adminCommand({currentOp: true, desc: "shard merge recipient"});
     checkStandardFieldsOK(res);
     checkPostConsistentFieldsOK(res);
     let currOp = res.inprog[0];
     // State should have changed.
-    assert.eq(currOp.state, TenantMigrationTest.RecipientStateEnum.kConsistent, res);
+    assert.eq(currOp.state, TenantMigrationTest.ShardMergeRecipientState.kConsistent, res);
+    assert.eq(currOp.garbageCollectable, false, res);
     assert.eq(currOp.migrationCompleted, false, res);
-    assert.eq(currOp.dataSyncCompleted, false, res);
     assert(!currOp.hasOwnProperty("expireAt"), res);
 
     // Wait to receive recipientSyncData with returnAfterReachingDonorTimestamp.
     fpAfterDataConsistent.off();
     fpBeforePersistingRejectReadsBeforeTimestamp.wait();
 
-    res = recipientPrimary.adminCommand({currentOp: true, desc: "tenant recipient migration"});
+    res = recipientPrimary.adminCommand({currentOp: true, desc: "shard merge recipient"});
     checkStandardFieldsOK(res);
     checkPostConsistentFieldsOK(res);
     currOp = res.inprog[0];
     // State should have changed.
-    assert.eq(currOp.state, TenantMigrationTest.RecipientStateEnum.kConsistent, res);
+    assert.eq(currOp.state, TenantMigrationTest.ShardMergeRecipientState.kConsistent, res);
+    assert.eq(currOp.garbageCollectable, false, res);
     assert.eq(currOp.migrationCompleted, false, res);
-    assert.eq(currOp.dataSyncCompleted, false, res);
     assert(!currOp.hasOwnProperty("expireAt"), res);
     // The oplog applier should have applied at least the noop resume token.
     assert.gte(currOp.numOpsApplied, 1, tojson(res));
@@ -201,41 +198,39 @@ const fpBeforePersistingRejectReadsBeforeTimestamp = configureFailPoint(
 }
 
 jsTestLog("Issuing a forget migration command.");
-const forgetMigrationThread =
-    new Thread(TenantMigrationUtil.forgetMigrationAsync,
-               migrationOpts.migrationIdString,
-               TenantMigrationUtil.createRstArgs(tenantMigrationTest.getDonorRst()),
-               true /* retryOnRetryableErrors */);
+const forgetMigrationThread = new Thread(forgetMigrationAsync,
+                                         migrationOpts.migrationIdString,
+                                         createRstArgs(tenantMigrationTest.getDonorRst()),
+                                         true /* retryOnRetryableErrors */);
 forgetMigrationThread.start();
 
 {
     jsTestLog("Waiting for the recipient to receive the forgetMigration, and pause at failpoint");
     fpAfterForgetMigration.wait();
 
-    let res = recipientPrimary.adminCommand({currentOp: true, desc: "tenant recipient migration"});
+    let res = recipientPrimary.adminCommand({currentOp: true, desc: "shard merge recipient"});
     checkStandardFieldsOK(res);
     checkPostConsistentFieldsOK(res);
     let currOp = res.inprog[0];
-    assert.eq(currOp.state, TenantMigrationTest.RecipientStateEnum.kConsistent, res);
-    assert.eq(currOp.migrationCompleted, false, res);
-    // dataSyncCompleted should have changed.
-    assert.eq(currOp.dataSyncCompleted, true, res);
+    assert.eq(currOp.state, TenantMigrationTest.ShardMergeRecipientState.kConsistent, res);
+    assert.eq(currOp.garbageCollectable, false, res);
+    // migrationCompleted should have changed.
+    assert.eq(currOp.migrationCompleted, true, res);
     assert(!currOp.hasOwnProperty("expireAt"), res);
 
     jsTestLog("Allow the forgetMigration to complete.");
     fpAfterForgetMigration.off();
     assert.commandWorked(forgetMigrationThread.returnData());
 
-    res = recipientPrimary.adminCommand({currentOp: true, desc: "tenant recipient migration"});
+    res = recipientPrimary.adminCommand({currentOp: true, desc: "shard merge recipient"});
     checkStandardFieldsOK(res);
     checkPostConsistentFieldsOK(res);
     currOp = res.inprog[0];
-    assert.eq(currOp.dataSyncCompleted, true, res);
-    // State, completion status and expireAt should have changed.
-    assert.eq(currOp.state, TenantMigrationTest.RecipientStateEnum.kDone, res);
     assert.eq(currOp.migrationCompleted, true, res);
+    // State, completion status and expireAt should have changed.
+    assert.eq(currOp.state, TenantMigrationTest.ShardMergeRecipientState.kCommitted, res);
+    assert.eq(currOp.garbageCollectable, true, res);
     assert(currOp.hasOwnProperty("expireAt") && currOp.expireAt instanceof Date, res);
 }
 
 tenantMigrationTest.stop();
-})();

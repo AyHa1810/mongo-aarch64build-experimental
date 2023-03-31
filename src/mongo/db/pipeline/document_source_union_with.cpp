@@ -127,12 +127,14 @@ std::unique_ptr<DocumentSourceUnionWith::LiteParsed> DocumentSourceUnionWith::Li
     NamespaceString unionNss;
     boost::optional<LiteParsedPipeline> liteParsedPipeline;
     if (spec.type() == BSONType::String) {
-        unionNss = NamespaceString(nss.dbName(), spec.valueStringData());
+        unionNss =
+            NamespaceStringUtil::parseNamespaceFromRequest(nss.dbName(), spec.valueStringData());
     } else {
         auto unionWithSpec =
             UnionWithSpec::parse(IDLParserContext(kStageName), spec.embeddedObject());
         if (unionWithSpec.getColl()) {
-            unionNss = NamespaceString(nss.dbName(), *unionWithSpec.getColl());
+            unionNss = NamespaceStringUtil::parseNamespaceFromRequest(nss.dbName(),
+                                                                      *unionWithSpec.getColl());
         } else {
             // If no collection specified, it must have $documents as first field in pipeline.
             validateUnionWithCollectionlessPipeline(unionWithSpec.getPipeline());
@@ -185,12 +187,14 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceUnionWith::createFromBson(
     NamespaceString unionNss;
     std::vector<BSONObj> pipeline;
     if (elem.type() == BSONType::String) {
-        unionNss = NamespaceString(expCtx->ns.dbName(), elem.valueStringData());
+        unionNss = NamespaceStringUtil::parseNamespaceFromRequest(expCtx->ns.dbName(),
+                                                                  elem.valueStringData());
     } else {
         auto unionWithSpec =
             UnionWithSpec::parse(IDLParserContext(kStageName), elem.embeddedObject());
         if (unionWithSpec.getColl()) {
-            unionNss = NamespaceString(expCtx->ns.dbName(), *unionWithSpec.getColl());
+            unionNss = NamespaceStringUtil::parseNamespaceFromRequest(expCtx->ns.dbName(),
+                                                                      *unionWithSpec.getColl());
         } else {
             // if no collection specified, it must have $documents as first field in pipeline
             validateUnionWithCollectionlessPipeline(unionWithSpec.getPipeline());
@@ -277,10 +281,10 @@ MONGO_COMPILER_NOINLINE void DocumentSourceUnionWith::logShardedViewFound(
 Pipeline::SourceContainer::iterator DocumentSourceUnionWith::doOptimizeAt(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     auto duplicateAcrossUnion = [&](auto&& nextStage) {
-        _pipeline->addFinalSource(nextStage->clone());
+        _pipeline->addFinalSource(nextStage->clone(_pipeline->getContext()));
         // Apply the same rewrite to the cached pipeline if available.
         if (pExpCtx->explain >= ExplainOptions::Verbosity::kExecStats) {
-            auto cloneForExplain = nextStage->clone();
+            auto cloneForExplain = nextStage->clone(_pipeline->getContext());
             if (!_cachedPipeline.empty()) {
                 cloneForExplain->setSource(_cachedPipeline.back().get());
             }
@@ -322,7 +326,12 @@ void DocumentSourceUnionWith::doDispose() {
     }
 }
 
-Value DocumentSourceUnionWith::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceUnionWith::serialize(SerializationOptions opts) const {
+    auto explain = opts.verbosity;
+    if (opts.redactFieldNames || opts.replacementForLiteralArgs) {
+        MONGO_UNIMPLEMENTED_TASSERT(7484307);
+    }
+
     auto collectionless = _pipeline->getContext()->ns.isCollectionlessAggregateNS();
     if (explain) {
         // There are several different possible states depending on the explain verbosity as well as
@@ -391,15 +400,19 @@ DepsTracker::State DocumentSourceUnionWith::getDependencies(DepsTracker* deps) c
     for (auto&& source : _pipeline->getSources()) {
         source->getDependencies(&subDeps);
     }
-    // Add sub-pipeline variable dependencies. Do not add field dependencies, since these refer
-    // to the fields from the foreign collection rather than the local collection.
-    // Similarly, do not add SEARCH_META as a dependency, since it is scoped to one pipeline.
-    for (auto&& varId : subDeps.vars) {
-        if (varId != Variables::kSearchMetaId)
-            deps->vars.insert(varId);
-    }
 
     return DepsTracker::State::SEE_NEXT;
+}
+
+void DocumentSourceUnionWith::addVariableRefs(std::set<Variables::Id>* refs) const {
+    // Add sub-pipeline variable dependencies. Do not add SEARCH_META as a dependency, since it is
+    // scoped to one pipeline.
+    std::set<Variables::Id> subPipeRefs;
+    _pipeline->addVariableRefs(&subPipeRefs);
+    for (auto&& varId : subPipeRefs) {
+        if (varId != Variables::kSearchMetaId)
+            refs->insert(varId);
+    }
 }
 
 void DocumentSourceUnionWith::detachFromOperationContext() {
@@ -418,6 +431,11 @@ void DocumentSourceUnionWith::reattachToOperationContext(OperationContext* opCtx
     if (_pipeline) {
         _pipeline->reattachToOperationContext(opCtx);
     }
+}
+
+bool DocumentSourceUnionWith::validateOperationContext(const OperationContext* opCtx) const {
+    return getContext()->opCtx == opCtx &&
+        (!_pipeline || _pipeline->validateOperationContext(opCtx));
 }
 
 void DocumentSourceUnionWith::addInvolvedCollections(

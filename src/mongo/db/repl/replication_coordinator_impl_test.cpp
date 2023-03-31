@@ -30,7 +30,6 @@
 
 #include "mongo/platform/basic.h"
 
-#include <boost/optional/optional_io.hpp>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -1179,7 +1178,6 @@ TEST_F(ReplCoordTest, NodeCalculatesDefaultWriteConcernOnStartupExistingLocalCon
                        HostAndPort("node1", 12345));
     auto& rwcDefaults = ReadWriteConcernDefaults::get(getServiceContext());
     ASSERT(rwcDefaults.getImplicitDefaultWriteConcernMajority_forTest());
-    ASSERT(rwcDefaults.getImplicitDefaultWriteConcernMajority_forTest().get());
 }
 
 
@@ -1199,8 +1197,7 @@ TEST_F(ReplCoordTest,
                                                   << "_id" << 2 << "arbiterOnly" << true))),
                        HostAndPort("node1", 12345));
     auto& rwcDefaults = ReadWriteConcernDefaults::get(getServiceContext());
-    ASSERT(rwcDefaults.getImplicitDefaultWriteConcernMajority_forTest());
-    ASSERT_FALSE(rwcDefaults.getImplicitDefaultWriteConcernMajority_forTest().get());
+    ASSERT_FALSE(rwcDefaults.getImplicitDefaultWriteConcernMajority_forTest());
 }
 
 
@@ -1261,7 +1258,6 @@ TEST_F(ReplCoordTest, NodeCalculatesDefaultWriteConcernOnStartupNewConfigMajorit
 
     auto& rwcDefaults = ReadWriteConcernDefaults::get(getServiceContext());
     ASSERT(rwcDefaults.getImplicitDefaultWriteConcernMajority_forTest());
-    ASSERT(rwcDefaults.getImplicitDefaultWriteConcernMajority_forTest().get());
 }
 
 
@@ -1321,8 +1317,7 @@ TEST_F(ReplCoordTest, NodeCalculatesDefaultWriteConcernOnStartupNewConfigNoMajor
     ASSERT_EQUALS(getStorageInterface()->getInitialDataTimestamp(), appliedTS);
 
     auto& rwcDefaults = ReadWriteConcernDefaults::get(getServiceContext());
-    ASSERT(rwcDefaults.getImplicitDefaultWriteConcernMajority_forTest());
-    ASSERT_FALSE(rwcDefaults.getImplicitDefaultWriteConcernMajority_forTest().get());
+    ASSERT_FALSE(rwcDefaults.getImplicitDefaultWriteConcernMajority_forTest());
 }
 
 
@@ -1713,7 +1708,7 @@ TEST_F(ReplCoordTest, UpdatePositionArgsAdvancesWallTimes) {
 
     // Make sure wall times are propagated through processReplSetUpdatePosition
     auto memberDataVector = repl->getMemberData();
-    for (auto member : memberDataVector) {
+    for (const auto& member : memberDataVector) {
         if (member.getMemberId() == MemberId(1)) {
             ASSERT_EQ(member.getLastAppliedWallTime(), memberOneAppliedWallTime);
             ASSERT_EQ(member.getLastDurableWallTime(), memberOneDurableWallTime);
@@ -3622,7 +3617,7 @@ TEST_F(ReplCoordTest, AwaitHelloResponseReturnsOnStepDown) {
         expectedCounter = topologyVersionAfterDisablingWrites->getCounter() + 1;
         deadline = getNet()->now() + maxAwaitTime;
         const auto responseStepdownComplete = awaitHelloWithNewOpCtx(
-            getReplCoord(), topologyVersionAfterDisablingWrites.get(), {}, deadline);
+            getReplCoord(), topologyVersionAfterDisablingWrites.value(), {}, deadline);
         const auto topologyVersionStepDownComplete = responseStepdownComplete->getTopologyVersion();
         ASSERT_EQUALS(topologyVersionStepDownComplete->getCounter(), expectedCounter);
         ASSERT_EQUALS(topologyVersionStepDownComplete->getProcessId(), expectedProcessId);
@@ -4981,7 +4976,7 @@ TEST_F(ReplCoordTest, AwaitHelloResponseReturnsOnElectionWin) {
         // The server TopologyVersion will increment again once we exit drain mode.
         expectedCounter = topologyVersionAfterElection->getCounter() + 1;
         const auto responseAfterDrainComplete = awaitHelloWithNewOpCtx(
-            getReplCoord(), topologyVersionAfterElection.get(), {}, deadline);
+            getReplCoord(), topologyVersionAfterElection.value(), {}, deadline);
         const auto topologyVersionAfterDrainComplete =
             responseAfterDrainComplete->getTopologyVersion();
         ASSERT_EQUALS(topologyVersionAfterDrainComplete->getCounter(), expectedCounter);
@@ -5075,7 +5070,7 @@ TEST_F(ReplCoordTest, AwaitHelloResponseReturnsOnElectionWinWithReconfig) {
         // The server TopologyVersion will increment once we finish reconfig.
         expectedCounter = topologyVersionAfterElection->getCounter() + 1;
         const auto responseAfterReconfig = awaitHelloWithNewOpCtx(
-            getReplCoord(), topologyVersionAfterElection.get(), {}, deadline);
+            getReplCoord(), topologyVersionAfterElection.value(), {}, deadline);
         const auto topologyVersionAfterReconfig = responseAfterReconfig->getTopologyVersion();
         ASSERT_EQUALS(topologyVersionAfterReconfig->getCounter(), expectedCounter);
         ASSERT_EQUALS(topologyVersionAfterReconfig->getProcessId(), expectedProcessId);
@@ -5090,7 +5085,7 @@ TEST_F(ReplCoordTest, AwaitHelloResponseReturnsOnElectionWinWithReconfig) {
         // The server TopologyVersion will increment again once we exit drain mode.
         expectedCounter = topologyVersionAfterReconfig->getCounter() + 1;
         const auto responseAfterDrainComplete = awaitHelloWithNewOpCtx(
-            getReplCoord(), topologyVersionAfterReconfig.get(), {}, deadline);
+            getReplCoord(), topologyVersionAfterReconfig.value(), {}, deadline);
         const auto topologyVersionAfterDrainComplete =
             responseAfterDrainComplete->getTopologyVersion();
         ASSERT_EQUALS(topologyVersionAfterDrainComplete->getCounter(), expectedCounter);
@@ -8373,7 +8368,7 @@ TEST_F(ReplCoordTest, IgnoreNonNullDurableOpTimeOrWallTimeForArbiterFromReplSetU
 
     // Make sure node 2 is fully caught up but node 3 has null durable optime/walltime.
     auto memberDataVector = repl->getMemberData();
-    for (auto member : memberDataVector) {
+    for (const auto& member : memberDataVector) {
         auto memberId = member.getMemberId();
         if (memberId == MemberId(1) || memberId == MemberId(2)) {
             ASSERT_EQ(member.getLastAppliedOpTime(), opTime2.asOpTime());
@@ -8442,7 +8437,7 @@ TEST_F(ReplCoordTest, IgnoreNonNullDurableOpTimeOrWallTimeForArbiterFromHeartbea
         hbResp.toBSON(), 1 /* targetIndex */, Milliseconds(5) /* ping */);
 
     auto memberDataVector = repl->getMemberData();
-    for (auto member : memberDataVector) {
+    for (const auto& member : memberDataVector) {
         auto memberId = member.getMemberId();
         if (memberId == MemberId(1)) {
             ASSERT_EQ(member.getLastAppliedOpTime(), opTime2.asOpTime());

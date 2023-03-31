@@ -12,18 +12,14 @@
  * ]
  */
 
-(function() {
-"use strict";
-
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
 load("jstests/libs/uuid_util.js");
 load("jstests/libs/fail_point_util.js");  // For configureFailPoint().
 
 const tenantMigrationTest =
     new TenantMigrationTest({name: jsTestName(), allowStaleReadsOnDonor: false});
 
-const kTenantId = "testTenantId";
+const kTenantId = ObjectId().str;
 const kDbName = tenantMigrationTest.tenantDB(kTenantId, "testDB");
 const kCollName = "testColl";
 
@@ -119,4 +115,3 @@ tenantMigrationTest.getDonorRst().nodes.forEach(
         {configureFailPoint: "tenantMigrationDonorAllowsNonTimestampedReads", mode: "alwaysOn"})));
 
 tenantMigrationTest.stop();
-})();

@@ -48,8 +48,9 @@ void AuthorizationSessionForTest::assumePrivilegesForDB(Privilege privilege, Str
 
 void AuthorizationSessionForTest::assumePrivilegesForDB(PrivilegeVector privileges,
                                                         StringData dbName) {
-    _authenticatedUser = UserHandle(User(UserName("authorizationSessionForTestUser", dbName)));
-    _authenticatedUser.get()->addPrivileges(privileges);
+    UserRequest request(UserName("authorizationSessionForTestUser"_sd, dbName), boost::none);
+    _authenticatedUser = UserHandle(User(request));
+    _authenticatedUser.value()->addPrivileges(privileges);
     _authenticationMode = AuthorizationSession::AuthenticationMode::kConnection;
     _updateInternalAuthorizationState();
 }

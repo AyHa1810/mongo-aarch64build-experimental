@@ -41,7 +41,8 @@
 namespace mongo {
 namespace {
 
-static constexpr int64_t kSmallestChunkSizeSupported = 1024 * 1024;
+static constexpr int64_t kSmallestChunkSizeBytesSupported = 1024 * 1024;
+static constexpr int64_t kBiggestChunkSizeBytesSupported = 1024 * 1024 * 1024;
 
 class AutoSplitVectorCommand final : public TypedCommand<AutoSplitVectorCommand> {
 public:
@@ -69,7 +70,7 @@ public:
         Response typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::IllegalOperation,
                     "The autoSplitVector command can only be invoked on shards (no CSRS).",
-                    serverGlobalParams.clusterRole == ClusterRole::ShardServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ShardServer));
 
             uassertStatusOK(ShardingState::get(opCtx)->canAcceptShardedCommands());
             opCtx->setAlwaysInterruptAtStepDownOrUp_UNSAFE();
@@ -77,16 +78,19 @@ public:
             const auto& req = request();
 
             uassert(ErrorCodes::ErrorCodes::InvalidOptions,
-                    str::stream() << "maxChunksSizeBytes cannot be smaller than "
-                                  << kSmallestChunkSizeSupported,
-                    req.getMaxChunkSizeBytes() >= kSmallestChunkSizeSupported);
+                    str::stream() << "maxChunksSizeBytes must lie within the range ["
+                                  << kSmallestChunkSizeBytesSupported / (1024 * 1024) << "MB, "
+                                  << kBiggestChunkSizeBytesSupported / (1024 * 1024) << "MB]",
+                    req.getMaxChunkSizeBytes() >= kSmallestChunkSizeBytesSupported &&
+                        req.getMaxChunkSizeBytes() <= kBiggestChunkSizeBytesSupported);
 
             auto [splitPoints, continuation] = autoSplitVector(opCtx,
                                                                ns(),
                                                                req.getKeyPattern(),
                                                                req.getMin(),
                                                                req.getMax(),
-                                                               req.getMaxChunkSizeBytes());
+                                                               req.getMaxChunkSizeBytes(),
+                                                               req.getLimit());
             return Response(std::move(splitPoints), continuation);
         }
 

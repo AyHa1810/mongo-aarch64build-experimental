@@ -41,8 +41,8 @@
 // The Intel C library typedefs wchar_t, but it is a distinct fundamental type
 // in C++, so we #define _WCHAR_T here to prevent the library from trying to typedef.
 #define _WCHAR_T
-#include <third_party/IntelRDFPMathLib20U1/LIBRARY/src/bid_conf.h>
-#include <third_party/IntelRDFPMathLib20U1/LIBRARY/src/bid_functions.h>
+#include <bid_conf.h>
+#include <bid_functions.h>
 #undef _WCHAR_T
 
 #include "mongo/base/static_assert.h"
@@ -891,6 +891,15 @@ Decimal128 Decimal128::power(const Decimal128& other,
     else
         result = bid128_pow(base, exp, roundMode, signalingFlags);
     return Decimal128{libraryTypeToValue(result)}.add(kLargestNegativeExponentZero);
+}
+
+Decimal128 Decimal128::scale(int n, RoundingMode roundMode) const {
+    std::uint32_t throwAwayFlag = 0;
+    BID_UINT128 x = decimal128ToLibraryType(_value);
+
+    BID_UINT128 result = bid128_scalbn(x, n, roundMode, &throwAwayFlag);
+    return Decimal128{libraryTypeToValue(result)};
+    ;
 }
 
 Decimal128 Decimal128::nonNormalizingQuantize(const Decimal128& other,

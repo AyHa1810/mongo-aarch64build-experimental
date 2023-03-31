@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/bson/json.h"
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/commands.h"
@@ -47,7 +45,6 @@
 #include "mongo/s/catalog/type_database_gen.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
-#include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/database_version.h"
 #include "mongo/s/sharding_router_test_fixture.h"
@@ -70,7 +67,8 @@ using std::vector;
 using unittest::assertGet;
 
 const int kMaxCommandRetry = 3;
-const NamespaceString kNamespace("TestDB", "TestColl");
+const NamespaceString kNamespace =
+    NamespaceString::createNamespaceString_forTest("TestDB", "TestColl");
 
 BSONObj getReplSecondaryOkMetadata() {
     BSONObjBuilder o;
@@ -84,7 +82,7 @@ using ShardingCatalogClientTest = ShardingTestFixture;
 TEST_F(ShardingCatalogClientTest, GetCollectionExisting) {
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
-    CollectionType expectedColl(NamespaceString("TestDB.TestNS"),
+    CollectionType expectedColl(NamespaceString::createNamespaceString_forTest("TestDB.TestNS"),
                                 OID::gen(),
                                 Timestamp(1, 1),
                                 Date_t::now(),
@@ -111,7 +109,7 @@ TEST_F(ShardingCatalogClientTest, GetCollectionExisting) {
             ASSERT_BSONOBJ_EQ(query->getFilter(),
                               BSON(CollectionType::kNssFieldName << expectedColl.getNss().ns()));
             ASSERT_BSONOBJ_EQ(query->getSort(), BSONObj());
-            ASSERT_EQ(query->getLimit().get(), 1);
+            ASSERT_EQ(query->getLimit().value(), 1);
 
             checkReadConcern(request.cmdObj,
                              VectorClock::kInitialComponentTime.asTimestamp(),
@@ -141,7 +139,8 @@ TEST_F(ShardingCatalogClientTest, GetCollectionNotExisting) {
 
     auto future = launchAsync([this] {
         ASSERT_THROWS_CODE(
-            catalogClient()->getCollection(operationContext(), NamespaceString("NonExistent")),
+            catalogClient()->getCollection(
+                operationContext(), NamespaceString::createNamespaceString_forTest("NonExistent")),
             DBException,
             ErrorCodes::NamespaceNotFound);
     });
@@ -286,7 +285,6 @@ TEST_F(ShardingCatalogClientTest, GetAllShardsValid) {
     s1.setName("shard0000");
     s1.setHost("ShardHost");
     s1.setDraining(false);
-    s1.setMaxSizeMB(50);
     s1.setTags({"tag1", "tag2", "tag3"});
 
     ShardType s2;
@@ -296,7 +294,6 @@ TEST_F(ShardingCatalogClientTest, GetAllShardsValid) {
     ShardType s3;
     s3.setName("shard0002");
     s3.setHost("ShardHost");
-    s3.setMaxSizeMB(65);
 
     const vector<ShardType> expectedShardsList = {s1, s2, s3};
 
@@ -317,7 +314,7 @@ TEST_F(ShardingCatalogClientTest, GetAllShardsValid) {
                   NamespaceString::kConfigsvrShardsNamespace);
         ASSERT_BSONOBJ_EQ(query->getFilter(), BSONObj());
         ASSERT_BSONOBJ_EQ(query->getSort(), BSONObj());
-        ASSERT_FALSE(query->getLimit().is_initialized());
+        ASSERT_FALSE(query->getLimit().has_value());
 
         checkReadConcern(request.cmdObj,
                          VectorClock::kInitialComponentTime.asTimestamp(),
@@ -421,7 +418,7 @@ TEST_F(ShardingCatalogClientTest, GetChunksForNSWithSortAndLimit) {
                       ChunkType::ConfigNS);
             ASSERT_BSONOBJ_EQ(query->getFilter(), chunksQuery);
             ASSERT_BSONOBJ_EQ(query->getSort(), BSON(ChunkType::lastmod() << -1));
-            ASSERT_EQ(query->getLimit().get(), 1);
+            ASSERT_EQ(query->getLimit().value(), 1);
 
             checkReadConcern(request.cmdObj,
                              VectorClock::kInitialComponentTime.asTimestamp(),
@@ -487,7 +484,7 @@ TEST_F(ShardingCatalogClientTest, GetChunksForUUIDNoSortNoLimit) {
                   ChunkType::ConfigNS);
         ASSERT_BSONOBJ_EQ(query->getFilter(), chunksQuery);
         ASSERT_BSONOBJ_EQ(query->getSort(), BSONObj());
-        ASSERT_FALSE(query->getLimit().is_initialized());
+        ASSERT_FALSE(query->getLimit().has_value());
 
         checkReadConcern(request.cmdObj,
                          VectorClock::kInitialComponentTime.asTimestamp(),
@@ -778,14 +775,14 @@ TEST_F(ShardingCatalogClientTest, RunUserManagementWriteCommandNotWritablePrimar
 TEST_F(ShardingCatalogClientTest, GetCollectionsValidResultsNoDb) {
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
-    CollectionType coll1(NamespaceString{"test.coll1"},
+    CollectionType coll1(NamespaceString::createNamespaceString_forTest("test.coll1"),
                          OID::gen(),
                          Timestamp(1, 1),
                          network()->now(),
                          UUID::gen(),
                          BSON("_id" << 1));
 
-    CollectionType coll2(NamespaceString{"anotherdb.coll1"},
+    CollectionType coll2(NamespaceString::createNamespaceString_forTest("anotherdb.coll1"),
                          OID::gen(),
                          Timestamp(1, 1),
                          network()->now(),
@@ -836,7 +833,7 @@ TEST_F(ShardingCatalogClientTest, GetCollectionsValidResultsNoDb) {
 TEST_F(ShardingCatalogClientTest, GetCollectionsValidResultsWithDb) {
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
-    CollectionType coll1(NamespaceString{"test.coll1"},
+    CollectionType coll1(NamespaceString::createNamespaceString_forTest("test.coll1"),
                          OID::gen(),
                          Timestamp(1, 1),
                          network()->now(),
@@ -844,7 +841,7 @@ TEST_F(ShardingCatalogClientTest, GetCollectionsValidResultsWithDb) {
                          BSON("_id" << 1));
     coll1.setUnique(true);
 
-    CollectionType coll2(NamespaceString{"test.coll2"},
+    CollectionType coll2(NamespaceString::createNamespaceString_forTest("test.coll2"),
                          OID::gen(),
                          Timestamp(1, 1),
                          network()->now(),
@@ -890,7 +887,7 @@ TEST_F(ShardingCatalogClientTest, GetCollectionsInvalidCollectionType) {
         ASSERT_THROWS(catalogClient()->getCollections(operationContext(), "test"), DBException);
     });
 
-    CollectionType validColl(NamespaceString{"test.coll1"},
+    CollectionType validColl(NamespaceString::createNamespaceString_forTest("test.coll1"),
                              OID::gen(),
                              Timestamp(1, 1),
                              network()->now(),
@@ -988,20 +985,20 @@ TEST_F(ShardingCatalogClientTest, GetTagsForCollection) {
     configTargeter()->setFindHostReturnValue(HostAndPort("TestHost1"));
 
     TagsType tagA;
-    tagA.setNS(NamespaceString("TestDB.TestColl"));
+    tagA.setNS(NamespaceString::createNamespaceString_forTest("TestDB.TestColl"));
     tagA.setTag("TagA");
     tagA.setMinKey(BSON("a" << 100));
     tagA.setMaxKey(BSON("a" << 200));
 
     TagsType tagB;
-    tagB.setNS(NamespaceString("TestDB.TestColl"));
+    tagB.setNS(NamespaceString::createNamespaceString_forTest("TestDB.TestColl"));
     tagB.setTag("TagB");
     tagB.setMinKey(BSON("a" << 200));
     tagB.setMaxKey(BSON("a" << 300));
 
     auto future = launchAsync([this] {
         const auto& tags = assertGet(catalogClient()->getTagsForCollection(
-            operationContext(), NamespaceString("TestDB.TestColl")));
+            operationContext(), NamespaceString::createNamespaceString_forTest("TestDB.TestColl")));
 
         ASSERT_EQ(2U, tags.size());
 
@@ -1037,7 +1034,7 @@ TEST_F(ShardingCatalogClientTest, GetTagsForCollectionNoTags) {
 
     auto future = launchAsync([this] {
         const auto& tags = assertGet(catalogClient()->getTagsForCollection(
-            operationContext(), NamespaceString("TestDB.TestColl")));
+            operationContext(), NamespaceString::createNamespaceString_forTest("TestDB.TestColl")));
 
         ASSERT_EQ(0U, tags.size());
 
@@ -1054,20 +1051,20 @@ TEST_F(ShardingCatalogClientTest, GetTagsForCollectionInvalidTag) {
 
     auto future = launchAsync([this] {
         const auto swTags = catalogClient()->getTagsForCollection(
-            operationContext(), NamespaceString("TestDB.TestColl"));
+            operationContext(), NamespaceString::createNamespaceString_forTest("TestDB.TestColl"));
 
         ASSERT_EQUALS(ErrorCodes::NoSuchKey, swTags.getStatus());
     });
 
     onFindCommand([](const RemoteCommandRequest& request) {
         TagsType tagA;
-        tagA.setNS(NamespaceString("TestDB.TestColl"));
+        tagA.setNS(NamespaceString::createNamespaceString_forTest("TestDB.TestColl"));
         tagA.setTag("TagA");
         tagA.setMinKey(BSON("a" << 100));
         tagA.setMaxKey(BSON("a" << 200));
 
         TagsType tagB;
-        tagB.setNS(NamespaceString("TestDB.TestColl"));
+        tagB.setNS(NamespaceString::createNamespaceString_forTest("TestDB.TestColl"));
         tagB.setTag("TagB");
         tagB.setMinKey(BSON("a" << 200));
         // Missing maxKey
@@ -1244,7 +1241,7 @@ TEST_F(ShardingCatalogClientTest, GetNewKeys) {
                   query->getNamespaceOrUUID().nss().value_or(NamespaceString()));
         ASSERT_BSONOBJ_EQ(expectedQuery, query->getFilter());
         ASSERT_BSONOBJ_EQ(BSON("expiresAt" << 1), query->getSort());
-        ASSERT_FALSE(query->getLimit().is_initialized());
+        ASSERT_FALSE(query->getLimit().has_value());
 
         checkReadConcern(request.cmdObj,
                          VectorClock::kInitialComponentTime.asTimestamp(),
@@ -1298,7 +1295,7 @@ TEST_F(ShardingCatalogClientTest, GetNewKeysWithEmptyCollection) {
                   query->getNamespaceOrUUID().nss().value_or(NamespaceString()));
         ASSERT_BSONOBJ_EQ(expectedQuery, query->getFilter());
         ASSERT_BSONOBJ_EQ(BSON("expiresAt" << 1), query->getSort());
-        ASSERT_FALSE(query->getLimit().is_initialized());
+        ASSERT_FALSE(query->getLimit().has_value());
 
         checkReadConcern(request.cmdObj,
                          VectorClock::kInitialComponentTime.asTimestamp(),

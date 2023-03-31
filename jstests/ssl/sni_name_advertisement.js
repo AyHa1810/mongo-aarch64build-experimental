@@ -10,6 +10,10 @@ load('jstests/ssl/libs/ssl_helpers.js');
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
 TestData.skipCheckRoutingTableConsistency = true;
+TestData.skipCheckShardFilteringMetadata = true;
+
+// Do not check metadata consistency as mongos is stopped for testing purposes.
+TestData.skipCheckMetadataConsistency = true;
 
 let path = "jstests/libs/";
 let pemKeyFile = path + "server.pem";

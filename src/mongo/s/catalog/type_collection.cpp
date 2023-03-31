@@ -41,7 +41,7 @@
 
 namespace mongo {
 
-const NamespaceString CollectionType::ConfigNS("config.collections");
+const NamespaceString CollectionType::ConfigNS(NamespaceString::kConfigsvrCollectionsNamespace);
 
 CollectionType::CollectionType(NamespaceString nss,
                                OID epoch,
@@ -54,7 +54,7 @@ CollectionType::CollectionType(NamespaceString nss,
                          std::move(creationTime),
                          std::move(uuid),
                          std::move(keyPattern)) {
-    invariant(creationTime != Timestamp(0, 0));
+    invariant(getTimestamp() != Timestamp(0, 0));
     setEpoch(std::move(epoch));
 }
 

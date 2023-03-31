@@ -55,9 +55,12 @@ namespace {
 
 using namespace mongo::repl;
 
-NamespaceString kMinValidNss("local", "replset.minvalid");
-NamespaceString kOplogTruncateAfterPointNss("local", "replset.oplogTruncateAfterPoint");
-NamespaceString kInitialSyncIdNss("local", "replset.initialSyncId");
+NamespaceString kMinValidNss =
+    NamespaceString::createNamespaceString_forTest("local", "replset.minvalid");
+NamespaceString kOplogTruncateAfterPointNss =
+    NamespaceString::createNamespaceString_forTest("local", "replset.oplogTruncateAfterPoint");
+NamespaceString kInitialSyncIdNss =
+    NamespaceString::createNamespaceString_forTest("local", "replset.initialSyncId");
 
 /**
  * Returns min valid document.
@@ -210,7 +213,7 @@ TEST_F(ReplicationConsistencyMarkersTest, ReplicationConsistencyMarkers) {
     OpTime startOpTime({Seconds(123), 0}, 1LL);
     OpTime endOpTime({Seconds(456), 0}, 1LL);
     consistencyMarkers.setAppliedThrough(opCtx, startOpTime);
-    consistencyMarkers.setMinValid(opCtx, endOpTime, true /* alwaysAllowUntimestampedWrite */);
+    consistencyMarkers.setMinValid(opCtx, endOpTime);
     consistencyMarkers.setOplogTruncateAfterPoint(opCtx, endOpTime.getTimestamp());
 
     ASSERT_EQ(consistencyMarkers.getAppliedThrough(opCtx), startOpTime);
@@ -231,7 +234,7 @@ TEST_F(ReplicationConsistencyMarkersTest, ReplicationConsistencyMarkers) {
 
     // Set min valid without waiting for the changes to be durable.
     OpTime endOpTime2({Seconds(789), 0}, 1LL);
-    consistencyMarkers.setMinValid(opCtx, endOpTime2, true);
+    consistencyMarkers.setMinValid(opCtx, endOpTime2);
     consistencyMarkers.clearAppliedThrough(opCtx);
     ASSERT_EQUALS(consistencyMarkers.getAppliedThrough(opCtx), OpTime());
     ASSERT_EQUALS(consistencyMarkers.getMinValid(opCtx), endOpTime2);

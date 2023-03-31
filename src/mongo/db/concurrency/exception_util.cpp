@@ -27,18 +27,17 @@
  *    it in the license file.
  */
 
-
 #include "mongo/db/concurrency/exception_util.h"
 
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/exception_util_gen.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/log_and_backoff.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kControl
-
 
 namespace mongo {
 
@@ -61,6 +60,11 @@ CounterMetric temporarilyUnavailableErrorsEscaped{"operation.temporarilyUnavaila
 CounterMetric temporarilyUnavailableErrorsConvertedToWriteConflict{
     "operation.temporarilyUnavailableErrorsConvertedToWriteConflict"};
 
+CounterMetric transactionTooLargeForCacheErrors{"operation.transactionTooLargeForCacheErrors"};
+CounterMetric transactionTooLargeForCacheErrorsConvertedToWriteConflict{
+    "operation.transactionTooLargeForCacheErrorsConvertedToWriteConflict"};
+
+
 }  // namespace
 
 void handleTemporarilyUnavailableException(OperationContext* opCtx,
@@ -68,6 +72,8 @@ void handleTemporarilyUnavailableException(OperationContext* opCtx,
                                            StringData opStr,
                                            StringData ns,
                                            const TemporarilyUnavailableException& e) {
+    CurOp::get(opCtx)->debug().additiveMetrics.incrementTemporarilyUnavailableErrors(1);
+
     opCtx->recoveryUnit()->abandonSnapshot();
     temporarilyUnavailableErrors.increment(1);
     if (opCtx->getClient()->isFromUserConnection() &&
@@ -107,6 +113,29 @@ void handleTemporarilyUnavailableExceptionInTransaction(OperationContext* opCtx,
     // usual.
     temporarilyUnavailableErrorsConvertedToWriteConflict.increment(1);
     throwWriteConflictException(e.reason());
+}
+
+void handleTransactionTooLargeForCacheException(OperationContext* opCtx,
+                                                int* writeConflictAttempts,
+                                                StringData opStr,
+                                                StringData ns,
+                                                const TransactionTooLargeForCacheException& e) {
+    transactionTooLargeForCacheErrors.increment(1);
+    if (opCtx->writesAreReplicated()) {
+        // Surface error on primaries.
+        throw e;
+    }
+    // If an operation succeeds on primary, it should always be retried on secondaries. Secondaries
+    // always retry TemporarilyUnavailableExceptions and WriteConflictExceptions indefinitely, the
+    // only difference being the rate of retry. We prefer retrying faster, by converting to
+    // WriteConflictException, to avoid stalling replication longer than necessary.
+    transactionTooLargeForCacheErrorsConvertedToWriteConflict.increment(1);
+
+    // Handle as write conflict.
+    CurOp::get(opCtx)->debug().additiveMetrics.incrementWriteConflicts(1);
+    logWriteConflictAndBackoff(*writeConflictAttempts, opStr, ns);
+    ++(*writeConflictAttempts);
+    opCtx->recoveryUnit()->abandonSnapshot();
 }
 
 }  // namespace mongo

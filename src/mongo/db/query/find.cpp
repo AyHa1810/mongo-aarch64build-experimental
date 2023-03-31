@@ -36,7 +36,6 @@
 
 #include "mongo/base/error_codes.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/catalog/collection.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
@@ -63,7 +62,6 @@
 #include "mongo/db/stats/top.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/chunk_version.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
@@ -109,13 +107,15 @@ void endQueryOp(OperationContext* opCtx,
                 const CollectionPtr& collection,
                 const PlanExecutor& exec,
                 long long numResults,
-                CursorId cursorId) {
+                boost::optional<ClientCursorPin&> cursor,
+                const BSONObj& cmdObj) {
     auto curOp = CurOp::get(opCtx);
 
-    // Fill out basic CurOp query exec properties.
-    curOp->debug().nreturned = numResults;
-    curOp->debug().cursorid = (0 == cursorId ? -1 : cursorId);
-    curOp->debug().cursorExhausted = (0 == cursorId);
+    // Fill out basic CurOp query exec properties. More metrics (nreturned and executionTime)
+    // are collected within collectTelemetryMongod.
+    curOp->debug().cursorid = (cursor.has_value() ? cursor->getCursor()->cursorid() : -1);
+    curOp->debug().cursorExhausted = !cursor.has_value();
+    curOp->debug().additiveMetrics.nBatches = 1;
 
     // Fill out CurOp based on explain summary statistics.
     PlanSummaryStats summaryStats;
@@ -123,11 +123,17 @@ void endQueryOp(OperationContext* opCtx,
     explainer.getSummaryStats(&summaryStats);
     curOp->debug().setPlanSummaryMetrics(summaryStats);
 
+    if (cursor) {
+        collectTelemetryMongod(opCtx, *cursor, numResults);
+    } else {
+        collectTelemetryMongod(opCtx, cmdObj, numResults);
+    }
+
     if (collection) {
         CollectionQueryInfo::get(collection).notifyOfQuery(opCtx, collection, summaryStats);
     }
 
-    if (curOp->shouldDBProfile(opCtx)) {
+    if (curOp->shouldDBProfile()) {
         auto&& [stats, _] = explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
         curOp->debug().execStats = std::move(stats);
     }

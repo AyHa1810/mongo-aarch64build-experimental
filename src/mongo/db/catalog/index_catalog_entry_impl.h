@@ -38,6 +38,7 @@
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/update_index_data.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
 
@@ -67,6 +68,8 @@ public:
 
     std::shared_ptr<Ident> getSharedIdent() const final;
 
+    void setIdent(std::shared_ptr<Ident> newIdent) final;
+
     IndexDescriptor* descriptor() final {
         return _descriptor.get();
     }
@@ -92,9 +95,7 @@ public:
         _indexBuildInterceptor = interceptor;
     }
 
-    const Ordering& ordering() const final {
-        return _ordering;
-    }
+    const Ordering& ordering() const final;
 
     const MatchExpression* getFilterExpression() const final {
         return _filterExpression.get();
@@ -109,6 +110,8 @@ public:
     /// ---------------------
 
     void setIsReady(bool newIsReady) final;
+
+    void setIsFrozen(bool newIsFrozen) final;
 
     void setDropped() final {
         _isDropped.store(true);
@@ -186,6 +189,10 @@ public:
      */
     void setMinimumVisibleSnapshot(Timestamp newMinimumVisibleSnapshot) final;
 
+    const UpdateIndexData& getIndexedPaths() const final {
+        return _indexedPaths;
+    }
+
 private:
     /**
      * Sets this index to be multikey when we are running inside a multi-document transaction.
@@ -230,7 +237,6 @@ private:
 
     const RecordId _catalogId;  // Location in the durable catalog of the collection entry
                                 // containing this index entry.
-    Ordering _ordering;         // TODO: this might be b-tree specific
     bool _isReady;              // cache of NamespaceDetails info
     bool _isFrozen;
     bool _shouldValidateDocument;
@@ -243,5 +249,8 @@ private:
     // Used to improve lookups without having to search for the index name
     // accessing the collection metadata.
     int _indexOffset;
+
+    // Describes the paths indexed by this index.
+    UpdateIndexData _indexedPaths;
 };
 }  // namespace mongo

@@ -41,7 +41,7 @@
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/transaction_coordinator_service.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/db/transaction_validation.h"
 #include "mongo/logv2/log.h"
 
@@ -84,6 +84,10 @@ public:
     }
 
     bool allowedInTransactions() const final {
+        return true;
+    }
+
+    bool allowedWithSecurityToken() const final {
         return true;
     }
 
@@ -142,10 +146,11 @@ public:
             auto optionalCommitTimestamp = request().getCommitTimestamp();
             if (optionalCommitTimestamp) {
                 // commitPreparedTransaction will throw if the transaction is not prepared.
-                txnParticipant.commitPreparedTransaction(opCtx, optionalCommitTimestamp.get(), {});
+                txnParticipant.commitPreparedTransaction(
+                    opCtx, optionalCommitTimestamp.value(), {});
             } else {
                 if (ShardingState::get(opCtx)->canAcceptShardedCommands().isOK() ||
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
                     TransactionCoordinatorService::get(opCtx)->cancelIfCommitNotYetStarted(
                         opCtx, *opCtx->getLogicalSessionId(), txnNumberAndRetryCounter);
                 }
@@ -199,6 +204,10 @@ public:
         return true;
     }
 
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
+
     class Invocation final : public InvocationBaseGen {
     public:
         using InvocationBaseGen::InvocationBaseGen;
@@ -249,7 +258,7 @@ public:
 
             if (!MONGO_unlikely(dontRemoveTxnCoordinatorOnAbort.shouldFail()) &&
                 (ShardingState::get(opCtx)->canAcceptShardedCommands().isOK() ||
-                 serverGlobalParams.clusterRole == ClusterRole::ConfigServer)) {
+                 serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer))) {
                 TransactionCoordinatorService::get(opCtx)->cancelIfCommitNotYetStarted(
                     opCtx, *opCtx->getLogicalSessionId(), txnNumberAndRetryCounter);
             }

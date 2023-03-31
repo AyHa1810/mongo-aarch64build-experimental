@@ -37,37 +37,8 @@
 #include <cstdint>
 #include <iostream>
 
-namespace mongo {
+namespace mongo::base64_detail {
 namespace {
-
-constexpr unsigned char kInvalid = ~0;
-
-constexpr std::size_t search(StringData table, int c) {
-    for (std::size_t i = 0; i < table.size(); ++i)
-        if (table[i] == c)
-            return i;
-    return kInvalid;
-}
-
-template <std::size_t... Cs>
-constexpr auto invertTable(StringData table, std::index_sequence<Cs...>) {
-    return std::array<unsigned char, sizeof...(Cs)>{
-        {static_cast<unsigned char>(search(table, Cs))...}};
-}
-
-struct Base64 {
-    static constexpr auto kEncodeTable =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"_sd;
-    static constexpr auto kDecodeTable = invertTable(kEncodeTable, std::make_index_sequence<256>{});
-    static constexpr bool kTerminatorRequired = true;
-};
-
-struct Base64URL {
-    static constexpr auto kEncodeTable =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"_sd;
-    static constexpr auto kDecodeTable = invertTable(kEncodeTable, std::make_index_sequence<256>{});
-    static constexpr bool kTerminatorRequired = false;
-};
 
 template <typename Mode>
 bool valid(unsigned char x) {
@@ -80,8 +51,12 @@ void encodeImpl(Writer&& write, StringData in) {
     static_assert(Mode::kEncodeTable.size() == 64, "Invalid encoding table");
     const char* data = in.rawData();
     std::size_t size = in.size();
-    auto readOctet = [&data] { return static_cast<std::uint8_t>(*data++); };
-    auto encodeSextet = [](unsigned x) { return Mode::kEncodeTable[x & 0b11'1111]; };
+    auto readOctet = [&data] {
+        return static_cast<std::uint8_t>(*data++);
+    };
+    auto encodeSextet = [](unsigned x) {
+        return Mode::kEncodeTable[x & 0b11'1111];
+    };
 
     std::array<char, 512> buf;
     std::array<char, 512>::iterator p;
@@ -211,42 +186,46 @@ void decodeImpl(const Writer& write, StringData in) {
 
 }  // namespace
 
-// Base64
-
-std::string base64::encode(StringData in) {
+template <typename Mode>
+std::string Base64Impl<Mode>::encode(StringData in) {
     std::string r;
     r.reserve(encodedLength(in.size()));
-    encodeImpl<Base64>([&](const char* s, std::size_t n) { r.append(s, s + n); }, in);
+    encodeImpl<Mode>([&](const char* s, std::size_t n) { r.append(s, s + n); }, in);
     return r;
 }
 
-std::string base64::decode(StringData in) {
+template <typename Mode>
+std::string Base64Impl<Mode>::decode(StringData in) {
     std::string r;
     r.reserve(in.size() / 4 * 3);
-    decodeImpl<Base64>([&](const char* s, std::size_t n) { r.append(s, s + n); }, in);
+    decodeImpl<Mode>([&](const char* s, std::size_t n) { r.append(s, s + n); }, in);
     return r;
 }
 
-void base64::encode(std::stringstream& ss, StringData in) {
-    encodeImpl<Base64>([&](const char* s, std::size_t n) { ss.write(s, n); }, in);
+template <typename Mode>
+void Base64Impl<Mode>::encode(std::stringstream& ss, StringData in) {
+    encodeImpl<Mode>([&](const char* s, std::size_t n) { ss.write(s, n); }, in);
 }
 
-void base64::decode(std::stringstream& ss, StringData in) {
-    decodeImpl<Base64>([&](const char* s, std::size_t n) { ss.write(s, n); }, in);
+template <typename Mode>
+void Base64Impl<Mode>::decode(std::stringstream& ss, StringData in) {
+    decodeImpl<Mode>([&](const char* s, std::size_t n) { ss.write(s, n); }, in);
 }
 
-void base64::encode(fmt::memory_buffer& buffer, StringData in) {
+template <typename Mode>
+void Base64Impl<Mode>::encode(fmt::memory_buffer& buffer, StringData in) {
     buffer.reserve(buffer.size() + encodedLength(in.size()));
-    encodeImpl<Base64>([&](const char* s, std::size_t n) { buffer.append(s, s + n); }, in);
+    encodeImpl<Mode>([&](const char* s, std::size_t n) { buffer.append(s, s + n); }, in);
 }
 
-void base64::decode(fmt::memory_buffer& buffer, StringData in) {
+template <typename Mode>
+void Base64Impl<Mode>::decode(fmt::memory_buffer& buffer, StringData in) {
     buffer.reserve(buffer.size() + in.size() / 4 * 3);
-    decodeImpl<Base64>([&](const char* s, std::size_t n) { buffer.append(s, s + n); }, in);
+    decodeImpl<Mode>([&](const char* s, std::size_t n) { buffer.append(s, s + n); }, in);
 }
 
-
-bool base64::validate(StringData s) {
+template <>
+bool Base64Impl<Standard>::validate(StringData s) {
     if (s.size() % 4) {
         return false;
     }
@@ -254,54 +233,23 @@ bool base64::validate(StringData s) {
         return true;
     }
 
-    auto const unwindTerminator = [](auto it) { return (*(it - 1) == '=') ? (it - 1) : it; };
+    auto const unwindTerminator = [](auto it) {
+        return (*(it - 1) == '=') ? (it - 1) : it;
+    };
     auto const e = unwindTerminator(unwindTerminator(std::end(s)));
 
-    return e == std::find_if(std::begin(s), e, [](const char ch) { return !valid<Base64>(ch); });
+    return e == std::find_if(std::begin(s), e, [](const char ch) { return !valid<Standard>(ch); });
 }
 
-// Base64URL
-
-std::string base64url::encode(StringData in) {
-    std::string r;
-    r.reserve(encodedLength(in.size()));
-    encodeImpl<Base64URL>([&](const char* s, std::size_t n) { r.append(s, s + n); }, in);
-    return r;
-}
-
-std::string base64url::decode(StringData in) {
-    std::string r;
-    // effectively ceil(in.size() / 4) * 3
-    r.reserve(((in.size() + 3) / 4) * 3);
-    decodeImpl<Base64URL>([&](const char* s, std::size_t n) { r.append(s, s + n); }, in);
-    return r;
-}
-
-void base64url::encode(std::stringstream& ss, StringData in) {
-    encodeImpl<Base64URL>([&](const char* s, std::size_t n) { ss.write(s, n); }, in);
-}
-
-void base64url::decode(std::stringstream& ss, StringData in) {
-    decodeImpl<Base64URL>([&](const char* s, std::size_t n) { ss.write(s, n); }, in);
-}
-
-void base64url::encode(fmt::memory_buffer& buffer, StringData in) {
-    buffer.reserve(buffer.size() + encodedLength(in.size()));
-    encodeImpl<Base64URL>([&](const char* s, std::size_t n) { buffer.append(s, s + n); }, in);
-}
-
-void base64url::decode(fmt::memory_buffer& buffer, StringData in) {
-    buffer.reserve(buffer.size() + in.size() / 4 * 3);
-    decodeImpl<Base64URL>([&](const char* s, std::size_t n) { buffer.append(s, s + n); }, in);
-}
-
-
-bool base64url::validate(StringData s) {
+template <>
+bool Base64Impl<URL>::validate(StringData s) {
     if (s.empty()) {
         return true;
     }
 
-    auto const unwindTerminator = [](auto it) { return (*(it - 1) == '=') ? (it - 1) : it; };
+    auto const unwindTerminator = [](auto it) {
+        return (*(it - 1) == '=') ? (it - 1) : it;
+    };
     auto e = std::end(s);
 
     switch (s.size() % 4) {
@@ -321,7 +269,10 @@ bool base64url::validate(StringData s) {
             break;
     }
 
-    return e == std::find_if(std::begin(s), e, [](const char ch) { return !valid<Base64URL>(ch); });
+    return e == std::find_if(std::begin(s), e, [](const char ch) { return !valid<URL>(ch); });
 }
 
-}  // namespace mongo
+template class Base64Impl<Standard>;
+template class Base64Impl<URL>;
+
+}  // namespace mongo::base64_detail

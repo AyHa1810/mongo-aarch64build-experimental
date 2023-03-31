@@ -33,7 +33,7 @@
 #include "mongo/db/s/resharding/document_source_resharding_ownership_match.h"
 
 #include "mongo/db/s/resharding/resharding_util.h"
-#include "mongo/db/transaction_history_iterator.h"
+#include "mongo/db/transaction/transaction_history_iterator.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/resharding/common_types_gen.h"
@@ -65,7 +65,7 @@ DocumentSourceReshardingOwnershipMatch::createFromBson(
             elem.type() == Object);
 
     auto parsed = DocumentSourceReshardingOwnershipMatchSpec::parse(
-        {"DocumentSourceReshardingOwnershipMatchSpec"}, elem.embeddedObject());
+        IDLParserContext{"DocumentSourceReshardingOwnershipMatchSpec"}, elem.embeddedObject());
 
     return new DocumentSourceReshardingOwnershipMatch(
         parsed.getRecipientShardId(), ShardKeyPattern(parsed.getReshardingKey()), expCtx);
@@ -92,8 +92,11 @@ StageConstraints DocumentSourceReshardingOwnershipMatch::constraints(
                             ChangeStreamRequirement::kDenylist);
 }
 
-Value DocumentSourceReshardingOwnershipMatch::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceReshardingOwnershipMatch::serialize(SerializationOptions opts) const {
+    if (opts.redactFieldNames || opts.replacementForLiteralArgs) {
+        MONGO_UNIMPLEMENTED_TASSERT(7484302);
+    }
+
     return Value{Document{{kStageName,
                            DocumentSourceReshardingOwnershipMatchSpec(
                                _recipientShardId, _reshardingKey.getKeyPattern())
@@ -122,8 +125,9 @@ DocumentSource::GetNextResult DocumentSourceReshardingOwnershipMatch::doGetNext(
 
         auto* catalogCache = Grid::get(pExpCtx->opCtx)->catalogCache();
         _tempReshardingChunkMgr =
-            uassertStatusOK(catalogCache->getShardedCollectionRoutingInfoWithRefresh(
-                pExpCtx->opCtx, tempReshardingNss));
+            uassertStatusOK(catalogCache->getShardedCollectionRoutingInfoWithPlacementRefresh(
+                                pExpCtx->opCtx, tempReshardingNss))
+                .cm;
     }
 
     auto nextInput = pSource->getNext();

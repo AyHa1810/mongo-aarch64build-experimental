@@ -32,8 +32,8 @@ global:
     cpp_namespace: "mongo::repl"
 
 imports:
-    - "mongo/idl/basic_types.idl"
-    - "mongo/db/logical_session_id.idl"
+    - "mongo/db/basic_types.idl"
+    - "mongo/db/session/logical_session_id.idl"
     - "mongo/db/pipeline/value.idl"
     - "mongo/db/repl/optime_base.idl"
     - "mongo/db/repl/replication_types.idl"
@@ -50,6 +50,8 @@ enums:
             kUpdate: "u"
             kDelete: "d"
             kNoop: "n"
+            kInsertGlobalIndexKey: "xi"
+            kDeleteGlobalIndexKey: "xd"
     RetryImage:
         description: "Dictates whether a pre-image or post-image is to be stored on behalf of this
                       retryable write."
@@ -59,9 +61,6 @@ enums:
             kPostImage: "postImage"
 
 structs:
-    # TODO SERVER-67155 Ensure the tenantId is included in the serialized "ns" field when
-    # multitenancySupport is on but featureFlagRequireTenantId is off. Currently it will not be
-    # included in either place
     DurableReplOperation:
         description: "A document that represents an operation. Should never be used directly in
                       server code. Instead, create an instance of ReplOperation."

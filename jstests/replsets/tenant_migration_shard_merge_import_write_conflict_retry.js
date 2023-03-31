@@ -8,18 +8,17 @@
  *   featureFlagShardMerge,
  *   incompatible_with_macos,
  *   incompatible_with_windows_tls,
- *   requires_fcv_52,
  *   requires_replication,
  *   requires_persistence,
  *   requires_wiredtiger,
  *   serverless,
  * ]
  */
-(function() {
-"use strict";
+
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {isShardMergeEnabled} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
 load("jstests/libs/fail_point_util.js");
 
 const migrationId = UUID();
@@ -27,17 +26,18 @@ const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
 const donorPrimary = tenantMigrationTest.getDonorPrimary();
 const recipientPrimary = tenantMigrationTest.getRecipientPrimary();
 
-if (!TenantMigrationUtil.isShardMergeEnabled(recipientPrimary.getDB("admin"))) {
+if (!isShardMergeEnabled(recipientPrimary.getDB("admin"))) {
     tenantMigrationTest.stop();
     jsTestLog("Skipping Shard Merge-specific test");
-    return;
+    quit();
 }
 
 const kDataDir =
     `${recipientPrimary.dbpath}/migrationTmpFiles.${extractUUIDFromObject(migrationId)}`;
 assert.eq(runNonMongoProgram("mkdir", "-p", kDataDir), 0);
 
-const dbName = "myDatabase";
+const tenantId = ObjectId();
+const dbName = `${tenantId.str}_myDatabase`;
 
 (function() {
 jsTestLog("Generate test data");
@@ -66,10 +66,9 @@ configureFailPoint(
 jsTestLog("Run migration");
 // The old multitenant migrations won't copy myDatabase since it doesn't start with testTenantId,
 // but shard merge copies everything so we still expect myDatabase on the recipient, below.
-const kTenantId = "testTenantId";
 const migrationOpts = {
     migrationIdString: extractUUIDFromObject(migrationId),
-    tenantId: kTenantId,
+    tenantIds: [tenantId]
 };
 TenantMigrationTest.assertCommitted(
     tenantMigrationTest.runMigration(migrationOpts, {enableDonorStartMigrationFsync: true}));
@@ -88,4 +87,3 @@ tenantMigrationTest.getRecipientRst().nodes.forEach(node => {
 });
 
 tenantMigrationTest.stop();
-})();

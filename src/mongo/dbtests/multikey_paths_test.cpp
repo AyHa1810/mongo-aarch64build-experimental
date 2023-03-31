@@ -27,17 +27,15 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include <iostream>
-#include <string>
-
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/update/document_diff_applier.h"
+#include "mongo/db/update/document_diff_calculator.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/str.h"
@@ -81,8 +79,8 @@ public:
 
     // Helper to refetch the Collection from the catalog in order to see any changes made to it
     CollectionPtr collection() const {
-        return CollectionCatalog::get(_opCtx.get())
-            ->lookupCollectionByNamespace(_opCtx.get(), _nss);
+        return CollectionPtr(
+            CollectionCatalog::get(_opCtx.get())->lookupCollectionByNamespace(_opCtx.get(), _nss));
     }
 
 
@@ -140,8 +138,9 @@ TEST_F(MultikeyPathsTest, PathsUpdatedOnIndexCreation) {
 
         WriteUnitOfWork wuow(_opCtx.get());
         OpDebug* const nullOpDebug = nullptr;
-        ASSERT_OK(collection->insertDocument(
+        ASSERT_OK(collection_internal::insertDocument(
             _opCtx.get(),
+            *collection,
             InsertStatement(BSON("_id" << 0 << "a" << 5 << "b" << BSON_ARRAY(1 << 2 << 3))),
             nullOpDebug));
         wuow.commit();
@@ -164,12 +163,14 @@ TEST_F(MultikeyPathsTest, PathsUpdatedOnIndexCreationWithMultipleDocuments) {
 
         WriteUnitOfWork wuow(_opCtx.get());
         OpDebug* const nullOpDebug = nullptr;
-        ASSERT_OK(collection->insertDocument(
+        ASSERT_OK(collection_internal::insertDocument(
             _opCtx.get(),
+            *collection,
             InsertStatement(BSON("_id" << 0 << "a" << 5 << "b" << BSON_ARRAY(1 << 2 << 3))),
             nullOpDebug));
-        ASSERT_OK(collection->insertDocument(
+        ASSERT_OK(collection_internal::insertDocument(
             _opCtx.get(),
+            *collection,
             InsertStatement(BSON("_id" << 1 << "a" << BSON_ARRAY(1 << 2 << 3) << "b" << 5)),
             nullOpDebug));
         wuow.commit();
@@ -198,8 +199,9 @@ TEST_F(MultikeyPathsTest, PathsUpdatedOnDocumentInsert) {
     {
         WriteUnitOfWork wuow(_opCtx.get());
         OpDebug* const nullOpDebug = nullptr;
-        ASSERT_OK(collection->insertDocument(
+        ASSERT_OK(collection_internal::insertDocument(
             _opCtx.get(),
+            *collection,
             InsertStatement(BSON("_id" << 0 << "a" << 5 << "b" << BSON_ARRAY(1 << 2 << 3))),
             nullOpDebug));
         wuow.commit();
@@ -210,8 +212,9 @@ TEST_F(MultikeyPathsTest, PathsUpdatedOnDocumentInsert) {
     {
         WriteUnitOfWork wuow(_opCtx.get());
         OpDebug* const nullOpDebug = nullptr;
-        ASSERT_OK(collection->insertDocument(
+        ASSERT_OK(collection_internal::insertDocument(
             _opCtx.get(),
+            *collection,
             InsertStatement(BSON("_id" << 1 << "a" << BSON_ARRAY(1 << 2 << 3) << "b" << 5)),
             nullOpDebug));
         wuow.commit();
@@ -232,8 +235,8 @@ TEST_F(MultikeyPathsTest, PathsUpdatedOnDocumentUpdate) {
     {
         WriteUnitOfWork wuow(_opCtx.get());
         OpDebug* const nullOpDebug = nullptr;
-        ASSERT_OK(collection->insertDocument(
-            _opCtx.get(), InsertStatement(BSON("_id" << 0 << "a" << 5)), nullOpDebug));
+        ASSERT_OK(collection_internal::insertDocument(
+            _opCtx.get(), *collection, InsertStatement(BSON("_id" << 0 << "a" << 5)), nullOpDebug));
         wuow.commit();
     }
 
@@ -248,17 +251,70 @@ TEST_F(MultikeyPathsTest, PathsUpdatedOnDocumentUpdate) {
         auto oldDoc = collection->docFor(_opCtx.get(), record->id);
         {
             WriteUnitOfWork wuow(_opCtx.get());
-            const bool indexesAffected = true;
             OpDebug* opDebug = nullptr;
-            CollectionUpdateArgs args;
-            collection->updateDocument(
+            CollectionUpdateArgs args{oldDoc.value()};
+            collection_internal::updateDocument(
                 _opCtx.get(),
+                *collection,
                 record->id,
                 oldDoc,
                 BSON("_id" << 0 << "a" << 5 << "b" << BSON_ARRAY(1 << 2 << 3)),
-                indexesAffected,
+                collection_internal::kUpdateAllIndexes,
                 opDebug,
                 &args);
+            wuow.commit();
+        }
+    }
+
+    assertMultikeyPaths(collection.getCollection(), keyPattern, {MultikeyComponents{}, {0U}});
+}
+
+TEST_F(MultikeyPathsTest, PathsUpdatedOnDocumentUpdateWithDamages) {
+    BSONObj keyPattern = BSON("a" << 1 << "b" << 1);
+    createIndex(collection(),
+                BSON("name"
+                     << "a_1_b_1"
+                     << "key" << keyPattern << "v" << static_cast<int>(kIndexVersion)))
+        .transitional_ignore();
+    AutoGetCollection collection(_opCtx.get(), _nss, MODE_IX);
+
+    auto oldDoc = BSON("_id" << 0 << "a" << 5);
+    {
+        WriteUnitOfWork wuow(_opCtx.get());
+        OpDebug* const nullOpDebug = nullptr;
+        ASSERT_OK(collection_internal::insertDocument(
+            _opCtx.get(), *collection, InsertStatement(oldDoc), nullOpDebug));
+        wuow.commit();
+    }
+
+    assertMultikeyPaths(
+        collection.getCollection(), keyPattern, {MultikeyComponents{}, MultikeyComponents{}});
+
+    {
+        auto cursor = collection->getCursor(_opCtx.get());
+        auto record = cursor->next();
+        invariant(record);
+
+        auto oldDoc = collection->docFor(_opCtx.get(), record->id);
+        auto newDoc = BSON("_id" << 0 << "a" << 5 << "b" << BSON_ARRAY(1 << 2 << 3));
+        auto diffResult = doc_diff::computeOplogDiff(oldDoc.value(), newDoc, 0, nullptr);
+        auto damagesOutput = doc_diff::computeDamages(oldDoc.value(), diffResult->diff, false);
+        {
+            WriteUnitOfWork wuow(_opCtx.get());
+            OpDebug* opDebug = nullptr;
+            CollectionUpdateArgs args{oldDoc.value()};
+            auto newDocResult = collection_internal::updateDocumentWithDamages(
+                _opCtx.get(),
+                *collection,
+                record->id,
+                oldDoc,
+                damagesOutput.damageSource.get(),
+                damagesOutput.damages,
+                collection_internal::kUpdateAllIndexes,
+                opDebug,
+                &args);
+            ASSERT_TRUE(newDocResult.getValue().woCompare(newDoc) == 0);
+            ASSERT_TRUE(newDocResult.isOK());
             wuow.commit();
         }
     }
@@ -278,8 +334,9 @@ TEST_F(MultikeyPathsTest, PathsNotUpdatedOnDocumentDelete) {
     {
         WriteUnitOfWork wuow(_opCtx.get());
         OpDebug* const nullOpDebug = nullptr;
-        ASSERT_OK(collection->insertDocument(
+        ASSERT_OK(collection_internal::insertDocument(
             _opCtx.get(),
+            *collection,
             InsertStatement(BSON("_id" << 0 << "a" << 5 << "b" << BSON_ARRAY(1 << 2 << 3))),
             nullOpDebug));
         wuow.commit();
@@ -295,7 +352,8 @@ TEST_F(MultikeyPathsTest, PathsNotUpdatedOnDocumentDelete) {
         {
             WriteUnitOfWork wuow(_opCtx.get());
             OpDebug* const nullOpDebug = nullptr;
-            collection->deleteDocument(_opCtx.get(), kUninitializedStmtId, record->id, nullOpDebug);
+            collection_internal::deleteDocument(
+                _opCtx.get(), *collection, kUninitializedStmtId, record->id, nullOpDebug);
             wuow.commit();
         }
     }
@@ -322,8 +380,9 @@ TEST_F(MultikeyPathsTest, PathsUpdatedForMultipleIndexesOnDocumentInsert) {
     {
         WriteUnitOfWork wuow(_opCtx.get());
         OpDebug* const nullOpDebug = nullptr;
-        ASSERT_OK(collection->insertDocument(
+        ASSERT_OK(collection_internal::insertDocument(
             _opCtx.get(),
+            *collection,
             InsertStatement(
                 BSON("_id" << 0 << "a" << BSON_ARRAY(1 << 2 << 3) << "b" << 5 << "c" << 8)),
             nullOpDebug));

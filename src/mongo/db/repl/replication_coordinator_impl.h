@@ -36,7 +36,6 @@
 
 #include "mongo/base/status.h"
 #include "mongo/bson/timestamp.h"
-#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
 #include "mongo/db/repl/delayable_timeout_callback.h"
 #include "mongo/db/repl/initial_syncer.h"
@@ -294,7 +293,8 @@ public:
     virtual Status doOptimizedReconfig(OperationContext* opCtx, GetNewConfigFn) override;
 
     virtual Status awaitConfigCommitment(OperationContext* opCtx,
-                                         bool waitForOplogCommitment) override;
+                                         bool waitForOplogCommitment,
+                                         long long term) override;
 
     virtual Status processReplSetInitiate(OperationContext* opCtx,
                                           const BSONObj& configObj,
@@ -409,8 +409,8 @@ public:
         boost::optional<TopologyVersion> clientTopologyVersion,
         boost::optional<Date_t> deadline) override;
 
-    virtual StatusWith<OpTime> getLatestWriteOpTime(OperationContext* opCtx) const
-        noexcept override;
+    virtual StatusWith<OpTime> getLatestWriteOpTime(
+        OperationContext* opCtx) const noexcept override;
 
     virtual HostAndPort getCurrentPrimaryHostAndPort() const override;
 
@@ -425,6 +425,8 @@ public:
     virtual void restartScheduledHeartbeats_forTest() override;
 
     virtual void recordIfCWWCIsSetOnConfigServerOnStartup(OperationContext* opCtx) final;
+
+    virtual SplitPrepareSessionManager* getSplitPrepareSessionManager() override;
 
     // ================== Test support API ===================
 
@@ -588,6 +590,8 @@ public:
      * Returns a pointer to the WriteConcernTagChanges used by this instance.
      */
     WriteConcernTagChanges* getWriteConcernTagChanges() override;
+
+    bool isRetryableWrite(OperationContext* opCtx) const override;
 
 private:
     using CallbackFn = executor::TaskExecutor::CallbackFn;
@@ -1360,7 +1364,9 @@ private:
     void _scheduleHeartbeatReconfig(WithLock lk, const ReplSetConfig& newConfig);
 
     /**
-     * Determines if the provided config is a split config, and validates it for installation.
+     * Accepts a ReplSetConfig and resolves it either to itself, or the embedded shard split
+     * recipient config if it's present and self is a shard split recipient. Returns a tuple of the
+     * resolved config and a boolean indicating whether a recipient config was found.
      */
     std::tuple<StatusWith<ReplSetConfig>, bool> _resolveConfigToApply(const ReplSetConfig& config);
 
@@ -1368,7 +1374,8 @@ private:
      * Method to write a configuration transmitted via heartbeat message to stable storage.
      */
     void _heartbeatReconfigStore(const executor::TaskExecutor::CallbackArgs& cbd,
-                                 const ReplSetConfig& newConfig);
+                                 const ReplSetConfig& newConfig,
+                                 bool isSplitRecipientConfig = false);
 
     /**
      * Conclusion actions of a heartbeat-triggered reconfiguration.
@@ -1376,7 +1383,7 @@ private:
     void _heartbeatReconfigFinish(const executor::TaskExecutor::CallbackArgs& cbData,
                                   const ReplSetConfig& newConfig,
                                   StatusWith<int> myIndex,
-                                  bool isRecipientConfig);
+                                  bool isSplitRecipientConfig);
 
     /**
      * Calculates the time (in millis) left in quiesce mode and converts the value to int64.
@@ -1563,6 +1570,12 @@ private:
      * Finish catch-up mode and start drain mode.
      */
     void _enterDrainMode_inlock();
+
+    /**
+     * Enter drain mode which does not result in a primary stepup. Returns a future which becomes
+     * ready when the oplog buffers have completed draining.
+     */
+    Future<void> _drainForShardSplit();
 
     /**
      * Waits for the config state to leave kConfigStartingUp, which indicates that start() has
@@ -1836,7 +1849,7 @@ private:
     // The cached value of the 'counter' field in the server's TopologyVersion.
     AtomicWord<int64_t> _cachedTopologyVersionCounter;  // (S)
 
-    // This should be set during sharding initialization.
+    // This should be set during sharding initialization except on catalog shard.
     boost::optional<bool> _wasCWWCSetOnConfigServerOnStartup;
 
     InitialSyncerInterface::OnCompletionFn _onCompletion;
@@ -1844,6 +1857,12 @@ private:
     // Construct used to synchronize default write concern changes with config write concern
     // changes.
     WriteConcernTagChangesImpl _writeConcernTagChanges;
+
+    // An optional promise created when entering drain mode for shard split.
+    boost::optional<Promise<void>> _finishedDrainingPromise;  // (M)
+
+    // Pointer to the SplitPrepareSessionManager owned by this ReplicationCoordinator.
+    SplitPrepareSessionManager _splitSessionManager;  // (S)
 };
 
 }  // namespace repl

@@ -105,7 +105,7 @@ public:
 
             HostAndPort target;
             if (auto optTarget = cmd.getTarget()) {
-                target = validateTarget(opCtx, optTarget.get());
+                target = validateTarget(opCtx, optTarget.value());
             } else {
                 target = selectTarget(opCtx);
             }
@@ -139,7 +139,7 @@ public:
         void doCheckAuthorization(OperationContext*) const final {}
 
         NamespaceString ns() const final {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
     };
 

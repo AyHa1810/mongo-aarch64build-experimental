@@ -66,26 +66,23 @@ DB.prototype.commandHelp = function(name) {
     return res.help;
 };
 
-// utility to attach readPreference if needed.
+// Utility to attach readPreference if needed.
 DB.prototype._attachReadPreferenceToCommand = function(cmdObj, readPref) {
     "use strict";
-    // if the user has not set a readpref, return the original cmdObj
+    // If the user has not set a read pref, return the original 'cmdObj'.
     if ((readPref === null) || typeof (readPref) !== "object") {
         return cmdObj;
     }
 
-    // if user specifies $readPreference manually, then don't change it
+    // If user specifies $readPreference manually, then don't change it.
     if (cmdObj.hasOwnProperty("$readPreference")) {
         return cmdObj;
     }
 
-    // copy object so we don't mutate the original
+    // Copy object so we don't mutate the original.
     var clonedCmdObj = Object.extend({}, cmdObj);
-    // The server selection spec mandates that the key is '$query', but
-    // the shell has historically used 'query'. The server accepts both,
-    // so we maintain the existing behavior
-    var cmdObjWithReadPref = {query: clonedCmdObj, $readPreference: readPref};
-    return cmdObjWithReadPref;
+    clonedCmdObj["$readPreference"] = readPref;
+    return clonedCmdObj;
 };
 
 /**
@@ -473,6 +470,7 @@ DB.prototype.help = function() {
     print("\tdb.eval() - deprecated");
     print("\tdb.fsyncLock() flush data to disk and lock server for backups");
     print("\tdb.fsyncUnlock() unlocks server following a db.fsyncLock()");
+    print("\tdb.checkMetadataConsistency() checks the consistency of the metadata in the db");
     print("\tdb.getCollection(cname) same as db['cname'] or db.cname");
     print("\tdb.getCollectionInfos([filter]) - returns a list that contains the names and options" +
           " of the db's collections");
@@ -636,7 +634,7 @@ DB.prototype.dbEval = DB.prototype.eval;
 DB.prototype.groupeval = function(parmsObj) {
     var groupFunction = function() {
         var parms = args[0];
-        var c = db[parms.ns].find(parms.cond || {});
+        var c = globalThis.db[parms.ns].find(parms.cond || {});
         var map = new Map();
         var pks = parms.key ? Object.keySet(parms.key) : null;
         var pkl = pks ? pks.length : 0;
@@ -801,13 +799,6 @@ DB.prototype.hello = function() {
 };
 
 DB.prototype.currentOp = function(arg) {
-    // TODO CLOUDP-89361: The shell is connected to the Atlas Proxy, which currently does not
-    // support the $currentOp aggregation stage. Remove the legacy server command path once the
-    // proxy can support $currentOp.
-    if (this.serverStatus().hasOwnProperty("atlasVersion")) {
-        return this.currentOpLegacy(arg);
-    }
-
     try {
         const results = this.currentOpCursor(arg).toArray();
         let res = {"inprog": results.length > 0 ? results : [], "ok": 1};
@@ -821,21 +812,6 @@ DB.prototype.currentOp = function(arg) {
     } catch (e) {
         return {"ok": 0, "code": e.code, "errmsg": "Error executing $currentOp: " + e.message};
     }
-};
-DB.prototype.currentOP = DB.prototype.currentOp;
-
-DB.prototype.currentOpLegacy = function(arg) {
-    let q = {};
-    if (arg) {
-        if (typeof (arg) == "object")
-            Object.extend(q, arg);
-        else if (arg)
-            q["$all"] = true;
-    }
-
-    var commandObj = {"currentOp": 1};
-    Object.extend(commandObj, q);
-    return this.adminCommand(commandObj);
 };
 
 DB.prototype.currentOpCursor = function(arg) {
@@ -1799,7 +1775,7 @@ DB.prototype.createEncryptedCollection = function(name, opts) {
 };
 
 DB.prototype.dropEncryptedCollection = function(name) {
-    const ci = db.getCollectionInfos({name: name})[0];
+    const ci = globalThis.db.getCollectionInfos({name: name})[0];
     if (ci == undefined) {
         throw `Encrypted Collection '${name}' not found`;
     }
@@ -1813,5 +1789,10 @@ DB.prototype.dropEncryptedCollection = function(name) {
     this.getCollection(ef.eccCollection).drop();
     this.getCollection(ef.ecocCollection).drop();
     return this.getCollection(name).drop();
+};
+
+DB.prototype.checkMetadataConsistency = function() {
+    const res = assert.commandWorked(this.runCommand({checkMetadataConsistency: 1}));
+    return new DBCommandCursor(this, res);
 };
 }());

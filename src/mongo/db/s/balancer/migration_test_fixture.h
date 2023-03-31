@@ -30,7 +30,6 @@
 #include <memory>
 
 #include "mongo/client/remote_command_targeter_mock.h"
-#include "mongo/db/s/balancer/type_migration.h"
 #include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/s/catalog/type_collection.h"
@@ -104,16 +103,9 @@ protected:
     void removeAllChunks(const NamespaceString& collName, const UUID& uuid);
 
     /**
-     * Inserts a document into the config.migrations collection as an active migration.
+     * Returns the ShardId by its HostAndPort
      */
-    void setUpMigration(const NamespaceString& ns, const ChunkType& chunk, const ShardId& toShard);
-
-    /**
-     * Asserts that config.migrations is empty and config.locks contains no locked documents other
-     * than the balancer's, both of which should be true if the MigrationManager is inactive and
-     * behaving properly.
-     */
-    void checkMigrationsCollectionIsEmptyAndLocksAreUnlocked();
+    ShardId getShardIdByHost(HostAndPort host);
 
     // Random static initialization order can result in X constructor running before Y constructor
     // if X and Y are defined in different source files. Defining variables here to enforce order.
@@ -130,17 +122,13 @@ protected:
     const long long kMaxSizeMB = 100;
 
     const BSONObj kShard0 =
-        BSON(ShardType::name(kShardId0.toString())
-             << ShardType::host(kShardHost0.toString()) << ShardType::maxSizeMB(kMaxSizeMB));
+        BSON(ShardType::name(kShardId0.toString()) << ShardType::host(kShardHost0.toString()));
     const BSONObj kShard1 =
-        BSON(ShardType::name(kShardId1.toString())
-             << ShardType::host(kShardHost1.toString()) << ShardType::maxSizeMB(kMaxSizeMB));
+        BSON(ShardType::name(kShardId1.toString()) << ShardType::host(kShardHost1.toString()));
     const BSONObj kShard2 =
-        BSON(ShardType::name(kShardId2.toString())
-             << ShardType::host(kShardHost2.toString()) << ShardType::maxSizeMB(kMaxSizeMB));
+        BSON(ShardType::name(kShardId2.toString()) << ShardType::host(kShardHost2.toString()));
     const BSONObj kShard3 =
-        BSON(ShardType::name(kShardId3.toString())
-             << ShardType::host(kShardHost3.toString()) << ShardType::maxSizeMB(kMaxSizeMB));
+        BSON(ShardType::name(kShardId3.toString()) << ShardType::host(kShardHost3.toString()));
 
     const std::string kPattern = "_id";
     const KeyPattern kKeyPattern = KeyPattern(BSON(kPattern << 1));

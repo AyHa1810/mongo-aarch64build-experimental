@@ -33,10 +33,10 @@
 #include "mongo/db/periodic_runner_job_abort_expired_transactions.h"
 
 #include "mongo/db/client.h"
-#include "mongo/db/kill_sessions_local.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/transaction_participant.h"
-#include "mongo/db/transaction_participant_gen.h"
+#include "mongo/db/session/kill_sessions_local.h"
+#include "mongo/db/transaction/transaction_participant.h"
+#include "mongo/db/transaction/transaction_participant_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/periodic_runner.h"
 
@@ -76,7 +76,7 @@ auto PeriodicThreadToAbortExpiredTransactions::operator*() const noexcept -> Per
     return *_anchor;
 }
 
-auto PeriodicThreadToAbortExpiredTransactions::operator-> () const noexcept -> PeriodicJobAnchor* {
+auto PeriodicThreadToAbortExpiredTransactions::operator->() const noexcept -> PeriodicJobAnchor* {
     stdx::lock_guard lk(_mutex);
     return _anchor.get();
 }

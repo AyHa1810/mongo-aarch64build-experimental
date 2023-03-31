@@ -59,7 +59,6 @@ public:
                                                                 _timestamp,   // timestamp
                                                                 boost::none,  // time series fields
                                                                 boost::none,  // resharding fields
-                                                                boost::none,  // chunk size bytes
                                                                 true,         // allowMigration
                                                                 chunks);
 
@@ -71,7 +70,7 @@ public:
     }
 
 private:
-    const NamespaceString _nss{"foo.bar"};
+    const NamespaceString _nss = NamespaceString::createNamespaceString_forTest("foo.bar");
     const UUID _uuid = UUID::gen();
     const OID _epoch{OID::gen()};
     const Timestamp _timestamp{Timestamp(1, 1)};

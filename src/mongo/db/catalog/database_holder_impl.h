@@ -32,7 +32,6 @@
 #include "mongo/db/catalog/database_holder.h"
 
 #include "mongo/db/database_name.h"
-#include "mongo/stdx/condition_variable.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/string_map.h"
 
@@ -60,24 +59,11 @@ public:
 
     std::vector<DatabaseName> getNames() override;
 
-    void setDbInfo(OperationContext* opCtx,
-                   const DatabaseName& dbName,
-                   const DatabaseType& dbInfo) override;
-
-    void clearDbInfo(OperationContext* opCtx, const DatabaseName& dbName) override;
-
-    boost::optional<DatabaseVersion> getDbVersion(OperationContext* opCtx,
-                                                  const DatabaseName& dbName) const override;
-
-    boost::optional<ShardId> getDbPrimary(OperationContext* opCtx,
-                                          const DatabaseName& dbName) const override;
-
 private:
     std::set<DatabaseName> _getNamesWithConflictingCasing_inlock(const DatabaseName& dbName);
 
     typedef stdx::unordered_map<DatabaseName, Database*> DBs;
     mutable SimpleMutex _m;
-    mutable stdx::condition_variable _c;
     DBs _dbs;
 };
 

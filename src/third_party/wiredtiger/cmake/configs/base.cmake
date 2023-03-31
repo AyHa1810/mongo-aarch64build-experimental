@@ -66,6 +66,7 @@ config_choice(
         "ppc64le;WT_PPC64;"
         "s390x;WT_S390X;"
         "riscv64;WT_RISCV64;"
+        "loongarch64;WT_LOONGARCH64;"
 )
 
 config_choice(
@@ -75,6 +76,12 @@ config_choice(
         "darwin;WT_DARWIN;"
         "windows;WT_WIN;"
         "linux;WT_LINUX;"
+)
+
+config_bool(
+    ENABLE_ANTITHESIS
+    "Enable the Antithesis random library"
+    DEFAULT OFF
 )
 
 config_bool(
@@ -103,6 +110,14 @@ config_bool(
 )
 
 config_bool(
+    HAVE_CALL_LOG
+    "Enable call log generation"
+    DEFAULT OFF
+    DEPENDS "HAVE_DIAGNOSTIC"
+    DEPENDS_ERROR ON "Call log requires diagnostic build to be enabled"
+)
+
+config_bool(
     NON_BARRIER_DIAGNOSTIC_YIELDS
     "Don't set a full barrier when yielding threads in diagnostic mode. Requires diagnostic mode to be enabled."
     DEFAULT OFF
@@ -111,6 +126,12 @@ config_bool(
 config_bool(
     HAVE_UNITTEST
     "Enable C++ Catch2 based WiredTiger unit tests"
+    DEFAULT OFF
+)
+
+config_bool(
+    HAVE_UNITTEST_ASSERTS
+    "Enable C++ Catch2 based WiredTiger unit tests. Special configuration for testing assertions"
     DEFAULT OFF
 )
 
@@ -261,8 +282,32 @@ config_bool(
 )
 
 config_bool(
+    ENABLE_CPPSUITE
+    "Build the cppsuite"
+    DEFAULT ON
+)
+
+config_bool(
+    ENABLE_LAZYFS
+    "Build LazyFS for testing"
+    DEFAULT OFF
+)
+
+config_bool(
     ENABLE_S3
     "Build the S3 storage extension"
+    DEFAULT OFF
+)
+
+config_bool(
+    ENABLE_GCP
+    "Build the Google Cloud Platform storage extension"
+    DEFAULT OFF
+)
+
+config_bool(
+    ENABLE_AZURE
+    "Build the Azure storage extension"
     DEFAULT OFF
 )
 
@@ -278,11 +323,7 @@ config_bool(
     DEFAULT ${default_enable_debug_info}
 )
 
-# FIXME-WT-9481: Ideally this would choose an optimization level of Og. Which is the recommended
-# configuration for build-debug cycles when using GCC and is a synonym in clang for O1.
-# Unfortunately at the moment, WiredTiger code generates compiler warnings (as errors) when
-# built with Og.
-set(default_optimize_level "-O1")
+set(default_optimize_level "-Og")
 if("${CMAKE_BUILD_TYPE}" MATCHES "^(Release|RelWithDebInfo)$")
     if(WT_WIN)
         set(default_optimize_level "/O2")
@@ -340,8 +381,17 @@ if(ENABLE_DEBUG_INFO)
         # Ensure a PDB file can be generated for debugging symbols.
         set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /DEBUG")
     else()
-        add_compile_options(-g)
-        add_compile_options(-ggdb)
+        # Higher debug levels `-g3`/`-ggdb3` emit additional debug information, including 
+        # macro definitions that allow us to evaluate macros such as `p S2C(session)` inside of gdb.
+        # This needs to be in DWARF version 2 format or later - and should be by default - but 
+        # we'll specify version 4 here to be safe.
+        add_compile_options(-g3)
+        add_compile_options(-ggdb3)
+        add_compile_options(-gdwarf-4)
+        if("${CMAKE_C_COMPILER_ID}" STREQUAL "Clang")
+            # Clang requires one additional flag to output macro debug information.
+            add_compile_options(-fdebug-macro)
+        endif()
     endif()
 endif()
 
@@ -355,6 +405,10 @@ if (NON_BARRIER_DIAGNOSTIC_YIELDS AND NOT HAVE_DIAGNOSTIC)
     message(FATAL_ERROR "`NON_BARRIER_DIAGNOSTIC_YIELDS` can only be enabled when `HAVE_DIAGNOSTIC` is enabled.")
 endif()
 
+if (HAVE_UNITTEST_ASSERTS AND NOT HAVE_UNITTEST)
+    message(FATAL_ERROR "`HAVE_UNITTEST_ASSERTS` can only be enabled when `HAVE_UNITTEST` is enabled.")
+endif()
+
 if(WT_WIN)
     # Check if we a using the dynamic or static run-time library.
     if(DYNAMIC_CRT)
@@ -364,4 +418,8 @@ if(WT_WIN)
         # Use the multithread, static version of the run-time library.
         add_compile_options(/MT)
     endif()
+endif()
+
+if(ENABLE_ANTITHESIS)
+    add_compile_options(-fsanitize-coverage=trace-pc-guard)
 endif()

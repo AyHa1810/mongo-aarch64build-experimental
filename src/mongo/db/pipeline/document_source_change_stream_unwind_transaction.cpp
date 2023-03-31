@@ -35,7 +35,7 @@
 #include "mongo/db/pipeline/change_stream_filter_helpers.h"
 #include "mongo/db/pipeline/change_stream_rewrite_helpers.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
-#include "mongo/db/transaction_history_iterator.h"
+#include "mongo/db/transaction/transaction_history_iterator.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
@@ -128,19 +128,26 @@ StageConstraints DocumentSourceChangeStreamUnwindTransaction::constraints(
                             ChangeStreamRequirement::kChangeStreamStage);
 }
 
-Value DocumentSourceChangeStreamUnwindTransaction::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
-    tassert(5467604, "expression has not been initialized", _expression);
+Value DocumentSourceChangeStreamUnwindTransaction::serialize(SerializationOptions opts) const {
+    tassert(7481400, "expression has not been initialized", _expression);
 
-    if (explain) {
-        return Value(
-            DOC(DocumentSourceChangeStream::kStageName << DOC("stage"
-                                                              << "internalUnwindTransaction"_sd
-                                                              << "filter" << _filter)));
+    if (opts.verbosity) {
+        BSONObjBuilder builder;
+        builder.append("stage"_sd, "internalUnwindTransaction"_sd);
+        builder.append(DocumentSourceChangeStreamUnwindTransactionSpec::kFilterFieldName,
+                       _expression->serialize(opts));
+
+        return Value(DOC(DocumentSourceChangeStream::kStageName << builder.obj()));
     }
 
-    DocumentSourceChangeStreamUnwindTransactionSpec spec(_filter);
-    return Value(Document{{kStageName, Value(spec.toBSON())}});
+    Value spec;
+    if (opts.replacementForLiteralArgs || opts.redactFieldNames) {
+        spec = Value(DOC(DocumentSourceChangeStreamUnwindTransactionSpec::kFilterFieldName
+                         << _expression->serialize(opts)));
+    } else {
+        spec = Value(DocumentSourceChangeStreamUnwindTransactionSpec(_filter).toBSON());
+    }
+    return Value(Document{{kStageName, spec}});
 }
 
 DepsTracker::State DocumentSourceChangeStreamUnwindTransaction::getDependencies(

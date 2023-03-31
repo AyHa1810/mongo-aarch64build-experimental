@@ -199,12 +199,18 @@ public:
     /**
      * List the databases stored in this storage engine.
      */
-    virtual std::vector<DatabaseName> listDatabases() const = 0;
+    virtual std::vector<DatabaseName> listDatabases(
+        boost::optional<TenantId> tenantId = boost::none) const = 0;
 
     /**
      * Returns whether the storage engine supports capped collections.
      */
     virtual bool supportsCappedCollections() const = 0;
+
+    /**
+     * Returns whether the storage engine supports checkpoints.
+     */
+    virtual bool supportsCheckpoints() const = 0;
 
     /**
      * Returns true if the engine does not persist data to disk; false otherwise.
@@ -221,13 +227,10 @@ public:
      * caller. For example, on starting from a previous unclean shutdown, we may try to recover
      * orphaned idents, which are known to the storage engine but not referenced in the catalog.
      */
-    virtual void loadCatalog(OperationContext* opCtx, LastShutdownState lastShutdownState) = 0;
+    virtual void loadCatalog(OperationContext* opCtx,
+                             boost::optional<Timestamp> stableTs,
+                             LastShutdownState lastShutdownState) = 0;
     virtual void closeCatalog(OperationContext* opCtx) = 0;
-
-    /**
-     * Closes all file handles associated with a database.
-     */
-    virtual Status closeDatabase(OperationContext* opCtx, const DatabaseName& dbName) = 0;
 
     /**
      * Deletes all data and metadata for a database.
@@ -375,7 +378,7 @@ public:
      * On error, the storage engine should assert and crash.
      * There is intentionally no uncleanShutdown().
      */
-    virtual void cleanShutdown() = 0;
+    virtual void cleanShutdown(ServiceContext* svcCtx) = 0;
 
     /**
      * Returns the SnapshotManager for this StorageEngine or NULL if not supported.
@@ -413,11 +416,11 @@ public:
     virtual bool supportsReadConcernMajority() const = 0;
 
     /**
-     * Returns true if the storage engine uses oplog stones to more finely control
+     * Returns true if the storage engine uses oplog truncate markers to more finely control
      * deletion of oplog history, instead of the standard capped collection controls on
      * the oplog collection size.
      */
-    virtual bool supportsOplogStones() const = 0;
+    virtual bool supportsOplogTruncateMarkers() const = 0;
 
     virtual bool supportsResumableIndexBuilds() const = 0;
 
@@ -432,6 +435,11 @@ public:
      * Returns a set of drop pending idents inside the storage engine.
      */
     virtual std::set<std::string> getDropPendingIdents() const = 0;
+
+    /**
+     * Returns the number of drop pending idents inside the storage engine.
+     */
+    virtual size_t getNumDropPendingIdents() const = 0;
 
     /**
      * Clears list of drop-pending idents in the storage engine.
@@ -449,6 +457,20 @@ public:
                                      DropIdentCallback&& onDrop = nullptr) = 0;
 
     /**
+     * Drops all unreferenced drop-pending idents with drop timestamps before 'ts', as well as all
+     * unreferenced idents with Timestamp::min() drop timestamps (untimestamped on standalones).
+     */
+    virtual void dropIdentsOlderThan(OperationContext* opCtx, const Timestamp& ts) = 0;
+
+    /**
+     * Marks the ident as in use and prevents the reaper from dropping the ident.
+     *
+     * Returns nullptr if the ident is not known to the reaper, is already being dropped, or is
+     * already dropped.
+     */
+    virtual std::shared_ptr<Ident> markIdentInUse(StringData ident) = 0;
+
+    /**
      * Starts the timestamp monitor. This periodically drops idents queued by addDropPendingIdent,
      * and removes historical ident entries no longer necessary.
      */
@@ -457,8 +479,9 @@ public:
     /**
      * Called when the checkpoint thread instructs the storage engine to take a checkpoint. The
      * underlying storage engine must take a checkpoint at this point.
+     * Acquires a resource mutex before taking the checkpoint.
      */
-    virtual void checkpoint() = 0;
+    virtual void checkpoint(OperationContext* opCtx) = 0;
 
     /**
      * Recovers the storage engine state to the last stable timestamp. "Stable" in this case
@@ -577,8 +600,9 @@ public:
     };
 
     /**
-     * Drop abandoned idents. If successful, returns a ReconcileResult with indexes that need to be
-     * rebuilt or builds that need to be restarted.
+     * Drop abandoned idents using two-phase drop at the stable timestamp. Idents may be needed for
+     * reads between the oldest and stable timestamps. If successful, returns a ReconcileResult with
+     * indexes that need to be rebuilt or builds that need to be restarted.
      *
      * Abandoned internal idents require special handling based on the context known only to the
      * caller. For example, on starting from a previous unclean shutdown, we would always drop all
@@ -586,7 +610,7 @@ public:
      * information for resuming index builds.
      */
     virtual StatusWith<ReconcileResult> reconcileCatalogAndIdents(
-        OperationContext* opCtx, LastShutdownState lastShutdownState) = 0;
+        OperationContext* opCtx, Timestamp stableTs, LastShutdownState lastShutdownState) = 0;
 
     /**
      * Returns the all_durable timestamp. All transactions with timestamps earlier than the
@@ -660,6 +684,13 @@ public:
      */
     virtual void setPinnedOplogTimestamp(const Timestamp& pinnedTimestamp) = 0;
 
+    /**
+     * Returns the input storage engine options, sanitized to remove options that may not apply to
+     * this node, such as encryption. Might be called for both collection and index options. See
+     * SERVER-68122.
+     */
+    virtual StatusWith<BSONObj> getSanitizedStorageOptionsForSecondaryReplication(
+        const BSONObj& options) const = 0;
     /**
      * Instructs the storage engine to dump its internal state.
      */

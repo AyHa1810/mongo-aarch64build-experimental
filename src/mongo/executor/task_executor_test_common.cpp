@@ -115,7 +115,9 @@ public:
     void CET_##TEST_NAME::_doTest()
 
 auto makeSetStatusClosure(Status* target) {
-    return [target](const TaskExecutor::CallbackArgs& cbData) { *target = cbData.status; };
+    return [target](const TaskExecutor::CallbackArgs& cbData) {
+        *target = cbData.status;
+    };
 }
 
 auto makeSetStatusAndShutdownClosure(Status* target) {
@@ -364,7 +366,6 @@ COMMON_EXECUTOR_TEST(EventWaitingWithTimeoutTest) {
 
     auto serviceContext = ServiceContext::make();
 
-    serviceContext->registerClientObserver(std::make_unique<LockerNoopClientObserver>());
     serviceContext->setFastClockSource(std::make_unique<ClockSourceMock>());
     auto mockClock = static_cast<ClockSourceMock*>(serviceContext->getFastClockSource());
 
@@ -387,7 +388,6 @@ COMMON_EXECUTOR_TEST(EventSignalWithTimeoutTest) {
 
     auto serviceContext = ServiceContext::make();
 
-    serviceContext->registerClientObserver(std::make_unique<LockerNoopClientObserver>());
     serviceContext->setFastClockSource(std::make_unique<ClockSourceMock>());
     auto mockClock = static_cast<ClockSourceMock*>(serviceContext->getFastClockSource());
 
@@ -1113,7 +1113,7 @@ COMMON_EXECUTOR_TEST(ScheduleExhaustRemoteCommandFutureIsResolvedWithErrorOnCanc
 
 void addTestsForExecutor(const std::string& suiteName, ExecutorFactory makeExecutor) {
     auto& suite = unittest::Suite::getSuite(suiteName);
-    for (auto testCase : executorTestCaseRegistry()) {
+    for (const auto& testCase : executorTestCaseRegistry()) {
         suite.add(str::stream() << suiteName << "::" << testCase.first,
                   __FILE__,
                   [testCase, makeExecutor] { testCase.second(makeExecutor)->run(); });

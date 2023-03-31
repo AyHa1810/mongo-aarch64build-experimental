@@ -30,10 +30,12 @@
 #pragma once
 
 #include <boost/optional/optional.hpp>
+#include <stack>
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/db/catalog/validate_results.h"
+#include "mongo/db/field_ref.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/ident.h"
@@ -43,44 +45,70 @@ using PathView = StringData;
 using PathValue = std::string;
 using CellView = StringData;
 using CellValue = std::string;
+using RowId = int64_t;
 
 struct FullCellView {
     PathView path;
-    RecordId rid;
+    RowId rid;
     CellView value;
+};
+
+/**
+ * An owned representation of a column-store index entry cell.
+ */
+struct FullCellValue {
+    PathValue path;
+    RowId rid;
+    CellValue value;
+
+    FullCellValue(FullCellView fcv) : path(fcv.path), rid(fcv.rid), value(fcv.value) {}
+    FullCellValue(PathView p, RowId r, CellView v) : path(p), rid(r), value(v) {}
 };
 
 struct CellViewForPath {
-    RecordId rid;
+    RowId rid;
     CellView value;
 };
 
-class ColumnStore : public Ident {
-protected:
-    class Cursor;
-
+/**
+ * This is a base class for column store index storage access, similar to RecordStore and
+ * SortedDataInterface.
+ *
+ * Whereas RecordStore maps RecordId to RecordData and SDI maps KeyString to RecordId, ColumnStore
+ * stores tuples of Path, RecordId and Value in a separate format.
+ */
+class ColumnStore {
 public:
+    class Cursor;
     class WriteCursor {
     public:
         virtual ~WriteCursor() = default;
-        virtual void insert(PathView, const RecordId&, CellView) = 0;
-        virtual void remove(PathView, const RecordId&) = 0;
-        virtual void update(PathView, const RecordId&, CellView) = 0;
+        virtual void insert(PathView, RowId, CellView) = 0;
+        virtual void remove(PathView, RowId) = 0;
+        virtual void update(PathView, RowId, CellView) = 0;
     };
 
-    class CursorForPath {
+    /**
+     * Wrapper around a regular storage cursor to return results only for a specific data column in
+     * a column store index. Only returns documents matching the path specified in the constructor.
+     * Considers non-path matching documents EOF and returns boost::none.
+     */
+    class ColumnCursor {
     public:
-        CursorForPath(StringData path, std::unique_ptr<Cursor> cursor)
-            : _path(path.toString()), _cursor(std::move(cursor)) {}
+        ColumnCursor(StringData path, std::unique_ptr<Cursor> cursor)
+            : _path(path.toString()),
+              _numPathParts(FieldRef{_path}.numParts()),
+              _cursor(std::move(cursor)) {}
+
         boost::optional<FullCellView> next() {
             if (_eof)
                 return {};
             return handleResult(_cursor->next());
         }
-        boost::optional<FullCellView> seekAtOrPast(const RecordId& rid) {
+        boost::optional<FullCellView> seekAtOrPast(RowId rid) {
             return handleResult(_cursor->seekAtOrPast(_path, rid));
         }
-        boost::optional<FullCellView> seekExact(const RecordId& rid) {
+        boost::optional<FullCellView> seekExact(RowId rid) {
             return handleResult(_cursor->seekExact(_path, rid));
         }
 
@@ -109,6 +137,10 @@ public:
             return _path;
         }
 
+        FieldIndex numPathParts() const {
+            return _numPathParts;
+        }
+
     private:
         boost::optional<FullCellView> handleResult(boost::optional<FullCellView> res) {
             if (!res || res->path != _path) {
@@ -120,6 +152,7 @@ public:
             return res;
         }
         const PathValue _path;
+        const FieldIndex _numPathParts = 0;
         bool _eof = true;
         const std::unique_ptr<Cursor> _cursor;
     };
@@ -127,7 +160,7 @@ public:
     class BulkBuilder {
     public:
         virtual ~BulkBuilder() = default;
-        virtual void addCell(PathView, const RecordId&, CellView) = 0;
+        virtual void addCell(PathView, RowId, CellView) = 0;
     };
 
     /**
@@ -137,6 +170,9 @@ public:
      * This is not a valid real path because it can never appear in valid UTF-8 data.
      */
     static constexpr StringData kRowIdPath = "\xFF"_sd;
+
+    // RowId equivalent of a null RecordId
+    static const RowId kNullRowId = 0;
 
     // This is really just a namespace
     struct Bytes {
@@ -211,7 +247,6 @@ public:
         static constexpr uint8_t kArrInfoSizeTinyMax = 0xec;
 
         // N bytes of ArrInfo at end of Cell.
-        // TODO prove there can never be more than 16MB of arrInfo, and use 3 rather than 4 bytes.
         static constexpr uint8_t kArrInfoSize1 = 0xed;
         static constexpr uint8_t kArrInfoSize2 = 0xee;
         static constexpr uint8_t kArrInfoSize4 = 0xef;
@@ -256,31 +291,26 @@ public:
     };
 
 
-    ColumnStore(StringData ident) : Ident(ident) {}
+    ColumnStore(StringData ident) : _ident(std::make_shared<Ident>(ident)) {}
     virtual ~ColumnStore() = default;
 
     //
     // CRUD
     //
     virtual std::unique_ptr<WriteCursor> newWriteCursor(OperationContext*) = 0;
-    virtual void insert(OperationContext*, PathView, const RecordId&, CellView) = 0;
-    virtual void remove(OperationContext*, PathView, const RecordId&) = 0;
-    virtual void update(OperationContext*, PathView, const RecordId&, CellView) = 0;
+    virtual void insert(OperationContext*, PathView, RowId, CellView) = 0;
+    virtual void remove(OperationContext*, PathView, RowId) = 0;
+    virtual void update(OperationContext*, PathView, RowId, CellView) = 0;
     virtual std::unique_ptr<Cursor> newCursor(OperationContext*) const = 0;
-    std::unique_ptr<CursorForPath> newCursor(OperationContext* opCtx, PathView path) const {
-        return std::make_unique<CursorForPath>(path, newCursor(opCtx));
-    }
-
-    bool haveAnyWithPath(OperationContext* opCtx, PathView path) const {
-        // TODO could avoid extra allocation. May also be more efficient to do a different way.
-        return bool(newCursor(opCtx, path)->seekAtOrPast(RecordId()));
+    std::unique_ptr<ColumnCursor> newCursor(OperationContext* opCtx, PathView path) const {
+        return std::make_unique<ColumnCursor>(path, newCursor(opCtx));
     }
 
     std::vector<PathValue> uniquePaths(OperationContext* opCtx) const {
         std::vector<PathValue> out;
         PathValue nextPath = "";
         auto cursor = newCursor(opCtx);
-        while (auto next = cursor->seekAtOrPast(nextPath, RecordId())) {
+        while (auto next = cursor->seekAtOrPast(nextPath, kNullRowId)) {
             out.push_back(next->path.toString());
             nextPath.assign(next->path.rawData(), next->path.size());
             nextPath += '\x01';  // next possible path (\0 is not allowed)
@@ -294,9 +324,7 @@ public:
     // Whole ColumnStore ops
     //
     virtual Status compact(OperationContext* opCtx) = 0;
-    virtual void fullValidate(OperationContext* opCtx,
-                              int64_t* numKeysOut,
-                              IndexValidateResults* fullResults) const = 0;
+    virtual IndexValidateResults validate(OperationContext* opCtx, bool full) const = 0;
 
     virtual bool appendCustomStats(OperationContext* opCtx,
                                    BSONObjBuilder* output,
@@ -306,11 +334,7 @@ public:
     virtual long long getFreeStorageBytes(OperationContext* opCtx) const = 0;
 
     virtual bool isEmpty(OperationContext* opCtx) = 0;
-    virtual long long numEntries(OperationContext* opCtx) const {
-        int64_t x = -1;
-        fullValidate(opCtx, &x, nullptr);
-        return x;
-    }
+    virtual int64_t numEntries(OperationContext* opCtx) const = 0;
 
     /**
      * If the range [*itPtr, end) begins with a number, returns it and positions *itPtr after the
@@ -348,14 +372,24 @@ public:
         return path.substr(0, lastDot);
     }
 
+    std::shared_ptr<Ident> getSharedIdent() const {
+        return _ident;
+    }
 
-protected:
+    void setIdent(std::shared_ptr<Ident> newIdent) {
+        _ident = std::move(newIdent);
+    }
+
+    /**
+     * The Cursor class is for raw access to the index. Except for unusual use cases (e.g., index
+     * validation) you'll want to use CursorForPath instead.
+     */
     class Cursor {
     public:
         virtual ~Cursor() = default;
         virtual boost::optional<FullCellView> next() = 0;
-        virtual boost::optional<FullCellView> seekAtOrPast(PathView, const RecordId&) = 0;
-        virtual boost::optional<FullCellView> seekExact(PathView, const RecordId&) = 0;
+        virtual boost::optional<FullCellView> seekAtOrPast(PathView, RowId) = 0;
+        virtual boost::optional<FullCellView> seekExact(PathView, RowId) = 0;
 
         virtual void save() = 0;
         virtual void saveUnpositioned() {
@@ -366,7 +400,64 @@ protected:
 
         virtual void detachFromOperationContext() = 0;
         virtual void reattachToOperationContext(OperationContext* opCtx) = 0;
+
+        virtual uint64_t getCheckpointId() const {
+            uasserted(ErrorCodes::CommandNotSupported,
+                      "The current storage engine does not support checkpoint ids");
+        }
     };
+
+    std::shared_ptr<Ident> _ident;
+};
+
+/*
+ * Array info reader based on a string representation of arrayInfo. Allows for reading/peeking of
+ * individual components.
+ */
+class ArrInfoReader {
+public:
+    explicit ArrInfoReader(StringData arrInfoStr) : _arrInfo(arrInfoStr) {}
+
+    char nextChar() const {
+        if (_offsetInArrInfo == _arrInfo.size()) {
+            // Reaching the end of the array info means an unlimited number of '|'s.
+            return '|';
+        }
+        return _arrInfo[_offsetInArrInfo];
+    }
+
+    char takeNextChar() {
+        if (_offsetInArrInfo == _arrInfo.size()) {
+            // Reaching the end of the array info means an unlimited number of '|'s.
+            return '|';
+        }
+        return _arrInfo[_offsetInArrInfo++];
+    }
+
+    size_t takeNumber() {
+        return ColumnStore::readArrInfoNumber(_arrInfo, &_offsetInArrInfo);
+    }
+
+    bool empty() const {
+        return _arrInfo.empty();
+    }
+
+    /*
+     * Returns whether more explicit components are yet to be consumed. Since array info logically
+     * ends with an infinite stream of |, this function indicates whether there are more components
+     * which are physically present to be read, not including the infinite sequence of |.
+     */
+    bool moreExplicitComponents() const {
+        return _offsetInArrInfo < _arrInfo.size();
+    }
+
+    StringData rawArrInfo() const {
+        return _arrInfo;
+    }
+
+private:
+    StringData _arrInfo;
+    size_t _offsetInArrInfo = 0;
 };
 
 struct SplitCellView {
@@ -387,7 +478,7 @@ struct SplitCellView {
                 return Out();
 
             invariant(elemPtr < end);
-            return decodeAndAdvance(elemPtr, encoder);
+            return decodeAndAdvance(elemPtr, *encoder);
         }
         bool hasNext() const {
             return elemPtr != end;
@@ -395,15 +486,194 @@ struct SplitCellView {
 
         const char* elemPtr;
         const char* end;
-        ValueEncoder encoder;
+        ValueEncoder* encoder;  // Unowned
     };
 
+    /**
+     * Construct a cursor that can iterate the values in a column store cell. Requires a
+     * 'ValueEncoder' that understands the binary format of cell data.
+     *
+     * Note: the 'ValueEncoder' is stored as an unowned pointer. The referenced encoder must stay
+     * valid for the lifetime of the returned cursor.
+     */
+    template <class ValueEncoder>
+    auto subcellValuesGenerator(ValueEncoder* valEncoder) const {
+        return Cursor<ValueEncoder>{firstValuePtr, arrInfo.rawData(), valEncoder};
+    }
 
     template <class ValueEncoder>
-    auto subcellValuesGenerator(ValueEncoder&& valEncoder) const {
-        return Cursor<ValueEncoder>{
-            firstValuePtr, arrInfo.rawData(), std::forward<ValueEncoder>(valEncoder)};
-    }
+    struct CursorWithArrayDepth {
+        CursorWithArrayDepth(int pathLength,
+                             const char* elemPtr,
+                             const StringData& arrayInfo,
+                             ValueEncoder* encoder)
+            : elemPtr(elemPtr),
+              end(arrayInfo.rawData()),
+              encoder(encoder),
+              arrInfoReader(arrayInfo),
+              pathLength(pathLength) {
+            singleSubObject = !hasNext();
+        }
+
+        bool hasNext() const {
+            return singleSubObject || elemPtr < end || arrInfoReader.moreExplicitComponents();
+        }
+
+        using Out = typename std::remove_reference_t<ValueEncoder>::Out;
+        struct CellValueWithMetadata {
+            Out value{};
+
+            // 'depthWithinDirectlyNestedArraysOnPath' represents nestedness of arrays along the
+            // path. That is, only arrays that are elements of other arrays are considered to be
+            // nested.
+            // Examples (considering path "x.y.z"):
+            // 1. {x: {y: {z: 42}}} -- 'depthWithinDirectlyNestedArraysOnPath' of 42 is 0.
+            // 2. {x: [{y: [{z: [42]}]}]} -- 'depthWithinDirectlyNestedArraysOnPath' of 42 is 0.
+            // 3. {x: {y: {z: [[42]]}}} -- 'depthWithinDirectlyNestedArraysOnPath' of 42 is 0.
+            // 4. {x: [[{y: {z: 42}}]]} -- 'depthWithinDirectlyNestedArraysOnPath' of 42 is 1.
+            // 5. {x: [[[{y: [[{z: 42}]]}]]]} -- 'depthWithinDirectlyNestedArraysOnPath' of 42 is 3.
+            int depthWithinDirectlyNestedArraysOnPath{0};
+
+            // 'depthAtLeaf' represents nestedness of arrays at the leaf of the path, regardless of
+            // the array structure along the path. Examples (considering path "x.y.z"):
+            // 1. {x: {y: {z: 42}}} -- 'depthAtLeaf' of "42" is 0.
+            // 2. {x: [[[[[{y: [[[{z: [42]}]]]}]]]]]} -- 'depthAtLeaf' of "42" is 1.
+            int depthAtLeaf{0};
+
+            // When 'isObject' is "true" the 'value' should be ignored. The cursor will return a
+            // single "object" value for a range of objects.
+            bool isObject{false};
+        };
+        /**
+         * Returns the next value with its array-nestedness level.
+         */
+        CellValueWithMetadata nextValue() {
+            // The expected most common case: implicit tail of values at the same depths.
+            if (!arrInfoReader.moreExplicitComponents()) {
+                if (singleSubObject) {
+                    singleSubObject = false;
+                    return {Out{},
+                            depthWithinDirectlyNestedArraysOnPath,
+                            depthAtLeaf,
+                            true /* isObject */};
+                }
+                return {decodeAndAdvance(elemPtr, *encoder),
+                        depthWithinDirectlyNestedArraysOnPath,
+                        depthAtLeaf,
+                        false};
+            }
+
+            // The next expected most common case: a range of values at the same depths.
+            if (repeats > 0) {
+                repeats--;
+                return {decodeAndAdvance(elemPtr, *encoder),
+                        depthWithinDirectlyNestedArraysOnPath,
+                        depthAtLeaf,
+                        false};
+            }
+
+            // An end of a range means we have to check for structural changes and update depths.
+            while (arrInfoReader.moreExplicitComponents()) {
+                switch (arrInfoReader.takeNextChar()) {
+                    case '[': {
+                        // A '[' can be followed by a number if there are objects in the array,
+                        // that should be retrieved from other paths when reconstructing the
+                        // record. We can ignore them as they don't contribute to the values.
+                        (void)arrInfoReader.takeNumber();
+
+                        if (pathDepth + 1 == pathLength) {
+                            depthAtLeaf++;
+                        } else if (!inArray.empty() && inArray.top()) {
+                            depthWithinDirectlyNestedArraysOnPath++;
+                        }
+                        inArray.push(true);
+                        break;
+                    }
+                    case '|': {
+                        repeats = arrInfoReader.takeNumber();
+                        return {decodeAndAdvance(elemPtr, *encoder),
+                                depthWithinDirectlyNestedArraysOnPath,
+                                depthAtLeaf,
+                                false};
+                    }
+                    case '{': {
+                        // We consider as nested only the arrays that are elements of other
+                        // arrays. When there is an array of objects and some of the fields of
+                        // these objects are arrays, the latter aren't nested.
+                        inArray.push(false);
+                        pathDepth++;
+                        break;
+                    }
+                    case ']': {
+                        invariant(inArray.size() > 0 && inArray.top());
+                        inArray.pop();
+
+                        if (pathDepth + 1 == pathLength) {
+                            invariant(depthAtLeaf > 0);
+                            depthAtLeaf--;
+                        } else if (inArray.size() > 0 && inArray.top()) {
+                            invariant(depthWithinDirectlyNestedArraysOnPath > 0);
+                            depthWithinDirectlyNestedArraysOnPath--;
+                        }
+
+                        // Closing an array implicitly closes all objects on the path between it
+                        // and the previous array.
+                        while (inArray.size() > 0 && !inArray.top()) {
+                            inArray.pop();
+                            pathDepth--;
+                        }
+                        break;
+                    }
+                    case '+': {
+                        // Indicates elements in arrays that are objects with sibling paths. These
+                        // objects don't contribute to the cell's values, so we can ignore them.
+                        // For example, for path "a.b" in
+                        // {a: [{b:41}, {c:100}, {c:100}, {b:[{c:100}, 51]}]}
+                        //     [  |     +2                {  [o
+                        // and the values are 41 and 51
+                        (void)arrInfoReader.takeNumber();
+                        break;
+                    }
+                    case 'o': {
+                        // Indicates the start of a nested object inside the cell. We don't need
+                        // to track this info because the nested objects don't contribute to the
+                        // values in the cell.
+                        (void)arrInfoReader.takeNumber();
+                        return {Out{},
+                                depthWithinDirectlyNestedArraysOnPath,
+                                depthAtLeaf,
+                                true /* isObject */};
+                        break;
+                    }
+                }
+            }
+
+            // Start consuming the implicit tail range.
+            return {decodeAndAdvance(elemPtr, *encoder),
+                    depthWithinDirectlyNestedArraysOnPath,
+                    depthAtLeaf,
+                    false};
+        }
+
+        const char* elemPtr;
+        const char* end;
+        ValueEncoder* encoder;
+        ArrInfoReader arrInfoReader;
+        int pathLength = 0;
+
+        int pathDepth = 0;
+
+        // Used to compute the corresponding fields in `CellValueWithMetadata`.
+        int depthWithinDirectlyNestedArraysOnPath = 0;
+        int depthAtLeaf = 0;
+
+        std::stack<bool, absl::InlinedVector<bool, 64>> inArray;
+        size_t repeats = 0;
+
+        // Cells with a single sub-object don't have any values and have empty array info, so we
+        // have to track their state separately.
+        bool singleSubObject = false;
+    };
 
     static SplitCellView parse(CellView cell) {
         using Bytes = ColumnStore::Bytes;
@@ -447,9 +717,6 @@ struct SplitCellView {
                 uint8_t(*it) <= Bytes::kLastArrInfoSize) {
                 const auto format = uint8_t(*it++);  // Consume size-kind byte.
 
-                // TODO SERVER-63284: This check for the tiny array info case would be more
-                // concisely expressed using the case range syntax and being added to the switch
-                // statement below.
                 if (Bytes::kArrInfoSizeTinyMin <= format && format <= Bytes::kArrInfoSizeTinyMax) {
                     arrInfoSize = format - TinySize::kArrInfoZero;
                 } else {
@@ -503,7 +770,6 @@ struct SplitCellView {
             return encoder(elem);
         }
 
-        // TODO SERVER-63284: This would be more concisely expressed using the case range syntax.
         if (byte >= Bytes::kTinyIntMin && byte <= Bytes::kTinyIntMax) {
             return encoder(int32_t(int8_t(byte - TinyNum::kTinyIntZero)));
         } else if (byte >= Bytes::kTinyLongMin && byte <= Bytes::kTinyLongMax) {

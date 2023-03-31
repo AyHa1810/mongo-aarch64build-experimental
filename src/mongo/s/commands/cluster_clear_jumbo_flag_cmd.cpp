@@ -27,9 +27,6 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
 #include <string>
 #include <vector>
 
@@ -41,6 +38,7 @@
 #include "mongo/s/commands/cluster_commands_gen.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/s/shard_key_pattern_query_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
@@ -74,9 +72,10 @@ public:
         }
 
         void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) override {
-            const auto cm = uassertStatusOK(
-                Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx,
-                                                                                             ns()));
+            const auto [cm, _] = uassertStatusOK(
+                Grid::get(opCtx)
+                    ->catalogCache()
+                    ->getShardedCollectionRoutingInfoWithPlacementRefresh(opCtx, ns()));
 
             uassert(ErrorCodes::InvalidOptions,
                     "bounds can only have exactly 2 elements",
@@ -93,8 +92,8 @@ public:
             boost::optional<Chunk> chunk;
 
             if (request().getFind()) {
-                BSONObj shardKey = uassertStatusOK(cm.getShardKeyPattern().extractShardKeyFromQuery(
-                    opCtx, ns(), *request().getFind()));
+                BSONObj shardKey = uassertStatusOK(extractShardKeyFromBasicQuery(
+                    opCtx, ns(), cm.getShardKeyPattern(), *request().getFind()));
                 uassert(51260,
                         str::stream()
                             << "no shard key found in chunk query " << *request().getFind(),

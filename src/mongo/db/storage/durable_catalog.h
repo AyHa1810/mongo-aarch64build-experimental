@@ -36,6 +36,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/storage/bson_collection_catalog_entry.h"
+#include "mongo/db/storage/durable_catalog_entry.h"
 #include "mongo/db/storage/storage_engine.h"
 
 namespace mongo {
@@ -57,9 +58,9 @@ public:
     /**
      * `Entry` ties together the common identifiers of a single `_mdb_catalog` document.
      */
-    struct Entry {
-        Entry() {}
-        Entry(RecordId catalogId, std::string ident, NamespaceString nss)
+    struct EntryIdentifier {
+        EntryIdentifier() {}
+        EntryIdentifier(RecordId catalogId, std::string ident, NamespaceString nss)
             : catalogId(std::move(catalogId)), ident(std::move(ident)), nss(std::move(nss)) {}
         RecordId catalogId;
         std::string ident;
@@ -83,11 +84,38 @@ public:
         return false;
     }
 
+    /**
+     * Gets the parsed namespace from a raw BSON catalog entry.
+     */
+    static NamespaceString getNamespaceFromCatalogEntry(const BSONObj& catalogEntry) {
+        return NamespaceString::parseFromStringExpectTenantIdInMultitenancyMode(
+            catalogEntry["ns"].checkAndGetStringData());
+    }
+
+    /**
+     * Gets the metadata as BSON from a raw BSON catalog entry.
+     */
+    static BSONObj getMetadataFromCatalogEntry(const BSONObj& catalogEntry) {
+        return catalogEntry["md"].Obj();
+    }
+
     virtual void init(OperationContext* opCtx) = 0;
 
-    virtual std::vector<Entry> getAllCatalogEntries(OperationContext* opCtx) const = 0;
+    virtual std::vector<EntryIdentifier> getAllCatalogEntries(OperationContext* opCtx) const = 0;
 
-    virtual Entry getEntry(const RecordId& catalogId) const = 0;
+    /**
+     * Scans the persisted catalog until an entry is found matching 'nss'.
+     */
+    virtual boost::optional<DurableCatalogEntry> scanForCatalogEntryByNss(
+        OperationContext* opCtx, const NamespaceString& nss) const = 0;
+
+    /**
+     * Scans the persisted catalog until an entry is found matching 'uuid'.
+     */
+    virtual boost::optional<DurableCatalogEntry> scanForCatalogEntryByUUID(
+        OperationContext* opCtx, const UUID& uuid) const = 0;
+
+    virtual EntryIdentifier getEntry(const RecordId& catalogId) const = 0;
 
     virtual std::string getIndexIdent(OperationContext* opCtx,
                                       const RecordId& id,
@@ -96,8 +124,20 @@ public:
     virtual std::vector<std::string> getIndexIdents(OperationContext* opCtx,
                                                     const RecordId& id) const = 0;
 
+    /**
+     * Get a raw catalog entry for catalogId as BSON.
+     */
     virtual BSONObj getCatalogEntry(OperationContext* opCtx, const RecordId& catalogId) const = 0;
 
+    /**
+     * Like 'getCatalogEntry' above but parses the catalog entry to common types.
+     */
+    virtual boost::optional<DurableCatalogEntry> getParsedCatalogEntry(
+        OperationContext* opCtx, const RecordId& catalogId) const = 0;
+
+    /**
+     * Like 'getParsedCatalogEntry' above but only extracts the metadata component.
+     */
     virtual std::shared_ptr<BSONCollectionCatalogEntry::MetaData> getMetaData(
         OperationContext* opCtx, const RecordId& id) const = 0;
 
@@ -124,11 +164,12 @@ public:
     /**
      * Create an entry in the catalog for an orphaned collection found in the
      * storage engine. Return the generated ns of the collection.
-     * Note that this function does not recreate the _id index on the collection because it does not
-     * have access to index catalog.
+     * Note that this function does not recreate the _id index on the for non-clustered collections
+     * because it does not have access to index catalog.
      */
     virtual StatusWith<std::string> newOrphanedIdent(OperationContext* opCtx,
-                                                     std::string ident) = 0;
+                                                     std::string ident,
+                                                     const CollectionOptions& optionsWithUUID) = 0;
 
     virtual std::string getFilesystemPathForDb(const std::string& dbName) const = 0;
 
@@ -136,6 +177,16 @@ public:
      * Generate an internal ident name.
      */
     virtual std::string newInternalIdent() = 0;
+
+    /**
+     * Generates a new unique identifier for a new "thing".
+     * @param nss - the containing namespace
+     * @param kind - what this "thing" is, likely collection or index
+     *
+     * Warning: It's only unique as far as we know without checking every file on disk, but it is
+     * possible that this ident collides with an existing one.
+     */
+    virtual std::string generateUniqueIdent(NamespaceString nss, const char* kind) = 0;
 
     /**
      * Generate an internal resumable index build ident name.
@@ -210,6 +261,10 @@ public:
                                                       StringData ident) = 0;
 
     virtual int getTotalIndexCount(OperationContext* opCtx, const RecordId& catalogId) const = 0;
+
+    virtual void getReadyIndexes(OperationContext* opCtx,
+                                 RecordId catalogId,
+                                 StringSet* names) const = 0;
 
     virtual bool isIndexPresent(OperationContext* opCtx,
                                 const RecordId& catalogId,

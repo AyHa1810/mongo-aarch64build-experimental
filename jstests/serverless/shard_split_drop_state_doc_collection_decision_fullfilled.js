@@ -9,20 +9,13 @@
  *   requires_majority_read_concern,
  *   requires_persistence,
  *   serverless,
- *   requires_fcv_52,
- *   featureFlagShardSplit
+ *   requires_fcv_63
  * ]
  */
 
-(function() {
-"use strict";
+import {findSplitOperation, ShardSplitTest} from "jstests/serverless/libs/shard_split_test.js";
 
 load("jstests/libs/fail_point_util.js");
-load("jstests/libs/uuid_util.js");
-load("jstests/serverless/libs/basic_serverless_test.js");
-
-const recipientTagName = "recipientNode";
-const recipientSetName = "recipient";
 
 TestData.skipCheckDBHashes = true;
 
@@ -36,7 +29,7 @@ function testDroppingStateDocCollections(
     test.addRecipientNodes();
     let donorPrimary = test.donor.getPrimary();
 
-    const tenantIds = ["tenant1", "tenant2"];
+    const tenantIds = [ObjectId(), ObjectId()];
 
     const operation = test.createSplitOperation(tenantIds);
     let migrationId = operation.migrationId;
@@ -48,7 +41,7 @@ function testDroppingStateDocCollections(
     fp.wait();
 
     if (dropDonorsCollection) {
-        assert(donorPrimary.getCollection(BasicServerlessTest.kConfigSplitDonorsNS).drop());
+        assert(donorPrimary.getCollection(ShardSplitTest.kConfigSplitDonorsNS).drop());
         let donorDoc = findSplitOperation(donorPrimary, migrationId);
         assert.eq(donorDoc, null);
 
@@ -80,10 +73,7 @@ function testDroppingStateDocCollections(
     const operation2 =
         retryWithDifferentMigrationId ? test.createSplitOperation(tenantIds) : operation;
     migrationId = operation2.migrationId;
-    const runMigrationRes = operation2.commit();
-
-    assert.commandWorked(runMigrationRes);
-    assert.eq(runMigrationRes.state, "committed");
+    assert.commandWorked(operation2.commit());
 
     operation2.forget();
 
@@ -91,12 +81,8 @@ function testDroppingStateDocCollections(
 }
 
 jsTest.log("Test dropping donor and recipient state doc collections during a shard split.");
-const test = new BasicServerlessTest({
-    recipientTagName,
-    recipientSetName,
-    quickGarbageCollection: true,
-    initiateWithShortElectionTimeout: true
-});
+const test =
+    new ShardSplitTest({quickGarbageCollection: true, initiateWithShortElectionTimeout: true});
 
 const fpName = "pauseShardSplitAfterDecision";
 testDroppingStateDocCollections(test, fpName, {dropDonorsCollection: true});
@@ -118,4 +104,3 @@ if (fpName) {
 }
 
 test.stop();
-})();

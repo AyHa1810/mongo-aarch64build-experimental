@@ -1,27 +1,20 @@
 /**
  *
  * Tests that runs a shard split to completion and tries to write before and during the split.
- * @tags: [requires_fcv_52, featureFlagShardSplit]
+ * @tags: [requires_fcv_63, serverless]
  */
 
-load("jstests/serverless/libs/shard_split_write_test.js");
+import {doWriteOperations, ShardSplitTest} from "jstests/serverless/libs/shard_split_test.js";
 
-(function() {
-"use strict";
-
-const recipientTagName = "recipientNode";
-const recipientSetName = "recipientSetName";
-const test = new BasicServerlessTest({recipientTagName, recipientSetName});
-
-test.addRecipientNodes();
-test.donor.awaitSecondaryNodes();
+const test = new ShardSplitTest();
+test.addAndAwaitRecipientNodes();
 
 const donorPrimary = test.donor.getPrimary();
-const tenantIds = ["tenant1", "tenant2"];
+const tenantIds = [ObjectId(), ObjectId()];
 
 jsTestLog("Writing data before split");
 tenantIds.forEach(id => {
-    const kDbName = test.tenantDB(id, "testDb");
+    const kDbName = test.tenantDB(id.str, "testDb");
     const kCollName = "testColl";
     const kNs = `${kDbName}.${kCollName}`;
 
@@ -39,7 +32,7 @@ blockingFP.wait();
 
 const donorRst = createRstArgs(test.donor);
 test.removeRecipientsFromRstArgs(donorRst);
-const writeThread = new Thread(doWriteOperations, donorRst, tenantIds);
+const writeThread = new Thread(doWriteOperations, donorRst, tojson(tenantIds));
 writeThread.start();
 
 blockingFP.off();
@@ -47,7 +40,6 @@ blockingFP.off();
 splitThread.join();
 const result = splitThread.returnData();
 assert.eq(result.ok, 1);
-assert.eq(result.state, "committed");
 
 writeThread.join();
 const writeResults = writeThread.returnData();
@@ -58,4 +50,3 @@ writeResults.forEach(res => {
 TestData.skipCheckDBHashes = true;
 
 test.stop();
-})();

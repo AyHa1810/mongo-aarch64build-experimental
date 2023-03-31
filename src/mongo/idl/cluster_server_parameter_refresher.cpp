@@ -32,6 +32,9 @@
 #include "mongo/idl/cluster_server_parameter_refresher.h"
 
 #include "mongo/db/audit.h"
+#include "mongo/db/commands/list_databases_for_all_tenants_gen.h"
+#include "mongo/db/multitenancy_gen.h"
+#include "mongo/idl/cluster_server_parameter_common.h"
 #include "mongo/idl/cluster_server_parameter_refresher_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
@@ -48,37 +51,44 @@ Seconds loadInterval() {
     return Seconds(clusterServerParameterRefreshIntervalSecs.load());
 }
 
-StatusWith<std::vector<BSONObj>> getClusterParametersFromConfigServer(
-    OperationContext* opCtx, const LogicalTime& latestTime) {
-    BSONObjBuilder queryObjBuilder;
-    BSONObjBuilder clusterParameterTimeObjBuilder =
-        queryObjBuilder.subobjStart("clusterParameterTime"_sd);
-    clusterParameterTimeObjBuilder.appendTimestamp("$gt"_sd, latestTime.asTimestamp().asInt64());
-    clusterParameterTimeObjBuilder.doneFast();
-
-    BSONObj query = queryObjBuilder.obj();
-
+StatusWith<TenantIdMap<stdx::unordered_map<std::string, BSONObj>>>
+getClusterParametersFromConfigServer(OperationContext* opCtx) {
     // Attempt to retrieve cluster parameter documents from the config server.
     // exhaustiveFindOnConfig makes up to 3 total attempts if it receives a retriable error before
     // giving up.
     LOGV2_DEBUG(6226404, 3, "Retrieving cluster server parameters from config server");
     auto configServers = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-    auto swFindResponse =
-        configServers->exhaustiveFindOnConfig(opCtx,
-                                              ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                                              repl::ReadConcernLevel::kMajorityReadConcern,
-                                              NamespaceString::kClusterParametersNamespace,
-                                              query,
-                                              BSONObj(),
-                                              boost::none);
+    auto swTenantIds = getTenantsWithConfigDbsOnShard(opCtx, configServers.get());
+    if (!swTenantIds.isOK()) {
+        return swTenantIds.getStatus();
+    }
+    auto tenantIds = std::move(swTenantIds.getValue());
 
-    // If the error is not retriable or persists beyond the max number of retry attempts, give up
-    // and throw an error.
-    if (!swFindResponse.isOK()) {
-        return swFindResponse.getStatus();
+    TenantIdMap<stdx::unordered_map<std::string, BSONObj>> allDocs;
+    for (const auto& tenantId : tenantIds) {
+        auto swFindResponse = configServers->exhaustiveFindOnConfig(
+            opCtx,
+            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+            repl::ReadConcernLevel::kMajorityReadConcern,
+            NamespaceString::makeClusterParametersNSS(tenantId),
+            BSONObj(),
+            BSONObj(),
+            boost::none);
+
+        // If the error is not retriable or persists beyond the max number of retry attempts, give
+        // up and throw an error.
+        if (!swFindResponse.isOK()) {
+            return swFindResponse.getStatus();
+        }
+        stdx::unordered_map<std::string, BSONObj> docsMap;
+        for (const auto& doc : swFindResponse.getValue().docs) {
+            auto name = doc["_id"].String();
+            docsMap.insert({std::move(name), doc});
+        }
+        allDocs.insert({std::move(tenantId), std::move(docsMap)});
     }
 
-    return swFindResponse.getValue().docs;
+    return allDocs;
 }
 
 }  // namespace
@@ -111,10 +121,8 @@ void ClusterServerParameterRefresher::setPeriod(Milliseconds period) {
 }
 
 Status ClusterServerParameterRefresher::refreshParameters(OperationContext* opCtx) {
-    // Query the config servers for all cluster parameter documents with
-    // clusterParameterTime greater than the largest in-memory timestamp.
-    auto swClusterParameterDocs =
-        getClusterParametersFromConfigServer(opCtx, _latestClusterParameterTime);
+    // Query the config servers for all cluster parameter documents.
+    auto swClusterParameterDocs = getClusterParametersFromConfigServer(opCtx);
     if (!swClusterParameterDocs.isOK()) {
         LOGV2_WARNING(6226401,
                       "Could not refresh cluster server parameters from config servers. Will retry "
@@ -124,57 +132,71 @@ Status ClusterServerParameterRefresher::refreshParameters(OperationContext* opCt
         return swClusterParameterDocs.getStatus();
     }
 
-    // Set each in-memory cluster parameter that was returned in the response. Then, advance the
-    // latest clusterParameterTime to the latest one returned if all of the cluster parameters are
-    // successfully set in-memory.
-    Timestamp latestTime;
+    // Set each in-memory cluster parameter that was returned in the response.
     bool isSuccessful = true;
-    Status setStatus = Status::OK();
+    Status status = Status::OK();
     ServerParameterSet* clusterParameterCache = ServerParameterSet::getClusterParameterSet();
-    std::vector<BSONObj> clusterParameterDocs = swClusterParameterDocs.getValue();
-    std::vector<BSONObj> updatedParameters;
-    updatedParameters.reserve(clusterParameterDocs.size());
 
-    for (const auto& clusterParameterDoc : clusterParameterDocs) {
-        Timestamp clusterParameterTime = clusterParameterDoc["clusterParameterTime"_sd].timestamp();
-        latestTime = (clusterParameterTime > latestTime) ? clusterParameterTime : latestTime;
+    auto clusterParameterDocs = std::move(swClusterParameterDocs.getValue());
+    std::vector<BSONObj> allUpdatedParameters;
+    allUpdatedParameters.reserve(clusterParameterDocs.size());
 
-        auto clusterParameterName = clusterParameterDoc["_id"_sd].String();
-        ServerParameter* sp = clusterParameterCache->get(clusterParameterName);
+    for (const auto& [tenantId, tenantParamDocs] : clusterParameterDocs) {
+        std::vector<BSONObj> updatedParameters;
+        updatedParameters.reserve(tenantParamDocs.size());
+        for (const auto& [name, sp] : clusterParameterCache->getMap()) {
+            if (!sp->isEnabled()) {
+                continue;
+            }
+            BSONObjBuilder oldClusterParameterBob;
+            sp->append(opCtx, &oldClusterParameterBob, name, tenantId);
 
-        BSONObjBuilder oldClusterParameterBob;
-        sp->append(opCtx, oldClusterParameterBob, clusterParameterName);
+            auto it = tenantParamDocs.find(name);
+            if (it == tenantParamDocs.end()) {
+                // Reset the local parameter to its default value.
+                status = sp->reset(tenantId);
+            } else {
+                // Set the local parameter to the pulled value.
+                const auto& clusterParameterDoc = it->second;
+                status = sp->set(clusterParameterDoc, tenantId);
+            }
 
-        setStatus = sp->set(clusterParameterDoc);
-        if (!setStatus.isOK()) {
-            LOGV2_WARNING(6226402,
-                          "Could not set in-memory cluster server parameter",
-                          "parameter"_attr = clusterParameterName,
-                          "reason"_attr = setStatus.reason());
-            isSuccessful = false;
+            if (!status.isOK()) {
+                LOGV2_WARNING(6226402,
+                              "Could not (re)set in-memory cluster server parameter",
+                              "parameter"_attr = name,
+                              "tenantId"_attr = tenantId,
+                              "presentOnConfigSvr"_attr = it != tenantParamDocs.end(),
+                              "reason"_attr = status.reason());
+                isSuccessful = false;
+            }
+
+            BSONObjBuilder updatedClusterParameterBob;
+            sp->append(opCtx, &updatedClusterParameterBob, name, tenantId);
+            BSONObj updatedClusterParameterBSON = updatedClusterParameterBob.obj().getOwned();
+
+            audit::logUpdateCachedClusterParameter(opCtx->getClient(),
+                                                   oldClusterParameterBob.obj().getOwned(),
+                                                   updatedClusterParameterBSON,
+                                                   tenantId);
+            if (it != tenantParamDocs.end()) {
+                updatedParameters.emplace_back(
+                    updatedClusterParameterBSON.removeField("clusterParameterTime"_sd));
+            }
         }
-
-        BSONObjBuilder updatedClusterParameterBob;
-        sp->append(opCtx, updatedClusterParameterBob, clusterParameterName);
-        BSONObj updatedClusterParameterBSON = updatedClusterParameterBob.obj().getOwned();
-
-        audit::logUpdateCachedClusterParameter(opCtx->getClient(),
-                                               oldClusterParameterBob.obj().getOwned(),
-                                               updatedClusterParameterBSON);
-
-        updatedParameters.emplace_back(
-            updatedClusterParameterBSON.removeField("clusterParameterTime"_sd));
+        auto tenantIdStr = tenantId ? tenantId->toString() : "none";
+        allUpdatedParameters.emplace_back(
+            BSON("tenantId" << tenantIdStr << "updatedParameters" << updatedParameters));
     }
 
     if (isSuccessful) {
-        _latestClusterParameterTime = LogicalTime(latestTime);
         LOGV2_DEBUG(6226403,
                     3,
                     "Updated cluster server parameters",
-                    "clusterParameterDocuments"_attr = updatedParameters);
+                    "clusterParameterDocuments"_attr = allUpdatedParameters);
     }
 
-    return setStatus;
+    return status;
 }
 
 void ClusterServerParameterRefresher::start(ServiceContext* serviceCtx, OperationContext* opCtx) {

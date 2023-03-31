@@ -1,6 +1,6 @@
 /**
  * Tests that the donor
- * - rejects reads with atClusterTime/afterClusterTime >= blockTimestamp reads and linearizable
+ * - rejects reads with atClusterTime/afterClusterTime >= blockOpTime reads and linearizable
  *   reads after the split commits.
  *
  * @tags: [
@@ -10,26 +10,20 @@
  *   requires_majority_read_concern,
  *   requires_persistence,
  *   serverless,
- *   requires_fcv_52,
- *   featureFlagShardSplit
+ *   requires_fcv_63
  * ]
  */
 
-(function() {
-'use strict';
+import {findSplitOperation, ShardSplitTest} from "jstests/serverless/libs/shard_split_test.js";
 
 load("jstests/libs/fail_point_util.js");
-load("jstests/libs/parallelTester.js");
-load("jstests/libs/uuid_util.js");
-load("jstests/serverless/libs/basic_serverless_test.js");
 load("jstests/serverless/shard_split_concurrent_reads_on_donor_util.js");
 
 const kCollName = "testColl";
-const kTenantDefinedDbName = "0";
 
 /**
  * Tests that after the split commits, the donor rejects linearizable reads and reads with
- * atClusterTime/afterClusterTime >= blockTimestamp.
+ * atClusterTime/afterClusterTime >= blockOpTime.
  */
 let countTenantMigrationCommittedErrorsPrimary = 0;
 let countTenantMigrationCommittedErrorsSecondaries = 0;
@@ -57,7 +51,7 @@ function testRejectReadsAfterMigrationCommitted(testCase, primary, dbName, collN
         const db = node.getDB(dbName);
         if (testCase.requiresReadTimestamp) {
             runCommandForConcurrentReadTest(db,
-                                            testCase.command(collName, donorDoc.blockTimestamp),
+                                            testCase.command(collName, donorDoc.blockOpTime.ts),
                                             ErrorCodes.TenantMigrationCommitted,
                                             testCase.isTransaction);
             runCommandForConcurrentReadTest(
@@ -76,14 +70,14 @@ function testRejectReadsAfterMigrationCommitted(testCase, primary, dbName, collN
 
 const testCases = shardSplitConcurrentReadTestCases;
 
-const test = new BasicServerlessTest({
+const test = new ShardSplitTest({
     recipientTagName: "recipientTag",
     recipientSetName: "recipientSet",
     quickGarbageCollection: true
 });
 test.addRecipientNodes();
 
-const tenantId = "tenantId";
+const tenantId = ObjectId();
 
 let donorRst = test.donor;
 const donorPrimary = test.getDonorPrimary();
@@ -107,22 +101,21 @@ donorRst.awaitLastOpCommitted();
 
 for (const [testCaseName, testCase] of Object.entries(testCases)) {
     jsTest.log(`Testing inCommitted with testCase ${testCaseName}`);
-    const dbName = `${tenantId}_${testCaseName}-inCommitted-${kTenantDefinedDbName}`;
+    const dbName = `${tenantId.str}_${testCaseName}`;
     testRejectReadsAfterMigrationCommitted(
         testCase, donorPrimary, dbName, kCollName, operation.migrationId);
 }
 
 // check on primary
-BasicServerlessTest.checkShardSplitAccessBlocker(donorPrimary, tenantId, {
+ShardSplitTest.checkShardSplitAccessBlocker(donorPrimary, tenantId, {
     numTenantMigrationCommittedErrors: countTenantMigrationCommittedErrorsPrimary
 });
 let secondaries = donorRst.getSecondaries();
 // check on secondaries
 secondaries.forEach(node => {
-    BasicServerlessTest.checkShardSplitAccessBlocker(node, tenantId, {
+    ShardSplitTest.checkShardSplitAccessBlocker(node, tenantId, {
         numTenantMigrationCommittedErrors: countTenantMigrationCommittedErrorsSecondaries
     });
 });
 
 test.stop();
-})();

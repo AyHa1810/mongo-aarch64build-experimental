@@ -82,16 +82,14 @@ public:
     /**
      * Sort the results, if there is a sort required.
      *
-     * The mandatory output parameters 'blockingSortOut' and 'explodeForSortOut' indicate if the
-     * generated sub-plan contains a blocking QSN, such as 'SortNode', and if the sub-plan was
-     * "exploded" to obtain an indexed sort (see QueryPlannerAnalysis::explodeForSort()).
+     * The mandatory output parameter 'blockingSortOut' indicates if the generated sub-plan contains
+     * a blocking QSN, such as 'SortNode'.
      */
     static std::unique_ptr<QuerySolutionNode> analyzeSort(
         const CanonicalQuery& query,
         const QueryPlannerParams& params,
         std::unique_ptr<QuerySolutionNode> solnRoot,
-        bool* blockingSortOut,
-        bool* explodeForSortOut);
+        bool* blockingSortOut);
 
     /**
      * Internal helper function used by analyzeSort.
@@ -130,6 +128,15 @@ public:
         std::unique_ptr<QuerySolution> soln);
 
     /**
+     * Walks the QuerySolutionNode tree rooted in 'soln', and looks for a ColumnScan that
+     * is a child of either a Group or Projection.  If the ColumnScan's parent will ignore
+     * extra fields, then eliminate its row store expression, allowing it to return extra fields
+     * in cases when it falls back to pulling the full document from the row store.
+     * If these conditions are not met this is a noop.
+     */
+    static void removeUselessColumnScanRowStoreExpression(QuerySolutionNode& root);
+
+    /**
      * For the provided 'foreignCollName' and 'foreignFieldName' corresponding to an EqLookupNode,
      * returns what join algorithm should be used to execute it. In particular:
      * - An empty array is produced for each document if the foreign collection does not exist.
@@ -142,7 +149,7 @@ public:
      */
     static std::pair<EqLookupNode::LookupStrategy, boost::optional<IndexEntry>>
     determineLookupStrategy(
-        const std::string& foreignCollName,
+        const NamespaceString& foreignCollName,
         const std::string& foreignField,
         const std::map<NamespaceString, SecondaryCollectionInfo>& collectionsInfo,
         bool allowDiskUse,

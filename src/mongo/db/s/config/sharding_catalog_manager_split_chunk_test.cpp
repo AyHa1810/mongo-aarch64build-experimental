@@ -29,12 +29,12 @@
 
 #include "mongo/client/read_preference.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/logical_session_cache_noop.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/transaction_coordinator_service.h"
-#include "mongo/db/session_catalog_mongod.h"
+#include "mongo/db/session/logical_session_cache_noop.h"
+#include "mongo/db/session/session_catalog_mongod.h"
 #include "mongo/s/catalog/type_chunk.h"
 
 namespace mongo {
@@ -52,8 +52,8 @@ protected:
         setupShards({shard});
 
         DBDirectClient client(operationContext());
-        client.createCollection(NamespaceString::kSessionTransactionsTableNamespace.ns());
-        client.createIndexes(NamespaceString::kSessionTransactionsTableNamespace.ns(),
+        client.createCollection(NamespaceString::kSessionTransactionsTableNamespace);
+        client.createIndexes(NamespaceString::kSessionTransactionsTableNamespace,
                              {MongoDSessionCatalog::getConfigTxnPartialIndexSpec()});
 
         LogicalSessionCache::set(getServiceContext(), std::make_unique<LogicalSessionCacheNoop>());
@@ -66,8 +66,10 @@ protected:
         ConfigServerTestFixture::tearDown();
     }
 
-    const NamespaceString _nss1{"TestDB", "TestColl1"};
-    const NamespaceString _nss2{"TestDB", "TestColl2"};
+    const NamespaceString _nss1 =
+        NamespaceString::createNamespaceString_forTest("TestDB", "TestColl1");
+    const NamespaceString _nss2 =
+        NamespaceString::createNamespaceString_forTest("TestDB", "TestColl2");
     const KeyPattern _keyPattern{BSON("a" << 1)};
 };
 
@@ -88,7 +90,8 @@ TEST_F(SplitChunkTest, SplitExistingChunkCorrectlyShouldSucceed) {
         auto chunkMax = BSON("a" << 10);
         chunk.setMin(chunkMin);
         chunk.setMax(chunkMax);
-        chunk.setHistory({ChunkHistory(Timestamp(100, 0), ShardId(_shardName)),
+        chunk.setOnCurrentShardSince(Timestamp(100, 0));
+        chunk.setHistory({ChunkHistory(*chunk.getOnCurrentShardSince(), ShardId(_shardName)),
                           ChunkHistory(Timestamp(90, 0), ShardId("shardY"))});
 
         auto chunkSplitPoint = BSON("a" << 5);
@@ -105,18 +108,18 @@ TEST_F(SplitChunkTest, SplitExistingChunkCorrectlyShouldSucceed) {
                                                          splitPoints,
                                                          "shard0000",
                                                          false /* fromChunkSplitter*/));
-        auto collVersion = ChunkVersion::parse(versions["collectionVersion"]);
-        auto shardVersion = ChunkVersion::parse(versions["shardVersion"]);
+        auto collPlacementVersion = versions.collectionPlacementVersion;
+        auto shardPlacementVersion = versions.shardPlacementVersion;
 
-        ASSERT_TRUE(origVersion.isOlderThan(shardVersion));
-        ASSERT_EQ(collVersion, shardVersion);
+        ASSERT_TRUE(origVersion.isOlderThan(shardPlacementVersion));
+        ASSERT_EQ(collPlacementVersion, shardPlacementVersion);
 
         // Check for increment on mergedChunk's minor version
-        auto expectedShardVersion =
+        auto expectedShardPlacementVersion =
             ChunkVersion({collEpoch, collTimestamp},
                          {origVersion.majorVersion(), origVersion.minorVersion() + 2});
-        ASSERT_EQ(expectedShardVersion, shardVersion);
-        ASSERT_EQ(shardVersion, collVersion);
+        ASSERT_EQ(expectedShardPlacementVersion, shardPlacementVersion);
+        ASSERT_EQ(shardPlacementVersion, collPlacementVersion);
 
         // First chunkDoc should have range [chunkMin, chunkSplitPoint]
         auto chunkDocStatus =
@@ -150,6 +153,8 @@ TEST_F(SplitChunkTest, SplitExistingChunkCorrectlyShouldSucceed) {
 
         // Both chunks should have the same history
         ASSERT(chunkDoc.getHistory() == otherChunkDoc.getHistory());
+        ASSERT(chunkDoc.getOnCurrentShardSince().has_value());
+        ASSERT_EQ(chunkDoc.getOnCurrentShardSince(), otherChunkDoc.getOnCurrentShardSince());
     };
 
     test(_nss2, Timestamp(42));
@@ -172,7 +177,8 @@ TEST_F(SplitChunkTest, MultipleSplitsOnExistingChunkShouldSucceed) {
         auto chunkMax = BSON("a" << 10);
         chunk.setMin(chunkMin);
         chunk.setMax(chunkMax);
-        chunk.setHistory({ChunkHistory(Timestamp(100, 0), ShardId(_shardName)),
+        chunk.setOnCurrentShardSince(Timestamp(100, 0));
+        chunk.setHistory({ChunkHistory(*chunk.getOnCurrentShardSince(), ShardId(_shardName)),
                           ChunkHistory(Timestamp(90, 0), ShardId("shardY"))});
 
         auto chunkSplitPoint = BSON("a" << 5);
@@ -181,15 +187,15 @@ TEST_F(SplitChunkTest, MultipleSplitsOnExistingChunkShouldSucceed) {
 
         setupCollection(nss, _keyPattern, {chunk});
 
-        ASSERT_OK(ShardingCatalogManager::get(operationContext())
-                      ->commitChunkSplit(operationContext(),
-                                         nss,
-                                         collEpoch,
-                                         collTimestamp,
-                                         ChunkRange(chunkMin, chunkMax),
-                                         splitPoints,
-                                         "shard0000",
-                                         false /* fromChunkSplitter*/));
+        uassertStatusOK(ShardingCatalogManager::get(operationContext())
+                            ->commitChunkSplit(operationContext(),
+                                               nss,
+                                               collEpoch,
+                                               collTimestamp,
+                                               ChunkRange(chunkMin, chunkMax),
+                                               splitPoints,
+                                               "shard0000",
+                                               false /* fromChunkSplitter*/));
 
         // First chunkDoc should have range [chunkMin, chunkSplitPoint]
         auto chunkDocStatus =
@@ -239,6 +245,10 @@ TEST_F(SplitChunkTest, MultipleSplitsOnExistingChunkShouldSucceed) {
         // Both chunks should have the same history
         ASSERT(chunkDoc.getHistory() == midChunkDoc.getHistory());
         ASSERT(midChunkDoc.getHistory() == lastChunkDoc.getHistory());
+
+        ASSERT(chunkDoc.getOnCurrentShardSince().has_value());
+        ASSERT_EQ(chunkDoc.getOnCurrentShardSince(), midChunkDoc.getOnCurrentShardSince());
+        ASSERT_EQ(midChunkDoc.getOnCurrentShardSince(), lastChunkDoc.getOnCurrentShardSince());
     };
 
     test(_nss2, Timestamp(42));
@@ -278,15 +288,15 @@ TEST_F(SplitChunkTest, NewSplitShouldClaimHighestVersion) {
 
         setupCollection(nss, _keyPattern, {chunk, chunk2});
 
-        ASSERT_OK(ShardingCatalogManager::get(operationContext())
-                      ->commitChunkSplit(operationContext(),
-                                         nss,
-                                         collEpoch,
-                                         collTimestamp,
-                                         ChunkRange(chunkMin, chunkMax),
-                                         splitPoints,
-                                         "shard0000",
-                                         false /* fromChunkSplitter*/));
+        uassertStatusOK(ShardingCatalogManager::get(operationContext())
+                            ->commitChunkSplit(operationContext(),
+                                               nss,
+                                               collEpoch,
+                                               collTimestamp,
+                                               ChunkRange(chunkMin, chunkMax),
+                                               splitPoints,
+                                               "shard0000",
+                                               false /* fromChunkSplitter*/));
 
         // First chunkDoc should have range [chunkMin, chunkSplitPoint]
         auto chunkDocStatus =
@@ -375,17 +385,19 @@ TEST_F(SplitChunkTest, NonExisingNamespaceErrors) {
 
         setupCollection(nss, _keyPattern, {chunk});
 
-        ASSERT_THROWS_WHAT(ShardingCatalogManager::get(operationContext())
-                               ->commitChunkSplit(operationContext(),
-                                                  NamespaceString("TestDB.NonExistingColl"),
-                                                  collEpoch,
-                                                  Timestamp{50, 0},
-                                                  ChunkRange(chunkMin, chunkMax),
-                                                  splitPoints,
-                                                  "shard0000",
-                                                  false /* fromChunkSplitter*/),
-                           DBException,
-                           "Collection does not exist");
+        ASSERT_EQUALS(ShardingCatalogManager::get(operationContext())
+                          ->commitChunkSplit(operationContext(),
+                                             NamespaceString::createNamespaceString_forTest(
+                                                 "TestDB.NonExistingColl"),
+                                             collEpoch,
+                                             Timestamp{50, 0},
+                                             ChunkRange(chunkMin, chunkMax),
+                                             splitPoints,
+                                             "shard0000",
+                                             false /* fromChunkSplitter*/)
+                          .getStatus()
+                          .code(),
+                      ErrorCodes::ConflictingOperationInProgress);
     };
 
     test(_nss2, Timestamp(42));
@@ -420,7 +432,7 @@ TEST_F(SplitChunkTest, NonMatchingEpochsOfChunkAndRequestErrors) {
                                                   splitPoints,
                                                   "shard0000",
                                                   false /* fromChunkSplitter*/);
-        ASSERT_EQ(ErrorCodes::StaleEpoch, splitStatus);
+        ASSERT_EQ(ErrorCodes::StaleEpoch, splitStatus.getStatus());
     };
 
     test(_nss2, Timestamp(42));
@@ -578,7 +590,7 @@ TEST_F(SplitChunkTest, SplitPointsWithDollarPrefixShouldFail) {
     test(_nss2, Timestamp(42));
 }
 
-TEST_F(SplitChunkTest, CantCommitSplitFromChunkSplitterDuringDefragmentation) {
+TEST_F(SplitChunkTest, CantCommitSplitDuringDefragmentation) {
     const auto& nss = _nss2;
     const auto collEpoch = OID::gen();
     const Timestamp collTimestamp{1, 0};
@@ -602,7 +614,7 @@ TEST_F(SplitChunkTest, CantCommitSplitFromChunkSplitterDuringDefragmentation) {
 
     setupCollection(nss, _keyPattern, {chunk});
 
-    // Bring collection in the `splitChunks` phase of the defragmentation
+    // Bring collection in defragmentation state
     DBDirectClient dbClient(operationContext());
     write_ops::UpdateCommandRequest updateOp(CollectionType::ConfigNS);
     updateOp.setUpdates({[&] {
@@ -626,8 +638,35 @@ TEST_F(SplitChunkTest, CantCommitSplitFromChunkSplitterDuringDefragmentation) {
                                               true /* fromChunkSplitter*/),
                        DBException,
                        ErrorCodes::ConflictingOperationInProgress);
+}
 
-    // The split commit must succeed if the request is sent by the defragmenter
+TEST_F(SplitChunkTest, SplitJumboChunkShouldUnsetJumboFlag) {
+    const auto& nss = _nss2;
+    const auto collTimestamp = Timestamp(42);
+    const auto collEpoch = OID::gen();
+    const auto collUuid = UUID::gen();
+
+    ChunkType chunk;
+    chunk.setName(OID::gen());
+    chunk.setCollectionUUID(collUuid);
+
+    auto origVersion = ChunkVersion({collEpoch, collTimestamp}, {1, 0});
+    chunk.setVersion(origVersion);
+    chunk.setShard(ShardId(_shardName));
+    chunk.setJumbo(true);
+
+    auto chunkMin = BSON("a" << 1);
+    auto chunkMax = BSON("a" << 10);
+    chunk.setMin(chunkMin);
+    chunk.setMax(chunkMax);
+
+    auto chunkSplitPoint = BSON("a" << 5);
+    std::vector<BSONObj> splitPoints{chunkSplitPoint};
+
+    setupCollection(nss, _keyPattern, {chunk});
+
+    ASSERT_EQ(true, chunk.getJumbo());
+
     uassertStatusOK(ShardingCatalogManager::get(operationContext())
                         ->commitChunkSplit(operationContext(),
                                            nss,
@@ -637,7 +676,18 @@ TEST_F(SplitChunkTest, CantCommitSplitFromChunkSplitterDuringDefragmentation) {
                                            splitPoints,
                                            "shard0000",
                                            false /* fromChunkSplitter*/));
-}
 
+    // Both resulting chunks must not be jumbo
+    auto chunkDocLeft =
+        getChunkDoc(operationContext(), collUuid, chunkMin, collEpoch, collTimestamp);
+    ASSERT_OK(chunkDocLeft.getStatus());
+
+    auto chunkDocRight =
+        getChunkDoc(operationContext(), collUuid, chunkSplitPoint, collEpoch, collTimestamp);
+    ASSERT_OK(chunkDocRight.getStatus());
+
+    ASSERT_EQ(false, chunkDocLeft.getValue().getJumbo());
+    ASSERT_EQ(false, chunkDocRight.getValue().getJumbo());
+}
 }  // namespace
 }  // namespace mongo

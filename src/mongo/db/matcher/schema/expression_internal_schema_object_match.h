@@ -40,17 +40,17 @@ public:
     static constexpr StringData kName = "$_internalSchemaObjectMatch"_sd;
     static constexpr int kNumChildren = 1;
 
-    InternalSchemaObjectMatchExpression(StringData path,
+    InternalSchemaObjectMatchExpression(boost::optional<StringData> path,
                                         std::unique_ptr<MatchExpression> expr,
                                         clonable_ptr<ErrorAnnotation> annotation = nullptr);
 
     bool matchesSingleElement(const BSONElement& elem, MatchDetails* details = nullptr) const final;
 
-    std::unique_ptr<MatchExpression> shallowClone() const final;
+    std::unique_ptr<MatchExpression> clone() const final;
 
     void debugString(StringBuilder& debug, int indentationLevel = 0) const final;
 
-    BSONObj getSerializedRightHandSide() const final;
+    BSONObj getSerializedRightHandSide(SerializationOptions opts) const final;
 
     bool equivalent(const MatchExpression* other) const final;
 

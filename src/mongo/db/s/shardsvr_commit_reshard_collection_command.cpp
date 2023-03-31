@@ -62,7 +62,7 @@ public:
 
             uassert(ErrorCodes::IllegalOperation,
                     "_shardsvrCommitReshardCollection can only be run on shard servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ShardServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ShardServer));
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
 
@@ -100,7 +100,7 @@ public:
                 }
             }
 
-            for (auto doneFuture : futuresToWait) {
+            for (const auto& doneFuture : futuresToWait) {
                 doneFuture.get(opCtx);
             }
 

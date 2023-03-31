@@ -75,8 +75,6 @@ public:
             bool collShardKeyIsUnique,
             boost::optional<TypeCollectionTimeseriesFields> collTimeseriesFields,
             boost::optional<TypeCollectionReshardingFields> collReshardingFields,
-            boost::optional<int64_t> maxChunkSizeBytes,
-            bool allowAutoSplit,
             bool allowMigrations,
             std::vector<ChunkType> chunks);
 
@@ -95,10 +93,6 @@ public:
         // If the collection is currently undergoing a resharding operation, the optional will be
         // populated.
         boost::optional<TypeCollectionReshardingFields> reshardingFields;
-
-        boost::optional<int64_t> maxChunkSizeBytes;
-
-        bool allowAutoSplit;
 
         bool allowMigrations;
 
@@ -132,9 +126,10 @@ public:
     virtual void shutDown() = 0;
 
     /**
-     * Notifies the loader that the persisted collection version for 'nss' has been updated.
+     * Notifies the loader that the persisted collection placement version for 'nss' has been
+     * updated.
      */
-    virtual void notifyOfCollectionVersionUpdate(const NamespaceString& nss) = 0;
+    virtual void notifyOfCollectionPlacementVersionUpdate(const NamespaceString& nss) = 0;
 
     /**
      * Non-blocking call, which returns the chunks changed since the specified version to be
@@ -175,6 +170,11 @@ public:
      * service context, so that 'create' can be called again.
      */
     static void clearForTests(ServiceContext* serviceContext);
+
+    /**
+     * TODO: SERVER-74105 remove
+     */
+    virtual void onFCVChanged() {}
 
 protected:
     CatalogCacheLoader() = default;

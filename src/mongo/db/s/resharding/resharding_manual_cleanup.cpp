@@ -65,7 +65,7 @@ std::vector<AsyncRequestsSender::Request> createShardCleanupRequests(
 
     auto participants = getAllParticipantsFromCoordDoc(doc);
     std::vector<AsyncRequestsSender::Request> requests;
-    for (auto participant : participants) {
+    for (const auto& participant : participants) {
         requests.emplace_back(participant,
                               ShardsvrCleanupReshardCollection(nss, reshardingUUID).toBSON({}));
     }
@@ -103,7 +103,7 @@ void ReshardingCleaner<Service, StateMachine, ReshardingDocument>::clean(Operati
 
     LOGV2(5403503,
           "Cleaning up resharding operation",
-          "namespace"_attr = _originalCollectionNss,
+          logAttrs(_originalCollectionNss),
           "reshardingUUID"_attr = _reshardingUUID,
           "serviceType"_attr = Service::kServiceName);
 
@@ -165,7 +165,7 @@ void ReshardingCleaner<Service, StateMachine, ReshardingDocument>::_waitOnMachin
 }
 
 template class ReshardingCleaner<ReshardingCoordinatorService,
-                                 ReshardingCoordinatorService::ReshardingCoordinator,
+                                 ReshardingCoordinator,
                                  ReshardingCoordinatorDocument>;
 
 template class ReshardingCleaner<ReshardingDonorService,
@@ -180,7 +180,7 @@ ReshardingCoordinatorCleaner::ReshardingCoordinatorCleaner(NamespaceString nss, 
     : ReshardingCleaner(NamespaceString::kConfigReshardingOperationsNamespace,
                         std::move(nss),
                         std::move(reshardingUUID)) {
-    invariant(serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+    invariant(serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
 }
 
 void ReshardingCoordinatorCleaner::_doClean(OperationContext* opCtx,
@@ -201,8 +201,7 @@ void ReshardingCoordinatorCleaner::_doClean(OperationContext* opCtx,
     _dropTemporaryReshardingCollection(opCtx, doc.getTempReshardingNss());
 }
 
-void ReshardingCoordinatorCleaner::_abortMachine(
-    ReshardingCoordinatorService::ReshardingCoordinator& machine) {
+void ReshardingCoordinatorCleaner::_abortMachine(ReshardingCoordinator& machine) {
     machine.abort();
 }
 
@@ -211,7 +210,7 @@ void ReshardingCoordinatorCleaner::_cleanOnParticipantShards(
     AsyncRequestsSender ars(
         opCtx,
         Grid::get(opCtx)->getExecutorPool()->getFixedExecutor(),
-        NamespaceString::kAdminDb,
+        DatabaseName::kAdmin.db(),
         createShardCleanupRequests(_originalCollectionNss, _reshardingUUID, doc),
         ReadPreferenceSetting(ReadPreference::PrimaryOnly),
         Shard::RetryPolicy::kIdempotent,
@@ -262,14 +261,14 @@ ReshardingDonorCleaner::ReshardingDonorCleaner(NamespaceString nss, UUID reshard
     : ReshardingCleaner(NamespaceString::kDonorReshardingOperationsNamespace,
                         std::move(nss),
                         std::move(reshardingUUID)) {
-    invariant(serverGlobalParams.clusterRole == ClusterRole::ShardServer);
+    invariant(serverGlobalParams.clusterRole.has(ClusterRole::ShardServer));
 }
 
 ReshardingRecipientCleaner::ReshardingRecipientCleaner(NamespaceString nss, UUID reshardingUUID)
     : ReshardingCleaner(NamespaceString::kRecipientReshardingOperationsNamespace,
                         std::move(nss),
                         std::move(reshardingUUID)) {
-    invariant(serverGlobalParams.clusterRole == ClusterRole::ShardServer);
+    invariant(serverGlobalParams.clusterRole.has(ClusterRole::ShardServer));
 }
 
 void ReshardingRecipientCleaner::_doClean(OperationContext* opCtx,

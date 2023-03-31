@@ -59,6 +59,7 @@ public:
     ThreadPool::Limits getThreadPoolLimits() const override {
         ThreadPool::Limits limits;
         limits.maxThreads = repl::maxTenantMigrationDonorServiceThreadPoolSize;
+        limits.minThreads = repl::minTenantMigrationDonorServiceThreadPoolSize;
         return limits;
     }
 
@@ -117,11 +118,11 @@ public:
         }
 
         /**
-         * Returns a Future that will be resolved when all work associated with this Instance has
-         * completed running.
+         * Returns a Future that will be resolved when the instance has been durably marked garbage
+         * collectable.
          */
-        SharedSemiFuture<void> getCompletionFuture() const {
-            return _completionPromise.getFuture();
+        SharedSemiFuture<void> getForgetMigrationDurableFuture() const {
+            return _forgetMigrationDurablePromise.getFuture();
         }
 
         /**
@@ -201,6 +202,10 @@ public:
             std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS,
             const CancellationToken& token);
 
+        ExecutorFuture<void> _waitForGarbageCollectionDelayThenDeleteStateDoc(
+            const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+            const CancellationToken& token);
+
         /**
          * Makes a task executor for executing commands against the recipient. If the server
          * parameter 'tenantMigrationDisableX509Auth' is false, configures the executor to use the
@@ -227,6 +232,14 @@ public:
             const CancellationToken& token);
 
         /**
+         * Deletes the state document. Does not return the opTime for the delete, since it's not
+         * necessary to wait for this delete to be majority committed (this is the last step in the
+         * chain, and if the delete rolls back, the new primary will re-do the delete).
+         */
+        ExecutorFuture<void> _removeStateDoc(std::shared_ptr<executor::ScopedTaskExecutor> executor,
+                                             const CancellationToken& token);
+
+        /**
          * Sets the "expireAt" time for the state document to be garbage collected, and returns the
          * the opTime for the write.
          */
@@ -239,15 +252,6 @@ public:
         ExecutorFuture<void> _waitForMajorityWriteConcern(
             std::shared_ptr<executor::ScopedTaskExecutor> executor,
             repl::OpTime opTime,
-            const CancellationToken& token);
-
-        /**
-         * Sends the given command to the recipient replica set.
-         */
-        ExecutorFuture<void> _sendCommandToRecipient(
-            std::shared_ptr<executor::ScopedTaskExecutor> executor,
-            std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS,
-            const BSONObj& cmdObj,
             const CancellationToken& token);
 
         /**
@@ -272,6 +276,11 @@ public:
             return recipientCmdThreadPoolLimits;
         }
 
+        /**
+         * Validate if the value of _tenantIds is correct for the given _protocol.
+         */
+        void validateTenantIdsForProtocol();
+
         /*
          * Initializes _abortMigrationSource and returns a token from it. The source will be
          * immediately canceled if an abort has already been requested.
@@ -288,6 +297,7 @@ public:
         // This data is provided in the initial state doc and never changes.  We keep copies to
         // avoid having to obtain the mutex to access them.
         const std::string _tenantId;
+        const std::vector<TenantId> _tenantIds;
         const MigrationProtocolEnum _protocol;
         const std::string _recipientConnectionString;
         const ReadPreferenceSetting _readPreference;
@@ -321,8 +331,8 @@ public:
         // Promise that is resolved when the donor receives the donorForgetMigration command.
         SharedPromise<void> _receiveDonorForgetMigrationPromise;
 
-        // Promise that is resolved when the chain of work kicked off by run() has completed.
-        SharedPromise<void> _completionPromise;
+        // Promise that is resolved when the instance has been durably marked garbage collectable.
+        SharedPromise<void> _forgetMigrationDurablePromise;
 
         // Promise that is resolved when the donor has majority-committed the write to commit or
         // abort.

@@ -72,9 +72,9 @@ TenantFileCloner::TenantFileCloner(const UUID& backupId,
       _queryStage("query", this, &TenantFileCloner::queryStage),
       _fsWorkTaskRunner(dbPool),
       _scheduleFsWorkFn([this](executor::TaskExecutor::CallbackFn work) {
-          auto task = [ this, work = std::move(work) ](
-                          OperationContext * opCtx,
-                          const Status& status) mutable noexcept->TaskRunner::NextAction {
+          auto task = [this, work = std::move(work)](
+                          OperationContext* opCtx,
+                          const Status& status) mutable noexcept -> TaskRunner::NextAction {
               try {
                   work(executor::TaskExecutor::CallbackArgs(nullptr, {}, status, opCtx));
               } catch (const DBException& e) {
@@ -173,8 +173,7 @@ void TenantFileCloner::runQuery() {
         "$_backupFile" << BSON("backupId" << _backupId << "file" << _remoteFileName << "byteOffset"
                                           << static_cast<int64_t>(getFileOffset())));
     AggregateCommandRequest aggRequest(
-        NamespaceString::makeCollectionlessAggregateNSS(NamespaceString::kAdminDb),
-        {backupFileStage});
+        NamespaceString::makeCollectionlessAggregateNSS(DatabaseName::kAdmin), {backupFileStage});
     aggRequest.setReadConcern(ReadConcernArgs::kImplicitDefault);
     aggRequest.setWriteConcern(WriteConcernOptions());
 
@@ -208,13 +207,12 @@ void TenantFileCloner::runQuery() {
 
 void TenantFileCloner::handleNextBatch(DBClientCursor& cursor) {
     LOGV2_DEBUG(6113307,
-                3,
+                4,
                 "TenantFileCloner handleNextBatch",
                 "source"_attr = getSource(),
                 "backupId"_attr = _backupId,
                 "remoteFile"_attr = _remoteFileName,
-                "fileOffset"_attr = getFileOffset(),
-                "moreInCurrentBatch"_attr = cursor.moreInCurrentBatch());
+                "fileOffset"_attr = getFileOffset());
     {
         stdx::lock_guard<TenantMigrationSharedData> lk(*getSharedData());
         if (!getSharedData()->getStatus(lk).isOK()) {
@@ -224,7 +222,7 @@ void TenantFileCloner::handleNextBatch(DBClientCursor& cursor) {
                       str::stream() << message << ": " << getSharedData()->getStatus(lk));
         }
     }
-    while (cursor.moreInCurrentBatch()) {
+    {
         stdx::lock_guard<Latch> lk(_mutex);
         _stats.receivedBatches++;
         while (cursor.moreInCurrentBatch()) {
@@ -265,7 +263,7 @@ void TenantFileCloner::handleNextBatch(DBClientCursor& cursor) {
 void TenantFileCloner::writeDataToFilesystemCallback(
     const executor::TaskExecutor::CallbackArgs& cbd) {
     LOGV2_DEBUG(6113309,
-                3,
+                4,
                 "TenantFileCloner writeDataToFilesystemCallback",
                 "backupId"_attr = _backupId,
                 "remoteFile"_attr = _remoteFileName,

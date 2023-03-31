@@ -31,7 +31,7 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/repl/replica_set_aware_service.h"
 
 namespace mongo {
@@ -52,26 +52,12 @@ public:
     static ClusterServerParameterInitializer* get(OperationContext* opCtx);
     static ClusterServerParameterInitializer* get(ServiceContext* serviceContext);
 
-    void updateParameter(OperationContext* opCtx, BSONObj doc, StringData mode);
-    void clearParameter(OperationContext* opCtx, ServerParameter* sp);
-    void clearParameter(OperationContext* opCtx, StringData id);
-    void clearAllParameters(OperationContext* opCtx);
-
-    /**
-     * Used to initialize in-memory cluster parameter state based on the on-disk contents after
-     * startup recovery or initial sync is complete.
-     */
-    void initializeAllParametersFromDisk(OperationContext* opCtx);
-
-    /**
-     * Used on rollback and rename with drop.
-     * Updates settings which are present and clears settings which are not.
-     */
-    void resynchronizeAllParametersFromDisk(OperationContext* opCtx);
-
     // Virtual methods coming from the ReplicaSetAwareService
     void onStartup(OperationContext* opCtx) override final {}
 
+    void onSetCurrentConfig(OperationContext* opCtx) override final {}
+
+    static void synchronizeAllParametersFromDisk(OperationContext* opCtx);
     /**
      * Called after startup recovery or initial sync is complete.
      */
@@ -82,34 +68,8 @@ public:
     void onStepUpComplete(OperationContext* opCtx, long long term) override final {}
     void onStepDown() override final {}
     void onBecomeArbiter() override final {}
-
-private:
-    template <typename OnEntry>
-    void doLoadAllParametersFromDisk(OperationContext* opCtx,
-                                     StringData mode,
-                                     OnEntry onEntry) try {
-        std::vector<Status> failures;
-
-        DBDirectClient client(opCtx);
-        FindCommandRequest findRequest{NamespaceString::kClusterParametersNamespace};
-        client.find(std::move(findRequest), [&](BSONObj doc) {
-            try {
-                onEntry(opCtx, doc, mode);
-            } catch (const DBException& ex) {
-                failures.push_back(ex.toStatus());
-            }
-        });
-        if (!failures.empty()) {
-            StringBuilder msg;
-            for (const auto& failure : failures) {
-                msg << failure.toString() << ", ";
-            }
-            msg.reset(msg.len() - 2);
-            uasserted(ErrorCodes::OperationFailed, msg.str());
-        }
-    } catch (const DBException& ex) {
-        uassertStatusOK(ex.toStatus().withContext(
-            str::stream() << "Failed " << mode << " cluster server parameters from disk"));
+    inline std::string getServiceName() const override final {
+        return "ClusterServerParameterInitializer";
     }
 };
 

@@ -30,6 +30,7 @@
 #include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/concurrency/lock_manager_test_help.h"
 #include "mongo/db/service_context_test_fixture.h"
+#include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -41,7 +42,9 @@ TEST(ResourceId, Semantics) {
     ASSERT(resIdDb.getType() == RESOURCE_DATABASE);
     ASSERT(resIdDb.getHashId() == 324334234);
 
-    ResourceId resIdColl(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    ResourceId resIdColl(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
     ASSERT(resIdColl.getType() == RESOURCE_COLLECTION);
 
     // Comparison functions
@@ -57,17 +60,9 @@ TEST(ResourceId, Semantics) {
     ASSERT_EQUALS(resId, resIdColl);
 }
 
-TEST(ResourceId, Constructors) {
-    ResourceId resIdString(RESOURCE_COLLECTION, std::string("TestDB.collection"));
-    ResourceId resIdStringData(RESOURCE_COLLECTION, StringData("TestDB.collection"));
-
-    ASSERT_EQUALS(resIdString, resIdStringData);
-}
-
 TEST(ResourceId, Masking) {
-    const ResourceType maxRes = static_cast<ResourceType>(ResourceTypesCount - 1);
     const uint64_t maxHash = (1ULL << 61) - 1;  //  Only 61 bits usable for hash
-    ResourceType resources[3] = {maxRes, RESOURCE_GLOBAL, RESOURCE_METADATA};
+    ResourceType resources[3] = {RESOURCE_GLOBAL, RESOURCE_COLLECTION, RESOURCE_METADATA};
     uint64_t hashes[3] = {maxHash, maxHash / 3, maxHash / 3 * 2};
 
     //  The test below verifies that types/hashes are stored/retrieved unchanged
@@ -80,13 +75,29 @@ TEST(ResourceId, Masking) {
     }
 }
 
+class ResourceIdTest : public unittest::Test {};
+
+DEATH_TEST_F(ResourceIdTest, StringConstructorMustNotBeCollection, "invariant") {
+    ResourceId(RESOURCE_COLLECTION, "TestDB.collection");
+}
+
+DEATH_TEST_F(ResourceIdTest, StringConstructorMustNotBeDatabase, "invariant") {
+    ResourceId(RESOURCE_DATABASE, "TestDB");
+}
+
+DEATH_TEST_F(ResourceIdTest, CantCreateResourceMutexDirectly, "invariant") {
+    ResourceId(RESOURCE_MUTEX, "TestDB");
+}
+
 //
 // LockManager
 //
 
 TEST_F(LockManagerTest, Grant) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl locker(getServiceContext());
     TrackingLockGrantNotification notify;
@@ -105,7 +116,9 @@ TEST_F(LockManagerTest, Grant) {
 
 TEST_F(LockManagerTest, GrantMultipleNoConflict) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl locker(getServiceContext());
     TrackingLockGrantNotification notify;
@@ -138,7 +151,9 @@ TEST_F(LockManagerTest, GrantMultipleNoConflict) {
 
 TEST_F(LockManagerTest, GrantMultipleFIFOOrder) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     std::unique_ptr<LockerImpl> locker[6];
     for (int i = 0; i < 6; i++) {
@@ -171,7 +186,9 @@ TEST_F(LockManagerTest, GrantMultipleFIFOOrder) {
 
 TEST_F(LockManagerTest, GrantRecursive) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl locker(getServiceContext());
     LockRequestCombo request(&locker);
@@ -199,7 +216,9 @@ TEST_F(LockManagerTest, GrantRecursive) {
 
 TEST_F(LockManagerTest, GrantRecursiveCompatibleConvertUp) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl locker(getServiceContext());
     LockRequestCombo request(&locker);
@@ -227,7 +246,9 @@ TEST_F(LockManagerTest, GrantRecursiveCompatibleConvertUp) {
 
 TEST_F(LockManagerTest, GrantRecursiveNonCompatibleConvertUp) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl locker(getServiceContext());
     LockRequestCombo request(&locker);
@@ -255,7 +276,9 @@ TEST_F(LockManagerTest, GrantRecursiveNonCompatibleConvertUp) {
 
 TEST_F(LockManagerTest, GrantRecursiveNonCompatibleConvertDown) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl locker(getServiceContext());
     LockRequestCombo request(&locker);
@@ -283,7 +306,9 @@ TEST_F(LockManagerTest, GrantRecursiveNonCompatibleConvertDown) {
 
 TEST_F(LockManagerTest, Conflict) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl locker1(getServiceContext());
     LockerImpl locker2(getServiceContext());
@@ -322,7 +347,9 @@ TEST_F(LockManagerTest, Conflict) {
 
 TEST_F(LockManagerTest, MultipleConflict) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl locker(getServiceContext());
     TrackingLockGrantNotification notify;
@@ -355,7 +382,9 @@ TEST_F(LockManagerTest, MultipleConflict) {
 
 TEST_F(LockManagerTest, ConflictCancelWaiting) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl locker1(getServiceContext());
     TrackingLockGrantNotification notify1;
@@ -388,7 +417,9 @@ TEST_F(LockManagerTest, ConflictCancelWaiting) {
 
 TEST_F(LockManagerTest, ConflictCancelMultipleWaiting) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl locker(getServiceContext());
     TrackingLockGrantNotification notify;
@@ -421,7 +452,9 @@ TEST_F(LockManagerTest, ConflictCancelMultipleWaiting) {
 
 TEST_F(LockManagerTest, CancelWaitingConversionWeakModes) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl locker1(getServiceContext());
     LockerImpl locker2(getServiceContext());
@@ -456,7 +489,9 @@ TEST_F(LockManagerTest, CancelWaitingConversionWeakModes) {
 
 TEST_F(LockManagerTest, CancelWaitingConversionStrongModes) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl locker1(getServiceContext());
     LockerImpl locker2(getServiceContext());
@@ -491,7 +526,9 @@ TEST_F(LockManagerTest, CancelWaitingConversionStrongModes) {
 
 TEST_F(LockManagerTest, ConflictingConversion) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl locker1(getServiceContext());
     LockerImpl locker2(getServiceContext());
@@ -526,7 +563,9 @@ TEST_F(LockManagerTest, ConflictingConversion) {
 
 TEST_F(LockManagerTest, ConflictingConversionInTheMiddle) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl locker(getServiceContext());
     TrackingLockGrantNotification notify;
@@ -558,7 +597,9 @@ TEST_F(LockManagerTest, ConflictingConversionInTheMiddle) {
 
 TEST_F(LockManagerTest, ConvertUpgrade) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl locker1(getServiceContext());
     LockRequestCombo request1(&locker1);
@@ -579,7 +620,9 @@ TEST_F(LockManagerTest, ConvertUpgrade) {
 
 TEST_F(LockManagerTest, Downgrade) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl locker1(getServiceContext());
     LockRequestCombo request1(&locker1);
@@ -607,7 +650,9 @@ static void checkConflict(ServiceContext* serviceContext,
                           LockMode newMode,
                           bool hasConflict) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl lockerExisting(serviceContext);
     TrackingLockGrantNotification notifyExisting;
@@ -656,7 +701,9 @@ TEST_F(LockManagerTest, ValidateConflictMatrix) {
 
 TEST_F(LockManagerTest, EnqueueAtFront) {
     LockManager lockMgr;
-    const ResourceId resId(RESOURCE_COLLECTION, std::string("TestDB.collection"));
+    const ResourceId resId(
+        RESOURCE_COLLECTION,
+        NamespaceString::createNamespaceString_forTest(boost::none, "TestDB.collection"));
 
     LockerImpl lockerX(getServiceContext());
     LockRequestCombo requestX(&lockerX);
@@ -956,6 +1003,25 @@ TEST_F(LockManagerTest, Fairness) {
 
     // Unlock all locks so we don't assert for leaked locks
     ASSERT(lockMgr.unlock(&requestIX1));
+}
+
+TEST_F(LockManagerTest, HasConflictingRequests) {
+    LockManager lockMgr;
+    ResourceId resId{RESOURCE_GLOBAL, 0};
+
+    LockerImpl lockerIX{getServiceContext()};
+    LockRequestCombo requestIX{&lockerIX};
+    ASSERT_EQ(lockMgr.lock(resId, &requestIX, LockMode::MODE_IX), LockResult::LOCK_OK);
+    ASSERT_FALSE(lockMgr.hasConflictingRequests(&requestIX));
+
+    LockerImpl lockerX{getServiceContext()};
+    LockRequestCombo requestX{&lockerX};
+    ASSERT_EQ(lockMgr.lock(resId, &requestX, LockMode::MODE_X), LockResult::LOCK_WAITING);
+    ASSERT_TRUE(lockMgr.hasConflictingRequests(&requestIX));
+    ASSERT_TRUE(lockMgr.hasConflictingRequests(&requestX));
+
+    ASSERT(lockMgr.unlock(&requestIX));
+    ASSERT(lockMgr.unlock(&requestX));
 }
 
 }  // namespace mongo

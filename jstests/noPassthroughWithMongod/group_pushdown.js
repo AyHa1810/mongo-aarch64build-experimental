@@ -8,7 +8,7 @@ load("jstests/libs/analyze_plan.js");
 load("jstests/libs/sbe_util.js");  // For checkSBEEnabled.
 
 if (!checkSBEEnabled(db)) {
-    jsTestLog("Skipping test because the sbe group pushdown feature flag is disabled");
+    jsTestLog("Skipping test because SBE is not enabled");
     return;
 }
 
@@ -60,7 +60,7 @@ let assertResultsMatchWithAndWithoutPushdown = function(
     assertGroupPushdown(coll, pipeline, expectedResults, expectedGroupCountInExplain);
 
     // Turn sbe off.
-    db.adminCommand({setParameter: 1, internalQueryForceClassicEngine: true});
+    db.adminCommand({setParameter: 1, internalQueryFrameworkControl: "forceClassicEngine"});
 
     // Sanity check the results when no pushdown happens.
     let resultNoGroupPushdown = coll.aggregate(pipeline).toArray();
@@ -68,17 +68,17 @@ let assertResultsMatchWithAndWithoutPushdown = function(
 
     // Turn sbe on which will allow $group stages that contain supported accumulators to be pushed
     // down under certain conditions.
-    db.adminCommand({setParameter: 1, internalQueryForceClassicEngine: false});
+    db.adminCommand({setParameter: 1, internalQueryFrameworkControl: "tryBonsai"});
 
     let resultWithGroupPushdown = coll.aggregate(pipeline).toArray();
     assert.sameMembers(resultNoGroupPushdown, resultWithGroupPushdown);
 };
 
 let assertShardedGroupResultsMatch = function(coll, pipeline, expectedGroupCountInExplain = 1) {
-    const originalSBEEngineStatus =
+    const originalFrameworkControl =
         assert
-            .commandWorked(
-                db.adminCommand({setParameter: 1, internalQueryForceClassicEngine: true}))
+            .commandWorked(db.adminCommand(
+                {setParameter: 1, internalQueryFrameworkControl: "forceClassicEngine"}))
             .was;
 
     const cmd = {
@@ -91,7 +91,7 @@ let assertShardedGroupResultsMatch = function(coll, pipeline, expectedGroupCount
 
     const classicalRes = coll.runCommand(cmd).cursor.firstBatch;
     assert.commandWorked(
-        db.adminCommand({setParameter: 1, internalQueryForceClassicEngine: false}));
+        db.adminCommand({setParameter: 1, internalQueryFrameworkControl: "tryBonsai"}));
     const explainCmd = {
         aggregate: coll.getName(),
         pipeline: pipeline,
@@ -107,7 +107,7 @@ let assertShardedGroupResultsMatch = function(coll, pipeline, expectedGroupCount
     assert.sameMembers(sbeRes, classicalRes);
 
     assert.commandWorked(db.adminCommand(
-        {setParameter: 1, internalQueryForceClassicEngine: originalSBEEngineStatus}));
+        {setParameter: 1, internalQueryFrameworkControl: originalFrameworkControl}));
 };
 
 // Try a pipeline with no group stage.
@@ -246,6 +246,179 @@ assertResultsMatchWithAndWithoutPushdown(
 ].forEach(pipeline =>
               assertResultsMatchWithAndWithoutPushdown(
                   coll, pipeline, [{_id: "a", ss: 30}, {_id: "b", ss: 60}, {_id: "c", ss: 10}], 2));
+
+// The second $group stage refers to a top-field below a $switch
+assertResultsMatchWithAndWithoutPushdown(coll,
+                                         [
+                                             {$group: {_id: {$divide: ["$price", 5]}}},
+                                             {
+                                                 $group: {
+                                                     _id: null,
+                                                     lowp: {
+                                                         $sum: {
+                                                             $switch: {
+                                                                 branches: [{
+                                                                     case: {$lte: ["$_id", 3]},
+                                                                     then: 1
+                                                                 }],
+                                                                 default: 0
+                                                             }
+                                                         }
+                                                     },
+                                                     highp: {
+                                                         $sum: {
+                                                             $switch: {
+                                                                 branches: [{
+                                                                     case: {$gt: ["$_id", 3]},
+                                                                     then: 1
+                                                                 }],
+                                                                 default: 0
+                                                             }
+                                                         }
+                                                     }
+                                                 }
+                                             }
+                                         ],
+                                         [{"_id": null, "lowp": 2, "highp": 1}],
+                                         2);
+
+// The second $group stage refers to a top-field below a $cond
+assertResultsMatchWithAndWithoutPushdown(
+    coll,
+    [
+        {$group: {_id: {$divide: ["$price", 5]}}},
+        {
+            $group: {
+                _id: null,
+                lowp: {$sum: {$cond: [{$lte: ["$_id", 3]}, 1, 0]}},
+                highp: {$sum: {$cond: [{$gt: ["$_id", 3]}, 1, 0]}}
+            }
+        }
+    ],
+    [{"_id": null, "lowp": 2, "highp": 1}],
+    2);
+
+// The second $group stage refers to a top-field below a nested $cond / $ifNull
+assertResultsMatchWithAndWithoutPushdown(coll,
+                                         [
+                                             {$group: {_id: {$divide: ["$price", 5]}}},
+                                             {
+                                                 $group: {
+                                                     _id: null,
+                                                     lowp: {
+                                                         $sum: {
+                                                             $cond: [
+                                                                 {
+                                                                     $lte:
+                                                                         [{$ifNull: ["$_id", 0]}, 3]
+                                                                 },
+                                                                 1,
+                                                                 0
+                                                             ]
+                                                         }
+                                                     },
+                                                     highp: {
+                                                         $sum: {
+                                                             $cond: [
+                                                                 {$gt: [{$ifNull: ["$_id", 0]}, 3]},
+                                                                 1,
+                                                                 0
+                                                             ]
+                                                         }
+                                                     }
+                                                 }
+                                             }
+                                         ],
+                                         [{"_id": null, "lowp": 2, "highp": 1}],
+                                         2);
+
+// The second $group stage refers to top-fields below a $let
+assertResultsMatchWithAndWithoutPushdown(
+    coll,
+    [
+        {$group: {
+            _id: "$item", maxp: {$max: "$price"}, minp: {$min: "$price"}, count: {$count: {}}
+        }},
+        {$group: {_id: "$_id", o: {$sum: {
+            $let: {
+                vars: {
+                    minPlusMax: {$add: ["$maxp", "$minp"]},
+                    count: "$count"
+                },
+                in: {$multiply: ["$$minPlusMax", "$$count"]}
+            }
+        }}}}
+    ],
+    [{ "_id" : "a", "o" : 30 }, { "_id" : "c", "o" : 10 }, { "_id" : "b", "o" : 60 }],
+    2);
+
+// The second $group stage refers to top-fields below a $and
+assertResultsMatchWithAndWithoutPushdown(coll,
+                                         [
+                                             {
+                                                 $group: {
+                                                     _id: "$item",
+                                                     maxp: {$max: "$price"},
+                                                     minp: {$min: "$price"}
+                                                 }
+                                             },
+                                             {
+                                                 $group:
+                                                     {
+                                                         _id: "$_id",
+                                                         o:
+                                                             {
+                                                                 $sum:
+                                                                     {
+                                                                         $and: [
+                                                                             {$gt: ["$maxp", 15]},
+                                                                             {$lt: ["$minp", 10]}
+                                                                         ]
+                                                                     }
+                                                             }
+                                                     }
+                                             }
+                                         ],
+                                         [
+                                             {"_id": "a", "o": 0},
+                                             {"_id": "c", "o": 0},
+                                             {"_id": "b", "o": 0}
+                                         ],
+                                         2);
+
+// The second $group stage refers to top-fields below a $or
+assertResultsMatchWithAndWithoutPushdown(coll,
+                                         [
+                                             {
+                                                 $group: {
+                                                     _id: "$item",
+                                                     maxp: {$max: "$price"},
+                                                     minp: {$min: "$price"}
+                                                 }
+                                             },
+                                             {
+                                                 $group:
+                                                     {
+                                                         _id: "$_id",
+                                                         o:
+                                                             {
+                                                                 $sum:
+                                                                     {
+                                                                         $or: [
+                                                                             {$gt: ["$maxp", 15]},
+                                                                             {$lt: ["$minp", 10]}
+                                                                         ]
+                                                                     }
+                                                             }
+                                                     }
+                                             }
+                                         ],
+                                         [
+                                             {"_id": "a", "o": 0},
+                                             {"_id": "c", "o": 0},
+                                             {"_id": "b", "o": 0}
+                                         ],
+                                         2);
 
 // The second $group stage refers to both a top-level field and a sub-field twice which does not
 // exist.
@@ -475,6 +648,11 @@ assertResultsMatchWithAndWithoutPushdown(
     [{$sortByCount: "$item"}],
     [{"_id": "a", "count": 2}, {"_id": "b", "count": 2}, {"_id": "c", "count": 1}]);
 
+assertResultsMatchWithAndWithoutPushdown(
+    coll,
+    [{$sortByCount: {$cond: [{$eq: ["$item", {$const: "a"}]}, "$price", "$quantity"]}}],
+    [{_id: 10, count: 3}, {_id: 1, count: 1}, {_id: 5, count: 1}]);
+
 // When at the mongos-side in a sharded environment or we are spilling $doingMerge is set to true.
 // We should bail out and not push down $group stages and the suffix of the pipeline when we
 // encounter a $group stage with this flag set.
@@ -557,4 +735,17 @@ assertNoGroupPushdown(coll, basicGroup, basicGroupResults);
 // Reset 'internalQuerySlotBasedExecutionDisableGroupPushdown' to its original value.
 assert.commandWorked(db.adminCommand(
     {setParameter: 1, internalQuerySlotBasedExecutionDisableGroupPushdown: oldValue}));
+
+(function testConstNothingForIdMappedToNull() {
+    // Prepare a collection.
+    const coll = db.nothing_id;
+    coll.drop();
+    coll.insert({_id: 0});
+
+    // $$REMOVE produce Nothing constant and it should be converted to Null. Without an accumulator
+    // $group is not pushed down and we need an accumulator.
+    assert.eq(
+        coll.aggregate([{$group: {_id: "$$REMOVE", o: {$first: "$non_existent_field"}}}]).toArray(),
+        [{_id: null, o: null}]);
+})();
 })();

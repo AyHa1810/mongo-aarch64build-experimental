@@ -64,33 +64,33 @@ public:
         return " example: { getShardVersion : 'alleyinsider.foo'  } ";
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
-                ActionType::getShardVersion)) {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(
+                     ResourcePattern::forExactNamespace(parseNs(dbName, cmdObj)),
+                     ActionType::getShardVersion)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
 
         return Status::OK();
     }
 
-    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
+    NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) const override {
         BSONElement first = cmdObj.firstElement();
         uassert(ErrorCodes::BadValue,
                 str::stream() << "namespace has invalid type " << typeName(first.type()),
                 first.canonicalType() == canonicalizeBSONType(mongo::String));
-        const NamespaceString nss(first.valueStringData());
-        return nss.ns();
+        return NamespaceStringUtil::parseNamespaceFromRequest(dbName.tenantId(),
+                                                              first.valueStringData());
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        const NamespaceString nss(parseNs(dbname, cmdObj));
-
+        const NamespaceString nss(parseNs(dbName, cmdObj));
         const auto catalogCache = Grid::get(opCtx)->catalogCache();
 
         if (nss.coll().empty()) {
@@ -101,7 +101,8 @@ public:
             result.append("version", cachedDbInfo->getVersion().toBSON());
         } else {
             // Return the collection's information.
-            const auto cm = uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, nss));
+            const auto [cm, sii] =
+                uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, nss));
             uassert(ErrorCodes::NamespaceNotSharded,
                     str::stream() << "Collection " << nss.ns() << " is not sharded.",
                     cm.isSharded());
@@ -109,6 +110,11 @@ public:
             result.appendTimestamp("version", cm.getVersion().toLong());
             result.append("versionEpoch", cm.getVersion().epoch());
             result.append("versionTimestamp", cm.getVersion().getTimestamp());
+
+
+            if (sii) {
+                result.append("indexVersion", sii->getCollectionIndexes().indexVersion());
+            }
 
             if (cmdObj["fullMetadata"].trueValue()) {
                 BSONArrayBuilder chunksArrBuilder;
@@ -135,6 +141,23 @@ public:
 
                 if (!exceedsSizeLimit) {
                     result.append("chunks", chunksArrBuilder.arr());
+
+                    if (sii) {
+                        BSONArrayBuilder indexesArrBuilder;
+                        sii->forEachIndex([&](const auto& index) {
+                            BSONObjBuilder indexB(index.toBSON());
+                            if (result.len() + indexesArrBuilder.len() + indexB.len() >
+                                BSONObjMaxUserSize) {
+                                exceedsSizeLimit = true;
+                            } else {
+                                indexesArrBuilder.append(indexB.done());
+                            }
+
+                            return !exceedsSizeLimit;
+                        });
+
+                        result.append("indexes", indexesArrBuilder.arr());
+                    }
                 }
             }
         }

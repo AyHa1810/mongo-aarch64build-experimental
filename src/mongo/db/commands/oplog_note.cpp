@@ -58,6 +58,9 @@ MONGO_FAIL_POINT_DEFINE(hangInAppendOplogNote);
 
 namespace {
 Status _performNoopWrite(OperationContext* opCtx, BSONObj msgObj, StringData note) {
+    ScopedAdmissionPriorityForLock priority{opCtx->lockState(),
+                                            AdmissionContext::Priority::kImmediate};
+
     repl::ReplicationCoordinator* const replCoord = repl::ReplicationCoordinator::get(opCtx);
     // Use GlobalLock instead of DBLock to allow return when the lock is not available. It may
     // happen when the primary steps down and a shared global lock is acquired.
@@ -107,18 +110,19 @@ public:
         return "Adds a no-op entry to the oplog";
     }
 
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), ActionType::appendOplogNote)) {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                    ActionType::appendOplogNote)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
         return Status::OK();
     }
 
     virtual bool run(OperationContext* opCtx,
-                     const string& dbname,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
         hangInAppendOplogNote.pauseWhileSet();

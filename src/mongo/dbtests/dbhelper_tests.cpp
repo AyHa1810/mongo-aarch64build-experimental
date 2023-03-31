@@ -27,10 +27,8 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/client/dbclient_cursor.h"
-#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
@@ -41,7 +39,6 @@
 #include "mongo/db/op_observer/op_observer_registry.h"
 #include "mongo/db/op_observer/oplog_writer_impl.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/range_arithmetic.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/write_concern_options.h"
@@ -50,11 +47,7 @@
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
-
 namespace {
-
-using std::set;
-using std::unique_ptr;
 
 /**
  * Unit tests related to DBHelpers
@@ -142,17 +135,18 @@ public:
         CollectionPtr collection1;
         {
             WriteUnitOfWork wuow(opCtx1.get());
-            collection1 = db->createCollection(opCtx1.get(), nss, CollectionOptions(), true);
-            ASSERT_TRUE(collection1 != nullptr);
-            ASSERT_TRUE(collection1
-                            ->insertDocument(
-                                opCtx1.get(), InsertStatement(doc), nullptr /* opDebug */, false)
-                            .isOK());
+            collection1 =
+                CollectionPtr(db->createCollection(opCtx1.get(), nss, CollectionOptions(), true));
+            ASSERT_TRUE(collection1);
+            ASSERT_TRUE(
+                collection_internal::insertDocument(
+                    opCtx1.get(), collection1, InsertStatement(doc), nullptr /* opDebug */, false)
+                    .isOK());
             wuow.commit();
         }
 
         BSONObj result;
-        Helpers::findById(opCtx1.get(), nss.ns(), idQuery, result, nullptr, nullptr);
+        Helpers::findById(opCtx1.get(), nss, idQuery, result, nullptr, nullptr);
         ASSERT_BSONOBJ_EQ(result, doc);
 
         // Assert that the same doc still exists after findByIdAndNoopUpdate
@@ -201,13 +195,14 @@ private:
             WriteUnitOfWork wuow2(opCtx2);
             auto collection2 =
                 CollectionCatalog::get(opCtx2)->lookupCollectionByNamespace(opCtx2, nss);
-            ASSERT(collection2 != nullptr);
+            ASSERT(collection2);
             auto lastApplied = repl::ReplicationCoordinator::get(opCtx2->getServiceContext())
                                    ->getMyLastAppliedOpTime()
                                    .getTimestamp();
             ASSERT_OK(opCtx2->recoveryUnit()->setTimestamp(lastApplied + 1));
             BSONObj res;
-            ASSERT_TRUE(Helpers::findByIdAndNoopUpdate(opCtx2, collection2, idQuery, res));
+            ASSERT_TRUE(
+                Helpers::findByIdAndNoopUpdate(opCtx2, CollectionPtr(collection2), idQuery, res));
 
             ASSERT_THROWS(Helpers::emptyCollection(opCtx1, nss), WriteConflictException);
 
@@ -216,11 +211,11 @@ private:
 
         // Assert that the doc still exists in the collection.
         BSONObj res1;
-        Helpers::findById(opCtx1, nss.ns(), idQuery, res1, nullptr, nullptr);
+        Helpers::findById(opCtx1, nss, idQuery, res1, nullptr, nullptr);
         ASSERT_BSONOBJ_EQ(res1, doc);
 
         BSONObj res2;
-        Helpers::findById(opCtx2, nss.ns(), idQuery, res2, nullptr, nullptr);
+        Helpers::findById(opCtx2, nss, idQuery, res2, nullptr, nullptr);
         ASSERT_BSONOBJ_EQ(res2, doc);
 
         // Assert that findByIdAndNoopUpdate did not generate an oplog entry.
@@ -248,10 +243,11 @@ private:
                 WriteUnitOfWork wuow2(opCtx2);
                 auto collection2 =
                     CollectionCatalog::get(opCtx2)->lookupCollectionByNamespace(opCtx2, nss);
-                ASSERT(collection2 != nullptr);
+                ASSERT(collection2);
 
                 BSONObj res;
-                ASSERT_THROWS(Helpers::findByIdAndNoopUpdate(opCtx2, collection2, idQuery, res),
+                ASSERT_THROWS(Helpers::findByIdAndNoopUpdate(
+                                  opCtx2, CollectionPtr(collection2), idQuery, res),
                               WriteConflictException);
             }
 
@@ -260,11 +256,11 @@ private:
 
         // Assert that the first storage transaction succeeded and that the doc is removed.
         BSONObj res1;
-        Helpers::findById(opCtx1, nss.ns(), idQuery, res1, nullptr, nullptr);
+        Helpers::findById(opCtx1, nss, idQuery, res1, nullptr, nullptr);
         ASSERT_BSONOBJ_EQ(res1, BSONObj());
 
         BSONObj res2;
-        Helpers::findById(opCtx2, nss.ns(), idQuery, res2, nullptr, nullptr);
+        Helpers::findById(opCtx2, nss, idQuery, res2, nullptr, nullptr);
         ASSERT_BSONOBJ_EQ(res2, BSONObj());
     }
 

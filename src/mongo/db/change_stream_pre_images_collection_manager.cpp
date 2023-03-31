@@ -27,17 +27,16 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/change_stream_pre_images_collection_manager.h"
 
 #include "mongo/base/error_codes.h"
 #include "mongo/db/catalog/clustered_collection_util.h"
-#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog/drop_collection.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/change_stream_options_manager.h"
+#include "mongo/db/change_stream_serverless_helpers.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/concurrency/locker.h"
@@ -49,7 +48,6 @@
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
-#include "mongo/util/fail_point.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
@@ -62,18 +60,6 @@ MONGO_FAIL_POINT_DEFINE(failPreimagesCollectionCreation);
 }  // namespace
 
 namespace change_stream_pre_image_helpers {
-
-bool PreImageAttributes::isExpiredPreImage(const boost::optional<Date_t>& preImageExpirationTime,
-                                           const Timestamp& earliestOplogEntryTimestamp) {
-    // Pre-image oplog entry is no longer present in the oplog if its timestamp is smaller
-    // than the 'earliestOplogEntryTimestamp'.
-    const bool preImageOplogEntryIsDeleted = ts < earliestOplogEntryTimestamp;
-    const auto expirationTime = preImageExpirationTime.get_value_or(Date_t::min());
-
-    // Pre-image is expired if its corresponding oplog entry is deleted or its operation
-    // time is less than or equal to the expiration time.
-    return preImageOplogEntryIsDeleted || operationTime <= expirationTime;
-}
 
 // Get the 'expireAfterSeconds' from the 'ChangeStreamOptions' if not 'off', boost::none otherwise.
 boost::optional<std::int64_t> getExpireAfterSecondsFromChangeStreamOptions(
@@ -91,6 +77,7 @@ boost::optional<std::int64_t> getExpireAfterSecondsFromChangeStreamOptions(
 // Returns pre-images expiry time in milliseconds since the epoch time if configured, boost::none
 // otherwise.
 boost::optional<Date_t> getPreImageExpirationTime(OperationContext* opCtx, Date_t currentTime) {
+    invariant(!change_stream_serverless_helpers::isChangeCollectionsModeActive());
     boost::optional<std::int64_t> expireAfterSeconds = boost::none;
 
     // Get the expiration time directly from the change stream manager.
@@ -102,6 +89,25 @@ boost::optional<Date_t> getPreImageExpirationTime(OperationContext* opCtx, Date_
     return expireAfterSeconds ? boost::optional<Date_t>(currentTime - Seconds(*expireAfterSeconds))
                               : boost::none;
 }
+
+// TODO SERVER-74981: Investigate whether there is a safer way to extract the Timestamp.
+Timestamp getPreImageTimestamp(const RecordId& rid) {
+    static constexpr auto kTopLevelFieldName = "ridAsBSON"_sd;
+    auto ridAsNestedBSON = record_id_helpers::toBSONAs(rid, kTopLevelFieldName);
+    // 'toBSONAs()' discards type bits of the underlying KeyString of the RecordId. However, since
+    // the 'ts' field of 'ChangeStreamPreImageId' is distinct CType::kTimestamp, type bits aren't
+    // necessary to obtain the original value.
+
+    auto ridBSON = ridAsNestedBSON.getObjectField(kTopLevelFieldName);
+    auto tsElem = ridBSON.getField(ChangeStreamPreImageId::kTsFieldName);
+    return tsElem.timestamp();
+}
+
+RecordId toRecordId(ChangeStreamPreImageId id) {
+    return record_id_helpers::keyForElem(
+        BSON(ChangeStreamPreImage::kIdFieldName << id.toBSON()).firstElement());
+}
+
 }  // namespace change_stream_pre_image_helpers
 
 void ChangeStreamPreImagesCollectionManager::createPreImagesCollection(
@@ -109,7 +115,8 @@ void ChangeStreamPreImagesCollectionManager::createPreImagesCollection(
     uassert(5868501,
             "Failpoint failPreimagesCollectionCreation enabled. Throwing exception",
             !MONGO_unlikely(failPreimagesCollectionCreation.shouldFail()));
-    const auto preImagesCollectionNamespace = NamespaceString::makePreImageCollectionNSS(tenantId);
+    const auto preImagesCollectionNamespace = NamespaceString::makePreImageCollectionNSS(
+        change_stream_serverless_helpers::resolveTenantId(tenantId));
 
     CollectionOptions preImagesCollectionOptions;
 
@@ -120,13 +127,15 @@ void ChangeStreamPreImagesCollectionManager::createPreImagesCollection(
         opCtx, preImagesCollectionNamespace, preImagesCollectionOptions, BSONObj());
     uassert(status.code(),
             str::stream() << "Failed to create the pre-images collection: "
-                          << preImagesCollectionNamespace.coll() << causedBy(status.reason()),
+                          << preImagesCollectionNamespace.toStringWithTenantId()
+                          << causedBy(status.reason()),
             status.isOK() || status.code() == ErrorCodes::NamespaceExists);
 }
 
 void ChangeStreamPreImagesCollectionManager::dropPreImagesCollection(
     OperationContext* opCtx, boost::optional<TenantId> tenantId) {
-    const auto preImagesCollectionNamespace = NamespaceString::makePreImageCollectionNSS(tenantId);
+    const auto preImagesCollectionNamespace = NamespaceString::makePreImageCollectionNSS(
+        change_stream_serverless_helpers::resolveTenantId(tenantId));
     DropReply dropReply;
     const auto status =
         dropCollection(opCtx,
@@ -135,7 +144,8 @@ void ChangeStreamPreImagesCollectionManager::dropPreImagesCollection(
                        DropCollectionSystemCollectionMode::kAllowSystemCollectionDrops);
     uassert(status.code(),
             str::stream() << "Failed to drop the pre-images collection: "
-                          << preImagesCollectionNamespace.coll() << causedBy(status.reason()),
+                          << preImagesCollectionNamespace.toStringWithTenantId()
+                          << causedBy(status.reason()),
             status.isOK() || status.code() == ErrorCodes::NamespaceNotFound);
 }
 
@@ -150,11 +160,13 @@ void ChangeStreamPreImagesCollectionManager::insertPreImage(OperationContext* op
                           << preImage.getId().getApplyOpsIndex(),
             preImage.getId().getApplyOpsIndex() >= 0);
 
+    const auto preImagesCollectionNamespace = NamespaceString::makePreImageCollectionNSS(
+        change_stream_serverless_helpers::resolveTenantId(tenantId));
+
     // This lock acquisition can block on a stronger lock held by another operation modifying
     // the pre-images collection. There are no known cases where an operation holding an
     // exclusive lock on the pre-images collection also waits for oplog visibility.
     AllowLockAcquisitionOnTimestampedUnitOfWork allowLockAcquisition(opCtx->lockState());
-    const auto preImagesCollectionNamespace = NamespaceString::makePreImageCollectionNSS(tenantId);
     AutoGetCollection preImagesCollectionRaii(
         opCtx, preImagesCollectionNamespace, LockMode::MODE_IX);
     auto& changeStreamPreImagesCollection = preImagesCollectionRaii.getCollection();
@@ -162,8 +174,11 @@ void ChangeStreamPreImagesCollectionManager::insertPreImage(OperationContext* op
             "The change stream pre-images collection is not present",
             changeStreamPreImagesCollection);
 
-    const auto insertionStatus = changeStreamPreImagesCollection->insertDocument(
-        opCtx, InsertStatement{preImage.toBSON()}, &CurOp::get(opCtx)->debug());
+    const auto insertionStatus =
+        collection_internal::insertDocument(opCtx,
+                                            changeStreamPreImagesCollection,
+                                            InsertStatement{preImage.toBSON()},
+                                            &CurOp::get(opCtx)->debug());
     tassert(5868601,
             str::stream() << "Attempted to insert a duplicate document into the pre-images "
                              "collection. Pre-image id: "
@@ -173,9 +188,35 @@ void ChangeStreamPreImagesCollectionManager::insertPreImage(OperationContext* op
 }
 
 namespace {
-RecordId toRecordId(ChangeStreamPreImageId id) {
-    return record_id_helpers::keyForElem(
-        BSON(ChangeStreamPreImage::kIdFieldName << id.toBSON()).firstElement());
+/**
+ * Finds the next collection UUID in the change stream pre-images collection 'preImagesCollPtr' for
+ * which collection UUID is greater than 'collectionUUID'. Returns boost::none if the next
+ * collection is not found.
+ */
+boost::optional<UUID> findNextCollectionUUID(OperationContext* opCtx,
+                                             const CollectionPtr* preImagesCollPtr,
+                                             boost::optional<UUID> collectionUUID
+
+) {
+    BSONObj preImageObj;
+    auto minRecordId = collectionUUID
+        ? boost::make_optional(
+              RecordIdBound(change_stream_pre_image_helpers::toRecordId(ChangeStreamPreImageId(
+                  *collectionUUID, Timestamp::max(), std::numeric_limits<int64_t>::max()))))
+        : boost::none;
+    auto planExecutor =
+        InternalPlanner::collectionScan(opCtx,
+                                        preImagesCollPtr,
+                                        PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
+                                        InternalPlanner::Direction::FORWARD,
+                                        boost::none /* resumeAfterRecordId */,
+                                        std::move(minRecordId));
+    if (planExecutor->getNext(&preImageObj, nullptr) == PlanExecutor::IS_EOF) {
+        return boost::none;
+    }
+    auto parsedUUID = UUID::parse(preImageObj["_id"].Obj()["nsUUID"]);
+    tassert(7027400, "Pre-image collection UUID must be of UUID type", parsedUUID.isOK());
+    return {std::move(parsedUUID.getValue())};
 }
 
 /**
@@ -184,13 +225,13 @@ RecordId toRecordId(ChangeStreamPreImageId id) {
  * Pre-images are ordered by collection UUID, ie. if UUID of collection A is ordered before UUID of
  * collection B, then pre-images of collection A will be stored before pre-images of collection B.
  *
- * While scanning the collection for expired pre-images, each pre-image timestamp is compared
- * against the 'earliestOplogEntryTimestamp' value. Any pre-image that has a timestamp greater than
- * the 'earliestOplogEntryTimestamp' value is not considered for deletion and the cursor seeks to
- * the next UUID in the collection.
- *
- * Seek to the next UUID is done by setting the values of 'Timestamp' and 'ApplyOpsIndex' fields to
- * max, ie. (currentPreImage.nsUUID, Timestamp::max(), ApplyOpsIndex::max()).
+ * Pre-images are considered expired based on expiration parameter. In case when expiration
+ * parameter is not set a pre-image is considered expired if its timestamp is smaller than the
+ * timestamp of the earliest oplog entry. In case when expiration parameter is specified, aside from
+ * timestamp check a check on the wall clock time of the pre-image recording ('operationTime') is
+ * performed. If the difference between 'currentTimeForTimeBasedExpiration' and 'operationTime' is
+ * larger than expiration parameter, the pre-image is considered expired. One of those two
+ * conditions must be true for a pre-image to be eligible for deletion.
  *
  *                               +-------------------------+
  *                               | config.system.preimages |
@@ -205,276 +246,119 @@ RecordId toRecordId(ChangeStreamPreImageId id) {
  * |   applyIndex: 0   | |   applyIndex: 0   | |   applyIndex: 0   | |   applyIndex: 1   |
  * +-------------------+ +-------------------+ +-------------------+ +-------------------+
  */
-class ChangeStreamExpiredPreImageIterator {
-public:
-    // Iterator over the range of pre-image documents, where each range defines a set of expired
-    // pre-image documents of one collection eligible for deletion due to expiration. Lower and
-    // upper bounds of a range are inclusive.
-    class Iterator {
-    public:
-        using RecordIdRange = std::pair<RecordId, RecordId>;
+size_t _deleteExpiredChangeStreamPreImagesCommon(OperationContext* opCtx,
+                                                 const CollectionPtr& preImageColl,
+                                                 const MatchExpression* filterPtr,
+                                                 Timestamp maxRecordIdTimestamp) {
+    size_t numberOfRemovals = 0;
+    boost::optional<UUID> currentCollectionUUID = boost::none;
+    while ((currentCollectionUUID =
+                findNextCollectionUUID(opCtx, &preImageColl, currentCollectionUUID))) {
+        writeConflictRetry(
+            opCtx,
+            "ChangeStreamExpiredPreImagesRemover",
+            NamespaceString::makePreImageCollectionNSS(boost::none).ns(),
+            [&] {
+                auto params = std::make_unique<DeleteStageParams>();
+                params->isMulti = true;
 
-        Iterator(OperationContext* opCtx,
-                 const CollectionPtr* preImagesCollPtr,
-                 Timestamp earliestOplogEntryTimestamp,
-                 boost::optional<Date_t> preImageExpirationTime,
-                 bool isEndIterator = false)
-            : _opCtx(opCtx),
-              _preImagesCollPtr(preImagesCollPtr),
-              _earliestOplogEntryTimestamp(earliestOplogEntryTimestamp),
-              _preImageExpirationTime(preImageExpirationTime) {
-            if (!isEndIterator) {
-                advance();
-            }
-        }
+                std::unique_ptr<BatchedDeleteStageParams> batchedDeleteParams;
+                batchedDeleteParams = std::make_unique<BatchedDeleteStageParams>();
+                RecordIdBound minRecordId(change_stream_pre_image_helpers::toRecordId(
+                    ChangeStreamPreImageId(*currentCollectionUUID, Timestamp(), 0)));
+                RecordIdBound maxRecordId =
+                    RecordIdBound(change_stream_pre_image_helpers::toRecordId(
+                        ChangeStreamPreImageId(*currentCollectionUUID,
+                                               maxRecordIdTimestamp,
+                                               std::numeric_limits<int64_t>::max())));
 
-        const RecordIdRange& operator*() const {
-            return _currentExpiredPreImageRange;
-        }
+                auto exec = InternalPlanner::deleteWithCollectionScan(
+                    opCtx,
+                    &preImageColl,
+                    std::move(params),
+                    PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
+                    InternalPlanner::Direction::FORWARD,
+                    std::move(minRecordId),
+                    std::move(maxRecordId),
+                    CollectionScanParams::ScanBoundInclusion::kIncludeBothStartAndEndRecords,
+                    std::move(batchedDeleteParams),
+                    filterPtr,
+                    filterPtr != nullptr);
+                numberOfRemovals += exec->executeDelete();
+            });
+    }
+    return numberOfRemovals;
+}
 
-        const RecordIdRange* operator->() const {
-            return &_currentExpiredPreImageRange;
-        }
+size_t deleteExpiredChangeStreamPreImages(OperationContext* opCtx,
+                                          Date_t currentTimeForTimeBasedExpiration) {
+    // Acquire intent-exclusive lock on the change collection.
+    AutoGetCollection preImageColl(
+        opCtx, NamespaceString::makePreImageCollectionNSS(boost::none), MODE_IX);
 
-        Iterator& operator++() {
-            advance();
-            return *this;
-        }
-
-        // Both iterators are equal if they are both pointing to the same expired pre-image range.
-        friend bool operator==(const Iterator& a, const Iterator& b) {
-            return a._currentExpiredPreImageRange == b._currentExpiredPreImageRange;
-        };
-
-        friend bool operator!=(const Iterator& a, const Iterator& b) {
-            return !(a == b);
-        };
-
-    private:
-        // Scans the pre-images collection and gets the next expired pre-image range or sets
-        // '_currentExpiredPreImageRange' to the range with empty record ids in case there are no
-        // more expired pre-images left.
-        void advance() {
-            const auto getNextPreImageAttributes =
-                [&](std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>& planExecutor)
-                -> boost::optional<change_stream_pre_image_helpers::PreImageAttributes> {
-                BSONObj preImageObj;
-                if (planExecutor->getNext(&preImageObj, nullptr) == PlanExecutor::IS_EOF) {
-                    return boost::none;
-                }
-
-                auto preImage =
-                    ChangeStreamPreImage::parse(IDLParserContext("pre-image"), preImageObj);
-                return {{std::move(preImage.getId().getNsUUID()),
-                         std::move(preImage.getId().getTs()),
-                         std::move(preImage.getOperationTime())}};
-            };
-
-            while (true) {
-                // Fetch the first pre-image from the next collection, that has pre-images enabled.
-                auto planExecutor = _previousCollectionUUID
-                    ? createCollectionScan(RecordIdBound(
-                          toRecordId(ChangeStreamPreImageId(*_previousCollectionUUID,
-                                                            Timestamp::max(),
-                                                            std::numeric_limits<int64_t>::max()))))
-                    : createCollectionScan(boost::none);
-                auto preImageAttributes = getNextPreImageAttributes(planExecutor);
-
-                // If there aren't any pre-images left, set the range to the empty record ids and
-                // return.
-                if (!preImageAttributes) {
-                    _currentExpiredPreImageRange = std::pair(RecordId(), RecordId());
-                    return;
-                }
-                const auto currentCollectionUUID = preImageAttributes->collectionUUID;
-                _previousCollectionUUID = currentCollectionUUID;
-
-                // If the first pre-image in the current collection is not expired, fetch the first
-                // pre-image from the next collection.
-                if (!preImageAttributes->isExpiredPreImage(_preImageExpirationTime,
-                                                           _earliestOplogEntryTimestamp)) {
-                    continue;
-                }
-
-                // If an expired pre-image is found, compute the max expired pre-image RecordId for
-                // this collection depending on the expiration parameter being set.
-                const auto minKey =
-                    toRecordId(ChangeStreamPreImageId(currentCollectionUUID, Timestamp(), 0));
-                RecordId maxKey;
-                if (_preImageExpirationTime) {
-                    // Reset the collection scan to start one increment before the
-                    // '_earliestOplogEntryTimestamp', as the pre-images with smaller or equal
-                    // timestamp are guaranteed to be expired.
-                    Timestamp lastExpiredPreimageTs(_earliestOplogEntryTimestamp.asULL() - 1);
-                    auto planExecutor = createCollectionScan(RecordIdBound(
-                        toRecordId(ChangeStreamPreImageId(currentCollectionUUID,
-                                                          lastExpiredPreimageTs,
-                                                          std::numeric_limits<int64_t>::max()))));
-
-                    // Iterate over all the expired pre-images in the collection in order to find
-                    // the max RecordId.
-                    while ((preImageAttributes = getNextPreImageAttributes(planExecutor)) &&
-                           preImageAttributes->isExpiredPreImage(_preImageExpirationTime,
-                                                                 _earliestOplogEntryTimestamp) &&
-                           preImageAttributes->collectionUUID == currentCollectionUUID) {
-                        lastExpiredPreimageTs = preImageAttributes->ts;
-                    }
-
-                    maxKey =
-                        toRecordId(ChangeStreamPreImageId(currentCollectionUUID,
-                                                          lastExpiredPreimageTs,
-                                                          std::numeric_limits<int64_t>::max()));
-                } else {
-                    // If the expiration parameter is not set, then the last expired pre-image
-                    // timestamp equals to one increment before the '_earliestOplogEntryTimestamp'.
-                    maxKey = toRecordId(
-                        ChangeStreamPreImageId(currentCollectionUUID,
-                                               Timestamp(_earliestOplogEntryTimestamp.asULL() - 1),
-                                               std::numeric_limits<int64_t>::max()));
-                }
-                tassert(6138300,
-                        "Max key of the expired pre-image range has to be valid",
-                        maxKey.isValid());
-                _currentExpiredPreImageRange = std::pair(minKey, maxKey);
-                return;
-            }
-        }
-
-        // Set up the new collection scan to start from the 'minKey'.
-        std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> createCollectionScan(
-            boost::optional<RecordIdBound> minKey) const {
-            return InternalPlanner::collectionScan(_opCtx,
-                                                   _preImagesCollPtr,
-                                                   PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
-                                                   InternalPlanner::Direction::FORWARD,
-                                                   boost::none,
-                                                   minKey);
-        }
-
-        OperationContext* _opCtx;
-        const CollectionPtr* _preImagesCollPtr;
-        RecordIdRange _currentExpiredPreImageRange;
-        boost::optional<UUID> _previousCollectionUUID;
-        const Timestamp _earliestOplogEntryTimestamp;
-
-        // The pre-images with operation time less than or equal to the '_preImageExpirationTime'
-        // are considered expired.
-        const boost::optional<Date_t> _preImageExpirationTime;
-    };
-
-    ChangeStreamExpiredPreImageIterator(
-        OperationContext* opCtx,
-        const CollectionPtr* preImagesCollPtr,
-        const Timestamp earliestOplogEntryTimestamp,
-        const boost::optional<Date_t> preImageExpirationTime = boost::none)
-        : _opCtx(opCtx),
-          _preImagesCollPtr(preImagesCollPtr),
-          _earliestOplogEntryTimestamp(earliestOplogEntryTimestamp),
-          _preImageExpirationTime(preImageExpirationTime) {}
-
-    Iterator begin() const {
-        return Iterator(
-            _opCtx, _preImagesCollPtr, _earliestOplogEntryTimestamp, _preImageExpirationTime);
+    // Early exit if the collection doesn't exist or running on a secondary.
+    if (!preImageColl ||
+        !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesForDatabase(
+            opCtx, DatabaseName::kConfig.toString())) {
+        return 0;
     }
 
-    Iterator end() const {
-        return Iterator(_opCtx,
-                        _preImagesCollPtr,
-                        _earliestOplogEntryTimestamp,
-                        _preImageExpirationTime,
-                        true /*isEndIterator*/);
+    // Get the timestamp of the earliest oplog entry.
+    const auto currentEarliestOplogEntryTs =
+        repl::StorageInterface::get(opCtx->getServiceContext())->getEarliestOplogTimestamp(opCtx);
+
+    const auto preImageExpirationTime = change_stream_pre_image_helpers::getPreImageExpirationTime(
+        opCtx, currentTimeForTimeBasedExpiration);
+
+    // Configure the filter for the case when expiration parameter is set.
+    if (preImageExpirationTime) {
+        OrMatchExpression filter;
+        filter.add(
+            std::make_unique<LTMatchExpression>("_id.ts"_sd, Value(currentEarliestOplogEntryTs)));
+        filter.add(std::make_unique<LTEMatchExpression>("operationTime"_sd,
+                                                        Value(*preImageExpirationTime)));
+        // If 'preImageExpirationTime' is set, set 'maxRecordIdTimestamp' is set to the maximum
+        // RecordId for this collection. Whether the pre-image has to be deleted will be determined
+        // by the 'filter' parameter.
+        return _deleteExpiredChangeStreamPreImagesCommon(
+            opCtx, *preImageColl, &filter, Timestamp::max() /* maxRecordIdTimestamp */);
     }
 
-private:
-    OperationContext* _opCtx;
-    const CollectionPtr* _preImagesCollPtr;
-    const Timestamp _earliestOplogEntryTimestamp;
-    const boost::optional<Date_t> _preImageExpirationTime;
-};
+    // 'preImageExpirationTime' is not set, so the last expired pre-image timestamp is less than
+    // 'currentEarliestOplogEntryTs'.
+    return _deleteExpiredChangeStreamPreImagesCommon(
+        opCtx,
+        *preImageColl,
+        nullptr /* filterPtr */,
+        Timestamp(currentEarliestOplogEntryTs.asULL() - 1) /* maxRecordIdTimestamp */);
+}
 
-void deleteExpiredChangeStreamPreImages(Client* client, Date_t currentTimeForTimeBasedExpiration) {
-    const auto startTime = Date_t::now();
-    ServiceContext::UniqueOperationContext opCtx;
-    try {
-        opCtx = client->makeOperationContext();
+size_t deleteExpiredChangeStreamPreImagesForTenants(OperationContext* opCtx,
+                                                    const TenantId& tenantId,
+                                                    Date_t currentTimeForTimeBasedExpiration) {
 
-        // Acquire intent-exclusive lock on the pre-images collection. Early exit if the collection
-        // doesn't exist.
-        AutoGetCollection autoColl(
-            opCtx.get(), NamespaceString::kChangeStreamPreImagesNamespace, MODE_IX);
-        const auto& preImagesColl = autoColl.getCollection();
-        if (!preImagesColl) {
-            return;
-        }
+    // Acquire intent-exclusive lock on the change collection.
+    AutoGetCollection preImageColl(opCtx,
+                                   NamespaceString::makePreImageCollectionNSS(
+                                       change_stream_serverless_helpers::resolveTenantId(tenantId)),
+                                   MODE_IX);
 
-        // Do not run the job on secondaries.
-        if (!repl::ReplicationCoordinator::get(opCtx.get())
-                 ->canAcceptWritesForDatabase(opCtx.get(), NamespaceString::kAdminDb)) {
-            return;
-        }
-
-        // Get the timestamp of the earliest oplog entry.
-        const auto currentEarliestOplogEntryTs =
-            repl::StorageInterface::get(client->getServiceContext())
-                ->getEarliestOplogTimestamp(opCtx.get());
-
-        const bool isBatchedRemoval = gBatchedExpiredChangeStreamPreImageRemoval.load();
-        size_t numberOfRemovals = 0;
-
-        ChangeStreamExpiredPreImageIterator expiredPreImages(
-            opCtx.get(),
-            &preImagesColl,
-            currentEarliestOplogEntryTs,
-            change_stream_pre_image_helpers::getPreImageExpirationTime(
-                opCtx.get(), currentTimeForTimeBasedExpiration));
-
-        for (const auto& collectionRange : expiredPreImages) {
-            writeConflictRetry(
-                opCtx.get(),
-                "ChangeStreamExpiredPreImagesRemover",
-                NamespaceString::kChangeStreamPreImagesNamespace.ns(),
-                [&] {
-                    auto params = std::make_unique<DeleteStageParams>();
-                    params->isMulti = true;
-
-                    std::unique_ptr<BatchedDeleteStageParams> batchedDeleteParams;
-                    if (isBatchedRemoval) {
-                        batchedDeleteParams = std::make_unique<BatchedDeleteStageParams>();
-                    }
-
-                    auto exec = InternalPlanner::deleteWithCollectionScan(
-                        opCtx.get(),
-                        &preImagesColl,
-                        std::move(params),
-                        PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
-                        InternalPlanner::Direction::FORWARD,
-                        RecordIdBound(collectionRange.first),
-                        RecordIdBound(collectionRange.second),
-                        CollectionScanParams::ScanBoundInclusion::kIncludeBothStartAndEndRecords,
-                        std::move(batchedDeleteParams));
-                    numberOfRemovals += exec->executeDelete();
-                });
-        }
-
-        if (numberOfRemovals > 0) {
-            LOGV2_DEBUG(5869104,
-                        3,
-                        "Periodic expired pre-images removal job finished executing",
-                        "numberOfRemovals"_attr = numberOfRemovals,
-                        "jobDuration"_attr = (Date_t::now() - startTime).toString());
-        }
-    } catch (const DBException& exception) {
-        if (opCtx && opCtx.get()->getKillStatus() != ErrorCodes::OK) {
-            LOGV2_DEBUG(5869105,
-                        3,
-                        "Periodic expired pre-images removal job operation was killed",
-                        "errorCode"_attr = opCtx.get()->getKillStatus());
-        } else {
-            LOGV2_ERROR(5869106,
-                        "Periodic expired pre-images removal job failed",
-                        "reason"_attr = exception.reason());
-        }
+    // Early exit if the collection doesn't exist or running on a secondary.
+    if (!preImageColl ||
+        !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesForDatabase(
+            opCtx, DatabaseName::kConfig.toString())) {
+        return 0;
     }
+
+    auto expiredAfterSeconds = change_stream_serverless_helpers::getExpireAfterSeconds(tenantId);
+    LTEMatchExpression filter{
+        "operationTime"_sd,
+        Value(currentTimeForTimeBasedExpiration - Seconds(expiredAfterSeconds))};
+
+    // Set the 'maxRecordIdTimestamp' parameter (upper scan boundary) to maximum possible. Whether
+    // the pre-image has to be deleted will be determined by the 'filter' parameter.
+    return _deleteExpiredChangeStreamPreImagesCommon(
+        opCtx, *preImageColl, &filter, Timestamp::max() /* maxRecordIdTimestamp */);
 }
 }  // namespace
 
@@ -495,7 +379,45 @@ void ChangeStreamPreImagesCollectionManager::performExpiredChangeStreamPreImages
             currentTimeForTimeBasedExpiration = currentTimeElem.Date();
         }
     });
-    deleteExpiredChangeStreamPreImages(client, currentTimeForTimeBasedExpiration);
+
+    const auto startTime = Date_t::now();
+    ServiceContext::UniqueOperationContext opCtx;
+    try {
+        opCtx = client->makeOperationContext();
+        size_t numberOfRemovals = 0;
+
+        if (change_stream_serverless_helpers::isChangeCollectionsModeActive()) {
+            const auto tenantIds =
+                change_stream_serverless_helpers::getConfigDbTenants(opCtx.get());
+            for (const auto& tenantId : tenantIds) {
+                numberOfRemovals += deleteExpiredChangeStreamPreImagesForTenants(
+                    opCtx.get(), tenantId, currentTimeForTimeBasedExpiration);
+            }
+        } else {
+            numberOfRemovals =
+                deleteExpiredChangeStreamPreImages(opCtx.get(), currentTimeForTimeBasedExpiration);
+        }
+
+        if (numberOfRemovals > 0) {
+            LOGV2_DEBUG(5869104,
+                        3,
+                        "Periodic expired pre-images removal job finished executing",
+                        "numberOfRemovals"_attr = numberOfRemovals,
+                        "jobDuration"_attr = (Date_t::now() - startTime).toString());
+        }
+    } catch (const DBException& exception) {
+        Status interruptStatus = opCtx ? opCtx.get()->checkForInterruptNoAssert() : Status::OK();
+        if (!interruptStatus.isOK()) {
+            LOGV2_DEBUG(5869105,
+                        3,
+                        "Periodic expired pre-images removal job operation was interrupted",
+                        "errorCode"_attr = interruptStatus);
+        } else {
+            LOGV2_ERROR(5869106,
+                        "Periodic expired pre-images removal job failed",
+                        "reason"_attr = exception.reason());
+        }
+    }
 }
 
 }  // namespace mongo

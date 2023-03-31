@@ -33,6 +33,7 @@
 #include "mongo/db/dbhelpers.h"
 
 #include "mongo/db/catalog/clustered_collection_util.h"
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/index/btree_access_method.h"
@@ -119,13 +120,13 @@ RecordId Helpers::findOne(OperationContext* opCtx,
 
     massertStatusOK(statusWithCQ.getStatus());
     unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
+    cq->setForceGenerateRecordId(true);
 
     auto exec = uassertStatusOK(getExecutor(opCtx,
                                             &collection,
                                             std::move(cq),
                                             nullptr /* extractAndAttachPipelineStages */,
-                                            PlanYieldPolicy::YieldPolicy::NO_YIELD,
-                                            QueryPlannerParams::DEFAULT));
+                                            PlanYieldPolicy::YieldPolicy::NO_YIELD));
 
     PlanExecutor::ExecState state;
     BSONObj obj;
@@ -137,15 +138,13 @@ RecordId Helpers::findOne(OperationContext* opCtx,
 }
 
 bool Helpers::findById(OperationContext* opCtx,
-                       StringData ns,
+                       const NamespaceString& nss,
                        BSONObj query,
                        BSONObj& result,
                        bool* nsFound,
                        bool* indexFound) {
-    // TODO ForRead?
-    NamespaceString nss{ns};
-    CollectionPtr collection =
-        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
+    auto collCatalog = CollectionCatalog::get(opCtx);
+    const Collection* collection = collCatalog->lookupCollectionByNamespace(opCtx, nss);
     if (!collection) {
         return false;
     }
@@ -181,7 +180,7 @@ bool Helpers::findById(OperationContext* opCtx,
         *indexFound = 1;
 
     auto recordId = catalog->getEntry(desc)->accessMethod()->asSortedData()->findSingle(
-        opCtx, collection, query["_id"].wrap());
+        opCtx, CollectionPtr(collection), query["_id"].wrap());
     if (recordId.isNull())
         return false;
     result = collection->docFor(opCtx, recordId).value();
@@ -355,9 +354,10 @@ BSONObj Helpers::inferKeyPattern(const BSONObj& o) {
 void Helpers::emptyCollection(OperationContext* opCtx, const NamespaceString& nss) {
     OldClientContext context(opCtx, nss);
     repl::UnreplicatedWritesBlock uwb(opCtx);
-    CollectionPtr collection = context.db()
-        ? CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss)
-        : nullptr;
+    CollectionPtr collection = CollectionPtr(
+        context.db() ? CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss)
+                     : nullptr);
+
     deleteObjects(opCtx, collection, nss, BSONObj(), false);
 }
 
@@ -384,10 +384,17 @@ bool Helpers::findByIdAndNoopUpdate(OperationContext* opCtx,
     // BSONObj because that's a second way OpObserverImpl::onUpdate() detects and ignores no-op
     // updates.
     repl::UnreplicatedWritesBlock uwb(opCtx);
-    CollectionUpdateArgs args;
+    CollectionUpdateArgs args(snapshottedDoc.value());
     args.criteria = idQuery;
     args.update = BSONObj();
-    collection->updateDocument(opCtx, recordId, snapshottedDoc, result, false, nullptr, &args);
+    collection_internal::updateDocument(opCtx,
+                                        collection,
+                                        recordId,
+                                        snapshottedDoc,
+                                        result,
+                                        collection_internal::kUpdateNoIndexes,
+                                        nullptr,
+                                        &args);
 
     return true;
 }

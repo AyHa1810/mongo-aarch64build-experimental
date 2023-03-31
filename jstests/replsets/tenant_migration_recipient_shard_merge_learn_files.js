@@ -11,29 +11,31 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {isShardMergeEnabled} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 
 const tenantMigrationTest =
     new TenantMigrationTest({name: jsTestName(), sharedOptions: {nodes: 3}});
 
 const recipientPrimary = tenantMigrationTest.getRecipientPrimary();
 
-if (!TenantMigrationUtil.isShardMergeEnabled(recipientPrimary.getDB("admin"))) {
+// Note: including this explicit early return here due to the fact that multiversion
+// suites will execute this test without featureFlagShardMerge enabled (despite the
+// presence of the featureFlagShardMerge tag above), which means the test will attempt
+// to run a multi-tenant migration and fail.
+if (!isShardMergeEnabled(recipientPrimary.getDB("admin"))) {
     tenantMigrationTest.stop();
     jsTestLog("Skipping Shard Merge-specific test");
-    return;
+    quit();
 }
 
 jsTestLog(
     "Test that recipient state is correctly set to 'learned filenames' after creating the backup cursor");
-const tenantId = "testTenantId";
-const tenantDB = tenantMigrationTest.tenantDB(tenantId, "DB");
+const tenantId = ObjectId();
+const tenantDB = tenantMigrationTest.tenantDB(tenantId.str, "DB");
 const collName = "testColl";
 
 const donorPrimary = tenantMigrationTest.getDonorPrimary();
@@ -44,14 +46,11 @@ tenantMigrationTest.insertDonorDB(tenantDB, collName);
 const failpoint = "fpBeforeMarkingCloneSuccess";
 const waitInFailPoint = configureFailPoint(recipientPrimary, failpoint, {action: "hang"});
 
-// In order to prevent the copying of "testTenantId" databases via logical cloning from donor to
-// recipient, start migration on a tenant id which is non-existent on the donor.
 const migrationUuid = UUID();
-const kDummyTenantId = "nonExistentTenantId";
 const migrationOpts = {
     migrationIdString: extractUUIDFromObject(migrationUuid),
-    tenantId: kDummyTenantId,
-    readPreference: {mode: 'primary'}
+    readPreference: {mode: 'primary'},
+    tenantIds: [tenantId],
 };
 
 jsTestLog(`Starting the tenant migration to wait in failpoint: ${failpoint}`);
@@ -60,12 +59,13 @@ assert.commandWorked(
 
 waitInFailPoint.wait();
 
-tenantMigrationTest.assertRecipientNodesInExpectedState(
-    tenantMigrationTest.getRecipientRst().nodes,
-    migrationUuid,
-    kDummyTenantId,
-    TenantMigrationTest.RecipientState.kLearnedFilenames,
-    TenantMigrationTest.RecipientAccessState.kReject);
+tenantMigrationTest.assertRecipientNodesInExpectedState({
+    nodes: tenantMigrationTest.getRecipientRst().nodes,
+    migrationId: migrationUuid,
+    tenantId: tenantId.str,
+    expectedState: TenantMigrationTest.ShardMergeRecipientState.kLearnedFilenames,
+    expectedAccessState: TenantMigrationTest.RecipientAccessState.kReject
+});
 
 waitInFailPoint.off();
 
@@ -83,4 +83,3 @@ tenantMigrationTest.getRecipientRst().nodes.forEach(node => {
 });
 
 tenantMigrationTest.stop();
-})();

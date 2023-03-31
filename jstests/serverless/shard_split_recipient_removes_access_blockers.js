@@ -1,27 +1,21 @@
 /*
- * Test that tenant access blockers are removed from recipients when applying the recipient config.
+ * Test that tenant access blockers are removed when applying the recipient config
  *
- * @tags: [requires_fcv_52, featureFlagShardSplit, serverless]
+ * @tags: [requires_fcv_63, serverless]
  */
 
-load("jstests/libs/fail_point_util.js");
-load("jstests/serverless/libs/basic_serverless_test.js");
+import {ShardSplitTest} from "jstests/serverless/libs/shard_split_test.js";
 
-(function() {
-"use strict";
+load("jstests/libs/fail_point_util.js");
 
 // Skip db hash check because secondary is left with a different config.
 TestData.skipCheckDBHashes = true;
 
-const test = new BasicServerlessTest({
-    recipientTagName: "recipientNode",
-    recipientSetName: "recipient",
-    quickGarbageCollection: true
-});
+const test = new ShardSplitTest({quickGarbageCollection: true});
 test.addRecipientNodes();
 
 const donorPrimary = test.donor.getPrimary();
-const tenantIds = ["tenant1", "tenant2"];
+const tenantIds = [ObjectId(), ObjectId()];
 const operation = test.createSplitOperation(tenantIds);
 
 const donorAfterBlockingFailpoint =
@@ -34,9 +28,11 @@ donorAfterBlockingFailpoint.wait();
 
 jsTestLog("Asserting recipient nodes have installed access blockers");
 assert.soon(() => test.recipientNodes.every(node => {
-    const accessBlockers = BasicServerlessTest.getTenantMigrationAccessBlocker({node});
-    return tenantIds.every(tenantId => accessBlockers && accessBlockers.hasOwnProperty(tenantId) &&
-                               !!accessBlockers[tenantId].donor);
+    return tenantIds.every(tenantId => {
+        const accessBlocker = ShardSplitTest.getTenantMigrationAccessBlocker({node, tenantId});
+        return accessBlocker && accessBlocker.hasOwnProperty(tenantId.str) &&
+            !!accessBlocker[tenantId.str].donor;
+    });
 }));
 donorAfterBlockingFailpoint.off();
 
@@ -45,8 +41,7 @@ assert.commandWorked(commitOp.returnData());
 
 jsTestLog("Asserting recipient nodes have removed access blockers");
 assert.soon(() => test.recipientNodes.every(node => {
-    return BasicServerlessTest.getTenantMigrationAccessBlocker({node}) == null;
+    return ShardSplitTest.getTenantMigrationAccessBlocker({node}) == null;
 }));
 
 test.stop();
-})();

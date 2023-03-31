@@ -3,34 +3,26 @@
  * Tests that runs a shard split, a stepdown and writes operation simultaneously to verify the
  * commands return the expected errors and success.
  * result of write operations.
- * @tags: [requires_fcv_52, featureFlagShardSplit]
+ * @tags: [requires_fcv_63, serverless]
  */
 
-load("jstests/serverless/libs/shard_split_write_test.js");
+import {doWriteOperations, ShardSplitTest} from "jstests/serverless/libs/shard_split_test.js";
 
-(function() {
-"use strict";
-
-const recipientTagName = "recipientNode";
-const recipientSetName = "recipientSetName";
-const test = new BasicServerlessTest({
-    recipientTagName,
-    recipientSetName,
+const test = new ShardSplitTest({
     nodeOptions: {
         // Set a short timeout to test that the operation times out waiting for replication
         setParameter: "shardSplitTimeoutMS=100000"
     }
 });
 
-test.addRecipientNodes();
-test.donor.awaitSecondaryNodes();
+test.addAndAwaitRecipientNodes();
 
 const donorPrimary = test.donor.getPrimary();
-const tenantIds = ["tenant1", "tenant2"];
+const tenantIds = [ObjectId(), ObjectId()];
 
 jsTestLog("Writing data before split");
 tenantIds.forEach(id => {
-    const kDbName = test.tenantDB(id, "testDb");
+    const kDbName = test.tenantDB(id.str, "testDb");
     const kCollName = "testColl";
     const kNs = `${kDbName}.${kCollName}`;
 
@@ -45,25 +37,21 @@ blockingFP.wait();
 
 const donorRst = createRstArgs(test.donor);
 test.removeRecipientsFromRstArgs(donorRst);
-const writeThread = new Thread(doWriteOperations, donorRst, tenantIds);
+const writeThread = new Thread(doWriteOperations, donorRst, tojson(tenantIds));
 writeThread.start();
 
 assert.commandWorked(donorPrimary.adminCommand({replSetStepDown: 360, force: true}));
 
 blockingFP.off();
 
-splitThread.join();
-const result = splitThread.returnData();
-assert.eq(result.ok, 0);
-assert.eq(result.code, ErrorCodes.InterruptedDueToReplStateChange);
+assert.commandFailedWithCode(splitThread.returnData(), ErrorCodes.InterruptedDueToReplStateChange);
 
-writeThread.join();
 const writeResults = writeThread.returnData();
 writeResults.forEach(res => {
+    jsTestLog(`result: ${res}`);
     assert.eq(res, ErrorCodes.TenantMigrationCommitted);
 });
 
 TestData.skipCheckDBHashes = true;
 
 test.stop();
-})();

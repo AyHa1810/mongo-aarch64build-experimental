@@ -31,6 +31,7 @@
 
 #include <boost/optional.hpp>
 
+#include "mongo/client/connection_string.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/migration_chunk_cloner_source.h"
 #include "mongo/db/s/migration_coordinator.h"
@@ -76,17 +77,14 @@ public:
      * Retrieves the MigrationSourceManager pointer that corresponds to the given collection under
      * a CollectionShardingRuntime that has its ResourceMutex locked.
      */
-    static MigrationSourceManager* get(CollectionShardingRuntime* csr,
-                                       CollectionShardingRuntime::CSRLock& csrLock);
+    static MigrationSourceManager* get(const CollectionShardingRuntime& csr);
 
     /**
      * If the currently installed migration has reached the cloning stage (i.e., after startClone),
      * returns the cloner currently in use.
-     *
-     * Must be called with a both a collection lock and the CSRLock.
      */
     static std::shared_ptr<MigrationChunkClonerSource> getCurrentCloner(
-        CollectionShardingRuntime* csr, CollectionShardingRuntime::CSRLock& csrLock);
+        const CollectionShardingRuntime& csr);
 
     /**
      * Instantiates a new migration source manager with the specified migration parameters. Must be
@@ -97,7 +95,7 @@ public:
      *
      * May throw any exception. Known exceptions are:
      *  - InvalidOptions if the operation context is missing shard version
-     *  - StaleConfigException if the expected collection version does not match what we find it
+     *  - StaleConfigException if the expected placement version does not match what we find it
      *      to be after acquiring the distributed lock.
      */
     MigrationSourceManager(OperationContext* opCtx,
@@ -170,7 +168,9 @@ public:
      *
      * Must be called with some form of lock on the collection namespace.
      */
-    BSONObj getMigrationStatusReport() const;
+    BSONObj getMigrationStatusReport(
+        const CollectionShardingRuntime::ScopedSharedCollectionShardingRuntime& scopedCsrLock)
+        const;
 
     const NamespaceString& nss() {
         return _args.getCommandParameter();
@@ -250,9 +250,7 @@ private:
     // sharding runtime for the collection
     class ScopedRegisterer {
     public:
-        ScopedRegisterer(MigrationSourceManager* msm,
-                         CollectionShardingRuntime* csr,
-                         const CollectionShardingRuntime::CSRLock& csrLock);
+        ScopedRegisterer(MigrationSourceManager* msm, CollectionShardingRuntime& csr);
         ~ScopedRegisterer();
 
     private:
@@ -289,7 +287,7 @@ private:
     // Optional future that is populated if the migration succeeds and range deletion is scheduled
     // on this node. The future is set when the range deletion completes. Used if the moveChunk was
     // sent with waitForDelete.
-    boost::optional<SemiFuture<void>> _cleanupCompleteFuture;
+    boost::optional<SharedSemiFuture<void>> _cleanupCompleteFuture;
 };
 
 }  // namespace mongo

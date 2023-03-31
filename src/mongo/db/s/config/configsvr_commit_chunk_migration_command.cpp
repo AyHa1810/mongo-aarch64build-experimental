@@ -27,9 +27,6 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/base/status_with.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/authorization_session.h"
@@ -43,12 +40,10 @@
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
-
 
 namespace mongo {
 namespace {
@@ -123,7 +118,7 @@ public:
 
             uassert(ErrorCodes::IllegalOperation,
                     "_configsvrCommitChunkMigration can only be run on config servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
 
             // Set the operation context read concern level to local for reads into the config
             // database.
@@ -133,7 +128,7 @@ public:
             const NamespaceString nss = ns();
             auto migratedChunk = toChunkType(request().getMigratedChunk());
 
-            StatusWith<BSONObj> chunkVersionResponse =
+            StatusWith<ShardingCatalogManager::ShardAndCollectionPlacementVersions> response =
                 ShardingCatalogManager::get(opCtx)->commitChunkMigration(
                     opCtx,
                     nss,
@@ -141,12 +136,11 @@ public:
                     request().getFromShardCollectionVersion().epoch(),
                     request().getFromShardCollectionVersion().getTimestamp(),
                     request().getFromShard(),
-                    request().getToShard(),
-                    request().getValidAfter());
+                    request().getToShard());
 
-            auto chunkVersionObj = uassertStatusOK(chunkVersionResponse);
+            auto shardAndCollVers = uassertStatusOK(response);
 
-            return Response{ChunkVersion::parse(chunkVersionObj[ChunkVersion::kShardVersionField])};
+            return Response{shardAndCollVers.shardPlacementVersion};
         }
 
     private:

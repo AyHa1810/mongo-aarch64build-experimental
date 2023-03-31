@@ -31,7 +31,6 @@
 
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/query/optimizer/node.h"
-#include "mongo/db/query/optimizer/utils/utils.h"
 
 namespace mongo::optimizer {
 
@@ -46,19 +45,17 @@ namespace mongo::optimizer {
  *        Obj * Keep "b", "c"
  */
 struct FieldMapEntry {
-    FieldMapEntry(std::string fieldName) : _fieldName(std::move(fieldName)) {
-        uassert(6624200, "Empty field name", !_fieldName.empty());
+    FieldMapEntry(FieldNameType fieldName) : _fieldName(std::move(fieldName)) {
+        uassert(6624200, "Empty field name", !_fieldName.value().empty());
     }
 
-    std::string _fieldName;
+    FieldNameType _fieldName;
     bool _hasKeep = false;
     bool _hasLeadingObj = false;
     bool _hasTrailingDefault = false;
     bool _hasDrop = false;
-    std::string _constVarName;
+    boost::optional<ProjectionName> _constVarName;
 
-    // TODO SERVER-66846: Consider maintaining children as a vector of FieldMapEntry's. Then we can
-    // remove the _fieldMap member of FieldMapBuilder.
     // Child paths are potentially dotted field paths.
     OrderedPathSet _childPaths;
 };

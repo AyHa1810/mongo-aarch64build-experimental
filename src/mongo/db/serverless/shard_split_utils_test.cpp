@@ -216,16 +216,17 @@ TEST(MakeSplitConfig, SplitConfigAssertionsTest) {
 }
 
 TEST(MakeSplitConfig, RecipientConfigValidationTest) {
-    std::vector<std::string> tenantIds = {"tenant1", "tenantAB"};
+    std::vector<TenantId> tenantIds = {TenantId(OID::gen()), TenantId(OID::gen())};
     std::string recipientSetName{"recipientSetName"};
     const std::string recipientTagName{"recipient"};
     const std::string donorConfigSetName{"rs0"};
     const std::string recipientConfigSetName{"newSet"};
 
     auto statedoc = ShardSplitDonorDocument::parse(
-        {"donor.document"},
-        BSON("_id" << UUID::gen() << "tenantIds" << tenantIds << "recipientTagName"
-                   << recipientTagName << "recipientSetName" << recipientSetName));
+        IDLParserContext{"donor.document"},
+        BSON("_id" << UUID::gen() << "recipientTagName" << recipientTagName << "recipientSetName"
+                   << recipientSetName));
+    statedoc.setTenantIds(tenantIds);
 
     auto makeConfig = [&](auto setName, bool shouldVote, bool uniqueTagValue, bool hidden) {
         auto vote = shouldVote ? 1 : 0;

@@ -477,6 +477,9 @@ Status storeMongodOptions(const moe::Environment& params) {
                           str::stream() << "Cannot specify both --repair and --restore");
         }
     }
+    if (params.count("magicRestore") && params["magicRestore"].as<bool>() == true) {
+        storageGlobalParams.magicRestore = 1;
+    }
 
     repl::ReplSettings replSettings;
     if (params.count("replication.serverless")) {
@@ -506,9 +509,9 @@ Status storeMongodOptions(const moe::Environment& params) {
         // a replica set member could be deleted. Replication can need history older than the last
         // checkpoint to support transactions.
         //
-        // Note: we only use this to defer oplog collection truncation via OplogStones in WT. Non-WT
-        // storage engines will continue to perform regular capped collection handling for the oplog
-        // collection, regardless of this parameter setting.
+        // Note: we only use this to defer oplog collection truncation via OplogTruncateMarkers in
+        // WT. Non-WT storage engines will continue to perform regular capped collection handling
+        // for the oplog collection, regardless of this parameter setting.
         storageGlobalParams.allowOplogTruncation = false;
     }
 
@@ -698,6 +701,17 @@ Status storeMongodOptions(const moe::Environment& params) {
 
     setGlobalReplSettings(replSettings);
     return Status::OK();
+}
+
+namespace {
+std::function<ExitCode(ServiceContext* svcCtx)> _magicRestoreMainFn = nullptr;
+}
+
+void setMagicRestoreMain(std::function<ExitCode(ServiceContext* svcCtx)> magicRestoreMainFn) {
+    _magicRestoreMainFn = magicRestoreMainFn;
+}
+std::function<ExitCode(ServiceContext* svcCtx)> getMagicRestoreMain() {
+    return _magicRestoreMainFn;
 }
 
 }  // namespace mongo

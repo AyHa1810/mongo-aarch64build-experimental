@@ -1,27 +1,21 @@
 /*
  * Test that a well timed abortShardSplit command does not abort an already committed split.
  *
- * @tags: [requires_fcv_52, featureFlagShardSplit, serverless]
+ * @tags: [requires_fcv_63, serverless]
  */
 
-load("jstests/libs/fail_point_util.js");
-load("jstests/serverless/libs/basic_serverless_test.js");
+import {assertMigrationState, ShardSplitTest} from "jstests/serverless/libs/shard_split_test.js";
 
-const failpoints = [
-    "pauseShardSplitBeforeSendingStepUpToRecipients",
-    "pauseShardSplitAfterUpdatingToCommittedState"
-];
+load("jstests/libs/fail_point_util.js");
+
+const failpoints = ["pauseShardSplitAfterUpdatingToCommittedState"];
 
 function testAbortAfterSplitIsAppliedStillsCommits(failpoint) {
     "use strict";
 
-    const tenantIds = ["tenant1", "tenant2"];
+    const tenantIds = [ObjectId(), ObjectId()];
 
-    const test = new BasicServerlessTest({
-        recipientTagName: "recipientNode",
-        recipientSetName: "recipient",
-        quickGarbageCollection: true
-    });
+    const test = new ShardSplitTest({quickGarbageCollection: true});
     test.addRecipientNodes();
 
     const donorPrimary = test.getDonorPrimary();

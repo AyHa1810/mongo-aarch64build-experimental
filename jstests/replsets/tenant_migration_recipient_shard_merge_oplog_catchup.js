@@ -7,39 +7,48 @@
  *   requires_majority_read_concern,
  *   requires_persistence,
  *   serverless,
- *   requires_fcv_61,
  *   featureFlagShardMerge
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {isShardMergeEnabled} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 
 const tenantMigrationTest =
     new TenantMigrationTest({name: jsTestName(), sharedOptions: {nodes: 3}});
 const donorPrimary = tenantMigrationTest.getDonorPrimary();
 
+// Note: including this explicit early return here due to the fact that multiversion
+// suites will execute this test without featureFlagShardMerge enabled (despite the
+// presence of the featureFlagShardMerge tag above), which means the test will attempt
+// to run a multi-tenant migration and fail.
+if (!isShardMergeEnabled(donorPrimary.getDB("admin"))) {
+    tenantMigrationTest.stop();
+    jsTestLog("Skipping Shard Merge-specific test");
+    quit();
+}
+
+const kTenant0 = ObjectId().str;
+const kTenant1 = ObjectId().str;
+const kTenant2 = ObjectId().str;
+
 // Insert some documents before migration start so that this collection gets cloned by file cloner.
 const collName = "testColl";
-const tenantDB0 = tenantMigrationTest.tenantDB("Tenant0", "DB");
+const tenantDB0 = tenantMigrationTest.tenantDB(kTenant0, "DB");
 assert.commandWorked(donorPrimary.getDB(tenantDB0)[collName].insert({_id: 0}));
 
 const failpoint = "pauseTenantMigrationBeforeLeavingDataSyncState";
 const pauseTenantMigrationBeforeLeavingDataSyncState =
     configureFailPoint(donorPrimary, failpoint, {action: "hang"});
 
-// Start migration on a tenant id which is non-existent on the donor.
 const migrationUuid = UUID();
-const kDummyTenantId = "nonExistentTenantId";
 const migrationOpts = {
     migrationIdString: extractUUIDFromObject(migrationUuid),
-    tenantId: kDummyTenantId,
-    readPreference: {mode: 'primary'}
+    readPreference: {mode: 'primary'},
+    tenantIds: [ObjectId(kTenant0), ObjectId(kTenant1), ObjectId(kTenant2)]
 };
 
 jsTestLog(`Starting the tenant migration to wait in failpoint: ${failpoint}`);
@@ -56,10 +65,10 @@ assert.commandWorked(donorPrimary.getDB(tenantDB0)[collName].update({_id: 0}, {'
 assert.commandWorked(donorPrimary.getDB(tenantDB0)[collName].insert({_id: 1}));
 
 // Add new tenant collections.
-const tenantDB1 = tenantMigrationTest.tenantDB("TenantId1", "DB");
+const tenantDB1 = tenantMigrationTest.tenantDB(kTenant1, "DB");
 tenantMigrationTest.insertDonorDB(tenantDB1, collName);
 
-const tenantDB2 = tenantMigrationTest.tenantDB("TenantId2", "DB");
+const tenantDB2 = tenantMigrationTest.tenantDB(kTenant2, "DB");
 tenantMigrationTest.insertDonorDB(tenantDB2, collName);
 
 // Resume migration.
@@ -81,4 +90,3 @@ tenantMigrationTest.getRecipientRst().nodes.forEach(node => {
 });
 
 tenantMigrationTest.stop();
-})();

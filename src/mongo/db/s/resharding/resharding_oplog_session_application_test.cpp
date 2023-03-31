@@ -30,13 +30,12 @@
 
 #include "mongo/platform/basic.h"
 
-#include <boost/optional/optional_io.hpp>
 #include <vector>
 
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/exec/document_value/document.h"
-#include "mongo/db/logical_session_id.h"
-#include "mongo/db/logical_session_id_helpers.h"
+#include "mongo/db/op_observer/op_observer_noop.h"
+#include "mongo/db/op_observer/op_observer_registry.h"
 #include "mongo/db/persistent_task_store.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/session_update_tracker.h"
@@ -44,8 +43,11 @@
 #include "mongo/db/s/resharding/donor_oplog_id_gen.h"
 #include "mongo/db/s/resharding/resharding_oplog_session_application.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/db/session_catalog_mongod.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/transaction/session_catalog_mongod_transaction_interface_impl.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
@@ -54,6 +56,24 @@
 
 namespace mongo {
 namespace {
+
+/**
+ * OpObserver for OplogApplierImpl test fixture.
+ */
+class ReshardingOplogSessionApplicationOpObserver : public OpObserverNoop {
+public:
+    /**
+     * Called when OplogApplierImpl prepares a multi-doc transaction using the
+     * TransactionParticipant.
+     */
+    std::unique_ptr<ApplyOpsOplogSlotAndOperationAssignment> preTransactionPrepare(
+        OperationContext* opCtx,
+        const std::vector<OplogSlot>& reservedSlots,
+        const TransactionOperations& transactionOperations,
+        Date_t wallClockTime) override {
+        return std::make_unique<ApplyOpsOplogSlotAndOperationAssignment>(/*prepare=*/false);
+    }
+};
 
 class ReshardingOplogSessionApplicationTest : public ServiceContextMongoDTest {
 public:
@@ -72,8 +92,20 @@ public:
             auto storageImpl = std::make_unique<repl::StorageInterfaceImpl>();
             repl::StorageInterface::set(serviceContext, std::move(storageImpl));
 
-            MongoDSessionCatalog::onStepUp(opCtx.get());
+            MongoDSessionCatalog::set(
+                serviceContext,
+                std::make_unique<MongoDSessionCatalog>(
+                    std::make_unique<MongoDSessionCatalogTransactionInterfaceImpl>()));
+            auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx.get());
+            mongoDSessionCatalog->onStepUp(opCtx.get());
         }
+
+        // Set up an OpObserver to ensure that preparing a multi-doc transaction has
+        // a valid description for mapping transaction operations to applyOps entries.
+        auto opObserverRegistry =
+            dynamic_cast<OpObserverRegistry*>(serviceContext->getOpObserver());
+        opObserverRegistry->addObserver(
+            std::make_unique<ReshardingOplogSessionApplicationOpObserver>());
 
         serverGlobalParams.clusterRole = ClusterRole::ShardServer;
     }
@@ -85,14 +117,17 @@ public:
         opCtx->setLogicalSessionId(std::move(lsid));
         opCtx->setTxnNumber(txnNumber);
 
-        MongoDOperationContextSession ocs(opCtx);
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
         txnParticipant.beginOrContinue(
             opCtx, {txnNumber}, boost::none /* autocommit */, boost::none /* startTransaction */);
 
         auto opTime = [opCtx] {
             WriteUnitOfWork wuow(opCtx);
-            ScopeGuard guard{[&wuow] { wuow.commit(); }};
+            ScopeGuard guard{[&wuow] {
+                wuow.commit();
+            }};
             return repl::getNextOpTime(opCtx);
         }();
         WriteUnitOfWork wuow(opCtx);
@@ -108,7 +143,7 @@ public:
 
     void insertOp(OperationContext* opCtx, const BSONObj& oplogBson) {
         DBDirectClient client(opCtx);
-        client.insert(_oplogBufferNss.toString(), oplogBson);
+        client.insert(_oplogBufferNss, oplogBson);
     }
 
     void makeInProgressTxn(OperationContext* opCtx, LogicalSessionId lsid, TxnNumber txnNumber) {
@@ -116,7 +151,8 @@ public:
         opCtx->setLogicalSessionId(std::move(lsid));
         opCtx->setTxnNumber(txnNumber);
 
-        MongoDOperationContextSession ocs(opCtx);
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
         txnParticipant.beginOrContinue(
             opCtx, {txnNumber}, false /* autocommit */, true /* startTransaction */);
@@ -132,7 +168,8 @@ public:
         opCtx->setLogicalSessionId(std::move(lsid));
         opCtx->setTxnNumber(txnNumber);
 
-        MongoDOperationContextSession ocs(opCtx);
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
         txnParticipant.beginOrContinue(
             opCtx, {txnNumber}, false /* autocommit */, true /* startTransaction */);
@@ -164,7 +201,8 @@ public:
         opCtx->setLogicalSessionId(std::move(lsid));
         opCtx->setTxnNumber(txnNumber);
 
-        MongoDOperationContextSession ocs(opCtx);
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
         txnParticipant.beginOrContinue(
             opCtx, {txnNumber}, false /* autocommit */, boost::none /* startTransaction */);
@@ -335,7 +373,8 @@ public:
         opCtx->setLogicalSessionId(std::move(lsid));
         opCtx->setTxnNumber(txnNumber);
 
-        MongoDOperationContextSession ocs(opCtx);
+        auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
         auto txnParticipant = TransactionParticipant::get(opCtx);
         txnParticipant.beginOrContinue(
             opCtx, {txnNumber}, boost::none /* autocommit */, boost::none /* startTransaction */);
@@ -349,8 +388,8 @@ public:
 private:
     // Used for pre/post image oplog entry lookup.
     const ShardId _donorShardId{"donor-0"};
-    const NamespaceString _oplogBufferNss{NamespaceString::kReshardingLocalOplogBufferPrefix +
-                                          _donorShardId.toString()};
+    const NamespaceString _oplogBufferNss = NamespaceString::createNamespaceString_forTest(
+        NamespaceString::kReshardingLocalOplogBufferPrefix + _donorShardId.toString());
 };
 
 TEST_F(ReshardingOplogSessionApplicationTest, IncomingRetryableWriteForNewSession) {

@@ -36,8 +36,8 @@
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/s/migration_destination_manager.h"
 #include "mongo/db/s/resharding/resharding_recipient_service.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/s/chunk_manager.h"
-#include "mongo/s/shard_id.h"
 
 namespace mongo {
 
@@ -64,8 +64,8 @@ public:
 
     virtual void refreshCatalogCache(OperationContext* opCtx, const NamespaceString& nss) = 0;
 
-    virtual ChunkManager getShardedCollectionRoutingInfo(OperationContext* opCtx,
-                                                         const NamespaceString& nss) = 0;
+    virtual CollectionRoutingInfo getShardedCollectionRoutingInfo(OperationContext* opCtx,
+                                                                  const NamespaceString& nss) = 0;
 
     virtual MigrationDestinationManager::CollectionOptionsAndUUID getCollectionOptions(
         OperationContext* opCtx,
@@ -80,6 +80,9 @@ public:
         const UUID& uuid,
         Timestamp afterClusterTime,
         StringData reason) = 0;
+
+    virtual boost::optional<ShardingIndexesCatalogCache> getCollectionIndexInfoWithRefresh(
+        OperationContext* opCtx, const NamespaceString& nss) = 0;
 
     virtual void withShardVersionRetry(OperationContext* opCtx,
                                        const NamespaceString& nss,
@@ -114,8 +117,8 @@ public:
 
     void refreshCatalogCache(OperationContext* opCtx, const NamespaceString& nss) override;
 
-    ChunkManager getShardedCollectionRoutingInfo(OperationContext* opCtx,
-                                                 const NamespaceString& nss) override;
+    CollectionRoutingInfo getShardedCollectionRoutingInfo(OperationContext* opCtx,
+                                                          const NamespaceString& nss) override;
 
     MigrationDestinationManager::CollectionOptionsAndUUID getCollectionOptions(
         OperationContext* opCtx,
@@ -129,6 +132,10 @@ public:
                                                                         const UUID& uuid,
                                                                         Timestamp afterClusterTime,
                                                                         StringData reason) override;
+
+
+    boost::optional<ShardingIndexesCatalogCache> getCollectionIndexInfoWithRefresh(
+        OperationContext* opCtx, const NamespaceString& nss) override;
 
     void withShardVersionRetry(OperationContext* opCtx,
                                const NamespaceString& nss,

@@ -75,7 +75,7 @@ public:
                                   std::uint64_t numRecords,
                                   CollectionDropType dropType) override;
 
-    std::set<std::string> droppedDatabaseNames;
+    std::set<DatabaseName> droppedDatabaseNames;
     std::set<NamespaceString> droppedCollectionNames;
     Database* db = nullptr;
     bool onDropCollectionThrowsException = false;
@@ -86,8 +86,7 @@ void OpObserverMock::onDropDatabase(OperationContext* opCtx, const DatabaseName&
     ASSERT_TRUE(opCtx->lockState()->inAWriteUnitOfWork());
     OpObserverNoop::onDropDatabase(opCtx, dbName);
     // Do not update 'droppedDatabaseNames' if OpObserverNoop::onDropDatabase() throws.
-    // TODO: SERVER-67549 to change droppedDatabaseNames to use DatabaseName
-    droppedDatabaseNames.insert(dbName.toStringWithTenantId());
+    droppedDatabaseNames.insert(dbName);
 }
 
 repl::OpTime OpObserverMock::onDropCollection(OperationContext* opCtx,
@@ -162,7 +161,7 @@ void DropDatabaseTest::setUp() {
     _opObserver = mockObserver.get();
     opObserverRegistry->addObserver(std::move(mockObserver));
 
-    _nss = NamespaceString("test.foo");
+    _nss = NamespaceString::createNamespaceString_forTest("test.foo");
 }
 
 void DropDatabaseTest::tearDown() {
@@ -205,14 +204,16 @@ void _removeDatabaseFromCatalog(OperationContext* opCtx, StringData dbName) {
     // twice.
     if (db) {
         auto databaseHolder = DatabaseHolder::get(opCtx);
+        WriteUnitOfWork wuow(opCtx);
         databaseHolder->dropDb(opCtx, db);
+        wuow.commit();
     }
 }
 
 TEST_F(DropDatabaseTest, DropDatabaseReturnsNamespaceNotFoundIfDatabaseDoesNotExist) {
     ASSERT_FALSE(AutoGetDb(_opCtx.get(), _nss.dbName(), MODE_X).getDb());
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound,
-                  dropDatabaseForApplyOps(_opCtx.get(), _nss.db().toString()));
+                  dropDatabaseForApplyOps(_opCtx.get(), _nss.dbName()));
 }
 
 TEST_F(DropDatabaseTest, DropDatabaseReturnsNotWritablePrimaryIfNotPrimary) {
@@ -221,7 +222,7 @@ TEST_F(DropDatabaseTest, DropDatabaseReturnsNotWritablePrimaryIfNotPrimary) {
     ASSERT_TRUE(_opCtx->writesAreReplicated());
     ASSERT_FALSE(_replCoord->canAcceptWritesForDatabase(_opCtx.get(), _nss.db()));
     ASSERT_EQUALS(ErrorCodes::NotWritablePrimary,
-                  dropDatabaseForApplyOps(_opCtx.get(), _nss.db().toString()));
+                  dropDatabaseForApplyOps(_opCtx.get(), _nss.dbName()));
 }
 
 /**
@@ -242,12 +243,12 @@ void _testDropDatabase(OperationContext* opCtx,
     ASSERT_TRUE(db);
     opObserver->db = db;
 
-    ASSERT_OK(dropDatabaseForApplyOps(opCtx, nss.db().toString()));
+    ASSERT_OK(dropDatabaseForApplyOps(opCtx, nss.dbName()));
     ASSERT_FALSE(AutoGetDb(opCtx, nss.dbName(), MODE_X).getDb());
     opObserver->db = nullptr;
 
     ASSERT_EQUALS(1U, opObserver->droppedDatabaseNames.size());
-    ASSERT_EQUALS(nss.db().toString(), *(opObserver->droppedDatabaseNames.begin()));
+    ASSERT_EQUALS(nss.dbName(), *(opObserver->droppedDatabaseNames.begin()));
 
     if (expectedOnDropCollection) {
         ASSERT_EQUALS(1U, opObserver->droppedCollectionNames.size());
@@ -262,7 +263,8 @@ TEST_F(DropDatabaseTest, DropDatabaseNotifiesOpObserverOfDroppedUserCollection) 
 }
 
 TEST_F(DropDatabaseTest, DropDatabaseNotifiesOpObserverOfDroppedReplicatedSystemCollection) {
-    NamespaceString replicatedSystemNss(_nss.getSisterNS("system.js"));
+    NamespaceString replicatedSystemNss =
+        NamespaceString::createNamespaceString_forTest(_nss.getSisterNS("system.js"));
     _testDropDatabase(_opCtx.get(), _opObserver, replicatedSystemNss, true);
 }
 
@@ -298,12 +300,13 @@ TEST_F(DropDatabaseTest, DropDatabasePassedThroughAwaitReplicationErrorForDropPe
     _createCollection(_opCtx.get(), dpns);
 
     ASSERT_EQUALS(ErrorCodes::WriteConcernFailed,
-                  dropDatabaseForApplyOps(_opCtx.get(), _nss.db().toString()));
+                  dropDatabaseForApplyOps(_opCtx.get(), _nss.dbName()));
 }
 
 TEST_F(DropDatabaseTest, DropDatabaseSkipsSystemProfileCollectionWhenDroppingCollections) {
     repl::OpTime dropOpTime(Timestamp(Seconds(100), 0), 1LL);
-    NamespaceString profileNss(_nss.getSisterNS("system.profile"));
+    NamespaceString profileNss =
+        NamespaceString::createNamespaceString_forTest(_nss.getSisterNS("system.profile"));
     _testDropDatabase(_opCtx.get(), _opObserver, profileNss, false);
 }
 
@@ -319,7 +322,7 @@ TEST_F(DropDatabaseTest, DropDatabaseResetsDropPendingStateOnException) {
         ASSERT_TRUE(db);
     }
 
-    ASSERT_THROWS_CODE_AND_WHAT(dropDatabaseForApplyOps(_opCtx.get(), _nss.db().toString()),
+    ASSERT_THROWS_CODE_AND_WHAT(dropDatabaseForApplyOps(_opCtx.get(), _nss.dbName()),
                                 AssertionException,
                                 ErrorCodes::OperationFailed,
                                 "onDropCollection() failed");
@@ -338,8 +341,7 @@ void _testDropDatabaseResetsDropPendingStateIfAwaitReplicationFails(OperationCon
 
     ASSERT_TRUE(AutoGetDb(opCtx, nss.dbName(), MODE_X).getDb());
 
-    ASSERT_EQUALS(ErrorCodes::WriteConcernFailed,
-                  dropDatabaseForApplyOps(opCtx, nss.db().toString()));
+    ASSERT_EQUALS(ErrorCodes::WriteConcernFailed, dropDatabaseForApplyOps(opCtx, nss.dbName()));
 
     AutoGetDb autoDb(opCtx, nss.dbName(), MODE_X);
     auto db = autoDb.getDb();
@@ -388,7 +390,7 @@ TEST_F(DropDatabaseTest,
 
     ASSERT_TRUE(AutoGetDb(_opCtx.get(), _nss.dbName(), MODE_X).getDb());
 
-    auto status = dropDatabaseForApplyOps(_opCtx.get(), _nss.db().toString());
+    auto status = dropDatabaseForApplyOps(_opCtx.get(), _nss.dbName());
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, status);
     ASSERT_EQUALS(status.reason(),
                   std::string(str::stream()
@@ -413,7 +415,7 @@ TEST_F(DropDatabaseTest,
 
     ASSERT_TRUE(AutoGetDb(_opCtx.get(), _nss.dbName(), MODE_X).getDb());
 
-    auto status = dropDatabaseForApplyOps(_opCtx.get(), _nss.db().toString());
+    auto status = dropDatabaseForApplyOps(_opCtx.get(), _nss.dbName());
     ASSERT_EQUALS(ErrorCodes::PrimarySteppedDown, status);
     ASSERT_EQUALS(status.reason(),
                   std::string(str::stream() << "Could not drop database " << _nss.db()
@@ -428,9 +430,10 @@ TEST_F(DropDatabaseTest,
 }
 
 TEST_F(DropDatabaseTest, DropDatabaseFailsToDropAdmin) {
-    NamespaceString adminNSS(NamespaceString::kAdminDb, "foo");
+    NamespaceString adminNSS =
+        NamespaceString::createNamespaceString_forTest(DatabaseName::kAdmin, "foo");
     _createCollection(_opCtx.get(), adminNSS);
-    ASSERT_THROWS_CODE_AND_WHAT(dropDatabaseForApplyOps(_opCtx.get(), adminNSS.db().toString()),
+    ASSERT_THROWS_CODE_AND_WHAT(dropDatabaseForApplyOps(_opCtx.get(), adminNSS.dbName()),
                                 AssertionException,
                                 ErrorCodes::IllegalOperation,
                                 "Dropping the 'admin' database is prohibited.");

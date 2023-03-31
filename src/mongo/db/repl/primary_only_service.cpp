@@ -40,6 +40,7 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/replica_set_aware_service.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
@@ -72,7 +73,7 @@ const auto _registryRegisterer =
     ReplicaSetAwareServiceRegistry::Registerer<PrimaryOnlyServiceRegistry>(
         "PrimaryOnlyServiceRegistry");
 
-const Status kExecutorShutdownStatus(ErrorCodes::InterruptedDueToReplStateChange,
+const Status kExecutorShutdownStatus(ErrorCodes::CallbackCanceled,
                                      "PrimaryOnlyService executor shut down due to stepDown");
 
 const auto primaryOnlyServiceStateForClient =
@@ -206,7 +207,37 @@ void PrimaryOnlyServiceRegistry::onStepUpComplete(OperationContext* opCtx, long 
               str::stream() << "Term from last optime (" << stepUpOpTime.getTerm()
                             << ") doesn't match the term we're stepping up in (" << term << ")");
 
+
+    // Since this method is called before we mark the node writable in
+    // ReplicationCoordinatorImpl::signalDrainComplete and therefore can block the new primary from
+    // starting to receive writes, generate a warning if we are spending too long here.
+    Timer totalTime{};
+    ON_BLOCK_EXIT([&] {
+        auto timeSpent = totalTime.millis();
+        auto threshold = slowTotalOnStepUpCompleteThresholdMS.load();
+        if (timeSpent > threshold) {
+            LOGV2(6699604,
+                  "Duration spent in PrimaryOnlyServiceRegistry::onStepUpComplete for all services "
+                  "exceeded slowTotalOnStepUpCompleteThresholdMS",
+                  "thresholdMillis"_attr = threshold,
+                  "durationMillis"_attr = timeSpent);
+        }
+    });
     for (auto& service : _servicesByName) {
+        // Additionally, generate a warning if any individual service is taking too long.
+        Timer t{};
+        ON_BLOCK_EXIT([&] {
+            auto timeSpent = t.millis();
+            auto threshold = slowServiceOnStepUpCompleteThresholdMS.load();
+            if (timeSpent > threshold) {
+                LOGV2(6699605,
+                      "Duration spent in PrimaryOnlyServiceRegistry::onStepUpComplete "
+                      "for service exceeded slowServiceOnStepUpCompleteThresholdMS",
+                      "thresholdMillis"_attr = threshold,
+                      "durationMillis"_attr = timeSpent,
+                      "serviceName"_attr = service.first);
+            }
+        });
         service.second->onStepUp(stepUpOpTime);
     }
 }
@@ -252,7 +283,7 @@ void PrimaryOnlyService::reportInstanceInfoForCurrentOp(
     for (auto& [_, instance] : _activeInstances) {
         auto op = instance.getInstance()->reportForCurrentOp(connMode, sessionMode);
         if (op.has_value()) {
-            ops->push_back(std::move(op.get()));
+            ops->push_back(std::move(op.value()));
         }
     }
 }
@@ -263,6 +294,14 @@ void PrimaryOnlyService::registerOpCtx(OperationContext* opCtx, bool allowOpCtxW
     invariant(inserted);
 
     if (_state == State::kRunning || (_state == State::kRebuilding && allowOpCtxWhileRebuilding)) {
+        // We do not allow creating an opCtx while in kRebuilding (unless the thread has explicitly
+        // requested it) in case the node has stepped down and back up. In that case the second
+        // stepup would join the instance from the first stepup which could wait on the opCtx which
+        // would not get interrupted. This could cause the second stepup to take a long time
+        // to join the old instance. Note that opCtx's created through a
+        // CancelableOperationContextFactory with a cancellation token *would* be interrupted (and
+        // would not delay the join), because the stepdown would have cancelled the cancellation
+        // token.
         return;
     } else {
         // If this service isn't running when an OpCtx associated with this service is created, then
@@ -403,31 +442,6 @@ void PrimaryOnlyService::onStepUp(const OpTime& stepUpOpTime) {
                 }
             }
             _rebuildInstances(newTerm);
-        })
-        .onCompletion([this, newTerm](Status s) {
-            stdx::lock_guard lk(_mutex);
-            if (_state != State::kRebuilding || _term != newTerm) {
-                bool steppedDown = _state == State::kPaused;
-                bool shutDown = _state == State::kShutdown;
-                bool termAdvanced = _term > newTerm;
-                StringData stateString = _getStateString(lk);
-                invariant(steppedDown || shutDown || termAdvanced,
-                          "Unexpected _state or _term; _state is {} term is {} term was {} "_format(
-                              stateString, _term, newTerm));
-                // We've either stepped or shut down, or advanced to a
-                // new term. In either case, we rely on the stepdown/shutdown
-                // logic or the step-up of the new term to handle managing _state
-                // and do nothing.
-                return;
-            }
-            // We're in the same term, and stepdown/shutdown hasn't occured.
-            invariant(_state == State::kRebuilding);
-            if (s.isOK()) {
-                _setState(State::kRunning, lk);
-            } else {
-                _rebuildStatus = s;
-                _setState(State::kRebuildFailed, lk);
-            }
         })
         .getAsync([](auto&&) {});  // Ignore the result Future
     lk.unlock();
@@ -665,7 +679,7 @@ bool PrimaryOnlyService::_getHasExecutor() const {
     return _hasExecutor.load();
 }
 
-void PrimaryOnlyService::_rebuildInstances(long long term) {
+void PrimaryOnlyService::_rebuildInstances(long long term) noexcept {
     std::vector<BSONObj> stateDocuments;
 
     auto serviceName = getServiceName();
@@ -704,7 +718,7 @@ void PrimaryOnlyService::_rebuildInstances(long long term) {
             while (cursor->more()) {
                 stateDocuments.push_back(cursor->nextSafe().getOwned());
             }
-        } catch (DBException& e) {
+        } catch (const DBException& e) {
             LOGV2_ERROR(
                 4923601,
                 "Failed to start PrimaryOnlyService {service} because the query on {namespace} "
@@ -714,10 +728,20 @@ void PrimaryOnlyService::_rebuildInstances(long long term) {
                 logAttrs(ns),
                 "error"_attr = e);
 
-            e.addContext(str::stream() << "Failed to start PrimaryOnlyService \"" << serviceName
-                                       << "\" because the query for state documents on ns \"" << ns
-                                       << "\" failed");
-            throw;
+            Status status = e.toStatus();
+            status.addContext(str::stream()
+                              << "Failed to start PrimaryOnlyService \"" << serviceName
+                              << "\" because the query for state documents on ns \"" << ns
+                              << "\" failed");
+
+            stdx::lock_guard lk(_mutex);
+            if (_state != State::kRebuilding || _term != term) {
+                _stateChangeCV.notify_all();
+                return;
+            }
+            _setState(State::kRebuildFailed, lk);
+            _rebuildStatus = std::move(status);
+            return;
         }
     }
 
@@ -725,15 +749,20 @@ void PrimaryOnlyService::_rebuildInstances(long long term) {
         {
             stdx::lock_guard lk(_mutex);
             if (_state != State::kRebuilding || _term != term) {  // Node stepped down
+                _stateChangeCV.notify_all();
                 return;
             }
         }
         sleepmillis(100);
     }
 
+    // Must create opCtx before taking _mutex to avoid deadlock.
+    AllowOpCtxWhenServiceRebuildingBlock allowOpCtxBlock(Client::getCurrent());
+    auto opCtx = cc().makeOperationContext();
     stdx::lock_guard lk(_mutex);
     if (_state != State::kRebuilding || _term != term) {
         // Node stepped down before finishing rebuilding service from previous stepUp.
+        _stateChangeCV.notify_all();
         return;
     }
     invariant(_activeInstances.empty());
@@ -756,12 +785,13 @@ void PrimaryOnlyService::_rebuildInstances(long long term) {
         [[maybe_unused]] auto newInstance =
             _insertNewInstance(lk, std::move(instance), std::move(instanceID));
     }
+    _setState(State::kRunning, lk);
 }
 
 std::shared_ptr<PrimaryOnlyService::Instance> PrimaryOnlyService::_insertNewInstance(
     WithLock wl, std::shared_ptr<Instance> instance, InstanceID instanceID) {
     CancellationSource instanceSource(_source.token());
-    auto instanceCompleteFuture =
+    auto runCompleteFuture =
         ExecutorFuture<void>(**_scopedExecutor)
             .then([serviceName = getServiceName(),
                    instance,
@@ -778,12 +808,20 @@ std::shared_ptr<PrimaryOnlyService::Instance> PrimaryOnlyService::_insertNewInst
 
                 return instance->run(std::move(scopedExecutor), std::move(token));
             })
+            // TODO SERVER-61717 remove this error handler once instance are automatically released
+            // at the end of run()
+            .onError<ErrorCodes::ConflictingServerlessOperation>([this, instanceID](Status status) {
+                LOGV2(6531507,
+                      "Removing instance due to ConflictingServerlessOperation error",
+                      "instanceID"_attr = instanceID);
+                releaseInstance(instanceID, Status::OK());
+
+                return status;
+            })
             .semi();
 
-    auto [it, inserted] = _activeInstances.try_emplace(instanceID,
-                                                       std::move(instance),
-                                                       std::move(instanceSource),
-                                                       std::move(instanceCompleteFuture));
+    auto [it, inserted] = _activeInstances.try_emplace(
+        instanceID, std::move(instance), std::move(instanceSource), std::move(runCompleteFuture));
     invariant(inserted);
     return it->second.getInstance();
 }

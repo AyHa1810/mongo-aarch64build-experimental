@@ -30,13 +30,15 @@
 #include <stack>
 
 #include "mongo/base/error_codes.h"
+#include "mongo/db/exec/docval_to_sbeval.h"
 #include "mongo/db/pipeline/abt/agg_expression_visitor.h"
 #include "mongo/db/pipeline/abt/expr_algebrizer_context.h"
 #include "mongo/db/pipeline/abt/utils.h"
 #include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/accumulator_multi.h"
+#include "mongo/db/pipeline/accumulator_percentile.h"
 #include "mongo/db/pipeline/expression_walker.h"
-#include "mongo/db/query/optimizer/utils/utils.h"
+#include "mongo/db/query/optimizer/utils/path_utils.h"
 
 namespace mongo::optimizer {
 
@@ -45,7 +47,7 @@ public:
     ABTAggExpressionVisitor(ExpressionAlgebrizerContext& ctx) : _ctx(ctx){};
 
     void visit(const ExpressionConstant* expr) override final {
-        auto [tag, val] = convertFrom(expr->getValue());
+        auto [tag, val] = sbe::value::makeValue(expr->getValue());
         _ctx.push<Constant>(tag, val);
     }
 
@@ -86,7 +88,18 @@ public:
     void visit(const ExpressionArrayElemAt* expr) override final {
         unsupportedExpression(expr->getOpName());
     }
-
+    void visit(const ExpressionBitAnd* expr) override final {
+        unsupportedExpression("bitAnd");
+    }
+    void visit(const ExpressionBitOr* expr) override final {
+        unsupportedExpression("bitOr");
+    }
+    void visit(const ExpressionBitXor* expr) override final {
+        unsupportedExpression("bitXor");
+    }
+    void visit(const ExpressionBitNot* expr) override final {
+        unsupportedExpression(expr->getOpName());
+    }
     void visit(const ExpressionFirst* expr) override final {
         unsupportedExpression(expr->getOpName());
     }
@@ -151,8 +164,8 @@ public:
         };
 
         const auto addEvalFilterFn = [&](ABT path, ABT expr, const Operations op) {
-            PathAppender appender(make<PathCompare>(op, std::move(expr)));
-            appender.append(path);
+            PathAppender::appendInPlace(path, make<PathCompare>(op, std::move(expr)));
+
             _ctx.push<EvalFilter>(std::move(path), _ctx.getRootProjVar());
         };
 
@@ -172,7 +185,7 @@ public:
                 isSimplePath(rightPtr->getPath()) &&
                 rightPtr->getInput() == _ctx.getRootProjVar()) {
                 addEvalFilterFn(
-                    std::move(rightPtr->getPath()), std::move(left), reverseComparisonOp(op));
+                    std::move(rightPtr->getPath()), std::move(left), flipComparisonOp(op));
                 return;
             }
         }
@@ -252,11 +265,11 @@ public:
         ABT path = translateFieldPath(
             fieldPath,
             make<PathIdentity>(),
-            [](const std::string& fieldName, const bool isLastElement, ABT input) {
+            [](FieldNameType fieldName, const bool isLastElement, ABT input) {
                 if (!isLastElement) {
-                    input = make<PathTraverse>(std::move(input), PathTraverse::kUnlimited);
+                    input = make<PathTraverse>(PathTraverse::kUnlimited, std::move(input));
                 }
-                return make<PathGet>(fieldName, std::move(input));
+                return make<PathGet>(std::move(fieldName), std::move(input));
             },
             1ul);
 
@@ -268,7 +281,7 @@ public:
         uassert(6624427,
                 "Filter variable must be user-defined.",
                 Variables::isUserDefinedVariable(varId));
-        const std::string& varName = generateVariableName(varId);
+        const ProjectionName varName{generateVariableName(varId)};
 
         _ctx.ensureArity(2);
         ABT filter = _ctx.pop();
@@ -276,10 +289,10 @@ public:
 
         _ctx.push<EvalPath>(
             make<PathTraverse>(
+                PathTraverse::kUnlimited,
                 make<PathLambda>(make<LambdaAbstraction>(
                     varName,
-                    make<If>(std::move(filter), make<Variable>(varName), Constant::nothing()))),
-                PathTraverse::kUnlimited),
+                    make<If>(std::move(filter), make<Variable>(varName), Constant::nothing())))),
             std::move(input));
     }
 
@@ -328,6 +341,10 @@ public:
     }
 
     void visit(const ExpressionInternalFLEEqual* expr) override final {
+        unsupportedExpression(expr->getOpName());
+    }
+
+    void visit(const ExpressionInternalFLEBetween* expr) override final {
         unsupportedExpression(expr->getOpName());
     }
 
@@ -688,6 +705,15 @@ public:
         unsupportedExpression(expr->getOpName());
     }
 
+    void visit(const ExpressionFromAccumulatorQuantile<AccumulatorMedian>* expr) override final {
+        unsupportedExpression(expr->getOpName());
+    }
+
+    void visit(
+        const ExpressionFromAccumulatorQuantile<AccumulatorPercentile>* expr) override final {
+        unsupportedExpression(expr->getOpName());
+    }
+
     void visit(const ExpressionFromAccumulator<AccumulatorStdDevPop>* expr) override final {
         unsupportedExpression(expr->getOpName());
     }
@@ -758,6 +784,14 @@ public:
 
     void visit(const ExpressionTsIncrement* expr) override final {
         unsupportedExpression("tsIncrement");
+    }
+
+    void visit(const ExpressionInternalOwningShard* expr) override final {
+        unsupportedExpression("$_internalOwningShard");
+    }
+
+    void visit(const ExpressionInternalIndexKey* expr) override final {
+        unsupportedExpression("$_internalIndexKey");
     }
 
 private:
@@ -848,10 +882,8 @@ private:
         _ctx.push(std::move(current));
     }
 
-    std::string generateVariableName(const Variables::Id varId) {
-        std::ostringstream os;
-        os << _ctx.getUniqueIdPrefix() << "_var_" << varId;
-        return os.str();
+    ProjectionName generateVariableName(const Variables::Id varId) {
+        return ProjectionName{str::stream() << "var_" << varId};
     }
 
     void unsupportedExpression(const char* op) const {
@@ -876,10 +908,10 @@ private:
 };
 
 ABT generateAggExpression(const Expression* expr,
-                          const std::string& rootProjection,
-                          const std::string& uniqueIdPrefix) {
+                          const ProjectionName& rootProjection,
+                          PrefixId& prefixId) {
     ExpressionAlgebrizerContext ctx(
-        true /*assertExprSort*/, false /*assertPathSort*/, rootProjection, uniqueIdPrefix);
+        true /*assertExprSort*/, false /*assertPathSort*/, rootProjection, prefixId);
     ABTAggExpressionVisitor visitor(ctx);
 
     AggExpressionWalker walker(&visitor);

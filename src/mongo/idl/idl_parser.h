@@ -39,6 +39,7 @@
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/stdx/type_traits.h"
+#include "mongo/util/serialization_context.h"
 
 namespace mongo {
 
@@ -165,7 +166,7 @@ struct Ordering {
     const T& _v;
 };
 template <typename T>
-Ordering(const T&)->Ordering<T>;
+Ordering(const T&) -> Ordering<T>;
 
 /** fallback case */
 template <typename T>
@@ -238,11 +239,35 @@ public:
     static constexpr auto kOpMsgDollarDB = "$db"_sd;
     static constexpr auto kOpMsgDollarDBDefault = "admin"_sd;
 
-    IDLParserContext(StringData fieldName, bool apiStrict = false)
-        : _currentField(fieldName), _apiStrict(apiStrict), _predecessor(nullptr) {}
+    explicit IDLParserContext(StringData fieldName) : IDLParserContext{fieldName, false} {}
+
+    IDLParserContext(StringData fieldName, bool apiStrict)
+        : IDLParserContext{fieldName, apiStrict, boost::none} {}
+
+    IDLParserContext(StringData fieldName,
+                     bool apiStrict,
+                     boost::optional<TenantId> tenantId,
+                     const SerializationContext& serializationContext = SerializationContext())
+        : _serializationContext(serializationContext),
+          _currentField(fieldName),
+          _apiStrict(apiStrict),
+          _tenantId(std::move(tenantId)),
+          _predecessor(nullptr) {}
 
     IDLParserContext(StringData fieldName, const IDLParserContext* predecessor)
-        : _currentField(fieldName), _predecessor(predecessor) {}
+        : IDLParserContext(fieldName, predecessor, boost::none, SerializationContext()) {}
+
+    IDLParserContext(StringData fieldName,
+                     const IDLParserContext* predecessor,
+                     boost::optional<TenantId> tenantId,
+                     const SerializationContext& serializationContext)
+        : _serializationContext(serializationContext),
+          _currentField(fieldName),
+          _apiStrict(predecessor->_apiStrict),
+          _tenantId(tenantId),
+          _predecessor(predecessor) {
+        assertTenantIdMatchesPredecessor(predecessor);
+    }
 
     /**
      * Check that BSON element is a given type or whether the field should be skipped.
@@ -358,6 +383,10 @@ public:
                                               const std::vector<StringData>& knownFields,
                                               BSONObjBuilder* builder);
 
+    const boost::optional<TenantId>& getTenantId() const;
+
+    const SerializationContext& getSerializationContext() const;
+
 private:
     /**
      * See comment on getElementPath below.
@@ -380,12 +409,30 @@ private:
      */
     bool checkAndAssertBinDataTypeSlowPath(const BSONElement& element, BinDataType type) const;
 
+    void assertTenantIdMatchesPredecessor(const IDLParserContext* predecessor) {
+        if (!_tenantId || predecessor == nullptr) {
+            return;
+        }
+
+        auto& parentTenantId = predecessor->getTenantId();
+        iassert(8423379,
+                str::stream() << "The IDLParserContext tenantId " << _tenantId->toString()
+                              << " must match the predecessor's tenantId "
+                              << parentTenantId->toString(),
+                !parentTenantId || parentTenantId == _tenantId);
+    }
+
 private:
+    // Modifies serialization behavior to match request format, only accessed by IDL generated code
+    const SerializationContext _serializationContext;
+
     // Name of the current field that is being parsed.
     const StringData _currentField;
 
     // Whether the 'apiStrict' parameter is set in the user request.
     const bool _apiStrict = false;
+
+    const boost::optional<TenantId> _tenantId;
 
     // Pointer to a parent parser context.
     // This provides a singly linked list of parent pointers, and use to produce a full path to a

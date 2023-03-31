@@ -52,7 +52,8 @@ static const RecordId kMetadataId = record_id_helpers::reservedIdFor(
     record_id_helpers::ReservationId::kWildcardMultikeyMetadataId, KeyFormat::Long);
 
 static const int kIndexVersion = static_cast<int>(IndexDescriptor::kLatestIndexVersion);
-static const NamespaceString kDefaultNSS{"wildcard_multikey_persistence.test"};
+static const NamespaceString kDefaultNSS =
+    NamespaceString::createNamespaceString_forTest("wildcard_multikey_persistence.test");
 static const std::string kDefaultIndexName{"wildcard_multikey"};
 static const BSONObj kDefaultIndexKey = fromjson("{'$**': 1}");
 static const BSONObj kDefaultPathProjection;
@@ -199,7 +200,7 @@ protected:
         BSONObjBuilder bob = std::move(BSONObjBuilder() << "name" << name << "key" << key);
 
         if (!pathProjection.isEmpty())
-            bob << IndexDescriptor::kPathProjectionFieldName << pathProjection;
+            bob << IndexDescriptor::kWildcardProjectionFieldName << pathProjection;
 
         auto indexSpec = (bob << "v" << kIndexVersion << "background" << background).obj();
 

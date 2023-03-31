@@ -33,6 +33,7 @@
 
 namespace mongo {
 CounterMetric planCacheTotalSizeEstimateBytes("query.planCacheTotalSizeEstimateBytes");
+CounterMetric planCacheEntries("query.planCacheTotalQueryShapes");
 
 std::ostream& operator<<(std::ostream& stream, const PlanCacheKey& key) {
     stream << key.toString();
@@ -129,12 +130,15 @@ bool shouldCacheQuery(const CanonicalQuery& query) {
     const MatchExpression* expr = query.root();
 
     if (!query.getSortPattern() && expr->matchType() == MatchExpression::AND &&
-        expr->numChildren() == 0 &&
-        !(feature_flags::gFeatureFlagSbeFull.isEnabledAndIgnoreFCV() && query.isSbeCompatible())) {
+        expr->numChildren() == 0 && !query.isSbeCompatible()) {
         return false;
     }
 
-    if (!findCommand.getHint().isEmpty()) {
+    // The classic plan cache doesn't have the plan itself, but only some data to re-construct the
+    // plan. It is only useful for skipping multiplanning, and hinted queries are generally not
+    // multi-planned, so it is not necessary to cache the plan. In contrast, the SBE plan cache has
+    // the plan itself, so caching hinted queries could help to skip the plan construction.
+    if (!query.isSbeCompatible() && !findCommand.getHint().isEmpty()) {
         return false;
     }
 
@@ -152,8 +156,8 @@ bool shouldCacheQuery(const CanonicalQuery& query) {
     //
     // There is one exception: $lookup's implementation in the DocumentSource engine relies on
     // caching the plan on the inner side in order to avoid repeating the planning process for every
-    // document on the outer side. To ensure that the 'executionTimeMillis' value is accurate for
-    // $lookup, we allow the inner side to use the cache even if the query is an explain.
+    // document on the outer side. To ensure that the 'executionTime' value is accurate for $lookup,
+    // we allow the inner side to use the cache even if the query is an explain.
     tassert(6497600, "expCtx is null", query.getExpCtxRaw());
     if (query.getExplain() && !query.getExpCtxRaw()->inLookup) {
         return false;

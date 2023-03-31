@@ -144,11 +144,10 @@ void DocumentSourceCursor::loadBatch() {
     tassert(5565800,
             "Expected PlanExecutor to use an external lock policy",
             _exec->lockPolicy() == PlanExecutor::LockPolicy::kLockExternally);
-    autoColl.emplace(pExpCtx->opCtx,
-                     _exec->nss(),
-                     AutoGetCollectionViewMode::kViewsForbidden,
-                     Date_t::max(),
-                     _exec->getSecondaryNamespaces());
+    autoColl.emplace(
+        pExpCtx->opCtx,
+        _exec->nss(),
+        AutoGetCollection::Options{}.secondaryNssOrUUIDs(_exec->getSecondaryNamespaces()));
     uassertStatusOK(repl::ReplicationCoordinator::get(pExpCtx->opCtx)
                         ->checkCanServeReadsFor(pExpCtx->opCtx, _exec->nss(), true));
 
@@ -209,7 +208,11 @@ void DocumentSourceCursor::recordPlanSummaryStats() {
     _exec->getPlanExplainer().getSummaryStats(&_stats.planSummaryStats);
 }
 
-Value DocumentSourceCursor::serialize(boost::optional<ExplainOptions::Verbosity> verbosity) const {
+Value DocumentSourceCursor::serialize(SerializationOptions opts) const {
+    auto verbosity = opts.verbosity;
+    if (opts.redactFieldNames || opts.replacementForLiteralArgs) {
+        MONGO_UNIMPLEMENTED_TASSERT(7484350);
+    }
     // We never parse a DocumentSourceCursor, so we only serialize for explain.
     if (!verbosity)
         return Value();
@@ -227,11 +230,10 @@ Value DocumentSourceCursor::serialize(boost::optional<ExplainOptions::Verbosity>
     {
         auto opCtx = pExpCtx->opCtx;
         auto secondaryNssList = _exec->getSecondaryNamespaces();
-        AutoGetCollectionForReadMaybeLockFree readLock(opCtx,
-                                                       _exec->nss(),
-                                                       AutoGetCollectionViewMode::kViewsForbidden,
-                                                       Date_t::max(),
-                                                       secondaryNssList);
+        AutoGetCollectionForReadMaybeLockFree readLock(
+            opCtx,
+            _exec->nss(),
+            AutoGetCollection::Options{}.secondaryNssOrUUIDs(secondaryNssList));
         MultipleCollectionAccessor collections(opCtx,
                                                &readLock.getCollection(),
                                                readLock.getNss(),
@@ -240,7 +242,7 @@ Value DocumentSourceCursor::serialize(boost::optional<ExplainOptions::Verbosity>
 
         Explain::explainStages(_exec.get(),
                                collections,
-                               verbosity.get(),
+                               verbosity.value(),
                                _execStatus,
                                _winningPlanTrialStats,
                                BSONObj(),
@@ -252,7 +254,7 @@ Value DocumentSourceCursor::serialize(boost::optional<ExplainOptions::Verbosity>
     invariant(explainStats["queryPlanner"]);
     out["queryPlanner"] = Value(explainStats["queryPlanner"]);
 
-    if (verbosity.get() >= ExplainOptions::Verbosity::kExecStats) {
+    if (verbosity.value() >= ExplainOptions::Verbosity::kExecStats) {
         invariant(explainStats["executionStats"]);
         out["executionStats"] = Value(explainStats["executionStats"]);
     }
@@ -317,7 +319,8 @@ DocumentSourceCursor::DocumentSourceCursor(
     : DocumentSource(kStageName, pCtx),
       _currentBatch(cursorType),
       _exec(std::move(exec)),
-      _trackOplogTS(trackOplogTimestamp) {
+      _trackOplogTS(trackOplogTimestamp),
+      _queryFramework(_exec->getQueryFramework()) {
     // It is illegal for both 'kEmptyDocuments' and 'trackOplogTimestamp' to be set.
     invariant(!(cursorType == CursorType::kEmptyDocuments && trackOplogTimestamp));
 

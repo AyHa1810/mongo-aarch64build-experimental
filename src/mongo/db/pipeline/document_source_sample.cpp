@@ -52,8 +52,10 @@ REGISTER_DOCUMENT_SOURCE(sample,
                          AllowedWithApiStrict::kAlways);
 
 DocumentSource::GetNextResult DocumentSourceSample::doGetNext() {
-    if (_size == 0)
+    if (_size == 0) {
+        pSource->dispose();
         return GetNextResult::makeEOF();
+    }
 
     if (!_sortStage->isPopulated()) {
         // Exhaust source stage, add random metadata, and push all into sorter.
@@ -81,7 +83,10 @@ DocumentSource::GetNextResult DocumentSourceSample::doGetNext() {
     return _sortStage->getNext();
 }
 
-Value DocumentSourceSample::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceSample::serialize(SerializationOptions opts) const {
+    if (opts.redactFieldNames || opts.replacementForLiteralArgs) {
+        MONGO_UNIMPLEMENTED_TASSERT(7484317);
+    }
     return Value(DOC(kStageName << DOC("size" << _size)));
 }
 

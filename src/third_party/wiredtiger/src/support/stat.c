@@ -15,6 +15,8 @@ static const char *const __stats_dsrc_desc[] = {
   "LSM: sleep for LSM checkpoint throttle",
   "LSM: sleep for LSM merge throttle",
   "LSM: total size of bloom filters",
+  "autocommit: retries for readonly operations",
+  "autocommit: retries for update operations",
   "block-manager: allocations requiring file extension",
   "block-manager: blocks allocated",
   "block-manager: blocks freed",
@@ -96,15 +98,22 @@ static const char *const __stats_dsrc_desc[] = {
   "timestamp on data page",
   "cache: history store table truncation to remove range of updates due to key being removed from "
   "the data page during reconciliation",
+  "cache: history store table truncations that would have happened in non-dryrun mode",
+  "cache: history store table truncations to remove an unstable update that would have happened in "
+  "non-dryrun mode",
+  "cache: history store table truncations to remove an update that would have happened in "
+  "non-dryrun mode",
   "cache: history store table updates without timestamps fixed up by reinserting with the fixed "
   "timestamp",
   "cache: history store table writes requiring squashed modifies",
   "cache: in-memory page passed criteria to be split",
   "cache: in-memory page splits",
+  "cache: internal page split blocked its eviction",
   "cache: internal pages evicted",
   "cache: internal pages split during eviction",
   "cache: leaf pages split during eviction",
   "cache: modified pages evicted",
+  "cache: overflow keys on a multiblock row-store page blocked its eviction",
   "cache: overflow pages read into cache",
   "cache: page split during eviction deepened the tree",
   "cache: page written requiring history store records",
@@ -115,9 +124,13 @@ static const char *const __stats_dsrc_desc[] = {
   "cache: pages seen by eviction walk",
   "cache: pages written from cache",
   "cache: pages written requiring in-memory restoration",
+  "cache: recent modification of a page blocked its eviction",
+  "cache: reverse splits performed",
+  "cache: reverse splits skipped because of VLCS namespace gap restrictions",
   "cache: the number of times full update inserted to history store",
   "cache: the number of times reverse modify inserted to history store",
   "cache: tracked dirty bytes in the cache",
+  "cache: uncommitted truncate blocked page eviction",
   "cache: unmodified pages evicted",
   "cache_walk: Average difference between current eviction generation when the page was last "
   "considered",
@@ -173,6 +186,7 @@ static const char *const __stats_dsrc_desc[] = {
   "cursor: create calls",
   "cursor: cursor bound calls that return an error",
   "cursor: cursor bounds cleared from reset",
+  "cursor: cursor bounds comparisons performed",
   "cursor: cursor bounds next called on an unpositioned cursor",
   "cursor: cursor bounds next early exit",
   "cursor: cursor bounds prev called on an unpositioned cursor",
@@ -191,8 +205,8 @@ static const char *const __stats_dsrc_desc[] = {
   "cursor: cursor modify calls that return an error",
   "cursor: cursor next calls that return an error",
   "cursor: cursor next calls that skip due to a globally visible history store tombstone",
+  "cursor: cursor next calls that skip greater than 1 and fewer than 100 entries",
   "cursor: cursor next calls that skip greater than or equal to 100 entries",
-  "cursor: cursor next calls that skip less than 100 entries",
   "cursor: cursor next random calls that return an error",
   "cursor: cursor prev calls that return an error",
   "cursor: cursor prev calls that skip due to a globally visible history store tombstone",
@@ -226,6 +240,7 @@ static const char *const __stats_dsrc_desc[] = {
   "cursor: update calls",
   "cursor: update key and value bytes",
   "cursor: update value size change",
+  "reconciliation: VLCS pages explicitly reconciled as empty",
   "reconciliation: approximate byte size of timestamps in pages written",
   "reconciliation: approximate byte size of transaction IDs in pages written",
   "reconciliation: dictionary matches",
@@ -263,18 +278,29 @@ static const char *const __stats_dsrc_desc[] = {
   "reconciliation: records written including a stop timestamp",
   "reconciliation: records written including a stop transaction ID",
   "session: object compaction",
+  "transaction: number of times overflow removed value is read",
   "transaction: race to read prepared update retry",
+  "transaction: rollback to stable history store keys that would have been swept in non-dryrun "
+  "mode",
   "transaction: rollback to stable history store records with stop timestamps older than newer "
   "records",
   "transaction: rollback to stable inconsistent checkpoint",
   "transaction: rollback to stable keys removed",
   "transaction: rollback to stable keys restored",
+  "transaction: rollback to stable keys that would have been removed in non-dryrun mode",
+  "transaction: rollback to stable keys that would have been restored in non-dryrun mode",
   "transaction: rollback to stable restored tombstones from history store",
   "transaction: rollback to stable restored updates from history store",
   "transaction: rollback to stable skipping delete rle",
   "transaction: rollback to stable skipping stable rle",
   "transaction: rollback to stable sweeping history store keys",
+  "transaction: rollback to stable tombstones from history store that would have been restored in "
+  "non-dryrun mode",
+  "transaction: rollback to stable updates from history store that would have been restored in "
+  "non-dryrun mode",
   "transaction: rollback to stable updates removed from history store",
+  "transaction: rollback to stable updates that would have been removed from history store in "
+  "non-dryrun mode",
   "transaction: transaction checkpoints due to obsolete pages",
   "transaction: update conflicts",
 };
@@ -329,6 +355,8 @@ __wt_stat_dsrc_clear_single(WT_DSRC_STATS *stats)
     stats->lsm_checkpoint_throttle = 0;
     stats->lsm_merge_throttle = 0;
     stats->bloom_size = 0;
+    stats->autocommit_readonly_retry = 0;
+    stats->autocommit_update_retry = 0;
     stats->block_extension = 0;
     stats->block_alloc = 0;
     stats->block_free = 0;
@@ -366,7 +394,7 @@ __wt_stat_dsrc_clear_single(WT_DSRC_STATS *stats)
     /* not clearing cache_bytes_dirty_total */
     stats->cache_bytes_read = 0;
     stats->cache_bytes_write = 0;
-    stats->cache_eviction_checkpoint = 0;
+    stats->cache_eviction_blocked_checkpoint = 0;
     stats->cache_eviction_blocked_checkpoint_hs = 0;
     stats->cache_eviction_fail = 0;
     stats->cache_eviction_blocked_no_ts_checkpoint_race_1 = 0;
@@ -389,7 +417,7 @@ __wt_stat_dsrc_clear_single(WT_DSRC_STATS *stats)
     stats->cache_eviction_walk_restart = 0;
     stats->cache_eviction_walk_from_root = 0;
     stats->cache_eviction_walk_saved_pos = 0;
-    stats->cache_eviction_hazard = 0;
+    stats->cache_eviction_blocked_hazard = 0;
     stats->cache_hs_insert = 0;
     stats->cache_hs_insert_restart = 0;
     stats->cache_hs_read = 0;
@@ -402,14 +430,19 @@ __wt_stat_dsrc_clear_single(WT_DSRC_STATS *stats)
     stats->cache_hs_key_truncate = 0;
     stats->cache_hs_order_remove = 0;
     stats->cache_hs_key_truncate_onpage_removal = 0;
+    stats->cache_hs_btree_truncate_dryrun = 0;
+    stats->cache_hs_key_truncate_rts_unstable_dryrun = 0;
+    stats->cache_hs_key_truncate_rts_dryrun = 0;
     stats->cache_hs_order_reinsert = 0;
     stats->cache_hs_write_squash = 0;
     stats->cache_inmem_splittable = 0;
     stats->cache_inmem_split = 0;
+    stats->cache_eviction_blocked_internal_page_split = 0;
     stats->cache_eviction_internal = 0;
     stats->cache_eviction_split_internal = 0;
     stats->cache_eviction_split_leaf = 0;
     stats->cache_eviction_dirty = 0;
+    stats->cache_eviction_blocked_overflow_keys = 0;
     stats->cache_read_overflow = 0;
     stats->cache_eviction_deepen = 0;
     stats->cache_write_hs = 0;
@@ -420,9 +453,13 @@ __wt_stat_dsrc_clear_single(WT_DSRC_STATS *stats)
     stats->cache_eviction_pages_seen = 0;
     stats->cache_write = 0;
     stats->cache_write_restore = 0;
+    stats->cache_eviction_blocked_recently_modified = 0;
+    stats->cache_reverse_splits = 0;
+    stats->cache_reverse_splits_skipped_vlcs = 0;
     stats->cache_hs_insert_full_update = 0;
     stats->cache_hs_insert_reverse_modify = 0;
     /* not clearing cache_bytes_dirty */
+    stats->cache_eviction_blocked_uncommitted_truncate = 0;
     stats->cache_eviction_clean = 0;
     /* not clearing cache_state_gen_avg_gap */
     /* not clearing cache_state_avg_written_size */
@@ -474,6 +511,7 @@ __wt_stat_dsrc_clear_single(WT_DSRC_STATS *stats)
     stats->cursor_create = 0;
     stats->cursor_bound_error = 0;
     stats->cursor_bounds_reset = 0;
+    stats->cursor_bounds_comparisons = 0;
     stats->cursor_bounds_next_unpositioned = 0;
     stats->cursor_bounds_next_early_exit = 0;
     stats->cursor_bounds_prev_unpositioned = 0;
@@ -492,8 +530,8 @@ __wt_stat_dsrc_clear_single(WT_DSRC_STATS *stats)
     stats->cursor_modify_error = 0;
     stats->cursor_next_error = 0;
     stats->cursor_next_hs_tombstone = 0;
-    stats->cursor_next_skip_ge_100 = 0;
     stats->cursor_next_skip_lt_100 = 0;
+    stats->cursor_next_skip_ge_100 = 0;
     stats->cursor_next_random_error = 0;
     stats->cursor_prev_error = 0;
     stats->cursor_prev_hs_tombstone = 0;
@@ -527,6 +565,7 @@ __wt_stat_dsrc_clear_single(WT_DSRC_STATS *stats)
     stats->cursor_update = 0;
     stats->cursor_update_bytes = 0;
     stats->cursor_update_bytes_changed = 0;
+    stats->rec_vlcs_emptied_pages = 0;
     stats->rec_time_window_bytes_ts = 0;
     stats->rec_time_window_bytes_txn = 0;
     stats->rec_dictionary = 0;
@@ -564,17 +603,24 @@ __wt_stat_dsrc_clear_single(WT_DSRC_STATS *stats)
     stats->rec_time_window_stop_ts = 0;
     stats->rec_time_window_stop_txn = 0;
     stats->session_compact = 0;
+    stats->txn_read_overflow_remove = 0;
     stats->txn_read_race_prepare_update = 0;
+    stats->txn_rts_sweep_hs_keys_dryrun = 0;
     stats->txn_rts_hs_stop_older_than_newer_start = 0;
     stats->txn_rts_inconsistent_ckpt = 0;
     stats->txn_rts_keys_removed = 0;
     stats->txn_rts_keys_restored = 0;
+    stats->txn_rts_keys_removed_dryrun = 0;
+    stats->txn_rts_keys_restored_dryrun = 0;
     stats->txn_rts_hs_restore_tombstones = 0;
     stats->txn_rts_hs_restore_updates = 0;
     stats->txn_rts_delete_rle_skipped = 0;
     stats->txn_rts_stable_rle_skipped = 0;
     stats->txn_rts_sweep_hs_keys = 0;
+    stats->txn_rts_hs_restore_tombstones_dryrun = 0;
+    stats->txn_rts_hs_restore_updates_dryrun = 0;
     stats->txn_rts_hs_removed = 0;
+    stats->txn_rts_hs_removed_dryrun = 0;
     stats->txn_checkpoint_obsolete_applied = 0;
     stats->txn_update_conflict = 0;
 }
@@ -604,6 +650,8 @@ __wt_stat_dsrc_aggregate_single(WT_DSRC_STATS *from, WT_DSRC_STATS *to)
     to->lsm_checkpoint_throttle += from->lsm_checkpoint_throttle;
     to->lsm_merge_throttle += from->lsm_merge_throttle;
     to->bloom_size += from->bloom_size;
+    to->autocommit_readonly_retry += from->autocommit_readonly_retry;
+    to->autocommit_update_retry += from->autocommit_update_retry;
     to->block_extension += from->block_extension;
     to->block_alloc += from->block_alloc;
     to->block_free += from->block_free;
@@ -651,7 +699,7 @@ __wt_stat_dsrc_aggregate_single(WT_DSRC_STATS *from, WT_DSRC_STATS *to)
     to->cache_bytes_dirty_total += from->cache_bytes_dirty_total;
     to->cache_bytes_read += from->cache_bytes_read;
     to->cache_bytes_write += from->cache_bytes_write;
-    to->cache_eviction_checkpoint += from->cache_eviction_checkpoint;
+    to->cache_eviction_blocked_checkpoint += from->cache_eviction_blocked_checkpoint;
     to->cache_eviction_blocked_checkpoint_hs += from->cache_eviction_blocked_checkpoint_hs;
     to->cache_eviction_fail += from->cache_eviction_fail;
     to->cache_eviction_blocked_no_ts_checkpoint_race_1 +=
@@ -679,7 +727,7 @@ __wt_stat_dsrc_aggregate_single(WT_DSRC_STATS *from, WT_DSRC_STATS *to)
     to->cache_eviction_walk_restart += from->cache_eviction_walk_restart;
     to->cache_eviction_walk_from_root += from->cache_eviction_walk_from_root;
     to->cache_eviction_walk_saved_pos += from->cache_eviction_walk_saved_pos;
-    to->cache_eviction_hazard += from->cache_eviction_hazard;
+    to->cache_eviction_blocked_hazard += from->cache_eviction_blocked_hazard;
     to->cache_hs_insert += from->cache_hs_insert;
     to->cache_hs_insert_restart += from->cache_hs_insert_restart;
     to->cache_hs_read += from->cache_hs_read;
@@ -692,14 +740,21 @@ __wt_stat_dsrc_aggregate_single(WT_DSRC_STATS *from, WT_DSRC_STATS *to)
     to->cache_hs_key_truncate += from->cache_hs_key_truncate;
     to->cache_hs_order_remove += from->cache_hs_order_remove;
     to->cache_hs_key_truncate_onpage_removal += from->cache_hs_key_truncate_onpage_removal;
+    to->cache_hs_btree_truncate_dryrun += from->cache_hs_btree_truncate_dryrun;
+    to->cache_hs_key_truncate_rts_unstable_dryrun +=
+      from->cache_hs_key_truncate_rts_unstable_dryrun;
+    to->cache_hs_key_truncate_rts_dryrun += from->cache_hs_key_truncate_rts_dryrun;
     to->cache_hs_order_reinsert += from->cache_hs_order_reinsert;
     to->cache_hs_write_squash += from->cache_hs_write_squash;
     to->cache_inmem_splittable += from->cache_inmem_splittable;
     to->cache_inmem_split += from->cache_inmem_split;
+    to->cache_eviction_blocked_internal_page_split +=
+      from->cache_eviction_blocked_internal_page_split;
     to->cache_eviction_internal += from->cache_eviction_internal;
     to->cache_eviction_split_internal += from->cache_eviction_split_internal;
     to->cache_eviction_split_leaf += from->cache_eviction_split_leaf;
     to->cache_eviction_dirty += from->cache_eviction_dirty;
+    to->cache_eviction_blocked_overflow_keys += from->cache_eviction_blocked_overflow_keys;
     to->cache_read_overflow += from->cache_read_overflow;
     to->cache_eviction_deepen += from->cache_eviction_deepen;
     to->cache_write_hs += from->cache_write_hs;
@@ -710,9 +765,14 @@ __wt_stat_dsrc_aggregate_single(WT_DSRC_STATS *from, WT_DSRC_STATS *to)
     to->cache_eviction_pages_seen += from->cache_eviction_pages_seen;
     to->cache_write += from->cache_write;
     to->cache_write_restore += from->cache_write_restore;
+    to->cache_eviction_blocked_recently_modified += from->cache_eviction_blocked_recently_modified;
+    to->cache_reverse_splits += from->cache_reverse_splits;
+    to->cache_reverse_splits_skipped_vlcs += from->cache_reverse_splits_skipped_vlcs;
     to->cache_hs_insert_full_update += from->cache_hs_insert_full_update;
     to->cache_hs_insert_reverse_modify += from->cache_hs_insert_reverse_modify;
     to->cache_bytes_dirty += from->cache_bytes_dirty;
+    to->cache_eviction_blocked_uncommitted_truncate +=
+      from->cache_eviction_blocked_uncommitted_truncate;
     to->cache_eviction_clean += from->cache_eviction_clean;
     to->cache_state_gen_avg_gap += from->cache_state_gen_avg_gap;
     to->cache_state_avg_written_size += from->cache_state_avg_written_size;
@@ -764,6 +824,7 @@ __wt_stat_dsrc_aggregate_single(WT_DSRC_STATS *from, WT_DSRC_STATS *to)
     to->cursor_create += from->cursor_create;
     to->cursor_bound_error += from->cursor_bound_error;
     to->cursor_bounds_reset += from->cursor_bounds_reset;
+    to->cursor_bounds_comparisons += from->cursor_bounds_comparisons;
     to->cursor_bounds_next_unpositioned += from->cursor_bounds_next_unpositioned;
     to->cursor_bounds_next_early_exit += from->cursor_bounds_next_early_exit;
     to->cursor_bounds_prev_unpositioned += from->cursor_bounds_prev_unpositioned;
@@ -783,8 +844,8 @@ __wt_stat_dsrc_aggregate_single(WT_DSRC_STATS *from, WT_DSRC_STATS *to)
     to->cursor_modify_error += from->cursor_modify_error;
     to->cursor_next_error += from->cursor_next_error;
     to->cursor_next_hs_tombstone += from->cursor_next_hs_tombstone;
-    to->cursor_next_skip_ge_100 += from->cursor_next_skip_ge_100;
     to->cursor_next_skip_lt_100 += from->cursor_next_skip_lt_100;
+    to->cursor_next_skip_ge_100 += from->cursor_next_skip_ge_100;
     to->cursor_next_random_error += from->cursor_next_random_error;
     to->cursor_prev_error += from->cursor_prev_error;
     to->cursor_prev_hs_tombstone += from->cursor_prev_hs_tombstone;
@@ -818,6 +879,7 @@ __wt_stat_dsrc_aggregate_single(WT_DSRC_STATS *from, WT_DSRC_STATS *to)
     to->cursor_update += from->cursor_update;
     to->cursor_update_bytes += from->cursor_update_bytes;
     to->cursor_update_bytes_changed += from->cursor_update_bytes_changed;
+    to->rec_vlcs_emptied_pages += from->rec_vlcs_emptied_pages;
     to->rec_time_window_bytes_ts += from->rec_time_window_bytes_ts;
     to->rec_time_window_bytes_txn += from->rec_time_window_bytes_txn;
     to->rec_dictionary += from->rec_dictionary;
@@ -856,17 +918,24 @@ __wt_stat_dsrc_aggregate_single(WT_DSRC_STATS *from, WT_DSRC_STATS *to)
     to->rec_time_window_stop_ts += from->rec_time_window_stop_ts;
     to->rec_time_window_stop_txn += from->rec_time_window_stop_txn;
     to->session_compact += from->session_compact;
+    to->txn_read_overflow_remove += from->txn_read_overflow_remove;
     to->txn_read_race_prepare_update += from->txn_read_race_prepare_update;
+    to->txn_rts_sweep_hs_keys_dryrun += from->txn_rts_sweep_hs_keys_dryrun;
     to->txn_rts_hs_stop_older_than_newer_start += from->txn_rts_hs_stop_older_than_newer_start;
     to->txn_rts_inconsistent_ckpt += from->txn_rts_inconsistent_ckpt;
     to->txn_rts_keys_removed += from->txn_rts_keys_removed;
     to->txn_rts_keys_restored += from->txn_rts_keys_restored;
+    to->txn_rts_keys_removed_dryrun += from->txn_rts_keys_removed_dryrun;
+    to->txn_rts_keys_restored_dryrun += from->txn_rts_keys_restored_dryrun;
     to->txn_rts_hs_restore_tombstones += from->txn_rts_hs_restore_tombstones;
     to->txn_rts_hs_restore_updates += from->txn_rts_hs_restore_updates;
     to->txn_rts_delete_rle_skipped += from->txn_rts_delete_rle_skipped;
     to->txn_rts_stable_rle_skipped += from->txn_rts_stable_rle_skipped;
     to->txn_rts_sweep_hs_keys += from->txn_rts_sweep_hs_keys;
+    to->txn_rts_hs_restore_tombstones_dryrun += from->txn_rts_hs_restore_tombstones_dryrun;
+    to->txn_rts_hs_restore_updates_dryrun += from->txn_rts_hs_restore_updates_dryrun;
     to->txn_rts_hs_removed += from->txn_rts_hs_removed;
+    to->txn_rts_hs_removed_dryrun += from->txn_rts_hs_removed_dryrun;
     to->txn_checkpoint_obsolete_applied += from->txn_checkpoint_obsolete_applied;
     to->txn_update_conflict += from->txn_update_conflict;
 }
@@ -889,6 +958,8 @@ __wt_stat_dsrc_aggregate(WT_DSRC_STATS **from, WT_DSRC_STATS *to)
     to->lsm_checkpoint_throttle += WT_STAT_READ(from, lsm_checkpoint_throttle);
     to->lsm_merge_throttle += WT_STAT_READ(from, lsm_merge_throttle);
     to->bloom_size += WT_STAT_READ(from, bloom_size);
+    to->autocommit_readonly_retry += WT_STAT_READ(from, autocommit_readonly_retry);
+    to->autocommit_update_retry += WT_STAT_READ(from, autocommit_update_retry);
     to->block_extension += WT_STAT_READ(from, block_extension);
     to->block_alloc += WT_STAT_READ(from, block_alloc);
     to->block_free += WT_STAT_READ(from, block_free);
@@ -936,7 +1007,7 @@ __wt_stat_dsrc_aggregate(WT_DSRC_STATS **from, WT_DSRC_STATS *to)
     to->cache_bytes_dirty_total += WT_STAT_READ(from, cache_bytes_dirty_total);
     to->cache_bytes_read += WT_STAT_READ(from, cache_bytes_read);
     to->cache_bytes_write += WT_STAT_READ(from, cache_bytes_write);
-    to->cache_eviction_checkpoint += WT_STAT_READ(from, cache_eviction_checkpoint);
+    to->cache_eviction_blocked_checkpoint += WT_STAT_READ(from, cache_eviction_blocked_checkpoint);
     to->cache_eviction_blocked_checkpoint_hs +=
       WT_STAT_READ(from, cache_eviction_blocked_checkpoint_hs);
     to->cache_eviction_fail += WT_STAT_READ(from, cache_eviction_fail);
@@ -968,7 +1039,7 @@ __wt_stat_dsrc_aggregate(WT_DSRC_STATS **from, WT_DSRC_STATS *to)
     to->cache_eviction_walk_restart += WT_STAT_READ(from, cache_eviction_walk_restart);
     to->cache_eviction_walk_from_root += WT_STAT_READ(from, cache_eviction_walk_from_root);
     to->cache_eviction_walk_saved_pos += WT_STAT_READ(from, cache_eviction_walk_saved_pos);
-    to->cache_eviction_hazard += WT_STAT_READ(from, cache_eviction_hazard);
+    to->cache_eviction_blocked_hazard += WT_STAT_READ(from, cache_eviction_blocked_hazard);
     to->cache_hs_insert += WT_STAT_READ(from, cache_hs_insert);
     to->cache_hs_insert_restart += WT_STAT_READ(from, cache_hs_insert_restart);
     to->cache_hs_read += WT_STAT_READ(from, cache_hs_read);
@@ -984,14 +1055,22 @@ __wt_stat_dsrc_aggregate(WT_DSRC_STATS **from, WT_DSRC_STATS *to)
     to->cache_hs_order_remove += WT_STAT_READ(from, cache_hs_order_remove);
     to->cache_hs_key_truncate_onpage_removal +=
       WT_STAT_READ(from, cache_hs_key_truncate_onpage_removal);
+    to->cache_hs_btree_truncate_dryrun += WT_STAT_READ(from, cache_hs_btree_truncate_dryrun);
+    to->cache_hs_key_truncate_rts_unstable_dryrun +=
+      WT_STAT_READ(from, cache_hs_key_truncate_rts_unstable_dryrun);
+    to->cache_hs_key_truncate_rts_dryrun += WT_STAT_READ(from, cache_hs_key_truncate_rts_dryrun);
     to->cache_hs_order_reinsert += WT_STAT_READ(from, cache_hs_order_reinsert);
     to->cache_hs_write_squash += WT_STAT_READ(from, cache_hs_write_squash);
     to->cache_inmem_splittable += WT_STAT_READ(from, cache_inmem_splittable);
     to->cache_inmem_split += WT_STAT_READ(from, cache_inmem_split);
+    to->cache_eviction_blocked_internal_page_split +=
+      WT_STAT_READ(from, cache_eviction_blocked_internal_page_split);
     to->cache_eviction_internal += WT_STAT_READ(from, cache_eviction_internal);
     to->cache_eviction_split_internal += WT_STAT_READ(from, cache_eviction_split_internal);
     to->cache_eviction_split_leaf += WT_STAT_READ(from, cache_eviction_split_leaf);
     to->cache_eviction_dirty += WT_STAT_READ(from, cache_eviction_dirty);
+    to->cache_eviction_blocked_overflow_keys +=
+      WT_STAT_READ(from, cache_eviction_blocked_overflow_keys);
     to->cache_read_overflow += WT_STAT_READ(from, cache_read_overflow);
     to->cache_eviction_deepen += WT_STAT_READ(from, cache_eviction_deepen);
     to->cache_write_hs += WT_STAT_READ(from, cache_write_hs);
@@ -1002,9 +1081,15 @@ __wt_stat_dsrc_aggregate(WT_DSRC_STATS **from, WT_DSRC_STATS *to)
     to->cache_eviction_pages_seen += WT_STAT_READ(from, cache_eviction_pages_seen);
     to->cache_write += WT_STAT_READ(from, cache_write);
     to->cache_write_restore += WT_STAT_READ(from, cache_write_restore);
+    to->cache_eviction_blocked_recently_modified +=
+      WT_STAT_READ(from, cache_eviction_blocked_recently_modified);
+    to->cache_reverse_splits += WT_STAT_READ(from, cache_reverse_splits);
+    to->cache_reverse_splits_skipped_vlcs += WT_STAT_READ(from, cache_reverse_splits_skipped_vlcs);
     to->cache_hs_insert_full_update += WT_STAT_READ(from, cache_hs_insert_full_update);
     to->cache_hs_insert_reverse_modify += WT_STAT_READ(from, cache_hs_insert_reverse_modify);
     to->cache_bytes_dirty += WT_STAT_READ(from, cache_bytes_dirty);
+    to->cache_eviction_blocked_uncommitted_truncate +=
+      WT_STAT_READ(from, cache_eviction_blocked_uncommitted_truncate);
     to->cache_eviction_clean += WT_STAT_READ(from, cache_eviction_clean);
     to->cache_state_gen_avg_gap += WT_STAT_READ(from, cache_state_gen_avg_gap);
     to->cache_state_avg_written_size += WT_STAT_READ(from, cache_state_avg_written_size);
@@ -1059,6 +1144,7 @@ __wt_stat_dsrc_aggregate(WT_DSRC_STATS **from, WT_DSRC_STATS *to)
     to->cursor_create += WT_STAT_READ(from, cursor_create);
     to->cursor_bound_error += WT_STAT_READ(from, cursor_bound_error);
     to->cursor_bounds_reset += WT_STAT_READ(from, cursor_bounds_reset);
+    to->cursor_bounds_comparisons += WT_STAT_READ(from, cursor_bounds_comparisons);
     to->cursor_bounds_next_unpositioned += WT_STAT_READ(from, cursor_bounds_next_unpositioned);
     to->cursor_bounds_next_early_exit += WT_STAT_READ(from, cursor_bounds_next_early_exit);
     to->cursor_bounds_prev_unpositioned += WT_STAT_READ(from, cursor_bounds_prev_unpositioned);
@@ -1078,8 +1164,8 @@ __wt_stat_dsrc_aggregate(WT_DSRC_STATS **from, WT_DSRC_STATS *to)
     to->cursor_modify_error += WT_STAT_READ(from, cursor_modify_error);
     to->cursor_next_error += WT_STAT_READ(from, cursor_next_error);
     to->cursor_next_hs_tombstone += WT_STAT_READ(from, cursor_next_hs_tombstone);
-    to->cursor_next_skip_ge_100 += WT_STAT_READ(from, cursor_next_skip_ge_100);
     to->cursor_next_skip_lt_100 += WT_STAT_READ(from, cursor_next_skip_lt_100);
+    to->cursor_next_skip_ge_100 += WT_STAT_READ(from, cursor_next_skip_ge_100);
     to->cursor_next_random_error += WT_STAT_READ(from, cursor_next_random_error);
     to->cursor_prev_error += WT_STAT_READ(from, cursor_prev_error);
     to->cursor_prev_hs_tombstone += WT_STAT_READ(from, cursor_prev_hs_tombstone);
@@ -1113,6 +1199,7 @@ __wt_stat_dsrc_aggregate(WT_DSRC_STATS **from, WT_DSRC_STATS *to)
     to->cursor_update += WT_STAT_READ(from, cursor_update);
     to->cursor_update_bytes += WT_STAT_READ(from, cursor_update_bytes);
     to->cursor_update_bytes_changed += WT_STAT_READ(from, cursor_update_bytes_changed);
+    to->rec_vlcs_emptied_pages += WT_STAT_READ(from, rec_vlcs_emptied_pages);
     to->rec_time_window_bytes_ts += WT_STAT_READ(from, rec_time_window_bytes_ts);
     to->rec_time_window_bytes_txn += WT_STAT_READ(from, rec_time_window_bytes_txn);
     to->rec_dictionary += WT_STAT_READ(from, rec_dictionary);
@@ -1155,18 +1242,26 @@ __wt_stat_dsrc_aggregate(WT_DSRC_STATS **from, WT_DSRC_STATS *to)
     to->rec_time_window_stop_ts += WT_STAT_READ(from, rec_time_window_stop_ts);
     to->rec_time_window_stop_txn += WT_STAT_READ(from, rec_time_window_stop_txn);
     to->session_compact += WT_STAT_READ(from, session_compact);
+    to->txn_read_overflow_remove += WT_STAT_READ(from, txn_read_overflow_remove);
     to->txn_read_race_prepare_update += WT_STAT_READ(from, txn_read_race_prepare_update);
+    to->txn_rts_sweep_hs_keys_dryrun += WT_STAT_READ(from, txn_rts_sweep_hs_keys_dryrun);
     to->txn_rts_hs_stop_older_than_newer_start +=
       WT_STAT_READ(from, txn_rts_hs_stop_older_than_newer_start);
     to->txn_rts_inconsistent_ckpt += WT_STAT_READ(from, txn_rts_inconsistent_ckpt);
     to->txn_rts_keys_removed += WT_STAT_READ(from, txn_rts_keys_removed);
     to->txn_rts_keys_restored += WT_STAT_READ(from, txn_rts_keys_restored);
+    to->txn_rts_keys_removed_dryrun += WT_STAT_READ(from, txn_rts_keys_removed_dryrun);
+    to->txn_rts_keys_restored_dryrun += WT_STAT_READ(from, txn_rts_keys_restored_dryrun);
     to->txn_rts_hs_restore_tombstones += WT_STAT_READ(from, txn_rts_hs_restore_tombstones);
     to->txn_rts_hs_restore_updates += WT_STAT_READ(from, txn_rts_hs_restore_updates);
     to->txn_rts_delete_rle_skipped += WT_STAT_READ(from, txn_rts_delete_rle_skipped);
     to->txn_rts_stable_rle_skipped += WT_STAT_READ(from, txn_rts_stable_rle_skipped);
     to->txn_rts_sweep_hs_keys += WT_STAT_READ(from, txn_rts_sweep_hs_keys);
+    to->txn_rts_hs_restore_tombstones_dryrun +=
+      WT_STAT_READ(from, txn_rts_hs_restore_tombstones_dryrun);
+    to->txn_rts_hs_restore_updates_dryrun += WT_STAT_READ(from, txn_rts_hs_restore_updates_dryrun);
     to->txn_rts_hs_removed += WT_STAT_READ(from, txn_rts_hs_removed);
+    to->txn_rts_hs_removed_dryrun += WT_STAT_READ(from, txn_rts_hs_removed_dryrun);
     to->txn_checkpoint_obsolete_applied += WT_STAT_READ(from, txn_checkpoint_obsolete_applied);
     to->txn_update_conflict += WT_STAT_READ(from, txn_update_conflict);
 }
@@ -1182,6 +1277,8 @@ static const char *const __stats_connection_desc[] = {
   "LSM: tree maintenance operations executed",
   "LSM: tree maintenance operations scheduled",
   "LSM: tree queue hit maximum",
+  "autocommit: retries for readonly operations",
+  "autocommit: retries for update operations",
   "block-cache: cached blocks updated",
   "block-cache: cached bytes updated",
   "block-cache: evicted blocks",
@@ -1197,6 +1294,7 @@ static const char *const __stats_connection_desc[] = {
   "block-cache: number of misses",
   "block-cache: number of put bypasses on checkpoint I/O",
   "block-cache: removed blocks",
+  "block-cache: time sleeping to remove block (usecs)",
   "block-cache: total blocks",
   "block-cache: total blocks inserted on read path",
   "block-cache: total blocks inserted on write path",
@@ -1317,11 +1415,17 @@ static const char *const __stats_connection_desc[] = {
   "timestamp on data page",
   "cache: history store table truncation to remove range of updates due to key being removed from "
   "the data page during reconciliation",
+  "cache: history store table truncations that would have happened in non-dryrun mode",
+  "cache: history store table truncations to remove an unstable update that would have happened in "
+  "non-dryrun mode",
+  "cache: history store table truncations to remove an update that would have happened in "
+  "non-dryrun mode",
   "cache: history store table updates without timestamps fixed up by reinserting with the fixed "
   "timestamp",
   "cache: history store table writes requiring squashed modifies",
   "cache: in-memory page passed criteria to be split",
   "cache: in-memory page splits",
+  "cache: internal page split blocked its eviction",
   "cache: internal pages evicted",
   "cache: internal pages queued for eviction",
   "cache: internal pages seen by eviction walk",
@@ -1329,10 +1433,12 @@ static const char *const __stats_connection_desc[] = {
   "cache: internal pages split during eviction",
   "cache: leaf pages split during eviction",
   "cache: maximum bytes configured",
-  "cache: maximum page size at eviction",
+  "cache: maximum page size seen at eviction",
+  "cache: maximum seconds spent at a single eviction",
   "cache: modified pages evicted",
   "cache: modified pages evicted by application threads",
   "cache: operations timed out waiting for space in cache",
+  "cache: overflow keys on a multiblock row-store page blocked its eviction",
   "cache: overflow pages read into cache",
   "cache: page split during eviction deepened the tree",
   "cache: page written requiring history store records",
@@ -1347,6 +1453,7 @@ static const char *const __stats_connection_desc[] = {
   "cache: pages read into cache",
   "cache: pages read into cache after truncate",
   "cache: pages read into cache after truncate in prepare state",
+  "cache: pages removed from the ordinary queue to be queued for urgent eviction",
   "cache: pages requested from the cache",
   "cache: pages seen by eviction walk",
   "cache: pages seen by eviction walk that are already queued",
@@ -1360,12 +1467,16 @@ static const char *const __stats_connection_desc[] = {
   "cache: pages written from cache",
   "cache: pages written requiring in-memory restoration",
   "cache: percentage overhead",
+  "cache: recent modification of a page blocked its eviction",
+  "cache: reverse splits performed",
+  "cache: reverse splits skipped because of VLCS namespace gap restrictions",
   "cache: the number of times full update inserted to history store",
   "cache: the number of times reverse modify inserted to history store",
   "cache: tracked bytes belonging to internal pages in the cache",
   "cache: tracked bytes belonging to leaf pages in the cache",
   "cache: tracked dirty bytes in the cache",
   "cache: tracked dirty pages in the cache",
+  "cache: uncommitted truncate blocked page eviction",
   "cache: unmodified pages evicted",
   "capacity: background fsync file handles considered",
   "capacity: background fsync file handles synced",
@@ -1395,6 +1506,8 @@ static const char *const __stats_connection_desc[] = {
   "connection: memory allocations",
   "connection: memory frees",
   "connection: memory re-allocations",
+  "connection: number of sessions without a sweep for 5+ minutes",
+  "connection: number of sessions without a sweep for 60+ minutes",
   "connection: pthread mutex condition wait calls",
   "connection: pthread mutex shared lock read-lock calls",
   "connection: pthread mutex shared lock write-lock calls",
@@ -1412,6 +1525,7 @@ static const char *const __stats_connection_desc[] = {
   "cursor: cached cursor count",
   "cursor: cursor bound calls that return an error",
   "cursor: cursor bounds cleared from reset",
+  "cursor: cursor bounds comparisons performed",
   "cursor: cursor bounds next called on an unpositioned cursor",
   "cursor: cursor bounds next early exit",
   "cursor: cursor bounds prev called on an unpositioned cursor",
@@ -1439,8 +1553,8 @@ static const char *const __stats_connection_desc[] = {
   "cursor: cursor next calls",
   "cursor: cursor next calls that return an error",
   "cursor: cursor next calls that skip due to a globally visible history store tombstone",
+  "cursor: cursor next calls that skip greater than 1 and fewer than 100 entries",
   "cursor: cursor next calls that skip greater than or equal to 100 entries",
-  "cursor: cursor next calls that skip less than 100 entries",
   "cursor: cursor next random calls that return an error",
   "cursor: cursor operation restarted",
   "cursor: cursor prev calls",
@@ -1581,11 +1695,15 @@ static const char *const __stats_connection_desc[] = {
   "perf: operation write latency histogram (bucket 3) - 500-999us",
   "perf: operation write latency histogram (bucket 4) - 1000-9999us",
   "perf: operation write latency histogram (bucket 5) - 10000us+",
+  "reconciliation: VLCS pages explicitly reconciled as empty",
   "reconciliation: approximate byte size of timestamps in pages written",
   "reconciliation: approximate byte size of transaction IDs in pages written",
   "reconciliation: fast-path pages deleted",
   "reconciliation: leaf-page overflow keys",
   "reconciliation: maximum seconds spent in a reconciliation call",
+  "reconciliation: maximum seconds spent in building a disk image in a reconciliation",
+  "reconciliation: maximum seconds spent in moving updates to the history store in a "
+  "reconciliation",
   "reconciliation: page reconciliation calls",
   "reconciliation: page reconciliation calls for eviction",
   "reconciliation: page reconciliation calls that resulted in values with prepared transaction "
@@ -1617,6 +1735,7 @@ static const char *const __stats_connection_desc[] = {
   "reconciliation: split bytes currently awaiting free",
   "reconciliation: split objects currently awaiting free",
   "session: attempts to remove a local object and the object is in use",
+  "session: flush_tier failed calls",
   "session: flush_tier operation calls",
   "session: flush_tier tables skipped due to no checkpoint",
   "session: flush_tier tables switched",
@@ -1672,6 +1791,8 @@ static const char *const __stats_connection_desc[] = {
   "transaction: Number of prepared updates committed",
   "transaction: Number of prepared updates repeated on the same key",
   "transaction: Number of prepared updates rolled back",
+  "transaction: number of times overflow removed value is read",
+  "transaction: oldest pinned transaction ID rolled back for eviction",
   "transaction: prepared transactions",
   "transaction: prepared transactions committed",
   "transaction: prepared transactions currently active",
@@ -1679,20 +1800,31 @@ static const char *const __stats_connection_desc[] = {
   "transaction: query timestamp calls",
   "transaction: race to read prepared update retry",
   "transaction: rollback to stable calls",
+  "transaction: rollback to stable history store keys that would have been swept in non-dryrun "
+  "mode",
   "transaction: rollback to stable history store records with stop timestamps older than newer "
   "records",
   "transaction: rollback to stable inconsistent checkpoint",
   "transaction: rollback to stable keys removed",
   "transaction: rollback to stable keys restored",
+  "transaction: rollback to stable keys that would have been removed in non-dryrun mode",
+  "transaction: rollback to stable keys that would have been restored in non-dryrun mode",
   "transaction: rollback to stable pages visited",
   "transaction: rollback to stable restored tombstones from history store",
   "transaction: rollback to stable restored updates from history store",
   "transaction: rollback to stable skipping delete rle",
   "transaction: rollback to stable skipping stable rle",
   "transaction: rollback to stable sweeping history store keys",
+  "transaction: rollback to stable tombstones from history store that would have been restored in "
+  "non-dryrun mode",
   "transaction: rollback to stable tree walk skipping pages",
   "transaction: rollback to stable updates aborted",
+  "transaction: rollback to stable updates from history store that would have been restored in "
+  "non-dryrun mode",
   "transaction: rollback to stable updates removed from history store",
+  "transaction: rollback to stable updates that would have been aborted in non-dryrun mode",
+  "transaction: rollback to stable updates that would have been removed from history store in "
+  "non-dryrun mode",
   "transaction: sessions scanned in each walk of concurrent sessions",
   "transaction: set timestamp calls",
   "transaction: set timestamp durable calls",
@@ -1727,7 +1859,6 @@ static const char *const __stats_connection_desc[] = {
   "transaction: transaction checkpoints",
   "transaction: transaction checkpoints due to obsolete pages",
   "transaction: transaction checkpoints skipped because database was clean",
-  "transaction: transaction failures due to history store",
   "transaction: transaction fsync calls for checkpoint after allocating the transaction ID",
   "transaction: transaction fsync duration for checkpoint after allocating the transaction ID "
   "(usecs)",
@@ -1793,6 +1924,8 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
     stats->lsm_work_units_done = 0;
     stats->lsm_work_units_created = 0;
     stats->lsm_work_queue_max = 0;
+    stats->autocommit_readonly_retry = 0;
+    stats->autocommit_update_retry = 0;
     stats->block_cache_blocks_update = 0;
     stats->block_cache_bytes_update = 0;
     stats->block_cache_blocks_evicted = 0;
@@ -1808,6 +1941,7 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
     stats->block_cache_misses = 0;
     stats->block_cache_bypass_chkpt = 0;
     stats->block_cache_blocks_removed = 0;
+    stats->block_cache_blocks_removed_blocked = 0;
     stats->block_cache_blocks = 0;
     stats->block_cache_blocks_insert_read = 0;
     stats->block_cache_blocks_insert_write = 0;
@@ -1840,7 +1974,7 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
     /* not clearing cache_bytes_other */
     stats->cache_bytes_read = 0;
     stats->cache_bytes_write = 0;
-    stats->cache_eviction_checkpoint = 0;
+    stats->cache_eviction_blocked_checkpoint = 0;
     stats->cache_eviction_blocked_checkpoint_hs = 0;
     stats->cache_eviction_get_ref = 0;
     stats->cache_eviction_get_ref_empty = 0;
@@ -1898,7 +2032,7 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
     stats->cache_eviction_force = 0;
     stats->cache_eviction_force_fail = 0;
     stats->cache_eviction_force_fail_time = 0;
-    stats->cache_eviction_hazard = 0;
+    stats->cache_eviction_blocked_hazard = 0;
     stats->cache_hazard_checks = 0;
     stats->cache_hazard_walks = 0;
     stats->cache_hazard_max = 0;
@@ -1916,10 +2050,14 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
     stats->cache_hs_key_truncate = 0;
     stats->cache_hs_order_remove = 0;
     stats->cache_hs_key_truncate_onpage_removal = 0;
+    stats->cache_hs_btree_truncate_dryrun = 0;
+    stats->cache_hs_key_truncate_rts_unstable_dryrun = 0;
+    stats->cache_hs_key_truncate_rts_dryrun = 0;
     stats->cache_hs_order_reinsert = 0;
     stats->cache_hs_write_squash = 0;
     stats->cache_inmem_splittable = 0;
     stats->cache_inmem_split = 0;
+    stats->cache_eviction_blocked_internal_page_split = 0;
     stats->cache_eviction_internal = 0;
     stats->cache_eviction_internal_pages_queued = 0;
     stats->cache_eviction_internal_pages_seen = 0;
@@ -1928,9 +2066,11 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
     stats->cache_eviction_split_leaf = 0;
     /* not clearing cache_bytes_max */
     /* not clearing cache_eviction_maximum_page_size */
+    /* not clearing cache_eviction_maximum_seconds */
     stats->cache_eviction_dirty = 0;
     stats->cache_eviction_app_dirty = 0;
     stats->cache_timed_out_ops = 0;
+    stats->cache_eviction_blocked_overflow_keys = 0;
     stats->cache_read_overflow = 0;
     stats->cache_eviction_deepen = 0;
     stats->cache_write_hs = 0;
@@ -1945,6 +2085,7 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
     stats->cache_read = 0;
     stats->cache_read_deleted = 0;
     stats->cache_read_deleted_prepared = 0;
+    stats->cache_eviction_clear_ordinary = 0;
     stats->cache_pages_requested = 0;
     stats->cache_eviction_pages_seen = 0;
     stats->cache_eviction_pages_already_queued = 0;
@@ -1956,12 +2097,16 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
     stats->cache_write = 0;
     stats->cache_write_restore = 0;
     /* not clearing cache_overhead */
+    stats->cache_eviction_blocked_recently_modified = 0;
+    stats->cache_reverse_splits = 0;
+    stats->cache_reverse_splits_skipped_vlcs = 0;
     stats->cache_hs_insert_full_update = 0;
     stats->cache_hs_insert_reverse_modify = 0;
     /* not clearing cache_bytes_internal */
     /* not clearing cache_bytes_leaf */
     /* not clearing cache_bytes_dirty */
     /* not clearing cache_pages_dirty */
+    stats->cache_eviction_blocked_uncommitted_truncate = 0;
     stats->cache_eviction_clean = 0;
     stats->fsync_all_fh_total = 0;
     stats->fsync_all_fh = 0;
@@ -1991,6 +2136,8 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
     stats->memory_allocation = 0;
     stats->memory_free = 0;
     stats->memory_grow = 0;
+    stats->no_session_sweep_5min = 0;
+    stats->no_session_sweep_60min = 0;
     stats->cond_wait = 0;
     stats->rwlock_read = 0;
     stats->rwlock_write = 0;
@@ -2006,6 +2153,7 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
     /* not clearing cursor_cached_count */
     stats->cursor_bound_error = 0;
     stats->cursor_bounds_reset = 0;
+    stats->cursor_bounds_comparisons = 0;
     stats->cursor_bounds_next_unpositioned = 0;
     stats->cursor_bounds_next_early_exit = 0;
     stats->cursor_bounds_prev_unpositioned = 0;
@@ -2033,8 +2181,8 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
     stats->cursor_next = 0;
     stats->cursor_next_error = 0;
     stats->cursor_next_hs_tombstone = 0;
-    stats->cursor_next_skip_ge_100 = 0;
     stats->cursor_next_skip_lt_100 = 0;
+    stats->cursor_next_skip_ge_100 = 0;
     stats->cursor_next_random_error = 0;
     stats->cursor_restart = 0;
     stats->cursor_prev = 0;
@@ -2175,11 +2323,14 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
     stats->perf_hist_opwrite_latency_lt1000 = 0;
     stats->perf_hist_opwrite_latency_lt10000 = 0;
     stats->perf_hist_opwrite_latency_gt10000 = 0;
+    stats->rec_vlcs_emptied_pages = 0;
     stats->rec_time_window_bytes_ts = 0;
     stats->rec_time_window_bytes_txn = 0;
     stats->rec_page_delete_fast = 0;
     stats->rec_overflow_key_leaf = 0;
     /* not clearing rec_maximum_seconds */
+    /* not clearing rec_maximum_image_build_seconds */
+    /* not clearing rec_maximum_hs_wrapup_seconds */
     stats->rec_pages = 0;
     stats->rec_pages_eviction = 0;
     stats->rec_pages_with_prepare = 0;
@@ -2210,6 +2361,7 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
     /* not clearing rec_split_stashed_bytes */
     /* not clearing rec_split_stashed_objects */
     stats->local_objects_inuse = 0;
+    stats->flush_tier_fail = 0;
     stats->flush_tier = 0;
     stats->flush_tier_skipped = 0;
     stats->flush_tier_switched = 0;
@@ -2265,6 +2417,8 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
     stats->txn_prepared_updates_committed = 0;
     stats->txn_prepared_updates_key_repeated = 0;
     stats->txn_prepared_updates_rolledback = 0;
+    stats->txn_read_overflow_remove = 0;
+    stats->txn_rollback_oldest_pinned = 0;
     stats->txn_prepare = 0;
     stats->txn_prepare_commit = 0;
     stats->txn_prepare_active = 0;
@@ -2272,19 +2426,26 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
     stats->txn_query_ts = 0;
     stats->txn_read_race_prepare_update = 0;
     stats->txn_rts = 0;
+    stats->txn_rts_sweep_hs_keys_dryrun = 0;
     stats->txn_rts_hs_stop_older_than_newer_start = 0;
     stats->txn_rts_inconsistent_ckpt = 0;
     stats->txn_rts_keys_removed = 0;
     stats->txn_rts_keys_restored = 0;
+    stats->txn_rts_keys_removed_dryrun = 0;
+    stats->txn_rts_keys_restored_dryrun = 0;
     stats->txn_rts_pages_visited = 0;
     stats->txn_rts_hs_restore_tombstones = 0;
     stats->txn_rts_hs_restore_updates = 0;
     stats->txn_rts_delete_rle_skipped = 0;
     stats->txn_rts_stable_rle_skipped = 0;
     stats->txn_rts_sweep_hs_keys = 0;
+    stats->txn_rts_hs_restore_tombstones_dryrun = 0;
     stats->txn_rts_tree_walk_skip_pages = 0;
     stats->txn_rts_upd_aborted = 0;
+    stats->txn_rts_hs_restore_updates_dryrun = 0;
     stats->txn_rts_hs_removed = 0;
+    stats->txn_rts_upd_aborted_dryrun = 0;
+    stats->txn_rts_hs_removed_dryrun = 0;
     stats->txn_sessions_walked = 0;
     stats->txn_set_ts = 0;
     stats->txn_set_ts_durable = 0;
@@ -2319,7 +2480,6 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
     stats->txn_checkpoint = 0;
     stats->txn_checkpoint_obsolete_applied = 0;
     stats->txn_checkpoint_skipped = 0;
-    stats->txn_fail_cache = 0;
     stats->txn_checkpoint_fsync_post = 0;
     /* not clearing txn_checkpoint_fsync_post_duration */
     /* not clearing txn_pinned_range */
@@ -2360,6 +2520,8 @@ __wt_stat_connection_aggregate(WT_CONNECTION_STATS **from, WT_CONNECTION_STATS *
     to->lsm_work_units_done += WT_STAT_READ(from, lsm_work_units_done);
     to->lsm_work_units_created += WT_STAT_READ(from, lsm_work_units_created);
     to->lsm_work_queue_max += WT_STAT_READ(from, lsm_work_queue_max);
+    to->autocommit_readonly_retry += WT_STAT_READ(from, autocommit_readonly_retry);
+    to->autocommit_update_retry += WT_STAT_READ(from, autocommit_update_retry);
     to->block_cache_blocks_update += WT_STAT_READ(from, block_cache_blocks_update);
     to->block_cache_bytes_update += WT_STAT_READ(from, block_cache_bytes_update);
     to->block_cache_blocks_evicted += WT_STAT_READ(from, block_cache_blocks_evicted);
@@ -2375,6 +2537,8 @@ __wt_stat_connection_aggregate(WT_CONNECTION_STATS **from, WT_CONNECTION_STATS *
     to->block_cache_misses += WT_STAT_READ(from, block_cache_misses);
     to->block_cache_bypass_chkpt += WT_STAT_READ(from, block_cache_bypass_chkpt);
     to->block_cache_blocks_removed += WT_STAT_READ(from, block_cache_blocks_removed);
+    to->block_cache_blocks_removed_blocked +=
+      WT_STAT_READ(from, block_cache_blocks_removed_blocked);
     to->block_cache_blocks += WT_STAT_READ(from, block_cache_blocks);
     to->block_cache_blocks_insert_read += WT_STAT_READ(from, block_cache_blocks_insert_read);
     to->block_cache_blocks_insert_write += WT_STAT_READ(from, block_cache_blocks_insert_write);
@@ -2407,7 +2571,7 @@ __wt_stat_connection_aggregate(WT_CONNECTION_STATS **from, WT_CONNECTION_STATS *
     to->cache_bytes_other += WT_STAT_READ(from, cache_bytes_other);
     to->cache_bytes_read += WT_STAT_READ(from, cache_bytes_read);
     to->cache_bytes_write += WT_STAT_READ(from, cache_bytes_write);
-    to->cache_eviction_checkpoint += WT_STAT_READ(from, cache_eviction_checkpoint);
+    to->cache_eviction_blocked_checkpoint += WT_STAT_READ(from, cache_eviction_blocked_checkpoint);
     to->cache_eviction_blocked_checkpoint_hs +=
       WT_STAT_READ(from, cache_eviction_blocked_checkpoint_hs);
     to->cache_eviction_get_ref += WT_STAT_READ(from, cache_eviction_get_ref);
@@ -2479,7 +2643,7 @@ __wt_stat_connection_aggregate(WT_CONNECTION_STATS **from, WT_CONNECTION_STATS *
     to->cache_eviction_force += WT_STAT_READ(from, cache_eviction_force);
     to->cache_eviction_force_fail += WT_STAT_READ(from, cache_eviction_force_fail);
     to->cache_eviction_force_fail_time += WT_STAT_READ(from, cache_eviction_force_fail_time);
-    to->cache_eviction_hazard += WT_STAT_READ(from, cache_eviction_hazard);
+    to->cache_eviction_blocked_hazard += WT_STAT_READ(from, cache_eviction_blocked_hazard);
     to->cache_hazard_checks += WT_STAT_READ(from, cache_hazard_checks);
     to->cache_hazard_walks += WT_STAT_READ(from, cache_hazard_walks);
     if ((v = WT_STAT_READ(from, cache_hazard_max)) > to->cache_hazard_max)
@@ -2501,10 +2665,16 @@ __wt_stat_connection_aggregate(WT_CONNECTION_STATS **from, WT_CONNECTION_STATS *
     to->cache_hs_order_remove += WT_STAT_READ(from, cache_hs_order_remove);
     to->cache_hs_key_truncate_onpage_removal +=
       WT_STAT_READ(from, cache_hs_key_truncate_onpage_removal);
+    to->cache_hs_btree_truncate_dryrun += WT_STAT_READ(from, cache_hs_btree_truncate_dryrun);
+    to->cache_hs_key_truncate_rts_unstable_dryrun +=
+      WT_STAT_READ(from, cache_hs_key_truncate_rts_unstable_dryrun);
+    to->cache_hs_key_truncate_rts_dryrun += WT_STAT_READ(from, cache_hs_key_truncate_rts_dryrun);
     to->cache_hs_order_reinsert += WT_STAT_READ(from, cache_hs_order_reinsert);
     to->cache_hs_write_squash += WT_STAT_READ(from, cache_hs_write_squash);
     to->cache_inmem_splittable += WT_STAT_READ(from, cache_inmem_splittable);
     to->cache_inmem_split += WT_STAT_READ(from, cache_inmem_split);
+    to->cache_eviction_blocked_internal_page_split +=
+      WT_STAT_READ(from, cache_eviction_blocked_internal_page_split);
     to->cache_eviction_internal += WT_STAT_READ(from, cache_eviction_internal);
     to->cache_eviction_internal_pages_queued +=
       WT_STAT_READ(from, cache_eviction_internal_pages_queued);
@@ -2516,9 +2686,12 @@ __wt_stat_connection_aggregate(WT_CONNECTION_STATS **from, WT_CONNECTION_STATS *
     to->cache_eviction_split_leaf += WT_STAT_READ(from, cache_eviction_split_leaf);
     to->cache_bytes_max += WT_STAT_READ(from, cache_bytes_max);
     to->cache_eviction_maximum_page_size += WT_STAT_READ(from, cache_eviction_maximum_page_size);
+    to->cache_eviction_maximum_seconds += WT_STAT_READ(from, cache_eviction_maximum_seconds);
     to->cache_eviction_dirty += WT_STAT_READ(from, cache_eviction_dirty);
     to->cache_eviction_app_dirty += WT_STAT_READ(from, cache_eviction_app_dirty);
     to->cache_timed_out_ops += WT_STAT_READ(from, cache_timed_out_ops);
+    to->cache_eviction_blocked_overflow_keys +=
+      WT_STAT_READ(from, cache_eviction_blocked_overflow_keys);
     to->cache_read_overflow += WT_STAT_READ(from, cache_read_overflow);
     to->cache_eviction_deepen += WT_STAT_READ(from, cache_eviction_deepen);
     to->cache_write_hs += WT_STAT_READ(from, cache_write_hs);
@@ -2538,6 +2711,7 @@ __wt_stat_connection_aggregate(WT_CONNECTION_STATS **from, WT_CONNECTION_STATS *
     to->cache_read += WT_STAT_READ(from, cache_read);
     to->cache_read_deleted += WT_STAT_READ(from, cache_read_deleted);
     to->cache_read_deleted_prepared += WT_STAT_READ(from, cache_read_deleted_prepared);
+    to->cache_eviction_clear_ordinary += WT_STAT_READ(from, cache_eviction_clear_ordinary);
     to->cache_pages_requested += WT_STAT_READ(from, cache_pages_requested);
     to->cache_eviction_pages_seen += WT_STAT_READ(from, cache_eviction_pages_seen);
     to->cache_eviction_pages_already_queued +=
@@ -2553,12 +2727,18 @@ __wt_stat_connection_aggregate(WT_CONNECTION_STATS **from, WT_CONNECTION_STATS *
     to->cache_write += WT_STAT_READ(from, cache_write);
     to->cache_write_restore += WT_STAT_READ(from, cache_write_restore);
     to->cache_overhead += WT_STAT_READ(from, cache_overhead);
+    to->cache_eviction_blocked_recently_modified +=
+      WT_STAT_READ(from, cache_eviction_blocked_recently_modified);
+    to->cache_reverse_splits += WT_STAT_READ(from, cache_reverse_splits);
+    to->cache_reverse_splits_skipped_vlcs += WT_STAT_READ(from, cache_reverse_splits_skipped_vlcs);
     to->cache_hs_insert_full_update += WT_STAT_READ(from, cache_hs_insert_full_update);
     to->cache_hs_insert_reverse_modify += WT_STAT_READ(from, cache_hs_insert_reverse_modify);
     to->cache_bytes_internal += WT_STAT_READ(from, cache_bytes_internal);
     to->cache_bytes_leaf += WT_STAT_READ(from, cache_bytes_leaf);
     to->cache_bytes_dirty += WT_STAT_READ(from, cache_bytes_dirty);
     to->cache_pages_dirty += WT_STAT_READ(from, cache_pages_dirty);
+    to->cache_eviction_blocked_uncommitted_truncate +=
+      WT_STAT_READ(from, cache_eviction_blocked_uncommitted_truncate);
     to->cache_eviction_clean += WT_STAT_READ(from, cache_eviction_clean);
     to->fsync_all_fh_total += WT_STAT_READ(from, fsync_all_fh_total);
     to->fsync_all_fh += WT_STAT_READ(from, fsync_all_fh);
@@ -2588,6 +2768,8 @@ __wt_stat_connection_aggregate(WT_CONNECTION_STATS **from, WT_CONNECTION_STATS *
     to->memory_allocation += WT_STAT_READ(from, memory_allocation);
     to->memory_free += WT_STAT_READ(from, memory_free);
     to->memory_grow += WT_STAT_READ(from, memory_grow);
+    to->no_session_sweep_5min += WT_STAT_READ(from, no_session_sweep_5min);
+    to->no_session_sweep_60min += WT_STAT_READ(from, no_session_sweep_60min);
     to->cond_wait += WT_STAT_READ(from, cond_wait);
     to->rwlock_read += WT_STAT_READ(from, rwlock_read);
     to->rwlock_write += WT_STAT_READ(from, rwlock_write);
@@ -2604,6 +2786,7 @@ __wt_stat_connection_aggregate(WT_CONNECTION_STATS **from, WT_CONNECTION_STATS *
     to->cursor_cached_count += WT_STAT_READ(from, cursor_cached_count);
     to->cursor_bound_error += WT_STAT_READ(from, cursor_bound_error);
     to->cursor_bounds_reset += WT_STAT_READ(from, cursor_bounds_reset);
+    to->cursor_bounds_comparisons += WT_STAT_READ(from, cursor_bounds_comparisons);
     to->cursor_bounds_next_unpositioned += WT_STAT_READ(from, cursor_bounds_next_unpositioned);
     to->cursor_bounds_next_early_exit += WT_STAT_READ(from, cursor_bounds_next_early_exit);
     to->cursor_bounds_prev_unpositioned += WT_STAT_READ(from, cursor_bounds_prev_unpositioned);
@@ -2632,8 +2815,8 @@ __wt_stat_connection_aggregate(WT_CONNECTION_STATS **from, WT_CONNECTION_STATS *
     to->cursor_next += WT_STAT_READ(from, cursor_next);
     to->cursor_next_error += WT_STAT_READ(from, cursor_next_error);
     to->cursor_next_hs_tombstone += WT_STAT_READ(from, cursor_next_hs_tombstone);
-    to->cursor_next_skip_ge_100 += WT_STAT_READ(from, cursor_next_skip_ge_100);
     to->cursor_next_skip_lt_100 += WT_STAT_READ(from, cursor_next_skip_lt_100);
+    to->cursor_next_skip_ge_100 += WT_STAT_READ(from, cursor_next_skip_ge_100);
     to->cursor_next_random_error += WT_STAT_READ(from, cursor_next_random_error);
     to->cursor_restart += WT_STAT_READ(from, cursor_restart);
     to->cursor_prev += WT_STAT_READ(from, cursor_prev);
@@ -2778,11 +2961,14 @@ __wt_stat_connection_aggregate(WT_CONNECTION_STATS **from, WT_CONNECTION_STATS *
     to->perf_hist_opwrite_latency_lt1000 += WT_STAT_READ(from, perf_hist_opwrite_latency_lt1000);
     to->perf_hist_opwrite_latency_lt10000 += WT_STAT_READ(from, perf_hist_opwrite_latency_lt10000);
     to->perf_hist_opwrite_latency_gt10000 += WT_STAT_READ(from, perf_hist_opwrite_latency_gt10000);
+    to->rec_vlcs_emptied_pages += WT_STAT_READ(from, rec_vlcs_emptied_pages);
     to->rec_time_window_bytes_ts += WT_STAT_READ(from, rec_time_window_bytes_ts);
     to->rec_time_window_bytes_txn += WT_STAT_READ(from, rec_time_window_bytes_txn);
     to->rec_page_delete_fast += WT_STAT_READ(from, rec_page_delete_fast);
     to->rec_overflow_key_leaf += WT_STAT_READ(from, rec_overflow_key_leaf);
     to->rec_maximum_seconds += WT_STAT_READ(from, rec_maximum_seconds);
+    to->rec_maximum_image_build_seconds += WT_STAT_READ(from, rec_maximum_image_build_seconds);
+    to->rec_maximum_hs_wrapup_seconds += WT_STAT_READ(from, rec_maximum_hs_wrapup_seconds);
     to->rec_pages += WT_STAT_READ(from, rec_pages);
     to->rec_pages_eviction += WT_STAT_READ(from, rec_pages_eviction);
     to->rec_pages_with_prepare += WT_STAT_READ(from, rec_pages_with_prepare);
@@ -2817,6 +3003,7 @@ __wt_stat_connection_aggregate(WT_CONNECTION_STATS **from, WT_CONNECTION_STATS *
     to->rec_split_stashed_bytes += WT_STAT_READ(from, rec_split_stashed_bytes);
     to->rec_split_stashed_objects += WT_STAT_READ(from, rec_split_stashed_objects);
     to->local_objects_inuse += WT_STAT_READ(from, local_objects_inuse);
+    to->flush_tier_fail += WT_STAT_READ(from, flush_tier_fail);
     to->flush_tier += WT_STAT_READ(from, flush_tier);
     to->flush_tier_skipped += WT_STAT_READ(from, flush_tier_skipped);
     to->flush_tier_switched += WT_STAT_READ(from, flush_tier_switched);
@@ -2875,6 +3062,8 @@ __wt_stat_connection_aggregate(WT_CONNECTION_STATS **from, WT_CONNECTION_STATS *
     to->txn_prepared_updates_committed += WT_STAT_READ(from, txn_prepared_updates_committed);
     to->txn_prepared_updates_key_repeated += WT_STAT_READ(from, txn_prepared_updates_key_repeated);
     to->txn_prepared_updates_rolledback += WT_STAT_READ(from, txn_prepared_updates_rolledback);
+    to->txn_read_overflow_remove += WT_STAT_READ(from, txn_read_overflow_remove);
+    to->txn_rollback_oldest_pinned += WT_STAT_READ(from, txn_rollback_oldest_pinned);
     to->txn_prepare += WT_STAT_READ(from, txn_prepare);
     to->txn_prepare_commit += WT_STAT_READ(from, txn_prepare_commit);
     to->txn_prepare_active += WT_STAT_READ(from, txn_prepare_active);
@@ -2882,20 +3071,28 @@ __wt_stat_connection_aggregate(WT_CONNECTION_STATS **from, WT_CONNECTION_STATS *
     to->txn_query_ts += WT_STAT_READ(from, txn_query_ts);
     to->txn_read_race_prepare_update += WT_STAT_READ(from, txn_read_race_prepare_update);
     to->txn_rts += WT_STAT_READ(from, txn_rts);
+    to->txn_rts_sweep_hs_keys_dryrun += WT_STAT_READ(from, txn_rts_sweep_hs_keys_dryrun);
     to->txn_rts_hs_stop_older_than_newer_start +=
       WT_STAT_READ(from, txn_rts_hs_stop_older_than_newer_start);
     to->txn_rts_inconsistent_ckpt += WT_STAT_READ(from, txn_rts_inconsistent_ckpt);
     to->txn_rts_keys_removed += WT_STAT_READ(from, txn_rts_keys_removed);
     to->txn_rts_keys_restored += WT_STAT_READ(from, txn_rts_keys_restored);
+    to->txn_rts_keys_removed_dryrun += WT_STAT_READ(from, txn_rts_keys_removed_dryrun);
+    to->txn_rts_keys_restored_dryrun += WT_STAT_READ(from, txn_rts_keys_restored_dryrun);
     to->txn_rts_pages_visited += WT_STAT_READ(from, txn_rts_pages_visited);
     to->txn_rts_hs_restore_tombstones += WT_STAT_READ(from, txn_rts_hs_restore_tombstones);
     to->txn_rts_hs_restore_updates += WT_STAT_READ(from, txn_rts_hs_restore_updates);
     to->txn_rts_delete_rle_skipped += WT_STAT_READ(from, txn_rts_delete_rle_skipped);
     to->txn_rts_stable_rle_skipped += WT_STAT_READ(from, txn_rts_stable_rle_skipped);
     to->txn_rts_sweep_hs_keys += WT_STAT_READ(from, txn_rts_sweep_hs_keys);
+    to->txn_rts_hs_restore_tombstones_dryrun +=
+      WT_STAT_READ(from, txn_rts_hs_restore_tombstones_dryrun);
     to->txn_rts_tree_walk_skip_pages += WT_STAT_READ(from, txn_rts_tree_walk_skip_pages);
     to->txn_rts_upd_aborted += WT_STAT_READ(from, txn_rts_upd_aborted);
+    to->txn_rts_hs_restore_updates_dryrun += WT_STAT_READ(from, txn_rts_hs_restore_updates_dryrun);
     to->txn_rts_hs_removed += WT_STAT_READ(from, txn_rts_hs_removed);
+    to->txn_rts_upd_aborted_dryrun += WT_STAT_READ(from, txn_rts_upd_aborted_dryrun);
+    to->txn_rts_hs_removed_dryrun += WT_STAT_READ(from, txn_rts_hs_removed_dryrun);
     to->txn_sessions_walked += WT_STAT_READ(from, txn_sessions_walked);
     to->txn_set_ts += WT_STAT_READ(from, txn_set_ts);
     to->txn_set_ts_durable += WT_STAT_READ(from, txn_set_ts_durable);
@@ -2932,7 +3129,6 @@ __wt_stat_connection_aggregate(WT_CONNECTION_STATS **from, WT_CONNECTION_STATS *
     to->txn_checkpoint += WT_STAT_READ(from, txn_checkpoint);
     to->txn_checkpoint_obsolete_applied += WT_STAT_READ(from, txn_checkpoint_obsolete_applied);
     to->txn_checkpoint_skipped += WT_STAT_READ(from, txn_checkpoint_skipped);
-    to->txn_fail_cache += WT_STAT_READ(from, txn_fail_cache);
     to->txn_checkpoint_fsync_post += WT_STAT_READ(from, txn_checkpoint_fsync_post);
     to->txn_checkpoint_fsync_post_duration +=
       WT_STAT_READ(from, txn_checkpoint_fsync_post_duration);
@@ -3005,6 +3201,7 @@ static const char *const __stats_session_desc[] = {
   "session: bytes read into cache",
   "session: bytes written from cache",
   "session: dhandle lock wait time (usecs)",
+  "session: dirty bytes in this txn",
   "session: page read from disk to cache time (usecs)",
   "session: page write from cache to disk time (usecs)",
   "session: schema lock wait time (usecs)",
@@ -3031,6 +3228,7 @@ __wt_stat_session_clear_single(WT_SESSION_STATS *stats)
     stats->bytes_read = 0;
     stats->bytes_write = 0;
     stats->lock_dhandle_wait = 0;
+    stats->txn_bytes_dirty = 0;
     stats->read_time = 0;
     stats->write_time = 0;
     stats->lock_schema_wait = 0;

@@ -53,7 +53,6 @@ MONGO_FAIL_POINT_DEFINE(simulateBsonColumnCompressionDataLoss);
 CompressionResult compressBucket(const BSONObj& bucketDoc,
                                  StringData timeFieldName,
                                  const NamespaceString& nss,
-                                 bool eligibleForReopening,
                                  bool validateDecompression) try {
     CompressionResult result;
 
@@ -180,34 +179,21 @@ CompressionResult compressBucket(const BSONObj& bucketDoc,
     {
         BSONObjBuilder control(builder.subobjStart(kBucketControlFieldName));
 
-        const bool shouldSetBucketClosed = !eligibleForReopening &&
-            feature_flags::gTimeseriesScalabilityImprovements.isEnabled(
-                serverGlobalParams.featureCompatibility);
-
-        // Set the version to indicate that the bucket was compressed and the closed flag if the
-        // bucket shouldn't be reopened. Leave other control fields unchanged.
-        bool closedSet = false;
+        // Set the version to indicate that the bucket was compressed. Leave other control fields
+        // unchanged.
         bool versionSet = false;
         for (const auto& controlField : controlElement.Obj()) {
             if (controlField.fieldNameStringData() == kBucketControlVersionFieldName) {
                 control.append(kBucketControlVersionFieldName, kTimeseriesControlCompressedVersion);
                 versionSet = true;
-            } else if (controlField.fieldNameStringData() == kBucketControlClosedFieldName &&
-                       shouldSetBucketClosed) {
-                control.append(kBucketControlClosedFieldName, true);
-                closedSet = true;
             } else {
                 control.append(controlField);
             }
         }
 
-        // Set version and closed if it was missing from uncompressed bucket
+        // Set version if it was missing from uncompressed bucket
         if (!versionSet) {
             control.append(kBucketControlVersionFieldName, kTimeseriesControlCompressedVersion);
-        }
-
-        if (!closedSet && shouldSetBucketClosed) {
-            control.append(kBucketControlClosedFieldName, true);
         }
 
         // Set count
@@ -281,11 +267,7 @@ CompressionResult compressBucket(const BSONObj& bucketDoc,
 
         // Add compressed time field first
         {
-            BSONColumnBuilder timeColumn(
-                timeFieldName,
-                std::move(columnBuffer),
-                feature_flags::gTimeseriesBucketCompressionWithArrays.isEnabled(
-                    serverGlobalParams.featureCompatibility));
+            BSONColumnBuilder timeColumn(std::move(columnBuffer));
             for (const auto& measurement : measurements) {
                 timeColumn.append(measurement.timeField);
             }
@@ -318,11 +300,7 @@ CompressionResult compressBucket(const BSONObj& bucketDoc,
 
         // Then add compressed data fields.
         for (size_t i = 0; i < columns.size(); ++i) {
-            BSONColumnBuilder column(
-                columns[i].first,
-                std::move(columnBuffer),
-                feature_flags::gTimeseriesBucketCompressionWithArrays.isEnabled(
-                    serverGlobalParams.featureCompatibility));
+            BSONColumnBuilder column(std::move(columnBuffer));
             for (const auto& measurement : measurements) {
                 if (auto elem = measurement.dataFields[i]) {
                     column.append(elem);
@@ -331,13 +309,13 @@ CompressionResult compressBucket(const BSONObj& bucketDoc,
                 }
             }
             BSONBinData dataBinary = column.finalize();
-            if (!validate(dataBinary, column.fieldName(), [i](const auto& measurement) {
+            if (!validate(dataBinary, columns[i].first, [i](const auto& measurement) {
                     return measurement.dataFields[i];
                 })) {
                 result.decompressionFailed = true;
                 return result;
             }
-            dataBuilder.append(column.fieldName(), dataBinary);
+            dataBuilder.append(columns[i].first, dataBinary);
             // We only record when the interleaved mode has to re-start. i.e. when more than one
             // interleaved start control byte was written in the binary
             if (int interleavedStarts = column.numInterleavedStartWritten();
@@ -357,6 +335,62 @@ CompressionResult compressBucket(const BSONObj& bucketDoc,
                 "Exception when compressing timeseries bucket, leaving it uncompressed",
                 "error"_attr = exceptionToStatus());
     return {};
+}
+
+boost::optional<BSONObj> decompressBucket(const BSONObj& bucketDoc) {
+    BSONObjBuilder builder;
+
+    for (auto&& topLevel : bucketDoc) {
+        if (topLevel.fieldNameStringData() == kBucketControlFieldName) {
+            BSONObjBuilder controlBuilder{builder.subobjStart(kBucketControlFieldName)};
+
+            for (auto&& e : topLevel.Obj()) {
+                if (e.fieldNameStringData() == kBucketControlVersionFieldName) {
+                    // Check that we have a compressed bucket, and rewrite the version to signal
+                    // it's uncompressed now.
+                    if (e.type() != BSONType::NumberInt ||
+                        e.numberInt() != kTimeseriesControlCompressedVersion) {
+                        // This bucket isn't compressed.
+                        return boost::none;
+                    }
+                    builder.append(kBucketControlVersionFieldName,
+                                   kTimeseriesControlUncompressedVersion);
+                } else if (e.fieldNameStringData() == kBucketControlCountFieldName) {
+                    // Omit the count field when decompressing.
+                    continue;
+                } else {
+                    // Just copy all the other fields.
+                    builder.append(e);
+                }
+            }
+        } else if (topLevel.fieldNameStringData() == kBucketDataFieldName) {
+            BSONObjBuilder dataBuilder{builder.subobjStart(kBucketDataFieldName)};
+
+            // Iterate over the compressed data columns and decompress each one.
+            for (auto&& e : topLevel.Obj()) {
+                if (e.type() != BSONType::BinData) {
+                    // This bucket isn't actually compressed.
+                    return boost::none;
+                }
+
+                BSONObjBuilder columnBuilder{dataBuilder.subobjStart(e.fieldNameStringData())};
+
+                BSONColumn column{e};
+                DecimalCounter<uint32_t> count{0};
+                for (auto&& measurement : column) {
+                    if (!measurement.eoo()) {
+                        builder.appendAs(measurement, count);
+                    }
+                    count++;
+                }
+            }
+        } else {
+            // If it's not control or data, we can just copy it and continue.
+            builder.append(topLevel);
+        }
+    }
+
+    return builder.obj();
 }
 
 bool isCompressedBucket(const BSONObj& bucketDoc) {

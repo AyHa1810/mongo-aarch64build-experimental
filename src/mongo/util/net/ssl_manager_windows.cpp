@@ -45,6 +45,7 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/config.h"
+#include "mongo/db/connection_health_metrics_parameter_gen.h"
 #include "mongo/db/server_options.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/atomic_word.h"
@@ -2058,10 +2059,21 @@ Future<SSLPeerInfo> SSLManagerWindows::parseAndValidatePeerCertificate(
         return Future<SSLPeerInfo>::makeReady(SSLPeerInfo(sni));
     }
 
-    LOGV2_DEBUG(23270,
-                2,
-                "Accepted TLS connection from peer: {peerSubjectName}",
-                "peerSubjectName"_attr = peerSubjectName);
+    SecPkgContext_CipherInfo cipherInfo;
+    SECURITY_STATUS ssCipher = QueryContextAttributes(ssl, SECPKG_ATTR_CIPHER_INFO, &cipherInfo);
+    if (ssCipher != SEC_E_OK) {
+        return Status(ErrorCodes::SSLHandshakeFailed,
+                      str::stream()
+                          << "QueryContextAttributes for connection info failed with" << ssCipher);
+    }
+    const auto cipher = std::wstring(cipherInfo.szCipherSuite);
+
+    if (!serverGlobalParams.quiet.load() && gEnableDetailedConnectionHealthMetricLogLines) {
+        LOGV2_INFO(6723802,
+                   "Accepted TLS connection from peer",
+                   "peerSubjectName"_attr = peerSubjectName,
+                   "cipher"_attr = toUtf8String(cipher));
+    }
 
     // If this is a server and client and server certificate are the same, log a warning.
     if (remoteHost.empty() && _sslConfiguration.serverSubjectName() == peerSubjectName) {

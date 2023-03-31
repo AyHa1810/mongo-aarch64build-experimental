@@ -8,38 +8,36 @@
  *   requires_majority_read_concern,
  *   requires_persistence,
  *   serverless,
- *   requires_fcv_52,
- *   featureFlagShardSplit
+ *   requires_fcv_63
  * ]
  */
-(function() {
-'use strict';
+
+import {
+    createCollectionAndInsertDocsForConcurrentWritesTest,
+    makeTestOptionsForConcurrentWritesTest,
+    runCommandForConcurrentWritesTest,
+    TenantMigrationConcurrentWriteUtil
+} from "jstests/replsets/tenant_migration_concurrent_writes_on_donor_util.js";
+import {ShardSplitTest} from "jstests/serverless/libs/shard_split_test.js";
 
 load("jstests/libs/fail_point_util.js");
-load("jstests/libs/parallelTester.js");
-load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/tenant_migration_concurrent_writes_on_donor_util.js");
-load("jstests/serverless/libs/basic_serverless_test.js");
 
 TestData.skipCheckDBHashes = true;
-const recipientTagName = "recipientNode";
-const recipientSetName = "recipient";
-const tenantMigrationTest = new BasicServerlessTest({
-    recipientTagName,
-    recipientSetName,
+const shardSplitTest = new ShardSplitTest({
     quickGarbageCollection: true,
     allowStaleReadsOnDonor: true,
-    initiateWithShortElectionTimeout: true
+    initiateWithShortElectionTimeout: true,
+    // Increase timeout because blocking in the critical section contributes to operation latency.
+    nodeOptions: {setParameter: {shardSplitTimeoutMS: 100000}}
 });
 
-const donorPrimary = tenantMigrationTest.getDonorPrimary();
+const donorPrimary = shardSplitTest.getDonorPrimary();
 
 const kCollName = "testColl";
 const kTenantDefinedDbName = "0";
 
 const testCases = TenantMigrationConcurrentWriteUtil.testCases;
-const kTenantID = "tenantId";
+const kTenantID = ObjectId();
 
 const kMaxTimeMS = 1 * 1000;
 
@@ -72,7 +70,7 @@ const testOptsMap = {};
  */
 function setupTestsBeforeMigration() {
     for (const [commandName, testCase] of Object.entries(testCases)) {
-        let baseDbName = kTenantID + "_" + commandName + "-inCommitted0";
+        let baseDbName = kTenantID.str + "_" + commandName;
 
         if (testCase.skip) {
             print("Skipping " + commandName + ": " + testCase.skip);
@@ -108,7 +106,7 @@ function setupTestsBeforeMigration() {
  */
 function runTestsWhileBlocking() {
     for (const [commandName, testCase] of Object.entries(testCases)) {
-        let baseDbName = kTenantID + "_" + commandName + "-inCommitted0";
+        let baseDbName = kTenantID.str + "_" + commandName;
         if (testCase.skip) {
             continue;
         }
@@ -136,7 +134,7 @@ function runTestsWhileBlocking() {
  */
 function runTestsAfterMigrationCommitted() {
     for (const [commandName, testCase] of Object.entries(testCases)) {
-        let baseDbName = kTenantID + "_" + commandName + "-inCommitted0";
+        let baseDbName = kTenantID.str + "_" + commandName;
         if (testCase.skip) {
             continue;
         }
@@ -159,9 +157,9 @@ function runTestsAfterMigrationCommitted() {
     }
 }
 
-tenantMigrationTest.addRecipientNodes();
+shardSplitTest.addRecipientNodes();
 const tenantIds = [kTenantID];
-const operation = tenantMigrationTest.createSplitOperation(tenantIds);
+const operation = shardSplitTest.createSplitOperation(tenantIds);
 
 setupTestsBeforeMigration();
 
@@ -180,15 +178,12 @@ runTestsWhileBlocking();
 blockFp.off();
 splitThread.join();
 
-const data = splitThread.returnData();
-assert.commandWorked(data);
-assert.eq(data.state, "committed");
+assert.commandWorked(splitThread.returnData());
 
 // run test after blocking is over and the migration committed.
 runTestsAfterMigrationCommitted();
 
-BasicServerlessTest.checkShardSplitAccessBlocker(
+ShardSplitTest.checkShardSplitAccessBlocker(
     donorPrimary, kTenantID, {numBlockedWrites: countBlockedWrites});
 
-tenantMigrationTest.stop();
-})();
+shardSplitTest.stop();

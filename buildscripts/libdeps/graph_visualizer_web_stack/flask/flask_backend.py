@@ -30,11 +30,15 @@ The backend interacts with the graph_analyzer to perform queries on various libd
 from pathlib import Path
 from collections import namedtuple, OrderedDict
 
+import time
+import threading
+import gc
+
 import flask
 import networkx
-
+import cxxfilt
+from pympler.asizeof import asizeof
 from flask_cors import CORS
-from flask_session import Session
 from lxml import etree
 from flask import request
 
@@ -45,8 +49,7 @@ import libdeps.analyzer
 class BackendServer:
     """Create small class for storing variables and state of the backend."""
 
-    # pylint: disable=too-many-instance-attributes
-    def __init__(self, graphml_dir, frontend_url):
+    def __init__(self, graphml_dir, frontend_url, memory_limit):
         """Create and setup the state variables."""
         self.app = flask.Flask(__name__)
         self.app.config['CORS_HEADERS'] = 'Content-Type'
@@ -65,8 +68,13 @@ class BackendServer:
                               self.return_paths_between, methods=['POST'])
 
         self.loaded_graphs = {}
+        self.total_graph_size = 0
         self.graphml_dir = Path(graphml_dir)
         self.frontend_url = frontend_url
+        self.loading_locks = {}
+        self.memory_limit_bytes = memory_limit * (10**9) * 0.8
+        self.unloading = False
+        self.unloading_lock = threading.Lock()
 
         self.graph_file_tuple = namedtuple('GraphFile', ['version', 'git_hash', 'graph_file'])
         self.graph_files = self.get_graphml_files()
@@ -157,16 +165,12 @@ class BackendServer:
                             'name': key, 'value': value
                         } for key, value in dependents_graph.nodes(data=True)[str(node)].items()],
                         'dependers': [{
-                            'node':
-                                depender, 'symbols':
-                                    dependents_graph[str(node)][depender].get('symbols',
-                                                                              '').split(' ')
+                            'node': depender, 'symbols': dependents_graph[str(node)]
+                                                         [depender].get('symbols')
                         } for depender in dependents_graph[str(node)]],
                         'dependencies': [{
-                            'node':
-                                dependency, 'symbols':
-                                    dependents_graph[dependency][str(node)].get('symbols',
-                                                                                '').split(' ')
+                            'node': dependency, 'symbols': dependents_graph[dependency]
+                                                           [str(node)].get('symbols')
                         } for dependency in dependency_graph[str(node)]],
                     })
 
@@ -189,16 +193,17 @@ class BackendServer:
 
                 nodes = {}
                 links = {}
+                links_trans = {}
 
                 def add_node_to_graph_data(node):
                     nodes[str(node)] = {
-                        'id': str(node), 'name': Path(node).name, 'type': dependents_graph.nodes()
-                                                                          [str(node)]['bin_type']
+                        'id': str(node), 'name': Path(node).name,
+                        'type': dependents_graph.nodes()[str(node)].get('bin_type', '')
                     }
 
-                def add_link_to_graph_data(source, target):
+                def add_link_to_graph_data(source, target, data):
                     links[str(source) + str(target)] = {
-                        'source': str(source), 'target': str(target)
+                        'source': str(source), 'target': str(target), 'data': data
                     }
 
                 for node in selected_nodes:
@@ -207,7 +212,15 @@ class BackendServer:
                     for libdep in dependency_graph[str(node)]:
                         if dependents_graph[libdep][str(node)].get('direct'):
                             add_node_to_graph_data(libdep)
-                            add_link_to_graph_data(node, libdep)
+                            add_link_to_graph_data(node, libdep,
+                                                   dependents_graph[libdep][str(node)])
+
+                if "transitive_edges" in req_body.keys() and req_body["transitive_edges"] is True:
+                    for node in selected_nodes:
+                        for libdep in dependency_graph[str(node)]:
+                            if str(libdep) in nodes.keys():
+                                add_link_to_graph_data(node, libdep,
+                                                       dependents_graph[libdep][str(node)])
 
                 if "extra_nodes" in req_body.keys():
                     extra_nodes = req_body["extra_nodes"]
@@ -216,12 +229,14 @@ class BackendServer:
 
                         for libdep in dependency_graph.get_direct_nonprivate_graph()[str(node)]:
                             add_node_to_graph_data(libdep)
-                            add_link_to_graph_data(node, libdep)
+                            add_link_to_graph_data(node, libdep,
+                                                   dependents_graph[libdep][str(node)])
 
                 node_data = {
                     'graphData': {
                         'nodes': [data for node, data in nodes.items()],
                         'links': [data for link, data in links.items()],
+                        'links_trans': [data for link, data in links_trans.items()],
                     }
                 }
                 return node_data, 200
@@ -297,16 +312,91 @@ class BackendServer:
                 'error': 'Git commit hash (' + git_hash + ') does not have a matching graph file.'
             }, 400
 
+    def perform_unloading(self, git_hash):
+        """Perform the unloading of a graph in a separate thread."""
+        if self.total_graph_size > self.memory_limit_bytes:
+            while self.total_graph_size > self.memory_limit_bytes:
+                self.app.logger.info(
+                    f"Current graph memory: {self.total_graph_size / (10**9)} GB, Unloading to get to {self.memory_limit_bytes / (10**9)} GB"
+                )
+
+                self.unloading_lock.acquire()
+
+                lru_hash = min(
+                    [graph_hash for graph_hash in self.loaded_graphs if graph_hash != git_hash],
+                    key=lambda x: self.loaded_graphs[x]['atime'])
+                if lru_hash:
+                    self.app.logger.info(
+                        f"Unloading {[lru_hash]}, last used {round(time.time() - self.loaded_graphs[lru_hash]['atime'] , 1)}s ago"
+                    )
+                    self.total_graph_size -= self.loaded_graphs[lru_hash]['size']
+                    del self.loaded_graphs[lru_hash]
+                    del self.loading_locks[lru_hash]
+                self.unloading_lock.release()
+            gc.collect()
+            self.app.logger.info(f"Memory limit satisfied: {self.total_graph_size / (10**9)} GB")
+        self.unloading = False
+
+    def unload_graphs(self, git_hash):
+        """Unload least recently used graph when hitting application memory threshold."""
+
+        if not self.unloading:
+            self.unloading = True
+
+            thread = threading.Thread(target=self.perform_unloading, args=(git_hash, ))
+            thread.daemon = True
+            thread.start()
+
     def load_graph(self, git_hash):
         """Load the graph into application memory."""
 
         with self.app.test_request_context():
+            self.unload_graphs(git_hash)
+
+            loaded_graph = None
+
+            self.unloading_lock.acquire()
             if git_hash in self.loaded_graphs:
-                return self.loaded_graphs[git_hash]
-            else:
+                self.loaded_graphs[git_hash]['atime'] = time.time()
+                loaded_graph = self.loaded_graphs[git_hash]['graph']
+            if git_hash not in self.loading_locks:
+                self.loading_locks[git_hash] = threading.Lock()
+            self.unloading_lock.release()
+
+            self.loading_locks[git_hash].acquire()
+            if git_hash not in self.loaded_graphs:
                 if git_hash in self.graph_files:
                     file_path = self.graph_files[git_hash].graph_file
-                    graph = libdeps.graph.LibdepsGraph(networkx.read_graphml(file_path))
-                    self.loaded_graphs[git_hash] = graph
-                    return graph
-                return None
+                    nx_graph = networkx.read_graphml(file_path)
+                    if int(self.get_graph_build_data(file_path).version) > 3:
+                        for source, target in nx_graph.edges:
+                            try:
+                                nx_graph[source][target]['symbols'] = list(
+                                    nx_graph[source][target].get('symbols').split('\n'))
+                            except AttributeError:
+                                nx_graph[source][target]['symbols'] = []
+                    else:
+                        for source, target in nx_graph.edges:
+                            try:
+                                nx_graph[source][target]['symbols'] = list(
+                                    map(cxxfilt.demangle,
+                                        nx_graph[source][target].get('symbols').split()))
+                            except AttributeError:
+                                try:
+                                    nx_graph[source][target]['symbols'] = list(
+                                        nx_graph[source][target].get('symbols').split())
+                                except AttributeError:
+                                    nx_graph[source][target]['symbols'] = []
+                    loaded_graph = libdeps.graph.LibdepsGraph(nx_graph)
+
+                    self.loaded_graphs[git_hash] = {
+                        'graph': loaded_graph,
+                        'size': asizeof(loaded_graph),
+                        'atime': time.time(),
+                    }
+                    self.total_graph_size += self.loaded_graphs[git_hash]['size']
+            else:
+                loaded_graph = self.loaded_graphs[git_hash]['graph']
+            self.loading_locks[git_hash].release()
+
+            return loaded_graph

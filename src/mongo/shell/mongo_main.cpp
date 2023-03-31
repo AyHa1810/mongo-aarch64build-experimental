@@ -37,11 +37,11 @@
 #include <boost/log/attributes/value_extraction.hpp>
 #include <boost/log/core.hpp>
 #include <boost/log/sinks.hpp>
+#include <csignal>
+#include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <iostream>
-#include <signal.h>
-#include <stdio.h>
-#include <string.h>
 
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
@@ -49,6 +49,7 @@
 #include "mongo/client/authenticate.h"
 #include "mongo/client/mongo_uri.h"
 #include "mongo/client/sasl_aws_client_options.h"
+#include "mongo/client/sasl_oidc_client_params.h"
 #include "mongo/config.h"
 #include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/client.h"
@@ -66,11 +67,12 @@
 #include "mongo/platform/atomic_word.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/shell/linenoise.h"
+#include "mongo/shell/program_runner.h"
 #include "mongo/shell/shell_options.h"
 #include "mongo/shell/shell_utils.h"
 #include "mongo/shell/shell_utils_launcher.h"
 #include "mongo/stdx/utility.h"
-#include "mongo/transport/transport_layer_asio.h"
+#include "mongo/transport/asio/asio_transport_layer.h"
 #include "mongo/util/ctype.h"
 #include "mongo/util/errno_util.h"
 #include "mongo/util/exit.h"
@@ -119,14 +121,14 @@ const std::string kDefaultMongoURL = "mongodb://"s + kDefaultMongoHost + ":"s + 
 // level. The server is responsible for rejecting usages of new features if its
 // featureCompatibilityVersion is lower.
 MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersionLatest,
-                                     ("EndStartupOptionSetup"))
+                                     ("EndStartupOptionStorage"))
 // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
 (InitializerContext* context) {
     mongo::serverGlobalParams.mutableFeatureCompatibility.setVersion(
         multiversion::GenericFCV::kLatest);
 }
 
-MONGO_INITIALIZER_WITH_PREREQUISITES(WireSpec, ("EndStartupOptionSetup"))(InitializerContext*) {
+MONGO_INITIALIZER_WITH_PREREQUISITES(WireSpec, ("EndStartupOptionHandling"))(InitializerContext*) {
     WireSpec::instance().initialize(WireSpec::Specification{});
 }
 
@@ -679,9 +681,9 @@ static void edit(const std::string& whatToEdit) {
 
 bool mechanismRequiresPassword(const MongoURI& uri) {
     if (const auto authMechanisms = uri.getOption("authMechanism")) {
-        constexpr std::array<StringData, 2> passwordlessMechanisms{auth::kMechanismGSSAPI,
-                                                                   auth::kMechanismMongoX509};
-        const std::string& authMechanism = authMechanisms.get();
+        constexpr std::array<StringData, 3> passwordlessMechanisms{
+            auth::kMechanismGSSAPI, auth::kMechanismMongoX509, auth::kMechanismMongoOIDC};
+        const std::string& authMechanism = authMechanisms.value();
         for (const auto& mechanism : passwordlessMechanisms) {
             if (mechanism.toString() == authMechanism) {
                 return false;
@@ -724,13 +726,14 @@ int mongo_main(int argc, char* argv[]) {
 #ifdef MONGO_CONFIG_SSL
         OCSPManager::start(serviceContext);
 #endif
+        shell_utils::ProgramRegistry::create(serviceContext);
 
-        transport::TransportLayerASIO::Options opts;
+        transport::AsioTransportLayer::Options opts;
         opts.enableIPv6 = shellGlobalParams.enableIPv6;
-        opts.mode = transport::TransportLayerASIO::Options::kEgress;
+        opts.mode = transport::AsioTransportLayer::Options::kEgress;
 
         serviceContext->setTransportLayer(
-            std::make_unique<transport::TransportLayerASIO>(opts, nullptr));
+            std::make_unique<transport::AsioTransportLayer>(opts, nullptr));
         auto tlPtr = serviceContext->getTransportLayer();
         uassertStatusOK(tlPtr->setup());
         uassertStatusOK(tlPtr->start());
@@ -783,18 +786,23 @@ int mongo_main(int argc, char* argv[]) {
                                                awsIam::saslAwsClientGlobalParams.awsSessionToken);
         }
 #endif
+        if (!oidcClientGlobalParams.oidcAccessToken.empty()) {
+            parsedURI.setOptionIfNecessary("authmechanismproperties"s,
+                                           str::stream() << "OIDC_ACCESS_TOKEN:"
+                                                         << oidcClientGlobalParams.oidcAccessToken);
+        }
 
         if (const auto authMechanisms = parsedURI.getOption("authMechanism")) {
             std::stringstream ss;
             ss << "DB.prototype._defaultAuthenticationMechanism = \""
-               << str::escape(authMechanisms.get()) << "\";" << std::endl;
+               << str::escape(authMechanisms.value()) << "\";" << std::endl;
             mongo::shell_utils::dbConnect += ss.str();
         }
 
         if (const auto gssapiServiveName = parsedURI.getOption("gssapiServiceName")) {
             std::stringstream ss;
             ss << "DB.prototype._defaultGssapiServiceName = \""
-               << str::escape(gssapiServiveName.get()) << "\";" << std::endl;
+               << str::escape(gssapiServiveName.value()) << "\";" << std::endl;
             mongo::shell_utils::dbConnect += ss.str();
         }
 
@@ -844,6 +852,15 @@ int mongo_main(int argc, char* argv[]) {
         mongo::getGlobalScriptEngine()->enableJavaScriptProtection(
             shellGlobalParams.javascriptProtection);
 
+        if (shellGlobalParams.files.size() > 0) {
+            boost::system::error_code ec;
+            auto loadPath =
+                boost::filesystem::canonical(shellGlobalParams.files[0], ec).parent_path().string();
+            if (!ec) {
+                mongo::getGlobalScriptEngine()->setLoadPath(loadPath);
+            }
+        }
+
         ScopeGuard poolGuard([] { ScriptEngine::dropScopeCache(); });
 
         std::unique_ptr<mongo::Scope> scope(mongo::getGlobalScriptEngine()->newScope());
@@ -887,6 +904,19 @@ int mongo_main(int argc, char* argv[]) {
 
             if (!scope->execFile(shellGlobalParams.files[i], false, true)) {
                 std::cout << "failed to load: " << shellGlobalParams.files[i] << std::endl;
+                std::cout << "exiting with code " << static_cast<int>(kInputFileError) << std::endl;
+                return kInputFileError;
+            }
+
+            // If the test began a GoldenTestContext, end it and compare actual/expected results.
+            // NOTE: putting this in ~MongoProgramScope would call it at the end of each load(),
+            // but we only want to call it once the original test file finishes.
+            try {
+                shell_utils::closeGoldenTestContext();
+            } catch (const shell_utils::GoldenTestContextShellFailure& exn) {
+                std::cout << "failed to load: " << shellGlobalParams.files[i] << std::endl;
+                std::cout << exn.toString() << std::endl;
+                exn.diff();
                 std::cout << "exiting with code " << static_cast<int>(kInputFileError) << std::endl;
                 return kInputFileError;
             }
@@ -1121,10 +1151,10 @@ int mongo_main(int argc, char* argv[]) {
                 {
                     std::string cmd = linePtr;
                     std::string::size_type firstSpace;
-                    if ((firstSpace = cmd.find(" ")) != std::string::npos)
+                    if ((firstSpace = cmd.find(' ')) != std::string::npos)
                         cmd = cmd.substr(0, firstSpace);
 
-                    if (cmd.find("\"") == std::string::npos) {
+                    if (cmd.find('\"') == std::string::npos) {
                         try {
                             lastLineSuccessful = scope->exec(
                                 std::string("__iscmd__ = shellHelper[\"") + cmd + "\"];",

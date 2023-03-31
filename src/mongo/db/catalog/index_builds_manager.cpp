@@ -28,6 +28,7 @@
  */
 
 
+#include "mongo/db/catalog/multi_index_block.h"
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/catalog/index_builds_manager.h"
@@ -115,7 +116,11 @@ Status IndexBuildsManager::setUpIndexBuild(OperationContext* opCtx,
     std::vector<BSONObj> indexes;
     try {
         indexes = writeConflictRetry(opCtx, "IndexBuildsManager::setUpIndexBuild", nss.ns(), [&]() {
-            return uassertStatusOK(builder->init(opCtx, collection, specs, onInit, resumeInfo));
+            MultiIndexBlock::InitMode mode = options.forRecovery
+                ? MultiIndexBlock::InitMode::Recovery
+                : MultiIndexBlock::InitMode::SteadyState;
+            return uassertStatusOK(
+                builder->init(opCtx, collection, specs, onInit, mode, resumeInfo));
         });
     } catch (const DBException& ex) {
         return ex.toStatus();
@@ -154,7 +159,9 @@ StatusWith<std::pair<long long, long long>> IndexBuildsManager::startBuildingInd
     {
         stdx::unique_lock<Client> lk(*opCtx->getClient());
         progressMeter.set(
-            CurOp::get(opCtx)->setProgress_inlock(curopMessage, coll->numRecords(opCtx)));
+            lk,
+            CurOp::get(opCtx)->setProgress_inlock(curopMessage, coll->numRecords(opCtx)),
+            opCtx);
     }
 
     auto ns = coll->ns();
@@ -190,9 +197,12 @@ StatusWith<std::pair<long long, long long>> IndexBuildsManager::startBuildingInd
                                   "id"_attr = id,
                                   "error"_attr = redact(validStatus));
                     rs->deleteRecord(opCtx, id);
-                    // Must reduce the progress meter's expected total after deleting an invalid
-                    // document from the collection.
-                    progressMeter->setTotalWhileRunning(coll->numRecords(opCtx));
+                    {
+                        stdx::unique_lock<Client> lk(*opCtx->getClient());
+                        // Must reduce the progress meter's expected total after deleting an invalid
+                        // document from the collection.
+                        progressMeter.get(lk)->setTotalWhileRunning(coll->numRecords(opCtx));
+                    }
                 } else {
                     numRecords++;
                     dataSize += data.size();
@@ -212,7 +222,10 @@ StatusWith<std::pair<long long, long long>> IndexBuildsManager::startBuildingInd
                     if (!insertStatus.isOK()) {
                         return insertStatus;
                     }
-                    progressMeter.hit();
+                    {
+                        stdx::unique_lock<Client> lk(*opCtx->getClient());
+                        progressMeter.get(lk)->hit();
+                    }
                 }
                 record = cursor->next();
             }
@@ -236,13 +249,16 @@ StatusWith<std::pair<long long, long long>> IndexBuildsManager::startBuildingInd
         }
     }
 
-    progressMeter.finished();
+    {
+        stdx::unique_lock<Client> lk(*opCtx->getClient());
+        progressMeter.get(lk)->finished();
+    }
 
     long long recordsRemoved = 0;
     long long bytesRemoved = 0;
 
     const NamespaceString lostAndFoundNss =
-        NamespaceString(NamespaceString::kLocalDb, "lost_and_found." + coll->uuid().toString());
+        NamespaceString::makeLocalCollection("lost_and_found." + coll->uuid().toString());
 
     // Delete duplicate record and insert it into local lost and found.
     Status status = [&] {
@@ -295,9 +311,10 @@ Status IndexBuildsManager::drainBackgroundWrites(
 
 Status IndexBuildsManager::retrySkippedRecords(OperationContext* opCtx,
                                                const UUID& buildUUID,
-                                               const CollectionPtr& collection) {
+                                               const CollectionPtr& collection,
+                                               RetrySkippedRecordMode mode) {
     auto builder = invariant(_getBuilder(buildUUID));
-    return builder->retrySkippedRecords(opCtx, collection);
+    return builder->retrySkippedRecords(opCtx, collection, mode);
 }
 
 Status IndexBuildsManager::checkIndexConstraintViolations(OperationContext* opCtx,
@@ -397,7 +414,7 @@ void IndexBuildsManager::_registerIndexBuild(UUID buildUUID) {
     invariant(_builders.insert(std::make_pair(buildUUID, std::move(mib))).second);
 }
 
-void IndexBuildsManager::unregisterIndexBuild(const UUID& buildUUID) {
+void IndexBuildsManager::tearDownAndUnregisterIndexBuild(const UUID& buildUUID) {
     stdx::unique_lock<Latch> lk(_mutex);
 
     auto builderIt = _builders.find(buildUUID);

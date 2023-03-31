@@ -47,7 +47,10 @@ namespace {
 
 using namespace fmt::literals;
 
-StaticImmortal<synchronized_value<SecureRandom>> uuidGen;
+synchronized_value<SecureRandom>& uuidGen() {
+    static StaticImmortal<synchronized_value<SecureRandom>> uuidGen;
+    return uuidGen.value();
+}
 
 }  // namespace
 
@@ -89,11 +92,9 @@ UUID UUID::parse(const BSONObj& obj) {
 bool UUID::isUUIDString(StringData s) {
     static constexpr auto pat = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"_sd;
     return s.size() == pat.size() &&
-        std::mismatch(s.begin(),
-                      s.end(),
-                      pat.begin(),
-                      [](char a, char b) { return b == 'x' ? ctype::isXdigit(a) : a == b; })
-            .first == s.end();
+        std::mismatch(s.begin(), s.end(), pat.begin(), [](char a, char b) {
+            return b == 'x' ? ctype::isXdigit(a) : a == b;
+        }).first == s.end();
 }
 
 bool UUID::isRFC4122v4() const {
@@ -102,7 +103,7 @@ bool UUID::isRFC4122v4() const {
 
 UUID UUID::gen() {
     UUIDStorage randomBytes;
-    (*uuidGen)->fill(&randomBytes, sizeof(randomBytes));
+    uuidGen()->fill(&randomBytes, sizeof(randomBytes));
 
     // Set version in high 4 bits of byte 6 and variant in high 2 bits of byte 8, see RFC 4122,
     // section 4.1.1, 4.1.2 and 4.1.3.

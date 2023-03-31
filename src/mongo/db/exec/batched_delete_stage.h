@@ -114,7 +114,7 @@ public:
     // Returns true when no more work can be done (there are no more deletes to commit).
     bool isEOF() final;
 
-    std::unique_ptr<PlanStageStats> getStats() final;
+    std::unique_ptr<mongo::PlanStageStats> getStats() final;
 
     const SpecificStats* getSpecificStats() const final;
 
@@ -137,6 +137,7 @@ private:
     long long _commitBatch(WorkingSetID* out,
                            std::set<WorkingSetID>* recordsToSkip,
                            unsigned int* docsDeleted,
+                           unsigned int* bytesDeleted,
                            unsigned int* bufferOffset);
 
     // Attempts to stage a new delete in the _stagedDeletesBuffer. Returns the PlanStage::StageState

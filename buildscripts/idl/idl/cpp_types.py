@@ -517,8 +517,8 @@ class BsonCppTypeBase(object, metaclass=ABCMeta):
         pass
 
 
-def _call_method_or_global_function(expression, method_name):
-    # type: (str, str) -> str
+def _call_method_or_global_function(expression, ast_type):
+    # type: (str, ast.Type) -> str
     """
     Given a fully-qualified method name, call it correctly.
 
@@ -526,13 +526,20 @@ def _call_method_or_global_function(expression, method_name):
     not treated as a global C++ function though. This notion of functions is designed to support
     enum deserializers/serializers which are not methods.
     """
+    method_name = ast_type.serializer
+    serialization_context = 'getSerializationContext()' if ast_type.deserialize_with_tenant else ''
+
     short_method_name = writer.get_method_name(method_name)
     if writer.is_function(method_name):
-        return common.template_args('${method_name}(${expression})', expression=expression,
-                                    method_name=method_name)
+        if ast_type.deserialize_with_tenant:
+            serialization_context = ', ' + serialization_context
+        return common.template_args('${method_name}(${expression}${serialization_context})',
+                                    expression=expression, method_name=method_name,
+                                    serialization_context=serialization_context)
 
-    return common.template_args('${expression}.${method_name}()', expression=expression,
-                                method_name=short_method_name)
+    return common.template_args('${expression}.${method_name}(${serialization_context})',
+                                expression=expression, method_name=short_method_name,
+                                serialization_context=serialization_context)
 
 
 class _CommonBsonCppTypeBase(BsonCppTypeBase):
@@ -555,7 +562,7 @@ class _CommonBsonCppTypeBase(BsonCppTypeBase):
 
     def gen_serializer_expression(self, indented_writer, expression):
         # type: (writer.IndentedTextWriter, str) -> str
-        return _call_method_or_global_function(expression, self._ast_type.serializer)
+        return _call_method_or_global_function(expression, self._ast_type)
 
 
 class _ObjectBsonCppTypeBase(BsonCppTypeBase):
@@ -580,9 +587,15 @@ class _ObjectBsonCppTypeBase(BsonCppTypeBase):
     def gen_serializer_expression(self, indented_writer, expression):
         # type: (writer.IndentedTextWriter, str) -> str
         method_name = writer.get_method_name(self._ast_type.serializer)
-        indented_writer.write_line(
-            common.template_args('const BSONObj localObject = ${expression}.${method_name}();',
-                                 expression=expression, method_name=method_name))
+        if self._ast_type.deserialize_with_tenant:  # SerializationContext is tied to tenant deserialization
+            indented_writer.write_line(
+                common.template_args(
+                    'const BSONObj localObject = ${expression}.${method_name}(getSerializationContext());',
+                    expression=expression, method_name=method_name))
+        else:
+            indented_writer.write_line(
+                common.template_args('const BSONObj localObject = ${expression}.${method_name}();',
+                                     expression=expression, method_name=method_name))
         return "localObject"
 
 
@@ -652,7 +665,6 @@ class _BinDataBsonCppTypeBase(BsonCppTypeBase):
 def get_bson_cpp_type(ast_type):
     # type: (ast.Type) -> Optional[BsonCppTypeBase]
     """Get a class that provides custom serialization for the given BSON type."""
-    # pylint: disable=too-many-return-statements
 
     # Does not support list of types
     if len(ast_type.bson_serialization_type) > 1:

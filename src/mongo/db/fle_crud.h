@@ -29,9 +29,8 @@
 
 #pragma once
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
 #include <cstdint>
-
-#include "boost/smart_ptr/intrusive_ptr.hpp"
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/oid.h"
@@ -44,12 +43,13 @@
 #include "mongo/db/query/count_command_gen.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/transaction_api.h"
+#include "mongo/db/transaction/transaction_api.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/s/write_ops/batch_write_exec.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 
 namespace mongo {
+class OperationContext;
 
 /**
  * FLE Result enum
@@ -229,34 +229,17 @@ bool shouldDoFLERewrite(const T& cmd) {
 /**
  * Abstraction layer for FLE
  */
-class FLEQueryInterface {
+class FLEQueryInterface : public FLETagQueryInterface {
 public:
-    virtual ~FLEQueryInterface();
-
-    /**
-     * Retrieve a single document by _id == BSONElement from nss.
-     *
-     * Returns an empty BSONObj if no document is found.
-     * Expected to throw an error if it detects more then one documents.
-     */
-    virtual BSONObj getById(const NamespaceString& nss, BSONElement element) = 0;
-
-    /**
-     * Count the documents in the collection.
-     *
-     * Throws if the collection is not found.
-     */
-    virtual uint64_t countDocuments(const NamespaceString& nss) = 0;
-
     /**
      * Insert a document into the given collection.
      *
      * If translateDuplicateKey == true and the insert returns DuplicateKey, returns
      * FLEStateCollectionContention instead.
      */
-    virtual StatusWith<write_ops::InsertCommandReply> insertDocument(
+    virtual StatusWith<write_ops::InsertCommandReply> insertDocuments(
         const NamespaceString& nss,
-        BSONObj obj,
+        std::vector<BSONObj> objs,
         StmtId* pStmtId,
         bool translateDuplicateKey,
         bool bypassDocumentValidation = false) = 0;
@@ -271,6 +254,11 @@ public:
         const NamespaceString& nss,
         const EncryptionInformation& ei,
         const write_ops::DeleteCommandRequest& deleteRequest) = 0;
+
+    virtual write_ops::DeleteCommandReply deleteDocument(
+        const NamespaceString& nss,
+        int32_t stmtId,
+        write_ops::DeleteCommandRequest& deleteRequest) = 0;
 
     /**
      * Update a single document with the given query and update operators.
@@ -309,6 +297,7 @@ public:
      */
     virtual std::vector<BSONObj> findDocuments(const NamespaceString& nss, BSONObj filter) = 0;
 };
+
 /**
  * Implementation of the FLE Query interface that exposes the DB operations needed for FLE 2
  * server-side work.
@@ -323,10 +312,15 @@ public:
 
     uint64_t countDocuments(const NamespaceString& nss) final;
 
-    StatusWith<write_ops::InsertCommandReply> insertDocument(
+    std::vector<std::vector<FLEEdgeCountInfo>> getTags(
         const NamespaceString& nss,
-        BSONObj obj,
-        int32_t* pStmtId,
+        const std::vector<std::vector<FLEEdgePrfBlock>>& escDerivedFromDataTokenAndCounter,
+        FLETagQueryInterface::TagQueryType type) final;
+
+    StatusWith<write_ops::InsertCommandReply> insertDocuments(
+        const NamespaceString& nss,
+        std::vector<BSONObj> objs,
+        StmtId* pStmtId,
         bool translateDuplicateKey,
         bool bypassDocumentValidation = false) final;
 
@@ -334,6 +328,11 @@ public:
         const NamespaceString& nss,
         const EncryptionInformation& ei,
         const write_ops::DeleteCommandRequest& deleteRequest) final;
+
+    write_ops::DeleteCommandReply deleteDocument(
+        const NamespaceString& nss,
+        int32_t stmtId,
+        write_ops::DeleteCommandRequest& deleteRequest) final;
 
     std::pair<write_ops::UpdateCommandReply, BSONObj> updateWithPreimage(
         const NamespaceString& nss,
@@ -357,13 +356,33 @@ private:
 };
 
 /**
+ * FLETagQueryInterface that does not use transaction_api.h to retrieve tags.
+ */
+class FLETagNoTXNQuery : public FLETagQueryInterface {
+public:
+    FLETagNoTXNQuery(OperationContext* opCtx);
+
+    BSONObj getById(const NamespaceString& nss, BSONElement element) final;
+
+    uint64_t countDocuments(const NamespaceString& nss) final;
+
+    std::vector<std::vector<FLEEdgeCountInfo>> getTags(
+        const NamespaceString& nss,
+        const std::vector<std::vector<FLEEdgePrfBlock>>& escDerivedFromDataTokenAndCounter,
+        FLETagQueryInterface::TagQueryType type) final;
+
+private:
+    OperationContext* _opCtx;
+};
+
+/**
  * Implementation of FLEStateCollectionReader for txn_api::TransactionClient
  *
  * Document count is cached since we only need it once per esc or ecc collection.
  */
 class TxnCollectionReader : public FLEStateCollectionReader {
 public:
-    TxnCollectionReader(uint64_t count, FLEQueryInterface* queryImpl, const NamespaceString& nss)
+    TxnCollectionReader(uint64_t count, FLETagQueryInterface* queryImpl, const NamespaceString& nss)
         : _count(count), _queryImpl(queryImpl), _nss(nss) {}
 
     uint64_t getDocumentCount() const override {
@@ -378,7 +397,7 @@ public:
 
 private:
     uint64_t _count;
-    FLEQueryInterface* _queryImpl;
+    FLETagQueryInterface* _queryImpl;
     NamespaceString _nss;
 };
 
@@ -406,7 +425,7 @@ StatusWith<write_ops::InsertCommandReply> processInsert(
     const NamespaceString& edcNss,
     std::vector<EDCServerPayloadInfo>& serverPayload,
     const EncryptedFieldConfig& efc,
-    int32_t stmtId,
+    int32_t* stmtId,
     BSONObj document,
     bool bypassDocumentValidation = false);
 
@@ -488,4 +507,17 @@ processFindAndModifyRequest<write_ops::FindAndModifyCommandRequest>(
 write_ops::UpdateCommandReply processUpdate(OperationContext* opCtx,
                                             const write_ops::UpdateCommandRequest& updateRequest,
                                             GetTxnCallback getTxns);
+
+void validateInsertUpdatePayloads(const std::vector<EncryptedField>& fields,
+                                  const std::vector<EDCServerPayloadInfo>& payload);
+
+/**
+ * Get the tags from local storage.
+ */
+std::vector<std::vector<FLEEdgeCountInfo>> getTagsFromStorage(
+    OperationContext* opCtx,
+    const NamespaceStringOrUUID& nsOrUUID,
+    const std::vector<std::vector<FLEEdgePrfBlock>>& escDerivedFromDataTokens,
+    FLETagQueryInterface::TagQueryType type);
+
 }  // namespace mongo

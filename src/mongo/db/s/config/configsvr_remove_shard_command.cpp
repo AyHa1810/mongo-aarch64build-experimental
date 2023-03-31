@@ -83,23 +83,24 @@ public:
         return true;
     }
 
-    Status checkAuthForCommand(Client* client,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj) const override {
-        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
-                ResourcePattern::forClusterResource(), ActionType::internal)) {
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
+        if (!AuthorizationSession::get(opCtx->getClient())
+                 ->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                    ActionType::internal)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
         return Status::OK();
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         uassert(ErrorCodes::IllegalOperation,
                 "_configsvrRemoveShard can only be run on config servers",
-                serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+                serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
         CommandHelpers::uassertCommandRunWithMajority(getName(), opCtx->getWriteConcern());
 
         ON_BLOCK_EXIT([&opCtx] {
@@ -117,7 +118,7 @@ public:
             return shard->getId();
         }();
 
-        const auto catalogClient = Grid::get(opCtx)->catalogClient();
+        const auto catalogClient = ShardingCatalogManager::get(opCtx)->localCatalogClient();
         const auto shardingCatalogManager = ShardingCatalogManager::get(opCtx);
 
         const auto shardDrainingStatus = [&] {
@@ -144,7 +145,7 @@ public:
 
             BSONArrayBuilder dbs(dbInfoBuilder.subarrayStart("dbsToMove"));
             for (const auto& db : databases) {
-                if (db != NamespaceString::kLocalDb) {
+                if (db != DatabaseName::kLocal.db()) {
                     dbs.append(db);
                 }
             }

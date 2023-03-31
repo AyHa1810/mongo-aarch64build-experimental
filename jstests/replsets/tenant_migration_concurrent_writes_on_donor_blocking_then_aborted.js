@@ -10,15 +10,18 @@
  *   serverless,
  * ]
  */
-(function() {
-'use strict';
+
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    checkTenantMigrationAccessBlockerForConcurrentWritesTest,
+    runCommandForConcurrentWritesTest,
+    runTestForConcurrentWritesTest,
+    TenantMigrationConcurrentWriteUtil
+} from "jstests/replsets/tenant_migration_concurrent_writes_on_donor_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/parallelTester.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
-load("jstests/replsets/tenant_migration_concurrent_writes_on_donor_util.js");
 
 const tenantMigrationTest = new TenantMigrationTest({
     name: jsTestName(),
@@ -36,14 +39,10 @@ const kTenantDefinedDbName = "0";
  * To be used to resume a migration that is paused after entering the blocking state. Waits for the
  * number of blocked reads to reach 'targetNumBlockedWrites' and unpauses the migration.
  */
-function resumeMigrationAfterBlockingWrite(host, tenantId, targetNumBlockedWrites) {
-    load("jstests/libs/fail_point_util.js");
-    load("jstests/replsets/libs/tenant_migration_util.js");
+async function resumeMigrationAfterBlockingWrite(host, tenantId, targetNumBlockedWrites) {
+    const {getNumBlockedWrites} = await import("jstests/replsets/libs/tenant_migration_util.js");
     const primary = new Mongo(host);
-
-    assert.soon(() => TenantMigrationUtil.getNumBlockedWrites(primary, tenantId) ==
-                    targetNumBlockedWrites);
-
+    assert.soon(() => getNumBlockedWrites(primary, tenantId) == targetNumBlockedWrites);
     assert.commandWorked(primary.adminCommand(
         {configureFailPoint: "pauseTenantMigrationBeforeLeavingBlockingState", mode: "off"}));
 }
@@ -95,8 +94,6 @@ const testCases = TenantMigrationConcurrentWriteUtil.testCases;
 
 // Run test cases while the migration is blocked and then rejects after aborted.
 for (const [commandName, testCase] of Object.entries(testCases)) {
-    let baseDbName = commandName + "-inBlockingThenAborted0";
-
     if (testCase.skip) {
         print("Skipping " + commandName + ": " + testCase.skip);
         continue;
@@ -105,14 +102,14 @@ for (const [commandName, testCase] of Object.entries(testCases)) {
     runTestForConcurrentWritesTest(donorPrimary,
                                    testCase,
                                    testRejectBlockedWritesAfterMigrationAborted,
-                                   baseDbName + "Basic_" + kTenantDefinedDbName,
+                                   ObjectId().str + "_Blocking-B-" + kTenantDefinedDbName,
                                    kCollName);
 
     if (testCase.testInTransaction) {
         runTestForConcurrentWritesTest(donorPrimary,
                                        testCase,
                                        testRejectBlockedWritesAfterMigrationAborted,
-                                       baseDbName + "Txn_" + kTenantDefinedDbName,
+                                       ObjectId().str + "_Blocking-T-" + kTenantDefinedDbName,
                                        kCollName,
                                        {testInTransaction: true});
     }
@@ -121,11 +118,10 @@ for (const [commandName, testCase] of Object.entries(testCases)) {
         runTestForConcurrentWritesTest(donorPrimary,
                                        testCase,
                                        testRejectBlockedWritesAfterMigrationAborted,
-                                       baseDbName + "Retryable_" + kTenantDefinedDbName,
+                                       ObjectId().str + "_Blocking-R-" + kTenantDefinedDbName,
                                        kCollName,
                                        {testAsRetryableWrite: true});
     }
 }
 
 tenantMigrationTest.stop();
-})();

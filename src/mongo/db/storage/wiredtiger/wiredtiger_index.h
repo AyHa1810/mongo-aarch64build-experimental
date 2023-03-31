@@ -123,14 +123,17 @@ public:
      */
     WiredTigerIndex(OperationContext* ctx,
                     const std::string& uri,
+                    const UUID& collectionUUID,
                     StringData ident,
                     KeyFormat rsKeyFormat,
                     const IndexDescriptor* desc,
                     bool isLogged);
 
-    virtual Status insert(OperationContext* opCtx,
-                          const KeyString::Value& keyString,
-                          bool dupsAllowed);
+    virtual Status insert(
+        OperationContext* opCtx,
+        const KeyString::Value& keyString,
+        bool dupsAllowed,
+        IncludeDuplicateRecordId includeDuplicateRecordId = IncludeDuplicateRecordId::kOff);
 
     virtual void unindex(OperationContext* opCtx,
                          const KeyString::Value& keyString,
@@ -139,9 +142,8 @@ public:
     virtual boost::optional<RecordId> findLoc(OperationContext* opCtx,
                                               const KeyString::Value& keyString) const override;
 
-    virtual void fullValidate(OperationContext* opCtx,
-                              long long* numKeysOut,
-                              IndexValidateResults* fullResults) const;
+    virtual IndexValidateResults validate(OperationContext* opCtx, bool full) const;
+
     virtual bool appendCustomStats(OperationContext* opCtx,
                                    BSONObjBuilder* output,
                                    double scale) const;
@@ -149,11 +151,16 @@ public:
 
     virtual bool isEmpty(OperationContext* opCtx);
 
+    virtual int64_t numEntries(OperationContext* opCtx) const;
+
     virtual long long getSpaceUsedBytes(OperationContext* opCtx) const;
 
     virtual long long getFreeStorageBytes(OperationContext* opCtx) const;
 
     virtual Status initAsEmpty(OperationContext* opCtx);
+
+    virtual void printIndexEntryMetadata(OperationContext* opCtx,
+                                         const KeyString::Value& keyString) const;
 
     Status compact(OperationContext* opCtx) override;
 
@@ -181,6 +188,10 @@ public:
         return false;
     }
 
+    virtual UUID getCollectionUUID() const {
+        return _collectionUUID;
+    }
+
     virtual bool isDup(OperationContext* opCtx,
                        WT_CURSOR* c,
                        const KeyString::Value& keyString) = 0;
@@ -193,10 +204,12 @@ public:
     }
 
 protected:
-    virtual Status _insert(OperationContext* opCtx,
-                           WT_CURSOR* c,
-                           const KeyString::Value& keyString,
-                           bool dupsAllowed) = 0;
+    virtual Status _insert(
+        OperationContext* opCtx,
+        WT_CURSOR* c,
+        const KeyString::Value& keyString,
+        bool dupsAllowed,
+        IncludeDuplicateRecordId includeDuplicateRecordId = IncludeDuplicateRecordId::kOff) = 0;
 
     virtual void _unindex(OperationContext* opCtx,
                           WT_CURSOR* c,
@@ -216,13 +229,32 @@ protected:
                                          size_t size);
 
     /**
+     * Checks whether the prefix key defined by 'keyString' and 'sizeWithoutRecordId' is in the
+     * index. If it is, returns the RecordId of the first matching key and positions the cursor 'c'
+     * on that key.
+     */
+    boost::optional<RecordId> _keyExistsBounded(OperationContext* opCtx,
+                                                WT_CURSOR* c,
+                                                const KeyString::Value& keyString,
+                                                size_t sizeWithoutRecordId);
+
+    /**
+     * Sets the upper bound on the passed in cursor to be the maximum value of the KeyString prefix.
+     */
+    void _setUpperBound(WT_CURSOR* c,
+                        const KeyString::Value& keyString,
+                        size_t sizeWithoutRecordId);
+
+    /**
      * Returns a DuplicateKey error if the prefix key exists in the index with a different RecordId.
      * Returns true if the prefix key exists in the index with the same RecordId. Returns false if
      * the prefix key does not exist in the index. Should only be used for non-_id indexes.
      */
-    StatusWith<bool> _checkDups(OperationContext* opCtx,
-                                WT_CURSOR* c,
-                                const KeyString::Value& keyString);
+    StatusWith<bool> _checkDups(
+        OperationContext* opCtx,
+        WT_CURSOR* c,
+        const KeyString::Value& keyString,
+        IncludeDuplicateRecordId includeDuplicateRecordId = IncludeDuplicateRecordId::kOff);
 
     /*
      * Determines the data format version from application metadata and verifies compatibility.
@@ -230,8 +262,18 @@ protected:
      */
     KeyString::Version _handleVersionInfo(OperationContext* ctx,
                                           const std::string& uri,
+                                          StringData ident,
                                           const IndexDescriptor* desc,
                                           bool isLogged);
+
+    /*
+     * Attempts to repair the data format version in the index table metadata if there is a mismatch
+     * to the index type during startup.
+     */
+    void _repairDataFormatVersion(OperationContext* opCtx,
+                                  const std::string& uri,
+                                  StringData ident,
+                                  const IndexDescriptor* desc);
 
     RecordId _decodeRecordIdAtEnd(const void* buffer, size_t size);
 
@@ -247,7 +289,7 @@ protected:
     int _dataFormatVersion;
     std::string _uri;
     uint64_t _tableId;
-    const IndexDescriptor* _desc;
+    const UUID _collectionUUID;
     const std::string _indexName;
     const BSONObj _keyPattern;
     const BSONObj _collation;
@@ -258,6 +300,7 @@ class WiredTigerIndexUnique : public WiredTigerIndex {
 public:
     WiredTigerIndexUnique(OperationContext* ctx,
                           const std::string& uri,
+                          const UUID& collectionUUID,
                           StringData ident,
                           KeyFormat rsKeyFormat,
                           const IndexDescriptor* desc,
@@ -285,7 +328,9 @@ protected:
     Status _insert(OperationContext* opCtx,
                    WT_CURSOR* c,
                    const KeyString::Value& keyString,
-                   bool dupsAllowed) override;
+                   bool dupsAllowed,
+                   IncludeDuplicateRecordId includeDuplicateRecordId =
+                       IncludeDuplicateRecordId::kOff) override;
 
     void _unindex(OperationContext* opCtx,
                   WT_CURSOR* c,
@@ -300,6 +345,7 @@ class WiredTigerIdIndex : public WiredTigerIndex {
 public:
     WiredTigerIdIndex(OperationContext* ctx,
                       const std::string& uri,
+                      const UUID& collectionUUID,
                       StringData ident,
                       const IndexDescriptor* desc,
                       bool isLogged);
@@ -331,7 +377,9 @@ protected:
     Status _insert(OperationContext* opCtx,
                    WT_CURSOR* c,
                    const KeyString::Value& keyString,
-                   bool dupsAllowed) override;
+                   bool dupsAllowed,
+                   IncludeDuplicateRecordId includeDuplicateRecordId =
+                       IncludeDuplicateRecordId::kOff) override;
 
     void _unindex(OperationContext* opCtx,
                   WT_CURSOR* c,
@@ -343,13 +391,15 @@ protected:
      */
     Status _checkDups(OperationContext* opCtx,
                       WT_CURSOR* c,
-                      const KeyString::Value& keyString) = delete;
+                      const KeyString::Value& keyString,
+                      IncludeDuplicateRecordId includeDuplicateRecordId) = delete;
 };
 
 class WiredTigerIndexStandard : public WiredTigerIndex {
 public:
     WiredTigerIndexStandard(OperationContext* ctx,
                             const std::string& uri,
+                            const UUID& collectionUUID,
                             StringData ident,
                             KeyFormat rsKeyFormat,
                             const IndexDescriptor* desc,
@@ -378,7 +428,9 @@ protected:
     Status _insert(OperationContext* opCtx,
                    WT_CURSOR* c,
                    const KeyString::Value& keyString,
-                   bool dupsAllowed) override;
+                   bool dupsAllowed,
+                   IncludeDuplicateRecordId includeDuplicateRecordId =
+                       IncludeDuplicateRecordId::kOff) override;
 
     void _unindex(OperationContext* opCtx,
                   WT_CURSOR* c,

@@ -9,6 +9,12 @@ of horizontal scaling or "sharding", the
 and the concept of a
 [**shard key in MongoDB**](https://docs.mongodb.com/manual/sharding/#shard-keys).
 
+## Sharding acronyms
+
+* CSRS: **C**onfig **S**erver as a **R**eplica **S**et. This is a fancy name for the [Config server](https://www.mongodb.com/docs/manual/core/sharded-cluster-config-servers/). Comes from the times of version 3.2 and earlier, when there was a legacy type of Config server called [SCCC](https://www.mongodb.com/docs/manual/release-notes/3.4-compatibility/#removal-of-support-for-sccc-config-servers).
+* Config Shard: Same as CSRS.
+* ConfigData: The set of collections residing on the CSRS, which contain state about the cluster.
+
 ---
 
 # Routing
@@ -22,10 +28,10 @@ corresponding data.
 The authoritative routing table is stored in a set of unsharded collections in the config database
 on the config server replica set. The schemas of the relevant collections are:
 
-* [**config.databases**](https://docs.mongodb.com/manual/reference/config-database/#config.databases)
-* [**config.collections**](https://docs.mongodb.com/manual/reference/config-database/#config.collections)
-* [**config.chunks**](https://docs.mongodb.com/manual/reference/config-database/#config.chunks)
-* [**config.shards**](https://docs.mongodb.com/manual/reference/config-database/#config.shards)
+* [**config.databases**](https://www.mongodb.com/docs/manual/reference/config-database/#mongodb-data-config.databases)
+* [**config.collections**](https://www.mongodb.com/docs/manual/reference/config-database/#mongodb-data-config.collections)
+* [**config.chunks**](https://www.mongodb.com/docs/manual/reference/config-database/#mongodb-data-config.chunks)
+* [**config.shards**](https://www.mongodb.com/docs/manual/reference/config-database/#mongodb-data-config.shards)
 
 #### Code references
 
@@ -41,6 +47,8 @@ copy of the routing table cache exists on each router and shard.
 
 Operations consult the routing table cache in order to route requests to shards that hold data for
 a collection.
+
+This [section](README_routing_info_cache_consistency_model.md#consistency-model-of-the-routing-table-cache) describes the conceptual consistency model of the routing table cache.
 
 ### How the routing table cache refreshes
 
@@ -63,17 +71,17 @@ will update its in-memory state with its corresponding source.
 
 ### When the routing table cache will refresh
 
-The routing table cache is “lazy.” It does not refresh from its source unless necessary. The cache
+The routing table cache is "lazy." It does not refresh from its source unless necessary. The cache
 will refresh in two scenarios:
 
 1. A request sent to a shard returns an error indicating that the shard’s known routing information for that request doesn't match the sender's routing information.
 2. The cache attempts to access information for a collection that has been locally marked as having out-of-date routing information (stale).
 
 Operations that change a collection’s routing information (for example, a moveChunk command that
-updates a chunk’s location) will mark the local node’s routing table cache as “stale” for affected
+updates a chunk’s location) will mark the local node’s routing table cache as "stale" for affected
 shards. Subsequent attempts to access routing information for affected shards will block on a
 routing table cache refresh. Some operations, such as dropCollection, will affect all shards. In
-this case, the entire collection will be marked as “stale.” Accordingly, subsequent attempts to
+this case, the entire collection will be marked as "stale." Accordingly, subsequent attempts to
 access any routing information for the collection will block on a routing table cache refresh.
 
 ### Types of refreshes
@@ -145,7 +153,7 @@ The database versioning protocol tracks the placement of databases for unsharded
 
 ### Versioning updates
 
-Nodes that track chunk/database versions “lazily” load versioning information. A router or shard
+Nodes that track chunk/database versions "lazily" load versioning information. A router or shard
 will only find out that its internally-stored versioning information is stale via receiving changed
 version information from another node.
 
@@ -259,7 +267,7 @@ A chunk is moved from one shard to another by the moveChunk command. This comman
 1. **Start the migration** - The ActiveMigrationsRegistry is [updated on the donor side](https://github.com/mongodb/mongo/blob/3f849d508692c038afb643b1acb99b8a8cb98d38/src/mongo/db/s/move_chunk_command.cpp#L138) to reflect that a specific chunk is being moved. This prevents any other chunk migrations from happening on this shard until the migration is completed. If an existing incoming or outgoing migration is in flight then the registration will fail and the migration will be aborted. If the inflight operation is for the same chunk then the the registration call will return an object that the moveChunk command can use to join the current operation.
 1. **Start cloning the chunk** - After validating the migration parameters, the donor starts the migration process by sending the _recvChunkStart message to the recipient. This causes the recipient to then [initiate the transfer of documents](https://github.com/mongodb/mongo/blob/5c72483523561c0331769abc3250cf623817883f/src/mongo/db/s/migration_destination_manager.cpp#L955) from the donor. The initial transfer of documents is done by [repeatedly sending the _migrateClone command to the donor](https://github.com/mongodb/mongo/blob/5c72483523561c0331769abc3250cf623817883f/src/mongo/db/s/migration_destination_manager.cpp#L1042) and inserting the fetched documents on the recipient.
 1. **Transfer queued modifications** - Once the initial batch of documents are copied, the recipient then needs to retrieve any modifications that have been queued up on the donor. This is done by  [repeatedly sending the _transferMods command to the donor](https://github.com/mongodb/mongo/blob/5c72483523561c0331769abc3250cf623817883f/src/mongo/db/s/migration_destination_manager.cpp#L1060-L1111). These are [inserts, updates and deletes](https://github.com/mongodb/mongo/blob/11eddfac181ff6ff9faf3e1d55c050373bc6fc24/src/mongo/db/s/migration_chunk_cloner_source_legacy.cpp#L534-L550) that occurred on the donor while the initial batch was being transferred.
-1. **Wait for recipient to clone documents** - The donor [polls the recipient](https://github.com/mongodb/mongo/blob/3f849d508692c038afb643b1acb99b8a8cb98d38/src/mongo/db/s/migration_chunk_cloner_source_legacy.cpp#L984) to see when the transfer of documents has been completed or the timeout has been exceeded. This is indicated when the recipient returns a state of “steady” as a result of the _recvChunkStatus command.
+1. **Wait for recipient to clone documents** - The donor [polls the recipient](https://github.com/mongodb/mongo/blob/3f849d508692c038afb643b1acb99b8a8cb98d38/src/mongo/db/s/migration_chunk_cloner_source_legacy.cpp#L984) to see when the transfer of documents has been completed or the timeout has been exceeded. This is indicated when the recipient returns a state of "steady" as a result of the _recvChunkStatus command.
 1. **Enter the critical section** - Once the recipient has cloned the initial documents, the donor then [declares that it is in a critical section](https://github.com/mongodb/mongo/blob/3f849d508692c038afb643b1acb99b8a8cb98d38/src/mongo/db/s/migration_source_manager.cpp#L344). This indicates that the next operations must not be interrupted and will require recovery actions if they are interrupted. Writes to the donor shard will be suspended while the critical section is in effect. The mechanism to implement the critical section writes the ShardingStateRecovery document to store the minimum optime of the sharding config metadata. If this document exists on stepup it is used to update the optime so that the correct metadata is used.
 1. **Commit on the recipient** - While in the critical section, the [_recvChunkCommit](https://github.com/mongodb/mongo/blob/3f849d508692c038afb643b1acb99b8a8cb98d38/src/mongo/db/s/migration_chunk_cloner_source_legacy.cpp#L360) command is sent to the recipient directing it to fetch any remaining documents for this chunk. The recipient responds by sending _transferMods to fetch the remaining documents while writes are blocked on the donor. Once the documents are transferred successfully, the _recvChunkCommit command returns its status to unblock the donor.
 1. **Commit on the config server** - The donor sends the _configsvrCommitChunkMigration command to the config server. Before the command is sent, [reads are also suspended](https://github.com/mongodb/mongo/blob/3f849d508692c038afb643b1acb99b8a8cb98d38/src/mongo/db/s/migration_source_manager.cpp#L436) on the donor shard.
@@ -268,7 +276,7 @@ A chunk is moved from one shard to another by the moveChunk command. This comman
 * [ActiveMigrationRegistry](https://github.com/mongodb/mongo/blob/9be1041342b666e979aaea483c2fdb929c801796/src/mongo/db/s/active_migrations_registry.h#L52) class
 * [MigrationSourceManager](https://github.com/mongodb/mongo/blob/2c87953010c2c1ec2d39dc9a7dbbd5f7d49dab10/src/mongo/db/s/migration_source_manager.h#L70) class
 * [MigrationDestinationManager](https://github.com/mongodb/mongo/blob/2c87953010c2c1ec2d39dc9a7dbbd5f7d49dab10/src/mongo/db/s/migration_destination_manager.h#L71) class
-* [MigrationChunkClonerSourceLegacy](https://github.com/mongodb/mongo/blob/11eddfac181ff6ff9faf3e1d55c050373bc6fc24/src/mongo/db/s/migration_chunk_cloner_source_legacy.h#L82) class
+* [MigrationChunkClonerSource](https://github.com/mongodb/mongo/blob/11eddfac181ff6ff9faf3e1d55c050373bc6fc24/src/mongo/db/s/migration_chunk_cloner_source.h#L82) class
 * [ShardingStateRecovery](https://github.com/mongodb/mongo/blob/2c87953010c2c1ec2d39dc9a7dbbd5f7d49dab10/src/mongo/db/s/sharding_state_recovery.h#L47) class
 
 ## Orphaned range deletion
@@ -514,8 +522,7 @@ collections, such as config.shards, config.chunks, and config.tags. For example,
 mergeChunks, and moveChunk all take the chunk ResourceMutex.
 
 #### Code references
-* [**DistLockManager class**](https://github.com/mongodb/mongo/blob/master/src/mongo/db/s/dist_lock_manager.h)
-* [**DistLockCatalog class**](https://github.com/mongodb/mongo/blob/master/src/mongo/db/s/dist_lock_catalog.h)
+* [**DDLLockManager class**](https://github.com/mongodb/mongo/blob/master/src/mongo/db/s/ddl_lock_manager.h)
 * The
 [**global ResourceMutexes**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/s/config/sharding_catalog_manager.h#L555-L581)
 
@@ -796,7 +803,7 @@ thirty (30) minutes out by default, but is user-configurable. This means that if
 in that use a session for thirty minutes, the TTL index will remove the session from the sessions
 collection. When the logical session cache performs its periodic refresh (defined below), it will
 find all sessions that currently exist in the cache that no longer exist in the sessions
-collection. This is the set of sessions that we consider “expired.” The expired sessions are then
+collection. This is the set of sessions that we consider "expired". The expired sessions are then
 removed from the in-memory cache.
 
 ### How a session gets placed into the logical session cache
@@ -841,7 +848,7 @@ the following steps will be performed:
 * [Place where a session is placed (or replaced) in the logical session cache](https://github.com/mongodb/mongo/blob/1f94484d52064e12baedc7b586a8238d63560baf/src/mongo/db/logical_session_cache.h#L71-L75)
 * [The logical session cache refresh function](https://github.com/mongodb/mongo/blob/1f94484d52064e12baedc7b586a8238d63560baf/src/mongo/db/logical_session_cache_impl.cpp#L207-L355)
 * [The periodic job to clean up the session catalog and transactions table (the "reap" function)](https://github.com/mongodb/mongo/blob/1f94484d52064e12baedc7b586a8238d63560baf/src/mongo/db/logical_session_cache_impl.cpp#L141-L205)
-* [Location of the session catalog and transactions table cleanup code on mongod](https://github.com/mongodb/mongo/blob/1f94484d52064e12baedc7b586a8238d63560baf/src/mongo/db/session_catalog_mongod.cpp#L331-L398)
+* [Location of the session catalog and transactions table cleanup code on mongod](https://github.com/mongodb/mongo/blob/1f94484d52064e12baedc7b586a8238d63560baf/src/mongo/db/session/session_catalog_mongod.cpp#L331-L398)
 
 ## The logical session catalog
 
@@ -857,7 +864,7 @@ or yield the session.
 Checking out an internal/child session additionally checks out its parent session (the session with the same `id` and `uid` value in the lsid, but without a `txnNumber` or `txnUUID` value), and vice versa.
 
 The runtime state for a session consists of the last checkout time and operation, the number of operations
-waiting to check out the session, and the number of kills requested. Retryable internal sessions are reaped from the logical session catalog [eagerly](https://github.com/mongodb/mongo/blob/67e37f8e806a6a5d402e20eee4b3097e2b11f820/src/mongo/db/session_catalog.cpp#L342), meaning that if a transaction session with a higher transaction number has successfully started, sessions with lower txnNumbers are removed from the session catalog and inserted into an in-memory buffer by the [InternalTransactionsReapService](https://github.com/mongodb/mongo/blob/67e37f8e806a6a5d402e20eee4b3097e2b11f820/src/mongo/db/internal_transactions_reap_service.h#L42) until a configurable threshold is met (1000 by default), after which they are deleted from the transactions table (`config.transactions`) and `config.image_collection` all at once. Eager reaping is best-effort, in that the in-memory buffer is cleared on stepdown or restart.
+waiting to check out the session, and the number of kills requested. Retryable internal sessions are reaped from the logical session catalog [eagerly](https://github.com/mongodb/mongo/blob/67e37f8e806a6a5d402e20eee4b3097e2b11f820/src/mongo/db/session/session_catalog.cpp#L342), meaning that if a transaction session with a higher transaction number has successfully started, sessions with lower txnNumbers are removed from the session catalog and inserted into an in-memory buffer by the [InternalTransactionsReapService](https://github.com/mongodb/mongo/blob/67e37f8e806a6a5d402e20eee4b3097e2b11f820/src/mongo/db/internal_transactions_reap_service.h#L42) until a configurable threshold is met (1000 by default), after which they are deleted from the transactions table (`config.transactions`) and `config.image_collection` all at once. Eager reaping is best-effort, in that the in-memory buffer is cleared on stepdown or restart.
 
 The last checkout time is used by
 the [periodic job inside the logical session cache](#periodic-cleanup-of-the-session-catalog-and-transactions-table)
@@ -872,15 +879,15 @@ the first kill request.
 The runtime state in a node's in-memory session catalog is made durable in the node's
 `config.transactions` collection, also called its transactions table. The in-memory session catalog
  is
-[invalidated](https://github.com/mongodb/mongo/blob/56655b06ac46825c5937ccca5947dc84ccbca69c/src/mongo/db/session_catalog_mongod.cpp#L324)
+[invalidated](https://github.com/mongodb/mongo/blob/56655b06ac46825c5937ccca5947dc84ccbca69c/src/mongo/db/session/session_catalog_mongod.cpp#L324)
 if the `config.transactions` collection is dropped and whenever there is a rollback. When
 invalidation occurs, all active sessions are killed, and the in-memory transaction state is marked
 as invalid to force it to be
-[reloaded from storage the next time a session is checked out](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/session_catalog_mongod.cpp#L426).
+[reloaded from storage the next time a session is checked out](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/session/session_catalog_mongod.cpp#L426).
 
 #### Code references
-* [**SessionCatalog class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/session_catalog.h)
-* [**MongoDSessionCatalog class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/session_catalog_mongod.h)
+* [**SessionCatalog class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/session/session_catalog.h)
+* [**MongoDSessionCatalog class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/session/session_catalog_mongod.h)
 * [**RouterSessionCatalog class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/s/session_catalog_router.h)
 * How [**mongod**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/service_entry_point_common.cpp#L537) and [**mongos**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/s/commands/strategy.cpp#L412) check out a session prior to executing a command.
 
@@ -932,14 +939,14 @@ to disk and [updates](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/
 For most writes, persisting only the (lsid, txnId) pair alone is sufficient to reconstruct a
 response. For findAndModify however, we also need to respond with the document that would have
 originally been returned. In version 5.0 and earlier, the default behavior is to
-[record the document image into the oplog](https://github.com/mongodb/mongo/blob/33ad68c0dc4bda897a5647608049422ae784a15e/src/mongo/db/op_observer/op_observer_impl.cpp#L191)
+[record the document image into the oplog](https://github.com/mongodb/mongo/blob/33ad68c0dc4bda897a5647608049422ae784a15e/src/mongo/db/op_observer_impl.cpp#L191)
 as a no-op entry. The oplog entries generated would look something like:
 
 * `{ op: "d", o: {_id: 1}, ts: Timestamp(100, 2), preImageOpTime: Timestamp(100, 1), lsid: ..., txnNumber: ...}`
 * `{ op: "n", o: {_id: 1, imageBeforeDelete: "foobar"}, ts: Timestamp(100, 1)}`
 
 There's a cost in "explicitly" replicating these images via the oplog. We've addressed this cost
-with 5.1 where the default is to instead [save the image into a side collection](https://github.com/mongodb/mongo/blob/33ad68c0dc4bda897a5647608049422ae784a15e/src/mongo/db/op_observer/op_observer_impl.cpp#L646-L650)
+with 5.1 where the default is to instead [save the image into a side collection](https://github.com/mongodb/mongo/blob/33ad68c0dc4bda897a5647608049422ae784a15e/src/mongo/db/op_observer_impl.cpp#L646-L650)
 with the namespace `config.image_collection`. A primary will add `needsRetryImage:
 <preImage/postImage>` to the oplog entry to communicate to secondaries that they must make a
 corollary write to `config.image_collection`.
@@ -959,30 +966,22 @@ For retry images saved in the image collection, the source will "downconvert" op
 `needsRetryImage: true` into two oplog entries, simulating the old format. As chunk migrations use
 internal commands, [this downconverting procedure](https://github.com/mongodb/mongo/blob/0beb0cacfcaf7b24259207862e1d0d489e1c16f1/src/mongo/db/s/session_catalog_migration_source.cpp#L58-L97)
 is installed under the hood. For resharding and tenant migrations, a new aggregation stage,
-[_internalFindAndModifyImageLookup](https://github.com/10gen/mongo/blob/e27dfa10b994f6deff7c59a122b87771cdfa8aba/src/mongo/db/pipeline/document_source_find_and_modify_image_lookup.cpp#L61),
+[_internalFindAndModifyImageLookup](https://github.com/mongodb/mongo/blob/e27dfa10b994f6deff7c59a122b87771cdfa8aba/src/mongo/db/pipeline/document_source_find_and_modify_image_lookup.cpp#L61),
 was introduced to perform the identical substitution. In order for this stage to have a valid timestamp
 to assign to the forged no-op oplog entry as result of the "downconvert", we must always assign an
 extra oplog slot when writing the original retryable findAndModify oplog entry with
 `needsRetryImage: true`.
 
-The server also supports [collection-level pre-images](https://docs.mongodb.com/realm/mongodb/trigger-preimages/#overview), a feature used by MongoDB Realm. This feature continues to store document pre-images in
-the oplog, and is expected to work with the new retryable findAndModify behavior described above.
-With this, it's possible that for a particular update operation, we must store a pre-image
-(for collection-level pre-images) in the oplog while storing the post-image
-(for retryable findAndModify) in `config.image_collection`. In order to avoid certain WiredTiger
-constraints surrounding setting multiple timestamps in a single storage transaction, we must reserve
+In order to avoid certain WiredTiger constraints surrounding setting multiple timestamps in a single storage transaction, we must reserve
 oplog slots before entering the OpObserver, which is where we would normally create an oplog entry
 and assign it the next available timestamp. Here, we have a table that describes the different
 scenarios, along with the timestamps that are reserved and the oplog entries assigned to each of
 those timestamps:
-| Parameters | NumSlotsReserved | TS - 2 | TS - 1 | TS | Oplog fields for entry with timestamp: TS |
-| --- | --- | --- | --- | --- | --- |
-| Update, NeedsRetryImage=postImage, preImageRecordingEnabled = True | 3 | No-op oplog entry storing the pre-image|Reserved for forged no-op entry eventually used by tenant migrations/resharding | Update oplog entry | NeedsRetryImage: postImage, preImageOpTime: \{TS - 2} |
-| Update, NeedsRetryImage=preImage, preImageRecordingEnabled=True | 3 |No-op oplog entry storing the pre-image | Reserved but will not be used|Update Oplog entry | preImageOpTime: \{TS - 2} |
-| Update, NeedsRetryImage=preImage, preImageRecordingEnabled=False | 2 | N/A | Reserved for forged no-op entry eventually used by tenant migrations/resharding|Update oplog entry|NeedsRetryImage: preImage |
-| Update, NeedsRetryImage=postImage, preImageRecordingEnabled=False | 2 | N/A | Reserved for forged no-op entry eventually used by tenant migrations/resharding|Update oplog entry | NeedsRetryImage: postImage |
-| Delete, NeedsRetryImage=preImage, preImageRecordingEnabled = True | 0. Note that the OpObserver will still create a no-op entry along with the delete oplog entry, assigning them the next two available timestamps (TS - 1 and TS respectively). | N/A | No-op oplog entry storing the pre-image|Delete oplog entry | preImageOpTime: \{TS - 1} |
-|Delete, NeedsRetryImage=preImage, preImageRecordingEnabled = False|2|N/A|Reserved for forged no-op entry eventually used by tenant migrations/resharding|Delete oplog entry|NeedsRetryImage: preImage|
+| Parameters | NumSlotsReserved | TS - 1 | TS | Oplog fields for entry with timestamp: TS |
+| --- | --- | --- | --- | --- |
+| Update, NeedsRetryImage=preImage | 2 | Reserved for forged no-op entry eventually used by tenant migrations/resharding|Update oplog entry|NeedsRetryImage: preImage |
+| Update, NeedsRetryImage=postImage | 2 | Reserved for forged no-op entry eventually used by tenant migrations/resharding|Update oplog entry | NeedsRetryImage: postImage |
+|Delete, NeedsRetryImage=preImage |2|Reserved for forged no-op entry eventually used by tenant migrations/resharding|Delete oplog entry|NeedsRetryImage: preImage|
 
 #### Code references
 * [**TransactionParticipant class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/transaction_participant.h)
@@ -1102,7 +1101,7 @@ If a client runs a command in a without a session or with session where retryabl
 
 If a client runs a command in a session where retryable writes are enabled I.E. `retryWrites: true`, the server will start a retryable internal transaction.
 
-**Note**: The distinction between **Retryable** and **Non-Retryable** here is the requirement that Retryable Internal Transactions must fulfill the retryable write contract, which is described below. Both types of transactions will be [retried internally on transient errors](https://github.com/mongodb/mongo/blob/master/src/mongo/db/transaction_api.cpp#L201-L221). The only exception is an internal transaction that is started on behalf of a `client transaction`, which can only be retried by the client.
+**Note**: The distinction between **Retryable** and **Non-Retryable** here is the requirement that Retryable Internal Transactions must fulfill the retryable write contract, which is described below. Both types of transactions will be [retried internally on transient errors](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/transaction/transaction_api.cpp#L207-L227). The only exception is an internal transaction that is started on behalf of a `client transaction`, which can only be retried by the client.
 
 #### How retryability is guaranteed
 
@@ -1117,7 +1116,7 @@ Each statement inside of a retryable write command should have a corresponding e
 
 In cases where a client retryable write command implicitly expects an auxiliary operation to be executed atomically with its current request, a retryable internal transaction may contain additional write statements that are not explicitly requested by a client retryable write command. An example could be that the client expects to atomically update an index when executing a write. Since these auxiliary write statements do not have a corresponding entry within the original client command, the `stmtId` field for these statements will be set to `{stmtId: kUninitializedStmtId}`. These auxiliary write statements are non-retryable, thus it is crucial that we use the `retriedStmtIds` to determine which client write statements were already successfully retried to avoid re-applying the corresponding auxilary write statements. Additionally, these statements will be excluded from the history check involving `retriedStmtIds`. 
 
-To guarantee that we can reconstruct the response regardless of retries, we do a "cross sectional" write history check for retryable writes and retryable internal transactions prior to running a client retryable write/retryable internal transaction command. This ensures we do not double apply non-idempotent operations, and instead recover the response for a successful execution when appropriate. To support this, the [RetryableWriteTransactionParticipantCatalog](https://github.com/mongodb/mongo/blob/master/src/mongo/db/transaction_participant.h#L1221-L1299) was added as a decoration on an external session and it stores the transaction participants for all active retryable writes on the session, which we use to do our [write history check](https://github.com/mongodb/mongo/blob/master/src/mongo/db/transaction_participant.cpp#L3206).
+To guarantee that we can reconstruct the response regardless of retries, we do a "cross sectional" write history check for retryable writes and retryable internal transactions prior to running a client retryable write/retryable internal transaction command. This ensures we do not double apply non-idempotent operations, and instead recover the response for a successful execution when appropriate. To support this, the [RetryableWriteTransactionParticipantCatalog](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/transaction/transaction_participant.h#L1221-L1299) was added as a decoration on an external session and it stores the transaction participants for all active retryable writes on the session, which we use to do our [write history check](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/transaction/transaction_participant.cpp#L3205-L3208).
 
 #### Reconstructing write responses
 
@@ -1136,24 +1135,24 @@ Currently, a retryable internal transaction can only support a **single** `findA
 
 #### Retryability across failover and restart
 
-To be able to guarantee retryability under failover, we need to make sure that a mongod **always** has all the necessary transaction state loaded while executing a retryable write command. To do this, we recover the transaction state of the client and internal sessions [when checking out sessions](https://github.com/mongodb/mongo/blob/master/src/mongo/db/session_catalog_mongod.cpp#L694) on recovery. During checkout, we call [refreshFromStorageIfNeeded()](https://github.com/mongodb/mongo/blob/master/src/mongo/db/transaction_participant.cpp#L2902) on the current client session (if we are running in one) to refresh the TransactionParticipant for that session. We then [fetch any relevant active internal sessions associated with the current client session and refresh the TransactionParticipants for those sessions](https://github.com/mongodb/mongo/blob/master/src/mongo/db/transaction_participant.cpp#L2988).
+To be able to guarantee retryability under failover, we need to make sure that a mongod **always** has all the necessary transaction state loaded while executing a retryable write command. To do this, we recover the transaction state of the client and internal sessions [when checking out sessions](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/session/session_catalog_mongod.cpp#L694) on recovery. During checkout, we call [refreshFromStorageIfNeeded()](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/transaction/transaction_participant.cpp#L2901) on the current client session (if we are running in one) to refresh the TransactionParticipant for that session. We then [fetch any relevant active internal sessions associated with the current client session and refresh the TransactionParticipants for those sessions](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/transaction/transaction_participant.cpp#L2987).
 
 #### Handling retry conflicts
 
 Due to the use of `txnUUID` in the lsid for de-duplication purposes, retries of client write statements will always spawn a different internal session/transaction than the one originally used to do the initial attempt. This has two implications for conflict resolution:
 
-1. If the client retries on the same mongos/mongod that the original write was run on, retries are blocked by mongos/mongod until the original attempt finishes execution. This is due to the [session checkout mechanism](https://github.com/mongodb/mongo/blob/master/src/mongo/db/service_entry_point_common.cpp#L941) that prevents checkout of an in-use session, which in this case would block the retry attempt from checking out the parent session. Once the original write finishes execution, the retry would either retry(if necessary) or recover the write response as described above.
+1. If the client retries on the same mongos/mongod that the original write was run on, retries are blocked by mongos/mongod until the original attempt finishes execution. This is due to the [session checkout mechanism](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/service_entry_point_common.cpp#L973) that prevents checkout of an in-use session, which in this case would block the retry attempt from checking out the parent session. Once the original write finishes execution, the retry would either retry(if necessary) or recover the write response as described above.
 
-2. If the client retries on a different mongos than the original write was run on, the new mongos will not have visibility over in-progress internal transactions run by another mongos, so this retry will not be blocked and legally begin execution. When the new mongos begins execution of the retried command, it will send commands with `startTransaction` to relevant transaction participants. The transaction participants will then [check if there is already an in-progress internal transaction that will conflict](https://github.com/mongodb/mongo/blob/master/src/mongo/db/transaction_participant.cpp#L2814-L2868) with the new internal transaction that is attempting to start. If so, then the transaction participant will throw `RetryableTransactionInProgress`, which will be caught and cause the new transaction to [block until the existing transaction is finished](https://github.com/mongodb/mongo/blob/master/src/mongo/db/service_entry_point_common.cpp#L1001-L1010).
+2. If the client retries on a different mongos than the original write was run on, the new mongos will not have visibility over in-progress internal transactions run by another mongos, so this retry will not be blocked and legally begin execution. When the new mongos begins execution of the retried command, it will send commands with `startTransaction` to relevant transaction participants. The transaction participants will then [check if there is already an in-progress internal transaction that will conflict](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/transaction/transaction_participant.cpp#L2827-L2846) with the new internal transaction that is attempting to start. If so, then the transaction participant will throw `RetryableTransactionInProgress`, which will be caught and cause the new transaction to [block until the existing transaction is finished](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/service_entry_point_common.cpp#L1029-L1036).
 
 
 #### Supporting retryability across chunk migration and resharding
 
- The session history, oplog entries, and image collection entries involving the chunk being migrated are cloned from the donor shard to the recipient shard during chunk migration. Once the recipient receives the relevant oplog entries from the donor, it will [nest and apply the each of the received oplog entries in a no-op oplog entry](https://github.com/mongodb/mongo/blob/master/src/mongo/db/s/session_catalog_migration_destination.cpp#L204-L347). Depending on the type of operation run, the behavior will differ as such. 
+ The session history, oplog entries, and image collection entries involving the chunk being migrated are cloned from the donor shard to the recipient shard during chunk migration. Once the recipient receives the relevant oplog entries from the donor, it will [nest and apply the each of the received oplog entries in a no-op oplog entry](https://github.com/mongodb/mongo/blob/0d84f4bab0945559abcd5b00be5ec322c5214642/src/mongo/db/s/session_catalog_migration_destination.cpp#L204-L347). Depending on the type of operation run, the behavior will differ as such. 
 
-* If a non-retryable write/non-retryable internal transaction is run, then the donor shard will [send a sentinel no-op oplog entry](https://github.com/mongodb/mongo/blob/master/src/mongo/db/s/session_catalog_migration_source.cpp#L657), which when parsed by the TransactionParticipant upon getting a retry against the recipient shard will [throw IncompleteTransactionHistory](https://github.com/mongodb/mongo/blob/master/src/mongo/db/transaction_participant.cpp#L328-L333). 
+* If a non-retryable write/non-retryable internal transaction is run, then the donor shard will [send a sentinel no-op oplog entry](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/s/session_catalog_migration_destination.cpp#L204-L354), which when parsed by the TransactionParticipant upon getting a retry against the recipient shard will [throw IncompleteTransactionHistory](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/transaction/transaction_participant.cpp#L323-L331). 
 
-* If a retryable write/retryable internal transaction is run, then the donor shard will send a ["downconverted" oplog entry](https://github.com/mongodb/mongo/blob/master/src/mongo/db/s/session_catalog_migration_source.cpp#L673-L684), which when parsed by the TransactionParticipant upon getting a retry against the recipient shard will return the original write response.
+* If a retryable write/retryable internal transaction is run, then the donor shard will send a ["downconverted" oplog entry](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/s/session_catalog_migration_source.cpp#L669-L680), which when parsed by the TransactionParticipant upon getting a retry against the recipient shard will return the original write response.
 
 `Note`: "Downconverting" in this context, is the process of extracting the operation information inside an applyOps entry for an internal transaction and constructing a new retryable write oplog entry with `lsid` and `txnNumber` set to the associated client's session id and txnNumber. 
 
@@ -1162,15 +1161,15 @@ For resharding, the process is similar to how chunk migrations are handled. The 
 
 #### Code References
 
-* [**Session checkout logic**](https://github.com/mongodb/mongo/blob/master/src/mongo/db/session_catalog_mongod.cpp#L694)
-* [**Cross-section history check logic**](https://github.com/mongodb/mongo/blob/master/src/mongo/db/transaction_participant.cpp#L3206)
-* [**Conflicting internal transaction check logic**](https://github.com/mongodb/mongo/blob/master/src/mongo/db/transaction_participant.cpp#L2814-L2868)
-* [**Refreshing client and internal sessions logic**](https://github.com/mongodb/mongo/blob/master/src/mongo/db/transaction_participant.cpp#L2923-L2986)
-* [**RetryableWriteTransactionParticipantCatalog**](https://github.com/mongodb/mongo/blob/master/src/mongo/db/transaction_participant.h#L1221-L1299)
+* [**Session checkout logic**](https://github.com/mongodb/mongo/blob/0d84f4bab0945559abcd5b00be5ec322c5214642/src/mongo/db/session/session_catalog_mongod.cpp#L694)
+* [**Cross-section history check logic**](https://github.com/mongodb/mongo/blob/0d84f4bab0945559abcd5b00be5ec322c5214642/src/mongo/db/transaction/transaction_participant.cpp#L3206)
+* [**Conflicting internal transaction check logic**](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/transaction/transaction_participant.cpp#L2827-L2846)
+* [**Refreshing client and internal sessions logic**](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/transaction/transaction_participant.cpp#L2889-L2899)
+* [**RetryableWriteTransactionParticipantCatalog**](https://github.com/mongodb/mongo/blob/d8ce3ee2e020d1ab2fa611a2a0f0a222b06b9779/src/mongo/db/transaction/transaction_participant.h#L1221-L1299)
 
 ### Transaction API
 
-The [transaction API](https://github.com/mongodb/mongo/blob/master/src/mongo/db/transaction_api.h) is used to initiate transactions from within the server. The API starts an internal transaction on its local process, executes transaction statements specified in a callback, and completes the transaction by committing/aborting/retrying on transient errors. By default, a transaction can be retried 120 times to mirror the 2 minute timeout used by the [driver’s convenient transactions API](https://github.com/mongodb/specifications/blob/92d77a6d/source/transactions-convenient-api/transactions-convenient-api.rst).
+The [transaction API](https://github.com/mongodb/mongo/blob/master/src/mongo/db/transaction/transaction_api.h) is used to initiate transactions from within the server. The API starts an internal transaction on its local process, executes transaction statements specified in a callback, and completes the transaction by committing/aborting/retrying on transient errors. By default, a transaction can be retried 120 times to mirror the 2 minute timeout used by the [driver’s convenient transactions API](https://github.com/mongodb/specifications/blob/92d77a6d/source/transactions-convenient-api/transactions-convenient-api.rst).
 
 Additionally, the API can use router commands when running on a mongod. Each command will execute as if on a mongos, targeting remote shards and initiating a two phase commit if necessary. To enable this router behavior the [`cluster_transaction_api`](https://github.com/mongodb/mongo/blob/master/src/mongo/db/cluster_transaction_api.h) defines an additional set of behaviors to rename commands to their [cluster command names](https://github.com/mongodb/mongo/blob/63f99193df82777239f038666270e4bfb2be3567/src/mongo/db/cluster_transaction_api.cpp#L44-L52).
 
@@ -1376,23 +1375,23 @@ privilege.
 The `UserWriteBlockModeOpObserver` is responsible for blocking disallowed writes. Upon any operation
 which writes, this `OpObserver` checks whether the `GlobalUserWriteBlockState` [allows writes to the
 target
-namespace](https://github.com/10gen/mongo/blob/25377181476e4140c970afa5b018f9b4fcc951e8/src/mongo/db/op_observer/user_write_block_mode_op_observer.cpp#L276-L283).
+namespace](https://github.com/mongodb/mongo/blob/387f8c0e26a352b95ecfc6bc51f749d26a929390/src/mongo/db/op_observer/user_write_block_mode_op_observer.cpp#L281-L288).
 The `GlobalUserWriteBlockState` stores whether user write blocking is enabled in a given
 `ServiceContext`. As part of its write access check, it [checks whether the `WriteBlockBypass`
 associated with the given `OperationContext` is
-enabled](https://github.com/10gen/mongo/blob/25377181476e4140c970afa5b018f9b4fcc951e8/src/mongo/db/s/global_user_write_block_state.cpp#L59-L67).
+enabled](https://github.com/mongodb/mongo/blob/25377181476e4140c970afa5b018f9b4fcc951e8/src/mongo/db/s/global_user_write_block_state.cpp#L59-L67).
 The `WriteBlockBypass` stores whether the user that initiated the write is able to perform writes
 when user write blocking is enabled.  On internal requests (i.e. from other `mongod` or `mongos`
 instances in the sharded cluster/replica set), the request originator propagates `WriteBlockBypass`
 [through the request
-metadata](https://github.com/10gen/mongo/blob/182616b7b45a1e360839c612c9ee8acaa130fe17/src/mongo/rpc/metadata.cpp#L115).
+metadata](https://github.com/mongodb/mongo/blob/182616b7b45a1e360839c612c9ee8acaa130fe17/src/mongo/rpc/metadata.cpp#L115).
 On external requests, `WriteBlockBypass` is enabled [if the authenticated user is privileged to
 bypass user
-writes](https://github.com/10gen/mongo/blob/07c3d2ebcd3ca8127ed5a5aaabf439b57697b530/src/mongo/db/write_block_bypass.cpp#L60-L63).
+writes](https://github.com/mongodb/mongo/blob/07c3d2ebcd3ca8127ed5a5aaabf439b57697b530/src/mongo/db/write_block_bypass.cpp#L60-L63).
 The `AuthorizationSession`, which is responsible for maintaining the authorization state, keeps track
 of whether the user has the privilege to bypass user write blocking by [updating a cached variable
 upon any changes to the authorization
-state](https://github.com/10gen/mongo/blob/e4032fe5c39f1974c76de4cefdc07d98ab25aeef/src/mongo/db/auth/authorization_session_impl.cpp#L1119-L1121).
+state](https://github.com/mongodb/mongo/blob/e4032fe5c39f1974c76de4cefdc07d98ab25aeef/src/mongo/db/auth/authorization_session_impl.cpp#L1119-L1121).
 This structure enables, for example, sharded writes to work correctly with user write blocking,
 because the `WriteBlockBypass` state is initially set on the `mongos` based on the
 `AuthorizationSession`, which knows the privileges of the user making the write request, and then
@@ -1416,26 +1415,26 @@ those operations from completing.
 
 #### Code references
 * The [`UserWriteBlockModeOpObserver`
-  class](https://github.com/10gen/mongo/blob/25377181476e4140c970afa5b018f9b4fcc951e8/src/mongo/db/op_observer/user_write_block_mode_op_observer.h#L40)
+  class](https://github.com/mongodb/mongo/blob/387f8c0e26a352b95ecfc6bc51f749d26a929390/src/mongo/db/op_observer/user_write_block_mode_op_observer.h#L40)
 * The [`GlobalUserWriteBlockState`
-  class](https://github.com/10gen/mongo/blob/25377181476e4140c970afa5b018f9b4fcc951e8/src/mongo/db/s/global_user_write_block_state.h#L37)
+  class](https://github.com/mongodb/mongo/blob/25377181476e4140c970afa5b018f9b4fcc951e8/src/mongo/db/s/global_user_write_block_state.h#L37)
 * The [`WriteBlockBypass`
-  class](https://github.com/10gen/mongo/blob/07c3d2ebcd3ca8127ed5a5aaabf439b57697b530/src/mongo/db/write_block_bypass.h#L38)
+  class](https://github.com/mongodb/mongo/blob/07c3d2ebcd3ca8127ed5a5aaabf439b57697b530/src/mongo/db/write_block_bypass.h#L38)
 * The [`abortUserIndexBuildsForUserWriteBlocking`
-  function](https://github.com/10gen/mongo/blob/25377181476e4140c970afa5b018f9b4fcc951e8/src/mongo/db/index_builds_coordinator.cpp#L850),
+  function](https://github.com/mongodb/mongo/blob/25377181476e4140c970afa5b018f9b4fcc951e8/src/mongo/db/index_builds_coordinator.cpp#L850),
   used to abort and drain all current user index builds
 * The [`SetUserWriteBlockModeCoordinator`
-  class](https://github.com/10gen/mongo/blob/ce908a66890bcdd87e709b584682c6b3a3a851be/src/mongo/db/s/config/set_user_write_block_mode_coordinator.h#L38),
+  class](https://github.com/mongodb/mongo/blob/ce908a66890bcdd87e709b584682c6b3a3a851be/src/mongo/db/s/config/set_user_write_block_mode_coordinator.h#L38),
   used to coordinate the `setUserWriteBlockMode` command for sharded clusters
 * The [`UserWritesRecoverableCriticalSectionService`
-  class](https://github.com/10gen/mongo/blob/1c4e5ba241829145026f8aa0db70707f15fbe7b3/src/mongo/db/s/user_writes_recoverable_critical_section_service.h#L88),
+  class](https://github.com/mongodb/mongo/blob/1c4e5ba241829145026f8aa0db70707f15fbe7b3/src/mongo/db/s/user_writes_recoverable_critical_section_service.h#L88),
   used to manage and persist the user write blocking state
 * The `setUserWriteBlockMode` command invocation:
     - [On a non-sharded
-      `mongod`](https://github.com/10gen/mongo/blob/25377181476e4140c970afa5b018f9b4fcc951e8/src/mongo/db/commands/set_user_write_block_mode_command.cpp#L68)
+      `mongod`](https://github.com/mongodb/mongo/blob/25377181476e4140c970afa5b018f9b4fcc951e8/src/mongo/db/commands/set_user_write_block_mode_command.cpp#L68)
     - [On a shard
-      server](https://github.com/10gen/mongo/blob/25377181476e4140c970afa5b018f9b4fcc951e8/src/mongo/db/s/shardsvr_set_user_write_block_mode_command.cpp#L61)
+      server](https://github.com/mongodb/mongo/blob/25377181476e4140c970afa5b018f9b4fcc951e8/src/mongo/db/s/shardsvr_set_user_write_block_mode_command.cpp#L61)
     - [On a config
-      server](https://github.com/10gen/mongo/blob/c96f8dacc4c71b4774c932a07be4fac71b6db628/src/mongo/db/s/config/configsvr_set_user_write_block_mode_command.cpp#L56)
+      server](https://github.com/mongodb/mongo/blob/c96f8dacc4c71b4774c932a07be4fac71b6db628/src/mongo/db/s/config/configsvr_set_user_write_block_mode_command.cpp#L56)
     - [On a
-      `mongos`](https://github.com/10gen/mongo/blob/4ba31bc8627426538307848866d3165a17aa29fb/src/mongo/s/commands/cluster_set_user_write_block_mode_command.cpp#L61)
+      `mongos`](https://github.com/mongodb/mongo/blob/4ba31bc8627426538307848866d3165a17aa29fb/src/mongo/s/commands/cluster_set_user_write_block_mode_command.cpp#L61)

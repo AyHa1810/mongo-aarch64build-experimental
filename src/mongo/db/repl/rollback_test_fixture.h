@@ -97,7 +97,8 @@ public:
                                                       StringData nss,
                                                       BSONObj cmdObj,
                                                       int recordId,
-                                                      boost::optional<BSONObj> o2 = boost::none);
+                                                      boost::optional<BSONObj> o2 = boost::none,
+                                                      boost::optional<TenantId> tid = boost::none);
 
     /**
      * Creates an oplog entry with a recordId for a command operation. The oplog entry will not have
@@ -278,7 +279,7 @@ public:
                                                       UUID uuid,
                                                       const BSONObj& filter) const override;
 
-    StatusWith<BSONObj> getCollectionInfoByUUID(const std::string& db,
+    StatusWith<BSONObj> getCollectionInfoByUUID(const DatabaseName& dbName,
                                                 const UUID& uuid) const override;
     StatusWith<BSONObj> getCollectionInfo(const NamespaceString& nss) const override;
 

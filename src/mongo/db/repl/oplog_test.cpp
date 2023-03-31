@@ -27,10 +27,7 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include <algorithm>
-#include <boost/optional/optional_io.hpp>
 #include <functional>
 #include <map>
 #include <utility>
@@ -39,7 +36,6 @@
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/lock_manager_test_help.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/field_parser.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/oplog_interface_local.h"
@@ -50,7 +46,6 @@
 #include "mongo/platform/mutex.h"
 #include "mongo/unittest/barrier.h"
 #include "mongo/util/concurrency/thread_pool.h"
-
 
 namespace mongo {
 namespace repl {
@@ -93,7 +88,7 @@ OplogEntry _getSingleOplogEntry(OperationContext* opCtx) {
 TEST_F(OplogTest, LogOpReturnsOpTimeOnSuccessfulInsertIntoOplogCollection) {
     auto opCtx = cc().makeOperationContext();
 
-    const NamespaceString nss("test.coll");
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.coll");
     auto msgObj = BSON("msg"
                        << "hello, world!");
 
@@ -159,7 +154,9 @@ void _testConcurrentLogOp(const F& makeTaskFunction,
     // Run 2 concurrent logOp() requests using the thread pool.
     ThreadPool::Options options;
     options.maxThreads = 2U;
-    options.onCreateThread = [](const std::string& name) { Client::initThread(name); };
+    options.onCreateThread = [](const std::string& name) {
+        Client::initThread(name);
+    };
     ThreadPool pool(options);
     pool.startup();
 
@@ -168,8 +165,8 @@ void _testConcurrentLogOp(const F& makeTaskFunction,
     // test thread can proceed with shutting the thread pool down.
     auto mtx = MONGO_MAKE_LATCH();
     unittest::Barrier barrier(3U);
-    const NamespaceString nss1("test1.coll");
-    const NamespaceString nss2("test2.coll");
+    const NamespaceString nss1 = NamespaceString::createNamespaceString_forTest("test1.coll");
+    const NamespaceString nss2 = NamespaceString::createNamespaceString_forTest("test2.coll");
     pool.schedule([&](auto status) mutable {
         ASSERT_OK(status) << "Failed to schedule logOp() task for namespace " << nss1;
         makeTaskFunction(nss1, &mtx, opTimeNssMap, &barrier)();
@@ -357,10 +354,9 @@ TEST_F(OplogTest, ConcurrentLogOpRevertLastOplogEntry) {
 TEST_F(OplogTest, MigrationIdAddedToOplog) {
     auto opCtx = cc().makeOperationContext();
     auto migrationUuid = UUID::gen();
-    tenantMigrationRecipientInfo(opCtx.get()) =
-        boost::make_optional<TenantMigrationRecipientInfo>(migrationUuid);
+    tenantMigrationInfo(opCtx.get()) = boost::make_optional<TenantMigrationInfo>(migrationUuid);
 
-    const NamespaceString nss("test.coll");
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("test.coll");
     auto msgObj = BSON("msg"
                        << "hello, world!");
 

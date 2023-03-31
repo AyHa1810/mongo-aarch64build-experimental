@@ -27,13 +27,11 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/repl/rollback_test_fixture.h"
 
-#include <memory>
 #include <string>
 
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
@@ -47,6 +45,8 @@
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/replication_recovery.h"
 #include "mongo/db/repl/rs_rollback.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/transaction/session_catalog_mongod_transaction_interface_impl.h"
 #include "mongo/unittest/log_test.h"
 #include "mongo/util/str.h"
 
@@ -109,6 +109,11 @@ void RollbackTest::setUp() {
     _replicationProcess->getConsistencyMarkers()->setMinValid(_opCtx.get(), OpTime{});
     _replicationProcess->initializeRollbackID(_opCtx.get()).transitional_ignore();
 
+    MongoDSessionCatalog::set(
+        serviceContext,
+        std::make_unique<MongoDSessionCatalog>(
+            std::make_unique<MongoDSessionCatalogTransactionInterfaceImpl>()));
+
     auto observerRegistry = checked_cast<OpObserverRegistry*>(serviceContext->getOpObserver());
     observerRegistry->addObserver(std::make_unique<RollbackTestOpObserver>());
 
@@ -170,14 +175,17 @@ std::pair<BSONObj, RecordId> RollbackTest::makeCommandOp(Timestamp ts,
                                                          StringData nss,
                                                          BSONObj cmdObj,
                                                          int recordId,
-                                                         boost::optional<BSONObj> o2) {
+                                                         boost::optional<BSONObj> o2,
+                                                         boost::optional<TenantId> tid) {
 
     BSONObjBuilder bob;
     bob.append("ts", ts);
     bob.append("op", "c");
     if (uuid) {  // Not all ops have UUID fields.
-        uuid.get().appendToBuilder(&bob, "ui");
+        uuid.value().appendToBuilder(&bob, "ui");
     }
+    if (tid)
+        tid->serializeToBSON("tid", &bob);
     bob.append("ns", nss);
     bob.append("o", cmdObj);
     if (o2) {
@@ -196,7 +204,7 @@ std::pair<BSONObj, RecordId> RollbackTest::makeCommandOpForApplyOps(boost::optio
     BSONObjBuilder bob;
     bob.append("op", "c");
     if (uuid) {  // Not all ops have UUID fields.
-        uuid.get().appendToBuilder(&bob, "ui");
+        uuid.value().appendToBuilder(&bob, "ui");
     }
     bob.append("ns", nss);
     bob.append("o", cmdObj);
@@ -234,8 +242,8 @@ void RollbackTest::_insertDocument(OperationContext* opCtx,
 
     auto insertDoc = [opCtx, &doc](const CollectionPtr& collection) {
         WriteUnitOfWork wuow(opCtx);
-        OpDebug* const opDebug = nullptr;
-        ASSERT_OK(collection->insertDocument(opCtx, InsertStatement(doc), opDebug));
+        ASSERT_OK(collection_internal::insertDocument(
+            opCtx, collection, InsertStatement(doc), nullptr /* OpDebug */));
         wuow.commit();
     };
     AutoGetCollection collection(opCtx, nss, MODE_X);
@@ -244,7 +252,7 @@ void RollbackTest::_insertDocument(OperationContext* opCtx,
     } else {
         CollectionOptions options;
         options.uuid = UUID::gen();
-        insertDoc(_createCollection(opCtx, nss, options));
+        insertDoc(CollectionPtr(_createCollection(opCtx, nss, options)));
     }
 }
 
@@ -292,7 +300,7 @@ StatusWith<BSONObj> RollbackSourceMock::getCollectionInfo(const NamespaceString&
     return BSON("name" << nss.ns() << "options" << BSONObj());
 }
 
-StatusWith<BSONObj> RollbackSourceMock::getCollectionInfoByUUID(const std::string& db,
+StatusWith<BSONObj> RollbackSourceMock::getCollectionInfoByUUID(const DatabaseName& dbName,
                                                                 const UUID& uuid) const {
     return BSON("options" << BSONObj() << "info" << BSON("uuid" << uuid));
 }

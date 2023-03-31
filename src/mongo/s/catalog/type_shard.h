@@ -35,7 +35,7 @@
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/s/shard_id.h"
+#include "mongo/db/shard_id.h"
 
 namespace mongo {
 
@@ -135,6 +135,8 @@ private:
     boost::optional<std::string> _host;
     // (O) is it draining chunks?
     boost::optional<bool> _draining;
+
+    // TODO SERVER-68430 remove maxSizeMB field after 7.0 branches out
     // (O) maximum allowed disk space in MB
     boost::optional<long long> _maxSizeMB;
     // (O) shard tags

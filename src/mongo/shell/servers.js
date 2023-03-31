@@ -72,15 +72,42 @@ var createMongoArgs = function(binaryName, args) {
     return fullArgs;
 };
 
+// A path.join-like thing for paths that must work
+// on Windows (\-separated) and *nix (/-separated).
+function pathJoin(...parts) {
+    const separator = _isWindows() ? '\\' : '/';
+    return parts.join(separator);
+}
+
 MongoRunner = function() {};
 
 MongoRunner.dataDir = "/data/db";
 MongoRunner.dataPath = "/data/db/";
 
-MongoRunner.mongodPath = "mongod";
-MongoRunner.mongosPath = "mongos";
-MongoRunner.mongoqPath = "mongoqd";
-MongoRunner.mongoShellPath = "mongo";
+function getMongoSuffixPath(binary_name) {
+    let installDir = _getEnv("INSTALL_DIR");
+    if (installDir && !jsTestOptions().inEvergreen) {
+        return pathJoin(installDir, binary_name);
+    }
+    return binary_name;
+}
+
+MongoRunner.getMongodPath = function() {
+    return getMongoSuffixPath("mongod");
+};
+
+MongoRunner.getMongosPath = function() {
+    return getMongoSuffixPath("mongos");
+};
+
+MongoRunner.getMongoqPath = function() {
+    return getMongoSuffixPath("mongoqd");
+};
+
+MongoRunner.getMongoShellPath = function() {
+    let shellPath = getMongoSuffixPath("mongo");
+    return shellPath;
+};
 
 MongoRunner.VersionSub = function(pattern, version) {
     this.pattern = pattern;
@@ -97,13 +124,6 @@ function getPids() {
     }
     pids = pids.concat(MongoRunner.runningChildPids());
     return pids;
-}
-
-// A path.join-like thing for paths that must work
-// on Windows (\-separated) and *nix (/-separated).
-function pathJoin(...parts) {
-    const separator = _isWindows() ? '\\' : '/';
-    return parts.join(separator);
 }
 
 // Internal state to determine if the hang analyzer should be enabled or not.
@@ -690,6 +710,29 @@ MongoRunner.mongodOptions = function(opts = {}) {
 
     opts.pathOpts = Object.merge(opts.pathOpts, {dbpath: opts.dbpath});
 
+    opts.setParameter = opts.setParameter || {};
+    if (jsTestOptions().enableTestCommands && typeof opts.setParameter !== "string") {
+        // TODO (SERVER-74847): Remove this transition once we remove testing around
+        // downgrading from latest to last continuous.
+        if (jsTestOptions().setParameters &&
+            jsTestOptions().setParameters.disableTransitionFromLatestToLastContinuous) {
+            opts.setParameter["disableTransitionFromLatestToLastContinuous"] =
+                jsTestOptions().setParameters.disableTransitionFromLatestToLastContinuous;
+        } else {
+            opts.setParameter["disableTransitionFromLatestToLastContinuous"] = false;
+        }
+
+        // TODO (SERVER-74398): Remove special handling of 'confirm: true' once we no longer run
+        // suites with v6.X. We disable this check by default now so that we can pass suites
+        // without individually handling each multiversion test running on old binaries.
+        if (jsTestOptions().setParameters && jsTestOptions().setParameters.requireConfirmInSetFcv) {
+            opts.setParameter["requireConfirmInSetFcv"] =
+                jsTestOptions().setParameters.requireConfirmInSetFcv;
+        } else {
+            opts.setParameter["requireConfirmInSetFcv"] = false;
+        }
+    }
+
     _removeSetParameterIfBeforeVersion(opts, "writePeriodicNoops", "3.3.12");
     _removeSetParameterIfBeforeVersion(opts, "numInitialSyncAttempts", "3.3.12");
     _removeSetParameterIfBeforeVersion(opts, "numInitialSyncConnectAttempts", "3.3.12");
@@ -701,8 +744,12 @@ MongoRunner.mongodOptions = function(opts = {}) {
         opts, "enableDefaultWriteConcernUpdatesForInitiate", "5.0.0");
     _removeSetParameterIfBeforeVersion(opts, "enableReconfigRollbackCommittedWritesCheck", "5.0.0");
     _removeSetParameterIfBeforeVersion(opts, "featureFlagRetryableFindAndModify", "5.0.0");
-    _removeSetParameterIfBeforeVersion(opts, "internalQueryForceClassicEngine", "5.1.0");
     _removeSetParameterIfBeforeVersion(opts, "allowMultipleArbiters", "5.3.0");
+    _removeSetParameterIfBeforeVersion(
+        opts, "internalQueryDisableExclusionProjectionFastPath", "6.2.0");
+    _removeSetParameterIfBeforeVersion(
+        opts, "disableTransitionFromLatestToLastContinuous", "7.0.0");
+    _removeSetParameterIfBeforeVersion(opts, "requireConfirmInSetFcv", "7.0.0");
 
     if (!opts.logFile && opts.useLogFiles) {
         opts.logFile = opts.dbpath + "/mongod.log";
@@ -773,6 +820,14 @@ MongoRunner.mongodOptions = function(opts = {}) {
         opts.auditPath = MongoRunner.toRealPath(opts.auditPath, opts);
     }
 
+    if (opts.hasOwnProperty("setParameter")) {
+        if (((typeof opts.setParameter === "string") &&
+             opts.setParameter.includes("multitenancySupport") &&
+             opts.setParameter.includes("true")) ||
+            (opts.setParameter.multitenancySupport))
+            opts.noscripting = "";
+    }
+
     if (opts.noReplSet)
         opts.replSet = null;
     if (opts.arbiter)
@@ -838,12 +893,6 @@ MongoRunner.mongosOptions = function(opts) {
 
     _removeSetParameterIfBeforeVersion(
         opts, "mongosShutdownTimeoutMillisForSignaledShutdown", "4.5.0", true);
-
-    // If the mongos is being restarted with a newer version, make sure we remove any options
-    // that no longer exist in the newer version.
-    if (opts.restart && MongoRunner.areBinVersionsTheSame('latest', opts.binVersion)) {
-        delete opts.noAutoSplit;
-    }
 
     return opts;
 };
@@ -978,7 +1027,7 @@ MongoRunner.runMongod = function(opts) {
             }
         }
 
-        var mongodProgram = MongoRunner.mongodPath;
+        var mongodProgram = MongoRunner.getMongodPath();
         opts = MongoRunner.arrOptions(mongodProgram, opts);
     }
 
@@ -1016,7 +1065,7 @@ MongoRunner.runMongos = function(opts) {
         runId = opts.runId;
         waitForConnect = opts.waitForConnect;
         env = opts.env;
-        var mongosProgram = MongoRunner.mongosPath;
+        var mongosProgram = MongoRunner.getMongosPath();
         opts = MongoRunner.arrOptions(mongosProgram, opts);
     }
 
@@ -1053,7 +1102,7 @@ MongoRunner.runMongoq = function(opts) {
         runId = opts.runId;
         waitForConnect = opts.waitForConnect;
         env = opts.env;
-        var mongoqProgram = MongoRunner.mongoqPath;
+        var mongoqProgram = MongoRunner.getMongoqPath();
         opts = MongoRunner.arrOptions(mongoqProgram, opts);
     }
 
@@ -1745,7 +1794,7 @@ startMongoProgramNoConnect = function() {
 };
 
 myPort = function() {
-    const hosts = db.getMongo().host.split(',');
+    const hosts = globalThis.db.getMongo().host.split(',');
 
     const ip6Numeric = hosts[0].match(/^\[[0-9A-Fa-f:]+\]:(\d+)$/);
     if (ip6Numeric) {

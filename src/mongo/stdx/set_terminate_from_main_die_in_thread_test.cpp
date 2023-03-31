@@ -29,7 +29,7 @@
 
 #include "mongo/stdx/exception.h"
 
-#include <stdlib.h>
+#include <cstdlib>
 
 #include <iostream>
 
@@ -52,8 +52,7 @@ void testTerminateDispatch() {
     stdx::thread{[] {
         std::cout << "Calling terminate from background thread." << std::endl;
         std::terminate();
-    }}
-        .join();
+    }}.join();
     exit(static_cast<int>(mongo::ExitCode::fail));
 }
 }  // namespace

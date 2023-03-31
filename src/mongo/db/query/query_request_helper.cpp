@@ -152,9 +152,9 @@ void refreshNSS(const NamespaceString& nss, FindCommandRequest* findCommand) {
 std::unique_ptr<FindCommandRequest> makeFromFindCommand(const BSONObj& cmdObj,
                                                         boost::optional<NamespaceString> nss,
                                                         bool apiStrict) {
-
-    auto findCommand = std::make_unique<FindCommandRequest>(
-        FindCommandRequest::parse(IDLParserContext("FindCommandRequest", apiStrict), cmdObj));
+    auto findCommand = std::make_unique<FindCommandRequest>(FindCommandRequest::parse(
+        IDLParserContext("FindCommandRequest", apiStrict, nss ? nss->tenantId() : boost::none),
+        cmdObj));
 
     // If there is an explicit namespace specified overwite it.
     if (nss) {
@@ -222,9 +222,10 @@ TailableModeEnum getTailableMode(const FindCommandRequest& findCommand) {
         tailableModeFromBools(findCommand.getTailable(), findCommand.getAwaitData()));
 }
 
-void validateCursorResponse(const BSONObj& outputAsBson) {
+void validateCursorResponse(const BSONObj& outputAsBson, boost::optional<TenantId> tenantId) {
     if (getTestCommandsEnabled()) {
-        CursorInitialReply::parse(IDLParserContext("CursorInitialReply"), outputAsBson);
+        CursorInitialReply::parse(
+            IDLParserContext("CursorInitialReply", false /* apiStrict */, tenantId), outputAsBson);
     }
 }
 

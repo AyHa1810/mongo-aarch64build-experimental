@@ -8,8 +8,7 @@
  * @tags: [
  *   requires_sharding,
  *   assumes_balancer_on,
- *   featureFlagBalanceAccordingToDataSize,
- *   requires_fcv_61,
+ *   antithesis_incompatible,
  *  ]
  */
 
@@ -53,10 +52,29 @@ var $config = (function() {
         },
     };
 
+    let defaultBalancerShouldReturnRandomMigrations;
+
     /*
      * Create sharded collections with random maxChunkSizeMB (betwen 1MB and 10MB)
      */
     let setup = function(db, collName, cluster) {
+        cluster.executeOnConfigNodes((db) => {
+            defaultBalancerShouldReturnRandomMigrations =
+                assert
+                    .commandWorked(db.adminCommand({
+                        getParameter: 1,
+                        'failpoint.balancerShouldReturnRandomMigrations': 1
+                    }))['failpoint.balancerShouldReturnRandomMigrations']
+                    .mode;
+
+            // If the failpoint is enabled on this suite, disable it because this test relies on the
+            // balancer taking correct decisions.
+            if (defaultBalancerShouldReturnRandomMigrations === 1) {
+                assert.commandWorked(db.adminCommand(
+                    {configureFailPoint: 'balancerShouldReturnRandomMigrations', mode: 'off'}));
+            }
+        });
+
         const mongos = cluster.getDB('config').getMongo();
         const shardNames = Object.keys(cluster.getSerializedCluster().shards);
         const numShards = shardNames.length;
@@ -106,59 +124,26 @@ var $config = (function() {
                 testedAtLeastOneCollection = true;
 
                 // Wait for collection to be considered balanced
-                assert.soon(
-                    function() {
-                        return assert
-                            .commandWorked(mongos.adminCommand({balancerCollectionStatus: ns}))
-                            .balancerCompliant;
-                    },
-                    'Timed out waiting for collections to be balanced',
-                    60000 * 5 /* timeout (5 minutes) */,
-                    1000 /* interval */);
-
-                const statsPipeline = [
-                    {'$collStats': {'storageStats': {}}},
-                    {
-                        '$project': {
-                            'shard': true,
-                            'storageStats': {
-                                'count': true,
-                                'size': true,
-                                'avgObjSize': true,
-                                'numOrphanDocs': true
-                            }
-                        }
-                    }
-                ];
-
-                // Get stats for the collection from each shard
-                const storageStats = coll.aggregate(statsPipeline).toArray();
-                let minSizeOnShardForCollection = Number.MAX_VALUE;
-                let maxSizeOnShardForCollection = Number.MIN_VALUE;
-
-                storageStats.forEach(function(shardStats) {
-                    const orphansSize = shardStats['storageStats']['numOrphanDocs'] *
-                        shardStats['storageStats']['avgObjSize'];
-                    const size = shardStats['storageStats']['size'] - orphansSize;
-                    if (size > maxSizeOnShardForCollection) {
-                        maxSizeOnShardForCollection = size;
-                    }
-                    if (size < minSizeOnShardForCollection) {
-                        minSizeOnShardForCollection = size;
-                    }
-                });
-
-                // Check that there is no imbalance
-                const collEntry = cluster.getDB('config').collections.findOne({'_id': ns});
-                const errMsg = "ns=" + ns + ' , collEntry=' + JSON.stringify(collEntry) +
-                    ', storageStats=' + JSON.stringify(storageStats);
-                assert.lte(maxSizeOnShardForCollection - minSizeOnShardForCollection,
-                           2 * collEntry.maxChunkSizeBytes,
-                           errMsg);
+                sh.awaitCollectionBalance(
+                    coll, 5 * 60000 /* 5min timeout */, 1000 /* 1s interval */);
+                sh.verifyCollectionIsBalanced(coll);
             }
 
             assert(testedAtLeastOneCollection);
         }
+
+        cluster.executeOnConfigNodes((db) => {
+            // Reset the failpoint to its original value.
+            if (defaultBalancerShouldReturnRandomMigrations === 1) {
+                defaultBalancerShouldReturnRandomMigrations =
+                    assert
+                        .commandWorked(db.adminCommand({
+                            configureFailPoint: 'balancerShouldReturnRandomMigrations',
+                            mode: 'alwaysOn'
+                        }))
+                        .was;
+            }
+        });
     };
 
     let transitions = {insert: {insert: 1.0}};

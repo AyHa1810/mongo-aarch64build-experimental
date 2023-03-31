@@ -606,8 +606,6 @@ DEATH_TEST_REGEX_F(DocumentSourceMatchTest,
     const auto matchSpec = BSON("a" << BSON("$elemMatch" << BSON("a.b" << 1)));
     const auto matchExpression =
         unittest::assertGet(MatchExpressionParser::parse(matchSpec, expCtx));
-    BSONObjBuilder out;
-    matchExpression->serialize(&out);
     DocumentSourceMatch::descendMatchOnPath(matchExpression.get(), "a", expCtx);
 }
 
@@ -703,6 +701,67 @@ TEST_F(DocumentSourceMatchTest, ShouldShowOptimizationsInExplainOutputWhenOptimi
     ASSERT_VALUE_EQ(
         Value((static_cast<DocumentSourceMatch*>(optimizedMatch.get()))->serialize(kExplain)),
         Value(expectedMatch));
+}
+
+TEST_F(DocumentSourceMatchTest, RedactionWithAnd) {
+    auto spec = fromjson(R"({
+        $match: {
+            $and: [
+                {
+                    a: 'abc'
+                },
+                {
+                    b: {
+                        $gt: 10
+                    }
+                }
+            ]
+        }})");
+    auto docSource = DocumentSourceMatch::createFromBson(spec.firstElement(), getExpCtx());
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$match": {
+                "$and": [
+                    {
+                        "HASH<a>": {
+                            "$eq": "?"
+                        }
+                    },
+                    {
+                        "HASH<b>": {
+                            "$gt": "?"
+                        }
+                    }
+                ]
+            }
+        })",
+        redact(*docSource));
+}
+
+TEST_F(DocumentSourceMatchTest, RedactionWithExprPipeline) {
+    auto spec = fromjson(R"({
+        $match: {
+            $expr: {
+                $eq: [
+                    '$foo',
+                    '$bar'
+                ]
+            }
+        }
+    })");
+    auto docSource = DocumentSourceMatch::createFromBson(spec.firstElement(), getExpCtx());
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT
+        R"({
+            "$match": {
+                "$expr": {
+                    "$eq": [
+                        "$HASH<foo>",
+                        "$HASH<bar>"
+                    ]
+                }
+            }
+        })",
+        redact(*docSource));
 }
 
 }  // namespace

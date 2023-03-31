@@ -51,6 +51,7 @@
 #include "mongo/db/query/planner_wildcard_helpers.h"
 #include "mongo/db/query/projection_ast_util.h"
 #include "mongo/db/query/query_planner_common.h"
+#include "mongo/db/query/util/set_util.h"
 
 namespace mongo {
 
@@ -295,10 +296,9 @@ void QuerySolution::extendWith(std::unique_ptr<QuerySolutionNode> extensionRoot)
 }
 
 void QuerySolution::setRoot(std::unique_ptr<QuerySolutionNode> root) {
+    uassert(6882300, "QuerySolutionNode must be non null", root);
     _root = std::move(root);
-    if (_root) {
-        _enumeratorExplainInfo.hitScanLimit = _root->getScanLimit();
-    }
+    _enumeratorExplainInfo.hitScanLimit = _root->getScanLimit();
 
     QsnIdGenerator idGenerator;
     assignNodeIds(idGenerator, *_root);
@@ -352,6 +352,7 @@ std::unique_ptr<QuerySolutionNode> CollectionScanNode::clone() const {
     copy->shouldWaitForOplogVisibility = this->shouldWaitForOplogVisibility;
     copy->clusteredIndex = this->clusteredIndex;
     copy->hasCompatibleCollation = this->hasCompatibleCollation;
+    copy->lowPriority = this->lowPriority;
     return copy;
 }
 
@@ -629,8 +630,8 @@ std::unique_ptr<QuerySolutionNode> FetchNode::clone() const {
 // IndexScanNode
 //
 
-IndexScanNode::IndexScanNode(IndexEntry index)
-    : index(std::move(index)),
+IndexScanNode::IndexScanNode(IndexEntry indexEntry)
+    : index(std::move(indexEntry)),
       direction(1),
       addKeyMetadata(false),
       shouldDedup(index.multikey),
@@ -693,8 +694,12 @@ FieldAvailability IndexScanNode::getFieldAvailability(const string& field) const
     for (auto&& elt : index.keyPattern) {
         // For $** indexes, the keyPattern is prefixed by a virtual field, '$_path'. We therefore
         // skip the first keyPattern field when deciding whether we can provide the requested field.
-        if (index.type == IndexType::INDEX_WILDCARD && !keyPatternFieldIndex) {
-            invariant(elt.fieldNameStringData() == "$_path"_sd);
+        if (index.type == IndexType::INDEX_WILDCARD &&
+            keyPatternFieldIndex == index.wildcardFieldPos - 1) {
+            tassert(7246701,
+                    "Expected element at the position before the wildcard field to be the virtual "
+                    "field $_path.",
+                    elt.fieldNameStringData() == "$_path"_sd);
             ++keyPatternFieldIndex;
             continue;
         }
@@ -873,7 +878,10 @@ bool confirmBoundsProvideSortComponentGivenMultikeyness(
     return true;
 }
 
-std::set<std::string> extractEqualityFields(const IndexBounds& bounds, const IndexEntry& index) {
+std::set<std::string> extractEqualityFields(
+    const IndexBounds& bounds,
+    const IndexEntry& index,
+    const std::vector<interval_evaluation_tree::IET>* iets) {
     std::set<std::string> equalityFields;
 
     // Find all equality predicate fields.
@@ -888,9 +896,50 @@ std::set<std::string> extractEqualityFields(const IndexBounds& bounds, const Ind
             if (!ival.isPoint()) {
                 continue;
             }
+
+            // If we have an IET for this field in our index bounds, we determine whether it
+            // guarantees that, upon evaluation, we will have point bounds for the corresponding
+            // field in our index. In particular, if the IET evaluates to a ConstNode, an equality
+            // EvalNode, or an ExplodeNode, then this field represents an equality.
+            if (iets && !iets->empty()) {
+                const auto& iet = (*iets)[i];
+                auto mustBePointInterval = [&]() {
+                    if (const auto* constNode = iet.cast<interval_evaluation_tree::ConstNode>();
+                        constNode) {
+                        // If we have 'constNodePtr', it must be the case that the interval that it
+                        // contains is the same as 'ival'.
+                        tassert(7426201,
+                                "'constNode' must have a single interval",
+                                constNode->oil.intervals.size() == 1);
+                        tassert(
+                            7426202,
+                            "'constNode' must have the same point interval as the one in 'bounds'",
+                            constNode->oil.intervals[0].equals(ival));
+                        return true;
+                    } else if (const auto* evalNode =
+                                   iet.cast<interval_evaluation_tree::EvalNode>();
+                               evalNode) {
+                        if (evalNode->matchType() == MatchExpression::MatchType::EQ) {
+                            return true;
+                        }
+                    } else if (const auto* explodeNode =
+                                   iet.cast<interval_evaluation_tree::ExplodeNode>();
+                               explodeNode) {
+                        return true;
+                    }
+                    return false;
+                }();
+
+                if (!mustBePointInterval) {
+                    continue;
+                }
+            }
             equalityFields.insert(oil.name);
         }
     } else {
+        tassert(7426200,
+                "Should not have IETs when evaluating min/max index bounds",
+                !iets || iets->empty());
         BSONObjIterator keyIter(index.keyPattern);
         BSONObjIterator startIter(bounds.startKey);
         BSONObjIterator endIter(bounds.endKey);
@@ -913,7 +962,8 @@ ProvidedSortSet computeSortsForScan(const IndexEntry& index,
                                     int direction,
                                     const IndexBounds& bounds,
                                     const CollatorInterface* queryCollator,
-                                    const std::set<StringData>& multikeyFields) {
+                                    const std::set<StringData>& multikeyFields,
+                                    const std::vector<interval_evaluation_tree::IET>* iets) {
     BSONObj sortPatternProvidedByIndex = index.keyPattern;
 
     // If 'index' is the result of expanding a wildcard index, then its key pattern should look like
@@ -921,26 +971,51 @@ ProvidedSortSet computeSortsForScan(const IndexEntry& index,
     // key as opposed to real user data. We shouldn't report any sort orders including "$_path". In
     // fact, $-prefixed path components are illegal in queries in most contexts, so misinterpreting
     // this as a path in user-data could trigger subsequent assertions.
+    //
+    // An expanded compound wildcard index can be used to answer queries on non-wildcard prefix
+    // fields, in this case, the wildcard field is unknown. This expanded IndexEntry holds a key
+    // pattern with the wildcard field being the reserved path, "$_path". All following regular
+    // fields should not support any sort operation, therefore, we should strip all fields starting
+    // from the first "$_path" field.
     if (index.type == IndexType::INDEX_WILDCARD) {
-        invariant(bounds.fields.size() == 2u);
+        tassert(7246700,
+                "The bounds did not have as many fields as the key pattern.",
+                static_cast<size_t>(index.keyPattern.nFields()) == bounds.fields.size());
 
         // No sorts are provided if the bounds for '$_path' consist of multiple intervals. This can
         // happen for existence queries. For example, {a: {$exists: true}} results in bounds
         // [["a","a"], ["a.", "a/")] for '$_path' so that keys from documents where "a" is a nested
         // object are in bounds.
-        if (bounds.fields[0].intervals.size() != 1u) {
+        if (bounds.fields[index.wildcardFieldPos - 1].intervals.size() != 1u) {
             return {};
         }
 
-        // Strip '$_path' out of 'sortPattern' and then proceed with regular sort analysis.
-        BSONObjIterator it{sortPatternProvidedByIndex};
-        invariant(it.more());
-        auto pathElement = it.next();
-        invariant(pathElement.fieldNameStringData() == "$_path"_sd);
-        invariant(it.more());
-        auto secondElement = it.next();
-        invariant(!it.more());
-        sortPatternProvidedByIndex = BSONObjBuilder{}.append(secondElement).obj();
+        BSONObjBuilder sortPatternStripped;
+        // Strip '$_path' and following fields out of 'sortPattern' and then proceed with regular
+        // sort analysis.
+        if (feature_flags::gFeatureFlagCompoundWildcardIndexes.isEnabledAndIgnoreFCV()) {
+            bool hasPathField = false;
+            for (auto elem : sortPatternProvidedByIndex) {
+                if (elem.fieldNameStringData() == "$_path"_sd) {
+                    if (hasPathField) {
+                        break;
+                    }
+                    hasPathField = true;
+                } else {
+                    sortPatternStripped.append(elem);
+                }
+            }
+            sortPatternProvidedByIndex = sortPatternStripped.obj();
+        } else {
+            BSONObjIterator it{sortPatternProvidedByIndex};
+            invariant(it.more());
+            auto pathElement = it.next();
+            invariant(pathElement.fieldNameStringData() == "$_path"_sd);
+            invariant(it.more());
+            auto secondElement = it.next();
+            invariant(!it.more());
+            sortPatternProvidedByIndex = BSONObjBuilder{}.append(secondElement).obj();
+        }
     }
 
     //
@@ -961,6 +1036,11 @@ ProvidedSortSet computeSortsForScan(const IndexEntry& index,
     // sort order on this field or any subsequent fields. When we encounter such a field in the
     // index key pattern, we truncate it and any later fields to form the "base sort pattern".
     //
+    // When dealing with autoparameterization (that is, when 'iets' is non-empty), the requirement
+    // for a field to be considered an equality field is stricter. In particular, we must be able to
+    // prove that the index bounds will always yield point bounds for any future value of the input
+    // parameter.
+    //
     // Example, consider an index pattern {a: 1, b: 1, c: 1, d: 1},
     // - If the query predicate is {a: 1} and 'c' is a multikey field then, unsupportedFields = {c},
     // equalityFields = {a}, ignoreFields = {} and baseSortPattern = {b: 1}. Field 'a' is dropped
@@ -980,7 +1060,7 @@ ProvidedSortSet computeSortsForScan(const IndexEntry& index,
     // So we can provide sorts {a: 1, d: 1}, {a: 1, c: 1, d: 1} but not sort patterns that include
     // field 'b'.
     //
-    std::set<std::string> equalityFields = extractEqualityFields(bounds, index);
+    std::set<std::string> equalityFields = extractEqualityFields(bounds, index, iets);
     std::set<StringData> unsupportedFields;
     std::set<StringData> ignoreFields;
     if (!CollatorInterface::collatorsMatch(queryCollator, index.collator)) {
@@ -1040,7 +1120,8 @@ std::pair<ProvidedSortSet, std::set<StringData>> computeSortsAndMultikeyPathsFor
     const IndexEntry& index,
     int direction,
     const IndexBounds& bounds,
-    const CollatorInterface* queryCollator) {
+    const CollatorInterface* queryCollator,
+    const std::vector<interval_evaluation_tree::IET>* iets) {
     // If the index is multikey but does not have path-level multikey metadata, then this index
     // cannot provide any sorts and we need not populate 'multikeyFieldsOut'.
     if (index.multikey && index.multikeyPaths.empty()) {
@@ -1051,14 +1132,14 @@ std::pair<ProvidedSortSet, std::set<StringData>> computeSortsAndMultikeyPathsFor
     if (index.multikey) {
         multikeyFieldsOut = getMultikeyFields(index.keyPattern, index.multikeyPaths);
     }
-    return {computeSortsForScan(index, direction, bounds, queryCollator, multikeyFieldsOut),
+    return {computeSortsForScan(index, direction, bounds, queryCollator, multikeyFieldsOut, iets),
             std::move(multikeyFieldsOut)};
 }
 }  // namespace
 
 void IndexScanNode::computeProperties() {
     std::tie(sortSet, multikeyFields) =
-        computeSortsAndMultikeyPathsForScan(index, direction, bounds, queryCollator);
+        computeSortsAndMultikeyPathsForScan(index, direction, bounds, queryCollator, &iets);
 }
 
 std::unique_ptr<QuerySolutionNode> IndexScanNode::clone() const {
@@ -1069,6 +1150,7 @@ std::unique_ptr<QuerySolutionNode> IndexScanNode::clone() const {
     copy->addKeyMetadata = this->addKeyMetadata;
     copy->bounds = this->bounds;
     copy->queryCollator = this->queryCollator;
+    copy->lowPriority = this->lowPriority;
 
     return copy;
 }
@@ -1099,16 +1181,17 @@ bool IndexScanNode::operator==(const IndexScanNode& other) const {
 ColumnIndexScanNode::ColumnIndexScanNode(ColumnIndexEntry indexEntry,
                                          OrderedPathSet outputFieldsIn,
                                          OrderedPathSet matchFieldsIn,
+                                         OrderedPathSet allFieldsIn,
                                          StringMap<std::unique_ptr<MatchExpression>> filtersByPath,
-                                         std::unique_ptr<MatchExpression> postAssemblyFilter)
+                                         std::unique_ptr<MatchExpression> postAssemblyFilter,
+                                         bool extraFieldsPermitted)
     : indexEntry(std::move(indexEntry)),
       outputFields(std::move(outputFieldsIn)),
       matchFields(std::move(matchFieldsIn)),
+      allFields(std::move(allFieldsIn)),
       filtersByPath(std::move(filtersByPath)),
-      postAssemblyFilter(std::move(postAssemblyFilter)) {
-    allFields = outputFields;
-    allFields.insert(matchFields.begin(), matchFields.end());
-}
+      postAssemblyFilter(std::move(postAssemblyFilter)),
+      extraFieldsPermitted(extraFieldsPermitted) {}
 
 void ColumnIndexScanNode::appendToString(str::stream* ss, int indent) const {
     addIndent(ss, indent);
@@ -1187,7 +1270,7 @@ void ProjectionNode::computeProperties() {
 void ProjectionNode::cloneProjectionData(ProjectionNode* copy) const {
     // ProjectionNode should not populate filter. This should be a no-op.
     if (this->filter)
-        copy->filter = this->filter->shallowClone();
+        copy->filter = this->filter->clone();
 
     copy->sortSet = this->sortSet;
 }
@@ -1444,7 +1527,9 @@ std::unique_ptr<QuerySolutionNode> DistinctNode::clone() const {
 void DistinctNode::computeProperties() {
     // Note that we don't need to save the returned multikey fields for a DISTINCT_SCAN. They are
     // only needed for explodeForSort(), which works on IXSCAN but not DISTINCT_SCAN.
-    sortSet = computeSortsAndMultikeyPathsForScan(index, direction, bounds, queryCollator).first;
+    sortSet = computeSortsAndMultikeyPathsForScan(
+                  index, direction, bounds, queryCollator, nullptr /* iets */)
+                  .first;
 }
 
 //
@@ -1613,6 +1698,12 @@ void EqLookupNode::appendToString(str::stream* ss, int indent) const {
     *ss << "foreignField = " << joinFieldForeign.fullPath() << "\n";
     addIndent(ss, indent + 1);
     *ss << "lookupStrategy = " << serializeLookupStrategy(lookupStrategy) << "\n";
+    if (idxEntry) {
+        addIndent(ss, indent + 1);
+        *ss << "indexName = " << idxEntry->identifier.catalogName << "\n";
+        addIndent(ss, indent + 1);
+        *ss << "indexKeyPattern = " << idxEntry->keyPattern << "\n";
+    }
     addCommon(ss, indent);
     addIndent(ss, indent + 1);
     *ss << "Child:" << '\n';

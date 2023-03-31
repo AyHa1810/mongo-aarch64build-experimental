@@ -59,15 +59,23 @@ static constexpr StringData kKeyFieldName = "key"_sd;
 static constexpr StringData kOriginalSpecFieldName = "originalSpec"_sd;
 static constexpr StringData kPartialFilterExpressionFieldName = "partialFilterExpression"_sd;
 
-static constexpr int kTimeseriesControlDefaultVersion = 1;
+static constexpr int kTimeseriesControlUncompressedVersion = 1;
 static constexpr int kTimeseriesControlCompressedVersion = 2;
+static constexpr int kTimeseriesControlLatestVersion = kTimeseriesControlCompressedVersion;
+static constexpr int kTimeseriesControlMinVersion = kTimeseriesControlUncompressedVersion;
+
+
+// These are hard-coded control object subfields.
+static constexpr StringData kControlVersionPath = "control.version"_sd;
+static constexpr StringData kControlClosedPath = "control.closed"_sd;
 
 static const StringDataSet kAllowedCollectionCreationOptions{
     CreateCommand::kStorageEngineFieldName,
     CreateCommand::kIndexOptionDefaultsFieldName,
     CreateCommand::kCollationFieldName,
     CreateCommand::kTimeseriesFieldName,
-    CreateCommand::kExpireAfterSecondsFieldName};
+    CreateCommand::kExpireAfterSecondsFieldName,
+    CreateCommand::kDollarTenantFieldName};
 
 }  // namespace timeseries
 }  // namespace mongo

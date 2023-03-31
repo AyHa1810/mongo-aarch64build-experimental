@@ -40,6 +40,7 @@
 #include <fmt/format.h>
 #include <fstream>
 
+#include "mongo/bson/bson_bin_util.h"
 #include "mongo/bson/bson_validate.h"
 #include "mongo/bson/util/bsoncolumn.h"
 #include "mongo/scripting/engine.h"
@@ -371,16 +372,17 @@ BSONObj writeFile(const BSONObj& args, void* data) {
 
     const boost::filesystem::path originalFilePath{filePathElem.String()};
     const boost::filesystem::path normalizedFilePath{originalFilePath.lexically_normal()};
+    const boost::filesystem::path absoluteFilePath{boost::filesystem::absolute(normalizedFilePath)};
 
     uassert(40343,
             "writeFile() can only write a file in a directory which already exists",
-            boost::filesystem::exists(normalizedFilePath.parent_path()));
+            boost::filesystem::exists(absoluteFilePath.parent_path()));
     uassert(40344,
             "writeFile() can only write to a file which does not yet exist",
-            !boost::filesystem::exists(normalizedFilePath));
+            !boost::filesystem::exists(absoluteFilePath));
     uassert(40345,
             "the file name must be compatible with POSIX and Windows",
-            boost::filesystem::portable_name(normalizedFilePath.filename().string()));
+            boost::filesystem::portable_name(absoluteFilePath.filename().string()));
 
     std::ios::openmode mode = std::ios::out;
 
@@ -395,14 +397,58 @@ BSONObj writeFile(const BSONObj& args, void* data) {
             mode |= std::ios::binary;
     }
 
-    boost::filesystem::ofstream ofs{normalizedFilePath, mode};
+    boost::filesystem::ofstream ofs{absoluteFilePath, mode};
     uassert(40346,
+            str::stream() << "failed to open file " << absoluteFilePath.string() << " for writing",
+            ofs);
+
+    ofs << fileContentElem.String();
+    uassert(40347, str::stream() << "failed to write to file " << absoluteFilePath.string(), ofs);
+
+    return undefinedReturn;
+}
+
+/**
+ * Writes an array of bson objects one after another. The format is readable by the `bsondump` tool.
+ */
+BSONObj writeBsonArrayToFile(const BSONObj& args, void* data) {
+    uassert(7196709, "writeBsonArrayToFile needs 2 arguments", args.nFields() == 2);
+
+    BSONObjIterator it(args);
+    auto filePathElem = it.next();
+    uassert(7196708, "first argument must be a string", filePathElem.type() == BSONType::String);
+
+    auto fileContentElem = it.next();
+    uassert(
+        7196707, "second argument must be a BSON array", fileContentElem.type() == BSONType::Array);
+
+    const boost::filesystem::path originalFilePath{filePathElem.String()};
+    const boost::filesystem::path normalizedFilePath{originalFilePath.lexically_normal()};
+    const boost::filesystem::path absoluteFilePath{boost::filesystem::absolute(normalizedFilePath)};
+
+    uassert(7196706,
+            "bsonArrayToFile() can only write a file in a directory which already exists",
+            boost::filesystem::exists(absoluteFilePath.parent_path()));
+    uassert(7196705,
+            "bsonArrayToFile() can only write to a file which does not yet exist",
+            !boost::filesystem::exists(absoluteFilePath));
+    uassert(7196704,
+            "the file name must be compatible with POSIX and Windows",
+            boost::filesystem::portable_name(absoluteFilePath.filename().string()));
+
+    std::ios::openmode mode = std::ios::out | std::ios::binary;
+    boost::filesystem::ofstream ofs{absoluteFilePath, mode};
+    uassert(7196703,
             str::stream() << "failed to open file " << normalizedFilePath.string()
                           << " for writing",
             ofs);
 
-    ofs << fileContentElem.String();
-    uassert(40347, str::stream() << "failed to write to file " << normalizedFilePath.string(), ofs);
+    for (const auto& obj : fileContentElem.Obj()) {
+        ofs.write(obj.Obj().objdata(), obj.objsize());
+        uassert(7196702, "Error writing to file", !ofs.bad());
+    }
+    ofs.flush();
+    uassert(7196701, str::stream() << "failed to write to file " << absoluteFilePath.string(), ofs);
 
     return undefinedReturn;
 }
@@ -467,6 +513,13 @@ BSONObj decompressBSONColumn(const BSONObj& a, void* data) {
     res.done();
 
     return wrapper.obj();
+}
+
+/**
+ * Dumps BSON data as a Hex-formatted string
+ */
+BSONObj dumpBSONAsHex(const BSONObj& a, void* data) {
+    return BSON("" << bson_bin_util::toHex(a));
 }
 
 // The name of the file to dump is provided as a string in the first
@@ -575,9 +628,11 @@ void installShellUtilsExtended(Scope& scope) {
     scope.injectNative("umask", changeUmask);
     scope.injectNative("getFileMode", getFileMode);
     scope.injectNative("decompressBSONColumn", decompressBSONColumn);
+    scope.injectNative("dumpBSONAsHex", dumpBSONAsHex);
     scope.injectNative("_copyFileRange", copyFileRange);
     scope.injectNative("_readDumpFile", readDumpFile);
     scope.injectNative("_getEnv", shellGetEnv);
+    scope.injectNative("writeBsonArrayToFile", writeBsonArrayToFile);
 }
 
 }  // namespace shell_utils

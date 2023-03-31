@@ -69,7 +69,9 @@ auto makeExpressionContext(OperationContext* opCtx,
     // AutoGetCollectionForReadCommand will throw if the sharding version for this connection is
     // out of date.
     AutoGetCollectionForReadCommandMaybeLockFree ctx(
-        opCtx, parsedMr.getNamespace(), AutoGetCollectionViewMode::kViewsPermitted);
+        opCtx,
+        parsedMr.getNamespace(),
+        AutoGetCollection::Options{}.viewMode(auto_get_collection::ViewMode::kViewsPermitted));
     uassert(ErrorCodes::CommandNotSupportedOnView,
             "mapReduce on a view is not supported",
             !ctx.getView());
@@ -107,10 +109,6 @@ auto makeExpressionContext(OperationContext* opCtx,
         boost::none,                             // let
         CurOp::get(opCtx)->dbProfileLevel() > 0  // mayDbProfile
     );
-    if (opCtx->readOnly()) {
-        // Disallow disk use if in read-only mode.
-        expCtx->allowDiskUse = false;
-    }
     expCtx->tempDir = storageGlobalParams.dbpath + "/_tmp";
     return expCtx;
 }
@@ -118,6 +116,7 @@ auto makeExpressionContext(OperationContext* opCtx,
 }  // namespace
 
 bool runAggregationMapReduce(OperationContext* opCtx,
+                             const DatabaseName& dbName,
                              const BSONObj& cmd,
                              BSONObjBuilder& result,
                              boost::optional<ExplainOptions::Verbosity> verbosity) {
@@ -139,7 +138,10 @@ bool runAggregationMapReduce(OperationContext* opCtx,
 
     Timer cmdTimer;
 
-    auto parsedMr = MapReduceCommandRequest::parse(IDLParserContext("mapReduce"), cmd);
+    auto parsedMr = MapReduceCommandRequest::parse(
+        IDLParserContext("mapReduce", false /* apiStrict */, dbName.tenantId()), cmd);
+    auto curop = CurOp::get(opCtx);
+    curop->beginQueryPlanningTimer();
     auto expCtx = makeExpressionContext(opCtx, parsedMr, verbosity);
     auto runnablePipeline = [&]() {
         auto pipeline = map_reduce_common::translateFromMR(parsedMr, expCtx);
@@ -148,10 +150,10 @@ bool runAggregationMapReduce(OperationContext* opCtx,
     }();
     auto exec = plan_executor_factory::make(expCtx, std::move(runnablePipeline));
     auto&& explainer = exec->getPlanExplainer();
-
+    // Store the plan summary string in CurOp.
     {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
-        CurOp::get(opCtx)->setPlanSummary_inlock(explainer.getPlanSummary());
+        curop->setPlanSummary_inlock(explainer.getPlanSummary());
     }
 
     try {
@@ -187,7 +189,7 @@ bool runAggregationMapReduce(OperationContext* opCtx,
         // this temp collection.
         {
             stdx::lock_guard<Client> lk(*opCtx->getClient());
-            CurOp::get(opCtx)->setNS_inlock(parsedMr.getNamespace().ns());
+            CurOp::get(opCtx)->setNS_inlock(parsedMr.getNamespace());
         }
 
         return true;

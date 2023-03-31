@@ -16,19 +16,20 @@
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {
+    makeX509OptionsForTest,
+} from "jstests/replsets/libs/tenant_migration_util.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/parallelTester.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
 
 const donorRst = new ReplSetTest({
     nodes: [{}, {rsConfig: {priority: 0}}, {rsConfig: {priority: 0}}],
     name: "TenantMigrationTest_donor",
-    nodeOptions: Object.assign(TenantMigrationUtil.makeX509OptionsForTest().donor, {
+    serverless: true,
+    nodeOptions: Object.assign(makeX509OptionsForTest().donor, {
         setParameter: {
             // Set the delay before a donor state doc is garbage collected to be short to speed up
             // the test.
@@ -48,13 +49,12 @@ const tenantMigrationTest =
 const recipientRst = tenantMigrationTest.getRecipientRst();
 const donorPrimary = donorRst.getPrimary();
 
-const kTenantIdPrefix = "testTenantId";
 const kCollName = "testColl";
 const kTenantDefinedDbName = "0";
-const kTenantId = `${kTenantIdPrefix}-multiWrites`;
+const kTenantId = ObjectId().str;
 const kDbName = tenantMigrationTest.tenantDB(kTenantId, kTenantDefinedDbName);
 
-const kRecords = 2000;
+const kRecords = 500;
 const kUpdateCycles = 600;
 
 function prepareDatabase(dbName) {
@@ -156,4 +156,3 @@ readWriteConcerns.forEach(concerns => {
 
 tenantMigrationTest.stop();
 donorRst.stopSet();
-})();

@@ -48,28 +48,33 @@ using boost::intrusive_ptr;
 
 constexpr StringData DocumentSourceSetVariableFromSubPipeline::kStageName;
 
-REGISTER_INTERNAL_DOCUMENT_SOURCE(
-    setVariableFromSubPipeline,
-    LiteParsedDocumentSourceDefault::parse,
-    DocumentSourceSetVariableFromSubPipeline::createFromBson,
-    // This can only be generated in certain versions, and registering document sources is too early
-    // to check the FCV.
-    feature_flags::gFeatureFlagSearchShardedFacets.isEnabledAndIgnoreFCV());
+REGISTER_INTERNAL_DOCUMENT_SOURCE(setVariableFromSubPipeline,
+                                  LiteParsedDocumentSourceDefault::parse,
+                                  DocumentSourceSetVariableFromSubPipeline::createFromBson,
+                                  true);
 
-Value DocumentSourceSetVariableFromSubPipeline::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceSetVariableFromSubPipeline::serialize(SerializationOptions opts) const {
+    if (opts.redactFieldNames || opts.replacementForLiteralArgs) {
+        MONGO_UNIMPLEMENTED_TASSERT(7484314);
+    }
+
     const auto var = "$$" + Variables::getBuiltinVariableName(_variableID);
     SetVariableFromSubPipelineSpec spec;
     tassert(625298, "SubPipeline cannot be null during serialization", _subPipeline);
     spec.setSetVariable(var);
-    spec.setPipeline(_subPipeline->serializeToBson(explain));
+    spec.setPipeline(_subPipeline->serializeToBson(opts.verbosity));
     return Value(DOC(getSourceName() << spec.toBSON()));
 }
 
 DepsTracker::State DocumentSourceSetVariableFromSubPipeline::getDependencies(
     DepsTracker* deps) const {
-    // TODO SERVER-63845: change to NOT_SUPPORTED.
-    return DepsTracker::State::SEE_NEXT;
+    return DepsTracker::State::NOT_SUPPORTED;
+}
+
+void DocumentSourceSetVariableFromSubPipeline::addVariableRefs(
+    std::set<Variables::Id>* refs) const {
+    refs->insert(_variableID);
+    _subPipeline->addVariableRefs(refs);
 }
 
 boost::intrusive_ptr<DocumentSource> DocumentSourceSetVariableFromSubPipeline::createFromBson(
@@ -133,6 +138,19 @@ DocumentSource::GetNextResult DocumentSourceSetVariableFromSubPipeline::doGetNex
 void DocumentSourceSetVariableFromSubPipeline::addSubPipelineInitialSource(
     boost::intrusive_ptr<DocumentSource> source) {
     _subPipeline->addInitialSource(std::move(source));
+}
+
+void DocumentSourceSetVariableFromSubPipeline::detachFromOperationContext() {
+    _subPipeline->detachFromOperationContext();
+}
+
+void DocumentSourceSetVariableFromSubPipeline::reattachToOperationContext(OperationContext* opCtx) {
+    _subPipeline->reattachToOperationContext(opCtx);
+}
+
+bool DocumentSourceSetVariableFromSubPipeline::validateOperationContext(
+    const OperationContext* opCtx) const {
+    return getContext()->opCtx == opCtx && _subPipeline->validateOperationContext(opCtx);
 }
 
 }  // namespace mongo

@@ -50,7 +50,8 @@ protected:
     void setUp() override {
         ShardServerTestFixture::setUp();
 
-        auto keysCollectionClient = std::make_unique<KeysCollectionClientDirect>();
+        auto keysCollectionClient = std::make_unique<KeysCollectionClientDirect>(
+            !getServiceContext()->getStorageEngine()->supportsReadConcernMajority());
 
         VectorClockMutable::get(getServiceContext())
             ->tickClusterTimeTo(LogicalTime(Timestamp(1, 0)));
@@ -362,7 +363,7 @@ TEST_F(VectorClockPersistenceTest, PrimaryRecoverWithIllegalVectorClockDocument)
     PersistentTaskStore<VectorClockDocument> store(NamespaceString::kVectorClockNamespace);
     ASSERT_EQ(store.count(opCtx, kVectorClockQuery), 0);
     DBDirectClient client(opCtx);
-    client.insert(NamespaceString::kVectorClockNamespace.ns(),
+    client.insert(NamespaceString::kVectorClockNamespace,
                   BSON("_id"
                        << "vectorClockState"
                        << "IllegalKey"

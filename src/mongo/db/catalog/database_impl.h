@@ -31,7 +31,6 @@
 
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/database_name.h"
-#include "mongo/s/catalog/type_database_gen.h"
 
 namespace mongo {
 
@@ -39,20 +38,18 @@ class DatabaseImpl final : public Database {
 public:
     explicit DatabaseImpl(const DatabaseName& dbName);
 
-    Status init(OperationContext*) final;
+    void init(OperationContext*) final;
 
     const DatabaseName& name() const final {
         return _name;
     }
-
-    void clearTmpCollections(OperationContext* opCtx) const final;
 
     void setDropPending(OperationContext* opCtx, bool dropPending) final;
 
     bool isDropPending(OperationContext* opCtx) const final;
 
     void getStats(OperationContext* opCtx,
-                  BSONObjBuilder* output,
+                  DBStats* output,
                   bool includeFreeStorage,
                   double scale = 1) const final;
 
@@ -63,16 +60,20 @@ public:
      * If we are applying a 'drop' oplog entry on a secondary, 'dropOpTime' will contain the optime
      * of the oplog entry.
      *
+     * When fromMigrate is set, the related oplog entry will be marked with a 'fromMigrate' field to
+     * reduce its visibility (e.g. in change streams).
+     *
      * The caller should hold a DB X lock and ensure there are no index builds in progress on the
      * collection.
      */
     Status dropCollection(OperationContext* opCtx,
                           NamespaceString nss,
-                          repl::OpTime dropOpTime) const final;
+                          repl::OpTime dropOpTime,
+                          bool markFromMigrate) const final;
     Status dropCollectionEvenIfSystem(OperationContext* opCtx,
                                       NamespaceString nss,
                                       repl::OpTime dropOpTime,
-                                      bool markFromMigrate = false) const final;
+                                      bool markFromMigrate) const final;
 
     Status dropView(OperationContext* opCtx, NamespaceString viewName) const final;
 
@@ -83,12 +84,22 @@ public:
                         const BSONObj& idIndex,
                         bool fromMigrate) const final;
 
+    Status userCreateVirtualNS(OperationContext* opCtx,
+                               const NamespaceString& fullns,
+                               CollectionOptions opts,
+                               const VirtualCollectionOptions& vopts) const final;
+
     Collection* createCollection(OperationContext* opCtx,
                                  const NamespaceString& nss,
                                  const CollectionOptions& options = CollectionOptions(),
                                  bool createDefaultIndexes = true,
                                  const BSONObj& idIndex = BSONObj(),
                                  bool fromMigrate = false) const final;
+
+    Collection* createVirtualCollection(OperationContext* opCtx,
+                                        const NamespaceString& nss,
+                                        const CollectionOptions& opts,
+                                        const VirtualCollectionOptions& vopts) const final;
 
     Status createView(OperationContext* opCtx,
                       const NamespaceString& viewName,
@@ -105,10 +116,17 @@ public:
         return _viewsName;
     }
 
-    void checkForIdIndexesAndDropPendingCollections(OperationContext* opCtx) const final;
-
 private:
-    friend class DatabaseHolderImpl;
+    StatusWith<std::unique_ptr<CollatorInterface>> _validateCollator(OperationContext* opCtx,
+                                                                     CollectionOptions& opts) const;
+    Collection* _createCollection(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const CollectionOptions& opts = CollectionOptions(),
+        bool createDefaultIndexes = true,
+        const BSONObj& idIndex = BSONObj(),
+        bool fromMigrate = false,
+        const boost::optional<VirtualCollectionOptions>& vopts = boost::none) const;
 
     /**
      * Throws if there is a reason 'ns' cannot be created as a user collection. Namespace pattern
@@ -143,9 +161,6 @@ private:
     // collections may be created in this Database.
     // This variable may only be read/written while the database is locked in MODE_X.
     AtomicWord<bool> _dropPending{false};
-
-    // Node's cached database info.
-    boost::optional<DatabaseType> _info;
 };
 
 }  // namespace mongo

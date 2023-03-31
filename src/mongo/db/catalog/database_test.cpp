@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#include <boost/optional/optional_io.hpp>
-
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/index_build_block.h"
@@ -101,7 +99,7 @@ void DatabaseTest::setUp() {
     opObserverRegistry->addObserver(
         std::make_unique<OpObserverImpl>(std::make_unique<OplogWriterMock>()));
 
-    _nss = NamespaceString("test.foo");
+    _nss = NamespaceString::createNamespaceString_forTest("test.foo");
 }
 
 void DatabaseTest::tearDown() {
@@ -246,7 +244,7 @@ void _testDropCollectionThrowsExceptionIfThereAreIndexesInProgress(OperationCont
         }
 
         auto indexCatalog = collection->getIndexCatalog();
-        ASSERT_EQUALS(indexCatalog->numIndexesInProgress(opCtx), 0);
+        ASSERT_EQUALS(indexCatalog->numIndexesInProgress(), 0);
         auto indexInfoObj = BSON("v" << int(IndexDescriptor::kLatestIndexVersion) << "key"
                                      << BSON("a" << 1) << "name"
                                      << "a_1");
@@ -255,7 +253,7 @@ void _testDropCollectionThrowsExceptionIfThereAreIndexesInProgress(OperationCont
             collection->ns(), indexInfoObj, IndexBuildMethod::kHybrid, UUID::gen());
         {
             WriteUnitOfWork wuow(opCtx);
-            ASSERT_OK(indexBuildBlock->init(opCtx, collection));
+            ASSERT_OK(indexBuildBlock->init(opCtx, collection, /*forRecovery=*/false));
             wuow.commit();
         }
         ON_BLOCK_EXIT([&indexBuildBlock, opCtx, collection] {
@@ -264,7 +262,7 @@ void _testDropCollectionThrowsExceptionIfThereAreIndexesInProgress(OperationCont
             wuow.commit();
         });
 
-        ASSERT_GREATER_THAN(indexCatalog->numIndexesInProgress(opCtx), 0);
+        ASSERT_GREATER_THAN(indexCatalog->numIndexesInProgress(), 0);
 
         WriteUnitOfWork wuow(opCtx);
         ASSERT_THROWS_CODE(db->dropCollection(opCtx, nss),
@@ -289,7 +287,7 @@ TEST_F(DatabaseTest,
 TEST_F(DatabaseTest, RenameCollectionPreservesUuidOfSourceCollectionAndUpdatesUuidCatalog) {
     auto opCtx = _opCtx.get();
     auto fromNss = _nss;
-    auto toNss = NamespaceString(fromNss.getSisterNS("bar"));
+    auto toNss = NamespaceString::createNamespaceString_forTest(fromNss.getSisterNS("bar"));
     ASSERT_NOT_EQUALS(fromNss, toNss);
 
     AutoGetDb autoDb(opCtx, fromNss.dbName(), MODE_X);
@@ -400,7 +398,8 @@ TEST_F(
             "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
             "abcdefghijklmnopqrstuvwxyz"_sd;
         for (const auto c : charsToChooseFrom) {
-            NamespaceString nss(_nss.db(), model.substr(0, model.find('%')) + std::string(1U, c));
+            NamespaceString nss = NamespaceString::createNamespaceString_forTest(
+                _nss.dbName(), model.substr(0, model.find('%')) + std::string(1U, c));
             WriteUnitOfWork wuow(_opCtx.get());
             ASSERT_TRUE(db->createCollection(_opCtx.get(), nss));
             wuow.commit();
@@ -414,7 +413,7 @@ TEST_F(
 }
 
 TEST_F(DatabaseTest, AutoGetDBSucceedsWithDeadlineNow) {
-    NamespaceString nss("test", "coll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "coll");
     Lock::DBLock lock(_opCtx.get(), nss.dbName(), MODE_X);
     ASSERT(_opCtx.get()->lockState()->isDbLockedForMode(nss.dbName(), MODE_X));
     try {
@@ -426,7 +425,7 @@ TEST_F(DatabaseTest, AutoGetDBSucceedsWithDeadlineNow) {
 }
 
 TEST_F(DatabaseTest, AutoGetDBSucceedsWithDeadlineMin) {
-    NamespaceString nss("test", "coll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "coll");
     Lock::DBLock lock(_opCtx.get(), nss.dbName(), MODE_X);
     ASSERT(_opCtx.get()->lockState()->isDbLockedForMode(nss.dbName(), MODE_X));
     try {
@@ -438,28 +437,28 @@ TEST_F(DatabaseTest, AutoGetDBSucceedsWithDeadlineMin) {
 }
 
 TEST_F(DatabaseTest, AutoGetCollectionForReadCommandSucceedsWithDeadlineNow) {
-    NamespaceString nss("test", "coll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "coll");
     Lock::DBLock dbLock(_opCtx.get(), nss.dbName(), MODE_X);
     ASSERT(_opCtx.get()->lockState()->isDbLockedForMode(nss.dbName(), MODE_X));
     Lock::CollectionLock collLock(_opCtx.get(), nss, MODE_X);
     ASSERT(_opCtx.get()->lockState()->isCollectionLockedForMode(nss, MODE_X));
     try {
         AutoGetCollectionForReadCommand db(
-            _opCtx.get(), nss, AutoGetCollectionViewMode::kViewsForbidden, Date_t::now());
+            _opCtx.get(), nss, AutoGetCollection::Options{}.deadline(Date_t::now()));
     } catch (const ExceptionFor<ErrorCodes::LockTimeout>&) {
         FAIL("Should get the db within the timeout");
     }
 }
 
 TEST_F(DatabaseTest, AutoGetCollectionForReadCommandSucceedsWithDeadlineMin) {
-    NamespaceString nss("test", "coll");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("test", "coll");
     Lock::DBLock dbLock(_opCtx.get(), nss.dbName(), MODE_X);
     ASSERT(_opCtx.get()->lockState()->isDbLockedForMode(nss.dbName(), MODE_X));
     Lock::CollectionLock collLock(_opCtx.get(), nss, MODE_X);
     ASSERT(_opCtx.get()->lockState()->isCollectionLockedForMode(nss, MODE_X));
     try {
         AutoGetCollectionForReadCommand db(
-            _opCtx.get(), nss, AutoGetCollectionViewMode::kViewsForbidden, Date_t());
+            _opCtx.get(), nss, AutoGetCollection::Options{}.deadline(Date_t()));
     } catch (const ExceptionFor<ErrorCodes::LockTimeout>&) {
         FAIL("Should get the db within the timeout");
     }

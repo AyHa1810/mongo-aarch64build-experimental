@@ -76,8 +76,8 @@ const kNonRetryableCommands = new Set([
     "_configsvrCommitChunksMerge",
     "_configsvrCommitChunkMigration",
     "_configsvrCommitChunkSplit",
+    "_configsvrCommitMergeAllChunksOnShard",
     "_configsvrCreateDatabase",
-    "_configsvrMoveChunk",
     "_configsvrMoveRange",
     "_configsvrRemoveShard",
     "_configsvrRemoveShardFromZone",
@@ -241,6 +241,12 @@ function isRetryableMoveChunkResponse(res) {
              res.errmsg.includes("operation was interrupted"))) ||
         // This error may occur when the node is shutting down.
         res.code === ErrorCodes.CallbackCanceled;
+}
+
+function isFailedToSatisfyPrimaryReadPreferenceError(msg) {
+    const kReplicaSetMonitorError =
+        /^Could not find host matching read preference.*mode: "primary"/;
+    return msg.match(kReplicaSetMonitorError);
 }
 
 function hasError(res) {
@@ -788,7 +794,7 @@ const kContinue = Object.create(null);
 // retry the current command without subtracting from our retry allocation. By default sets ok=1
 // for failures with acceptable error codes, unless shouldOverrideAcceptableError is false.
 function shouldRetryWithNetworkErrorOverride(
-    res, cmdName, logError, shouldOverrideAcceptableError = true) {
+    res, cmdName, startTime, logError, shouldOverrideAcceptableError = true) {
     assert(configuredForNetworkRetry());
 
     if (RetryableWritesUtil.isRetryableWriteCmdName(cmdName)) {
@@ -844,15 +850,14 @@ function shouldRetryWithNetworkErrorOverride(
             return kContinue;
         }
 
-        // listCollections and listIndexes called through mongos may return OperationFailed if
-        // the request to establish a cursor on the targeted shard fails with a network error.
-        //
-        // TODO SERVER-30949: Remove this check once those two commands retry on retryable
-        // errors automatically.
-        if ((cmdName === "listCollections" || cmdName === "listIndexes") &&
-            res.code === ErrorCodes.OperationFailed && res.hasOwnProperty("errmsg") &&
-            res.errmsg.indexOf("failed to read command response from shard") >= 0) {
-            logError("Retrying failed mongos cursor command");
+        if (isFailedToSatisfyPrimaryReadPreferenceError(res.errmsg) &&
+            Date.now() - startTime < 5 * 60 * 1000) {
+            // ReplicaSetMonitor::getHostOrRefresh() waits up to 15 seconds to find the
+            // primary of the replica set. It is possible for the step up attempt of another
+            // node in the replica set to take longer than 15 seconds so we allow retrying
+            // for up to 5 minutes.
+            logError("Failed to find primary when attempting to run command," +
+                     " will retry for another 15 seconds");
             return kContinue;
         }
 
@@ -954,12 +959,11 @@ function shouldRetryWithNetworkExceptionOverride(
     e, cmdName, cmdObj, startTime, numNetworkErrorRetries, logError) {
     assert(configuredForNetworkRetry());
 
-    const kReplicaSetMonitorError =
-        /^Could not find host matching read preference.*mode: "primary"/;
     if (numNetworkErrorRetries === 0) {
         logError("No retries, throwing");
         throw e;
-    } else if (e.message.match(kReplicaSetMonitorError) && Date.now() - startTime < 5 * 60 * 1000) {
+    } else if (isFailedToSatisfyPrimaryReadPreferenceError(e.message) &&
+               Date.now() - startTime < 5 * 60 * 1000) {
         // ReplicaSetMonitor::getHostOrRefresh() waits up to 15 seconds to find the
         // primary of the replica set. It is possible for the step up attempt of another
         // node in the replica set to take longer than 15 seconds so we allow retrying
@@ -1030,7 +1034,8 @@ function runCommandOverrideBody(conn, dbName, cmdName, cmdObj, lsid, clientFunct
             }
 
             if (canRetryNetworkError) {
-                const networkRetryRes = shouldRetryWithNetworkErrorOverride(res, cmdName, logError);
+                const networkRetryRes =
+                    shouldRetryWithNetworkErrorOverride(res, cmdName, startTime, logError);
                 if (networkRetryRes === kContinue) {
                     continue;
                 } else {
@@ -1085,13 +1090,6 @@ function runCommandOverrideBody(conn, dbName, cmdName, cmdObj, lsid, clientFunct
 function runCommandOverride(conn, dbName, cmdName, cmdObj, clientFunction, makeFuncArgs) {
     currentCommandID.push(newestCommandID++);
     nestingLevel++;
-
-    // If the command is in a wrapped form, then we look for the actual command object
-    // inside the query/$query object.
-    if (cmdName === "query" || cmdName === "$query") {
-        cmdObj = cmdObj[cmdName];
-        cmdName = Object.keys(cmdObj)[0];
-    }
 
     const lsid = cmdObj.lsid;
     try {

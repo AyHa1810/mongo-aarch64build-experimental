@@ -38,13 +38,13 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/kill_sessions.h"
-#include "mongo/db/kill_sessions_common.h"
-#include "mongo/db/kill_sessions_local.h"
-#include "mongo/db/logical_session_cache.h"
-#include "mongo/db/logical_session_id.h"
-#include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/session/kill_sessions.h"
+#include "mongo/db/session/kill_sessions_common.h"
+#include "mongo/db/session/kill_sessions_local.h"
+#include "mongo/db/session/logical_session_cache.h"
+#include "mongo/db/session/logical_session_id.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
 #include "mongo/db/stats/top.h"
 
 namespace mongo {
@@ -61,7 +61,7 @@ KillAllSessionsByPatternSet patternsForLoggedInUser(OperationContext* opCtx) {
         auto* as = AuthorizationSession::get(client);
         if (auto user = as->getAuthenticatedUser()) {
             auto item = makeKillAllSessionsByPattern(opCtx);
-            item.pattern.setUid(user.get()->getDigest());
+            item.pattern.setUid(user.value()->getDigest());
             patterns.emplace(std::move(item));
         }
     } else {
@@ -94,9 +94,9 @@ public:
     }
 
     // Any user can kill their own sessions
-    Status checkAuthForOperation(OperationContext* opCtx,
-                                 const std::string& dbname,
-                                 const BSONObj& cmdObj) const override {
+    Status checkAuthForOperation(OperationContext*,
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
         return Status::OK();
     }
 
@@ -108,7 +108,7 @@ public:
     }
 
     virtual bool run(OperationContext* opCtx,
-                     const std::string& db,
+                     const DatabaseName&,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) override {
         IDLParserContext ctx("KillSessionsCmd");

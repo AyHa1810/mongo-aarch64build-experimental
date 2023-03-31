@@ -27,9 +27,6 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_catalog_helper.h"
@@ -43,9 +40,9 @@
 #include "mongo/db/multitenancy.h"
 #include "mongo/db/views/view_catalog_helpers.h"
 #include "mongo/logv2/log.h"
+#include "mongo/util/database_name_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
-
 
 namespace mongo {
 namespace {
@@ -125,8 +122,9 @@ public:
             // If there is no database name present in the input, run validation against all the
             // databases.
             auto dbNames = validateCmdRequest.getDb()
-                ? std::vector<DatabaseName>{DatabaseName(getActiveTenant(opCtx),
-                                                         validateCmdRequest.getDb()->toString())}
+                ? std::vector<DatabaseName>{DatabaseNameUtil::deserialize(
+                      validateCmdRequest.getDbName().tenantId(),
+                      validateCmdRequest.getDb()->toString())}
                 : collectionCatalog->getAllDbNames();
 
             for (const auto& dbName : dbNames) {
@@ -136,9 +134,9 @@ public:
                 }
 
                 if (validateCmdRequest.getCollection()) {
-                    if (!_validateNamespace(
-                            opCtx,
-                            NamespaceString(dbName.db(), *validateCmdRequest.getCollection()))) {
+                    if (!_validateNamespace(opCtx,
+                                            NamespaceStringUtil::parseNamespaceFromRequest(
+                                                dbName, *validateCmdRequest.getCollection()))) {
                         return;
                     }
                     continue;
@@ -156,7 +154,7 @@ public:
                      ++collIt) {
                     if (!_validateNamespace(
                             opCtx,
-                            collectionCatalog->lookupNSSByUUID(opCtx, collIt.uuid().get()).get())) {
+                            collectionCatalog->lookupNSSByUUID(opCtx, collIt.uuid()).value())) {
                         return;
                     }
                 }
@@ -190,8 +188,11 @@ public:
             auto apiVersion = APIParameters::get(opCtx).getAPIVersion().value_or("");
 
             // We permit views here so that user requested views can be allowed.
-            AutoGetCollection collection(
-                opCtx, coll, LockMode::MODE_IS, AutoGetCollectionViewMode::kViewsPermitted);
+            AutoGetCollection collection(opCtx,
+                                         coll,
+                                         LockMode::MODE_IS,
+                                         AutoGetCollection::Options{}.viewMode(
+                                             auto_get_collection::ViewMode::kViewsPermitted));
 
             // If it view, just do the validations for view.
             if (auto viewDef = collection.getView()) {

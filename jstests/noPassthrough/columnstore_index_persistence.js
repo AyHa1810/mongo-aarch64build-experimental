@@ -1,9 +1,13 @@
 /**
- * Tests that a columnstore index can be persisted and found in listIndexes after a server restart.
+ * Tests around columnstore indexes and persistence. In particular, this tests that a columnstore
+ * index can be persisted, appears in listIndexes, and that a warning is added to the startup log
+ * as well as the createIndex response when a columnstore index is created.
  *
  * @tags: [
- *  requires_persistence,
- *  requires_replication,
+ *   requires_persistence,
+ *   requires_replication,
+ *   # column store indexes are still under a feature flag.
+ *   featureFlagColumnstoreIndexes,
  * ]
  */
 
@@ -11,33 +15,63 @@
 'use strict';
 
 load('jstests/libs/index_catalog_helpers.js');
+load("jstests/libs/columnstore_util.js");  // For setUpServerForColumnStoreIndexTest.
 
 const rst = new ReplSetTest({nodes: 1});
 rst.startSet();
 rst.initiate();
 
 let primary = rst.getPrimary();
-const columnstoreIndexesEnabled =
-    assert.commandWorked(primary.adminCommand({getParameter: 1, featureFlagColumnstoreIndexes: 1}))
-        .featureFlagColumnstoreIndexes.value;
 
-if (!columnstoreIndexesEnabled) {
-    jsTestLog('Skipping test because the columnstore index feature flag is disabled');
+const collName = 'columnstore_index_persistence';
+let db_primary = primary.getDB('test');
+
+if (!setUpServerForColumnStoreIndexTest(db_primary)) {
     rst.stopSet();
     return;
 }
 
-const collName = 'columnstore_index_persistence';
-let db_primary = primary.getDB('test');
 let coll_primary = db_primary.getCollection(collName);
+// Create the collection by inserting a dummy doc.
+assert.commandWorked(coll_primary.insert({a: 1}));
 
-assert.commandWorked(coll_primary.createIndex({"$**": "columnstore"}));
+const previewFeatureRegex = /preview feature/;
 
-// Restarts the primary and checks the index spec is persisted.
+{
+    // Create the index, and check that the command returns a note indicating that this feature is
+    // in preview.
+    const createResponse = assert.commandWorked(coll_primary.createIndex({"$**": "columnstore"}));
+    assert(previewFeatureRegex.test(createResponse.note), createResponse);
+}
+
+// Restart the primary and run some checks.
 rst.restart(primary);
 rst.waitForPrimary();
-const indexList = rst.getPrimary().getDB('test').getCollection(collName).getIndexes();
-assert.neq(null, IndexCatalogHelpers.findByKeyPattern(indexList, {"$**": "columnstore"}));
+
+// Reset our handles after restarting the primary node.
+primary = rst.getPrimary();
+db_primary = primary.getDB('test');
+coll_primary = db_primary.getCollection(collName);
+
+{
+    // Test that the code for the CSI preview warning appears in the startup log.
+    const getLogRes = assert.commandWorked(db_primary.adminCommand({getLog: "startupWarnings"}));
+    assert(/7281100/.test(getLogRes.log), getLogRes.log);
+}
+
+{
+    // Check that attempting to recreate the index still reports the "preview feature" note.
+    const createAgainResponse =
+        assert.commandWorked(coll_primary.createIndex({"$**": "columnstore"}));
+    assert.eq(createAgainResponse.numIndexesBefore, createAgainResponse.numIndexesAfter);
+    assert(previewFeatureRegex.test(createAgainResponse.note), createAgainResponse);
+}
+
+{
+    // Check that the index appears in the listIndex output.
+    const indexList = db_primary.getCollection(collName).getIndexes();
+    assert.neq(null, IndexCatalogHelpers.findByKeyPattern(indexList, {"$**": "columnstore"}));
+}
 
 rst.stopSet();
 })();

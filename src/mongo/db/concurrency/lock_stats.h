@@ -101,11 +101,12 @@ struct LockStatCounters {
     }
 
     // The lock statistics we track.
-    CounterType numAcquisitions;
-    CounterType numWaits;
-    CounterType combinedWaitTimeMicros;
+    CounterType numAcquisitions{0};
+    CounterType numWaits{0};
+    CounterType combinedWaitTimeMicros{0};
 };
 
+const ResourceId resourceIdRsOplog(RESOURCE_COLLECTION, NamespaceString::kRsOplogNamespace);
 
 /**
  * Templatized lock statistics management class, which can be specialized with atomic integers
@@ -118,11 +119,6 @@ class LockStats {
 public:
     // Declare the type for the lock counters bundle
     typedef LockStatCounters<CounterType> LockStatCountersType;
-
-    /**
-     * Initializes the locking statistics with zeroes (calls reset).
-     */
-    LockStats();
 
     void recordAcquisition(ResourceId resId, LockMode mode) {
         CounterOps::add(get(resId, mode).numAcquisitions, 1);
@@ -137,7 +133,7 @@ public:
     }
 
     LockStatCountersType& get(ResourceId resId, LockMode mode) {
-        if (resId == resourceIdOplog) {
+        if (resId == resourceIdRsOplog) {
             return _oplogStats.modeStats[mode];
         }
 

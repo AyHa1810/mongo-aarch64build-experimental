@@ -211,6 +211,12 @@ void ResourceConsumption::OperationMetrics::toBson(BSONObjBuilder* builder) cons
     }
 }
 
+BSONObj ResourceConsumption::OperationMetrics::toBson() const {
+    BSONObjBuilder builder;
+    toBson(&builder);
+    return builder.obj();
+}
+
 void ResourceConsumption::OperationMetrics::toBsonNonZeroFields(BSONObjBuilder* builder) const {
     appendNonZeroMetric(builder, kDocBytesRead, readMetrics.docsRead.bytes());
     appendNonZeroMetric(builder, kDocUnitsRead, readMetrics.docsRead.units());
@@ -328,9 +334,14 @@ void ResourceConsumption::MetricsCollector::beginScopedCollecting(OperationConte
     _collecting = ScopedCollectionState::kInScopeCollecting;
     _hasCollectedMetrics = true;
 
-    // The OperationCPUTimer may be nullptr on unsupported systems.
-    _metrics.cpuTimer = OperationCPUTimer::get(opCtx);
-    if (_metrics.cpuTimer) {
+    // We must clear the metrics here to ensure we do not accumulate metrics from previous scoped
+    // collections. Note that we can't clear metrics in endScopedCollecting() because consumers
+    // expect metrics to be available after a scoped collection period has ended.
+    _metrics = {};
+
+    // The OperationCPUTimers may be nullptr on unsupported systems.
+    if (auto timers = OperationCPUTimers::get(opCtx)) {
+        _metrics.cpuTimer = timers->makeTimer();
         _metrics.cpuTimer->start();
     }
 }
@@ -408,6 +419,12 @@ void ResourceConsumption::merge(OperationContext* opCtx,
                                 const OperationMetrics& metrics) {
     invariant(!dbName.empty());
 
+    LOGV2_DEBUG(7527700,
+                1,
+                "ResourceConsumption::merge",
+                "dbName"_attr = dbName,
+                "metrics"_attr = metrics.toBson());
+
     // All metrics over the duration of this operation will be attributed to the current state, even
     // if it ran accross state transitions.
     // The RSTL is normally required to check the replication state, but callers may not always be
@@ -415,7 +432,7 @@ void ResourceConsumption::merge(OperationContext* opCtx,
     // inconsistent state is not impactful for the purposes of metrics collection, perform a
     // best-effort check so that we can record metrics for this operation.
     auto isPrimary = repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesForDatabase_UNSAFE(
-        opCtx, NamespaceString::kAdminDb);
+        opCtx, DatabaseName::kAdmin.toString());
 
     AggregatedMetrics newMetrics;
     if (isPrimary) {

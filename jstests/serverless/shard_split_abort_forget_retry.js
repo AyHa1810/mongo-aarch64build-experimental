@@ -4,25 +4,18 @@
  * and then issues a forgetShardSplit command. Finally, starts a second shard split operation with
  * the same tenantIds as the aborted shard split, and expects this second one to go through.
  *
- * @tags: [requires_fcv_52, featureFlagShardSplit]
+ * @tags: [requires_fcv_63, serverless]
  */
 
-(function() {
-"use strict";
+import {assertMigrationState, ShardSplitTest} from "jstests/serverless/libs/shard_split_test.js";
 
 load("jstests/libs/fail_point_util.js");
-load('jstests/libs/parallel_shell_helpers.js');  // for "startParallelShell"
-load("jstests/libs/uuid_util.js");
-load("jstests/serverless/libs/basic_serverless_test.js");
 
-const recipientTagName = "recipientNode";
-const recipientSetName = "recipientSetName";
 TestData.skipCheckDBHashes = true;
-const test =
-    new BasicServerlessTest({recipientTagName, recipientSetName, quickGarbageCollection: true});
+const test = new ShardSplitTest({quickGarbageCollection: true});
 
 (() => {
-    const tenantIds = ["tenant1", "tenant2"];
+    const tenantIds = [ObjectId(), ObjectId()];
     test.addRecipientNodes();
 
     const donorPrimary = test.donor.getPrimary();
@@ -33,9 +26,9 @@ const test =
     // Start a shard split with the "abortShardSplitBeforeLeavingBlockingState" failPoint
     // enabled. The split will abort as a result, and a status of "kAborted" should be returned.
     jsTestLog(
-        `Starting a shard split that is expected to abort due to setting 
+        `Starting a shard split that is expected to abort due to setting
             abortShardSplitBeforeLeavingBlockingState failpoint. migrationId:
-            ${operation.migrationId} , tenantIds: ${tenantIds}`);
+            ${operation.migrationId} , tenantIds: ${tojson(tenantIds)}`);
 
     operation.commit();
     abortFp.off();
@@ -51,8 +44,8 @@ const test =
     test.addRecipientNodes();
     const operation2 = test.createSplitOperation(tenantIds);
     jsTestLog(
-        `Attempting to run a shard split with the same tenantIds. New migrationId: 
-            ${operation2.migrationId}, tenantIds: ${tenantIds}`);
+        `Attempting to run a shard split with the same tenantIds. New migrationId:
+            ${operation2.migrationId}, tenantIds: ${tojson(tenantIds)}`);
 
     operation2.commit();
     assertMigrationState(donorPrimary, operation2.migrationId, "committed");
@@ -62,7 +55,7 @@ const test =
 })();
 
 (() => {
-    const tenantIds = ["tenant3", "tenant4"];
+    const tenantIds = [ObjectId(), ObjectId()];
 
     test.addRecipientNodes();
 
@@ -71,19 +64,18 @@ const test =
 
     const operation = test.createSplitOperation(tenantIds);
     jsTestLog(
-        `Starting a shard split that is expected to abort in blocking state due to receiving 
-        abortShardSplit. migrationId: ${operation.migrationId}, tenantIds: ${tenantIds}`);
+        `Starting a shard split that is expected to abort in blocking state due to receiving
+        abortShardSplit. migrationId: ${operation.migrationId}, tenantIds: ${tojson(tenantIds)}`);
     const commitAsyncRes = operation.commitAsync();
 
     fp.wait();
 
     assertMigrationState(donorPrimary, operation.migrationId, "blocking");
 
-    const abortMigrationThread = operation.abortAsync();
+    operation.abort();
 
     fp.off();
 
-    abortMigrationThread.join();
     commitAsyncRes.join();
 
     assertMigrationState(donorPrimary, operation.migrationId, "aborted");
@@ -98,7 +90,7 @@ const test =
     const operation2 = test.createSplitOperation(tenantIds);
     jsTestLog(
         `Attempting to run a new shard split with the same tenantIds. New migrationId:
-        ${operation2.migrationId}, tenantIds: ${tenantIds}`);
+        ${operation2.migrationId}, tenantIds: ${tojson(tenantIds)}`);
     operation2.commit();
 
     assertMigrationState(donorPrimary, operation2.migrationId, "committed");
@@ -107,4 +99,3 @@ const test =
 })();
 
 test.stop();
-})();

@@ -34,8 +34,8 @@
 
 #include "mongo/client/dbclient_base.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/logical_session_id.h"
 #include "mongo/db/ops/write_ops.h"
+#include "mongo/db/session/logical_session_id.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
@@ -127,6 +127,8 @@ struct BenchRunOp {
     bool useWriteCmd = false;
     BSONObj writeConcern;
     BSONObj value;
+    BSONObj expectedDoc;
+    boost::optional<TenantId> tenantId;
 
     // Only used for find cmds when set greater than 0. A find operation will retrieve the latest
     // cluster time from the oplog and randomly chooses a time between that timestamp and
@@ -253,6 +255,7 @@ public:
 
     bool throwGLE;
     bool breakOnTrap;
+    bool benchRunOnce;  // is this a call of benchRunOnce() instead of benchRunSync(), etc.?
 
 private:
     static std::function<std::unique_ptr<DBClientBase>(const BenchRunConfig&)> _factory;
@@ -516,7 +519,7 @@ private:
 
     stdx::thread _thread;
 
-    const size_t _id;
+    const size_t _id;  // 0-based ID of this worker instance
 
     const BenchRunConfig* _config;
 
@@ -600,6 +603,7 @@ public:
     static BSONObj benchFinish(const BSONObj& argsFake, void* data);
     static BSONObj benchStart(const BSONObj& argsFake, void* data);
     static BSONObj benchRunSync(const BSONObj& argsFake, void* data);
+    static BSONObj benchRunOnce(const BSONObj& argsFake, void* data);
 
 private:
     // TODO: Same as for createWithConfig.

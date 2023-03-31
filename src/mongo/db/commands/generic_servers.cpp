@@ -81,7 +81,7 @@ public:
         }
 
         NamespaceString ns() const final {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
     };
 
@@ -158,8 +158,11 @@ HostInfoReply HostInfoCmd::Invocation::typedRun(OperationContext*) {
     system.setMemSizeMB(static_cast<long>(p.getSystemMemSizeMB()));
     system.setMemLimitMB(static_cast<long>(p.getMemSizeMB()));
     system.setNumCores(static_cast<int>(p.getNumAvailableCores()));
+    system.setNumPhysicalCores(static_cast<int>(p.getNumPhysicalCores()));
+    system.setNumCpuSockets(static_cast<int>(p.getNumCpuSockets()));
     system.setCpuArch(p.getArch());
     system.setNumaEnabled(p.hasNumaEnabled());
+    system.setNumNumaNodes(static_cast<int>(p.getNumNumaNodes()));
 
     HostInfoOsReply os;
     os.setType(p.getOsType());
@@ -259,7 +262,7 @@ public:
     }
 
     Status checkAuthForOperation(OperationContext* opCtx,
-                                 const std::string&,
+                                 const DatabaseName&,
                                  const BSONObj&) const final {
         auto* as = AuthorizationSession::get(opCtx->getClient());
         if (!as->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
@@ -274,7 +277,7 @@ public:
     }
 
     bool run(OperationContext* opCtx,
-             const std::string& db,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) final {
         if (MONGO_unlikely(hangInGetLog.shouldFail())) {
@@ -282,7 +285,7 @@ public:
             hangInGetLog.pauseWhileSet();
         }
 
-        auto request = GetLogCommand::parse({"getLog"}, cmdObj);
+        auto request = GetLogCommand::parse(IDLParserContext{"getLog"}, cmdObj);
         auto logName = request.getCommandParameter();
         if (logName == "*") {
             std::vector<std::string> names;

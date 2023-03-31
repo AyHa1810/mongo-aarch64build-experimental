@@ -29,7 +29,6 @@
 #include "mongo/client/sdam/sdam_test_base.h"
 
 #include <boost/algorithm/string.hpp>
-#include <boost/optional/optional_io.hpp>
 #include <ostream>
 #include <set>
 
@@ -391,7 +390,9 @@ TEST_F(ServerDescriptionTestFixture, ShouldPreserveRTTPrecisionForMicroseconds) 
     const int numIterations = 100;
     const int minRttMicros = 100;
 
-    const auto randMicroseconds = [](int m) { return Microseconds(rand.nextInt64(m) + m); };
+    const auto randMicroseconds = [](int m) {
+        return Microseconds(rand.nextInt64(m) + m);
+    };
     auto lastServerDescription = ServerDescriptionBuilder()
                                      .withType(ServerType::kRSPrimary)
                                      .withRtt(randMicroseconds(minRttMicros))

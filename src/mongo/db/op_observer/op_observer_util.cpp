@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/op_observer/op_observer_util.h"
 
 #include "mongo/db/bson/dotted_path_support.h"
@@ -59,19 +57,20 @@ BSONObj makeCollModCmdObj(const BSONObj& collModCmd,
             BSONObjBuilder indexObjBuilder;
             indexObjBuilder.append("name", indexInfo->indexName);
             if (indexInfo->expireAfterSeconds)
-                indexObjBuilder.append("expireAfterSeconds",
-                                       durationCount<Seconds>(indexInfo->expireAfterSeconds.get()));
+                indexObjBuilder.append(
+                    "expireAfterSeconds",
+                    durationCount<Seconds>(indexInfo->expireAfterSeconds.value()));
             if (indexInfo->hidden)
-                indexObjBuilder.append("hidden", indexInfo->hidden.get());
+                indexObjBuilder.append("hidden", indexInfo->hidden.value());
 
             if (indexInfo->unique)
-                indexObjBuilder.append("unique", indexInfo->unique.get());
+                indexObjBuilder.append("unique", indexInfo->unique.value());
 
             if (indexInfo->prepareUnique)
-                indexObjBuilder.append("prepareUnique", indexInfo->prepareUnique.get());
+                indexObjBuilder.append("prepareUnique", indexInfo->prepareUnique.value());
 
             if (indexInfo->forceNonUnique)
-                indexObjBuilder.append("forceNonUnique", indexInfo->forceNonUnique.get());
+                indexObjBuilder.append("forceNonUnique", indexInfo->forceNonUnique.value());
 
             cmdObjBuilder.append(indexFieldName, indexObjBuilder.obj());
         } else {
@@ -88,7 +87,7 @@ BSONObj DocumentKey::getId() const {
 
 BSONObj DocumentKey::getShardKeyAndId() const {
     if (_shardKey) {
-        BSONObjBuilder builder(_shardKey.get());
+        BSONObjBuilder builder(_shardKey.value());
         builder.appendElementsUnique(_id);
         return builder.obj();
     }
@@ -97,23 +96,15 @@ BSONObj DocumentKey::getShardKeyAndId() const {
     return getId();
 }
 
-DocumentKey getDocumentKey(OperationContext* opCtx,
-                           NamespaceString const& nss,
-                           BSONObj const& doc) {
+DocumentKey getDocumentKey(OperationContext* opCtx, const CollectionPtr& coll, BSONObj const& doc) {
     auto idField = doc["_id"];
     BSONObj id = idField ? idField.wrap() : doc;
     boost::optional<BSONObj> shardKey;
 
-    // Extract the shard key from the collection description in the CollectionShardingState
-    // if running on standalone or primary. Skip this completely on secondaries since they are
-    // not expected to have the collection metadata cached.
-    if (opCtx->writesAreReplicated()) {
-        auto collDesc = CollectionShardingState::get(opCtx, nss)->getCollectionDescription(opCtx);
-        if (collDesc.isSharded()) {
-            shardKey =
-                dotted_path_support::extractElementsBasedOnTemplate(doc, collDesc.getKeyPattern())
-                    .getOwned();
-        }
+    if (coll.isSharded()) {
+        shardKey = dotted_path_support::extractElementsBasedOnTemplate(
+                       doc, coll.getShardKeyPattern().toBSON())
+                       .getOwned();
     }
 
     return {std::move(id), std::move(shardKey)};

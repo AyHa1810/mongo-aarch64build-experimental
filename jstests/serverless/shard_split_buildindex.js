@@ -8,30 +8,23 @@
  *   requires_majority_read_concern,
  *   requires_persistence,
  *   serverless,
- *   requires_fcv_52,
- *   featureFlagShardSplit
+ *   requires_fcv_63
  * ]
  */
 
-(function() {
-"use strict";
+import {TenantMigrationTest} from "jstests/replsets/libs/tenant_migration_test.js";
+import {assertMigrationState, ShardSplitTest} from "jstests/serverless/libs/shard_split_test.js";
 
 load("jstests/libs/fail_point_util.js");
-load("jstests/replsets/libs/tenant_migration_test.js");
-load("jstests/serverless/libs/basic_serverless_test.js");
 
-const shardSplitTest = new BasicServerlessTest({
-    recipientTagName: "recipientNode",
-    recipientSetName: "recipient",
-    quickGarbageCollection: true
-});
+const shardSplitTest = new ShardSplitTest({quickGarbageCollection: true});
 shardSplitTest.addRecipientNodes();
 
-const kTenantId = "testTenantId1";
+const kTenantId = ObjectId();
 const tenantIds = [kTenantId];
-const kUnrelatedTenantId = "testTenantId2";
-const kDbName = shardSplitTest.tenantDB(kTenantId, "testDB");
-const kUnrelatedDbName = shardSplitTest.tenantDB(kUnrelatedTenantId, "testDB");
+const kUnrelatedTenantId = ObjectId();
+const kDbName = shardSplitTest.tenantDB(kTenantId.str, "testDB");
+const kUnrelatedDbName = shardSplitTest.tenantDB(kUnrelatedTenantId.str, "testDB");
 const kEmptyCollName = "testEmptyColl";
 const kNonEmptyCollName = "testNonEmptyColl";
 const kNewCollName1 = "testNewColl1";
@@ -118,9 +111,9 @@ nonEmptyIndexThread.start();
 jsTestLog("Allowing migration to commit");
 afterBlockingFp.off();
 assert.soon(() => {
-    const state = BasicServerlessTest
-                      .getTenantMigrationAccessBlocker({node: donorPrimary, tenantId: kTenantId})
-                      .donor.state;
+    const state =
+        ShardSplitTest.getTenantMigrationAccessBlocker({node: donorPrimary, tenantId: kTenantId})
+            .donor.state;
     return state === TenantMigrationTest.DonorAccessState.kBlockWritesAndReads ||
         state === TenantMigrationTest.DonorAccessState.kReject;
 });
@@ -148,4 +141,3 @@ assert.commandFailedWithCode(db[kNewCollName1].createIndex({b: 1}),
 operation.forget();
 shardSplitTest.cleanupSuccesfulCommitted(operation.migrationId, tenantIds);
 shardSplitTest.stop();
-})();

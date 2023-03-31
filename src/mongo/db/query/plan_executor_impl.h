@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/util/duration.h"
 #include <boost/optional.hpp>
 #include <queue>
 
@@ -127,6 +128,10 @@ public:
     LockPolicy lockPolicy() const final;
     const PlanExplainer& getPlanExplainer() const final;
 
+    PlanExecutor::QueryFramework getQueryFramework() const override final {
+        return PlanExecutor::QueryFramework::kClassicOnly;
+    }
+
     /**
      * Same as restoreState() but without the logic to retry if a WriteConflictException is thrown.
      *
@@ -144,6 +149,10 @@ public:
     void enableSaveRecoveryUnitAcrossCommandsIfSupported() override {}
     bool isSaveRecoveryUnitAcrossCommandsEnabled() const override {
         return false;
+    }
+
+    void setReturnOwnedData(bool returnOwnedData) override final {
+        _mustReturnOwnedBson = returnOwnedData;
     }
 
 private:
@@ -196,7 +205,7 @@ private:
     Status _killStatus = Status::OK();
 
     // Whether the executor must return owned BSON.
-    const bool _mustReturnOwnedBson;
+    bool _mustReturnOwnedBson;
 
     // What namespace are we operating over?
     NamespaceString _nss;

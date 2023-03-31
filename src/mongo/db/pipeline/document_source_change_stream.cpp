@@ -32,10 +32,11 @@
 
 #include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/db/bson/bson_helper.h"
-#include "mongo/db/commands/feature_compatibility_version_documentation.h"
+#include "mongo/db/feature_compatibility_version_documentation.h"
 #include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/change_stream_constants.h"
 #include "mongo/db/pipeline/change_stream_filter_helpers.h"
+#include "mongo/db/pipeline/change_stream_helpers.h"
 #include "mongo/db/pipeline/change_stream_helpers_legacy.h"
 #include "mongo/db/pipeline/document_path_support.h"
 #include "mongo/db/pipeline/document_source_change_stream_add_post_image.h"
@@ -46,6 +47,7 @@
 #include "mongo/db/pipeline/document_source_change_stream_ensure_resume_token_present.h"
 #include "mongo/db/pipeline/document_source_change_stream_handle_topology_change.h"
 #include "mongo/db/pipeline/document_source_change_stream_oplog_match.h"
+#include "mongo/db/pipeline/document_source_change_stream_split_large_event.h"
 #include "mongo/db/pipeline/document_source_change_stream_transform.h"
 #include "mongo/db/pipeline/document_source_change_stream_unwind_transaction.h"
 #include "mongo/db/pipeline/document_source_limit.h"
@@ -70,10 +72,7 @@ using std::list;
 using std::string;
 using std::vector;
 
-// The $changeStream stage is an alias for many stages, but we need to be able to serialize
-// and re-parse the pipeline. To make this work, the 'transformation' stage will serialize itself
-// with the original specification, and all other stages that are created during the alias expansion
-// will not serialize themselves.
+// The $changeStream stage is an alias for many stages.
 REGISTER_DOCUMENT_SOURCE(changeStream,
                          DocumentSourceChangeStream::LiteParsed::parse,
                          DocumentSourceChangeStream::createFromBson,
@@ -236,23 +235,6 @@ std::string DocumentSourceChangeStream::regexEscapeNsForChangeStream(StringData 
     return result;
 }
 
-ResumeTokenData DocumentSourceChangeStream::resolveResumeTokenFromSpec(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    const DocumentSourceChangeStreamSpec& spec) {
-    if (spec.getStartAfter()) {
-        return spec.getStartAfter()->getData();
-    } else if (spec.getResumeAfter()) {
-        return spec.getResumeAfter()->getData();
-    } else if (spec.getStartAtOperationTime()) {
-        return ResumeToken::makeHighWaterMarkToken(*spec.getStartAtOperationTime(),
-                                                   expCtx->changeStreamTokenVersion)
-            .getData();
-    }
-    tasserted(5666901,
-              "Expected one of 'startAfter', 'resumeAfter' or 'startAtOperationTime' to be "
-              "populated in $changeStream spec");
-}
-
 Timestamp DocumentSourceChangeStream::getStartTimeForNewStream(
     const boost::intrusive_ptr<ExpressionContext>& expCtx) {
     // If we do not have an explicit starting point, we should start from the latest majority
@@ -282,6 +264,13 @@ list<intrusive_ptr<DocumentSource>> DocumentSourceChangeStream::createFromBson(
     // Make sure that it is legal to run this $changeStream before proceeding.
     DocumentSourceChangeStream::assertIsLegalSpecification(expCtx, spec);
 
+    // If the user did not specify an explicit starting point, set it to the current time.
+    if (!spec.getResumeAfter() && !spec.getStartAfter() && !spec.getStartAtOperationTime()) {
+        // Make sure we update the 'startAtOperationTime' in the 'spec' so that we serialize the
+        // correct start point when sending it to the shards.
+        spec.setStartAtOperationTime(DocumentSourceChangeStream::getStartTimeForNewStream(expCtx));
+    }
+
     // Save a copy of the spec on the expression context. Used when building the oplog filter.
     expCtx->changeStreamSpec = spec;
 
@@ -292,15 +281,8 @@ std::list<boost::intrusive_ptr<DocumentSource>> DocumentSourceChangeStream::_bui
     const boost::intrusive_ptr<ExpressionContext>& expCtx, DocumentSourceChangeStreamSpec spec) {
     std::list<boost::intrusive_ptr<DocumentSource>> stages;
 
-    // If the user did not specify an explicit starting point, set it to the current time.
-    if (!spec.getResumeAfter() && !spec.getStartAfter() && !spec.getStartAtOperationTime()) {
-        // Make sure we update the 'startAtOperationTime' in the 'spec' so that we serialize the
-        // correct start point when sending it to the shards.
-        spec.setStartAtOperationTime(DocumentSourceChangeStream::getStartTimeForNewStream(expCtx));
-    }
-
     // Obtain the resume token from the spec. This will be used when building the pipeline.
-    auto resumeToken = DocumentSourceChangeStream::resolveResumeTokenFromSpec(expCtx, spec);
+    auto resumeToken = change_stream::resolveResumeTokenFromSpec(expCtx, spec);
 
     // Unfold the $changeStream into its constituent stages and add them to the pipeline.
     stages.push_back(DocumentSourceChangeStreamOplogMatch::create(expCtx, spec));
@@ -315,11 +297,9 @@ std::list<boost::intrusive_ptr<DocumentSource>> DocumentSourceChangeStream::_bui
     // whether the event that matches the resume token should be followed by an "invalidate" event.
     stages.push_back(DocumentSourceChangeStreamCheckInvalidate::create(expCtx, spec));
 
-    // If the starting point is a high water mark, or if we will be splitting the pipeline for
-    // dispatch to the shards in a cluster, we must include a DSCSCheckResumability stage.
-    if (expCtx->inMongos || ResumeToken::isHighWaterMarkToken(resumeToken)) {
-        stages.push_back(DocumentSourceChangeStreamCheckResumability::create(expCtx, spec));
-    }
+    // Always include a DSCSCheckResumability stage, both to verify that there is enough history to
+    // cover the change stream's starting point, and to swallow all events up to the resume point.
+    stages.push_back(DocumentSourceChangeStreamCheckResumability::create(expCtx, spec));
 
     // If the pipeline is built on MongoS, we check for topology change events here. If a topology
     // change event is detected, this stage forwards the event directly to the executor via an
@@ -328,7 +308,6 @@ std::list<boost::intrusive_ptr<DocumentSource>> DocumentSourceChangeStream::_bui
     if (expCtx->inMongos) {
         stages.push_back(DocumentSourceChangeStreamCheckTopologyChange::create(expCtx));
     }
-
 
     // If 'fullDocumentBeforeChange' is not set to 'off', add the DSCSAddPreImage stage into the
     // pipeline. We place this stage here so that any $match stages which follow the $changeStream
@@ -413,7 +392,7 @@ void DocumentSourceChangeStream::assertIsLegalSpecification(
             !spec.getResumeAfter() || !spec.getStartAfter());
 
     auto resumeToken = (spec.getResumeAfter() || spec.getStartAfter())
-        ? resolveResumeTokenFromSpec(expCtx, spec)
+        ? change_stream::resolveResumeTokenFromSpec(expCtx, spec)
         : boost::optional<ResumeTokenData>();
 
     uassert(40674,

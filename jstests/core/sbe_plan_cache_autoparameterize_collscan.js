@@ -7,8 +7,15 @@
  *   assumes_read_preference_unchanged,
  *   assumes_unsharded_collection,
  *   does_not_support_stepdowns,
- *   # The SBE plan cache was introduced in 6.0.
- *   requires_fcv_60,
+ *   # Auto-parameterization behavior observed by this test changed in 7.0 as a result of enabling
+ *   # additional scenarios in SBE.
+ *   requires_fcv_70,
+ *   # Plan cache state is node-local and will not get migrated alongside tenant data.
+ *   tenant_migration_incompatible,
+ *   # TODO SERVER-67607: Test plan cache with CQF enabled.
+ *   cqf_incompatible,
+ *   # Uses $where operation.
+ *   requires_scripting,
  * ]
  */
 (function() {
@@ -18,9 +25,9 @@ load("jstests/libs/analyze_plan.js");
 load("jstests/libs/sbe_util.js");
 
 // This test is specifically verifying the behavior of the SBE plan cache, which is only enabled
-// when 'featureFlagSbeFull' is on.
-if (!checkSBEEnabled(db, ["featureFlagSbeFull"])) {
-    jsTestLog("Skipping test because SBE is not fully enabled");
+// when SBE is enabled.
+if (!checkSBEEnabled(db)) {
+    jsTestLog("Skipping test because SBE is not enabled");
     return;
 }
 
@@ -325,12 +332,27 @@ runTest({query: {$expr: {$gte: ["$a", 2]}, a: {$type: "number"}}, projection: {_
         [{_id: 2}, {_id: 3}, {_id: 4}, {_id: 5}, {_id: 6}],
         false);
 
-// Test that the entire list of $in values is treated as a parameter.
+// Test that the same length of $in list generates the same plan cache key.
+runTest({query: {a: {$in: [1, 2]}}, projection: {_id: 1}},
+        [{_id: 0}, {_id: 1}],
+        {query: {a: {$in: [2, 3]}}, projection: {_id: 1}},
+        [{_id: 1}, {_id: 2}, {_id: 5}, {_id: 6}],
+        true);
+
+// Test that different length of $in list with the same number of unique values generates the same
+// plan cache key.
+runTest({query: {a: {$in: [1, 2]}}, projection: {_id: 1}},
+        [{_id: 0}, {_id: 1}],
+        {query: {a: {$in: [2, 3, 2]}}, projection: {_id: 1}},
+        [{_id: 1}, {_id: 2}, {_id: 5}, {_id: 6}],
+        true);
+
+// Test that a different number of unique $in values results in a different plan cache key.
 runTest({query: {a: {$in: [1, 2]}}, projection: {_id: 1}},
         [{_id: 0}, {_id: 1}],
         {query: {a: {$in: [1, 2, 3, 4]}}, projection: {_id: 1}},
         [{_id: 0}, {_id: 1}, {_id: 2}, {_id: 3}, {_id: 4}, {_id: 5}, {_id: 6}],
-        true);
+        false);
 
 // Adding a null value to an $in inhibits auto-parameterization.
 runTest({query: {a: {$in: [1, 2]}}, projection: {_id: 1}},

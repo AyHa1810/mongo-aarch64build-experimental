@@ -58,13 +58,24 @@ void readImpersonatedUserMetadata(const BSONElement& elem, OperationContext* opC
         IDLParserContext errCtx(kImpersonationMetadataSectionName);
         auto data = ImpersonatedUserMetadata::parse(errCtx, elem.embeddedObject());
 
+        // TODO SERVER-72448: Remove the getUsers() pathway
+        // In the meantime, we only accept $impersonatedUser OR $impersonatedUsers with exactly 1
+        // user.
+        auto newImpersonatedUser = data.getUser();
+        auto legacyImpersonatedUser = data.getUsers();
         uassert(ErrorCodes::BadValue,
-                "Impersonating multiple users is not supported",
-                data.getUsers().size() <= 1);
+                "Cannot specify both $impersonatedUser and $impersonatedUsers",
+                !newImpersonatedUser || !legacyImpersonatedUser);
+        uassert(ErrorCodes::BadValue,
+                "Can only impersonate up to one user per connection",
+                !legacyImpersonatedUser || legacyImpersonatedUser->empty() ||
+                    legacyImpersonatedUser->size() == 1);
 
         // Set the impersonation data only if there are actually impersonated
         // users/roles.
-        if ((!data.getUsers().empty()) || (!data.getRoles().empty())) {
+        const bool userExists =
+            newImpersonatedUser || (legacyImpersonatedUser && !legacyImpersonatedUser->empty());
+        if (userExists || !data.getRoles().empty()) {
             newData = std::move(data);
         }
     }
@@ -92,11 +103,19 @@ void writeAuthDataToImpersonatedUserMetadata(OperationContext* opCtx, BSONObjBui
     }
 
     ImpersonatedUserMetadata metadata;
-    if (userName) {
-        metadata.setUsers({userName.get()});
+    if (serverGlobalParams.featureCompatibility.isLessThanOrEqualTo(
+            multiversion::FeatureCompatibilityVersion::kVersion_6_2)) {
+        if (userName) {
+            metadata.setUsers({{userName.value()}});
+        } else {
+            metadata.setUsers({});
+        }
     } else {
-        metadata.setUsers({});
+        if (userName) {
+            metadata.setUser(userName.value());
+        }
     }
+
     metadata.setRoles(roleNameIteratorToContainer<std::vector<RoleName>>(roleNames));
 
     BSONObjBuilder section(out->subobjStart(kImpersonationMetadataSectionName));

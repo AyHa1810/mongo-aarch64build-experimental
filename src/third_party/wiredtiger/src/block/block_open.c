@@ -132,6 +132,7 @@ __wt_block_close(WT_SESSION_IMPL *session, WT_BLOCK *block)
     }
 
     __wt_free(session, block->name);
+    __wt_spin_destroy(session, &block->cache_lock);
     __wt_free(session, block->related);
 
     WT_TRET(__wt_close(session, &block->fh));
@@ -204,6 +205,9 @@ __wt_block_open(WT_SESSION_IMPL *session, const char *filename, uint32_t objecti
     block->ref = 1;
     WT_CONN_BLOCK_INSERT(conn, block, bucket);
     block->linked = true;
+
+    /* Initialize the block cache layer lock. */
+    WT_ERR(__wt_spin_init(session, &block->cache_lock, "block cache"));
 
     /* If not passed an allocation size, get one from the configuration. */
     if (allocsize == 0) {
@@ -403,7 +407,10 @@ __desc_read(WT_SESSION_IMPL *session, uint32_t allocsize, WT_BLOCK *block)
      */
     if (desc->magic != WT_BLOCK_MAGIC || !checksum_matched) {
         if (strcmp(block->name, WT_METAFILE) == 0 || strcmp(block->name, WT_HS_FILE) == 0)
-            WT_ERR_MSG(session, WT_TRY_SALVAGE, "%s is corrupted", block->name);
+            WT_ERR_MSG(session, WT_TRY_SALVAGE,
+              "%s is corrupted: calculated block checksum of %#" PRIx32
+              " doesn't match expected checksum of %#" PRIx32,
+              block->name, __wt_checksum(desc, allocsize), checksum_tmp);
         /*
          * If we're doing an import, we can't expect to be able to verify checksums since we don't
          * know the allocation size being used. This isn't an error so we should just return success

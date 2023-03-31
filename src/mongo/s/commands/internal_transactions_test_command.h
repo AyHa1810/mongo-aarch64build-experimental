@@ -31,7 +31,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/internal_transactions_test_command_gen.h"
 #include "mongo/db/query/find_command_gen.h"
-#include "mongo/db/transaction_api.h"
+#include "mongo/db/transaction/transaction_api.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/s/grid.h"
@@ -124,7 +124,7 @@ public:
         };
 
         NamespaceString ns() const override {
-            return NamespaceString(Base::request().getDbName(), "");
+            return NamespaceString(Base::request().getDbName());
         }
 
         bool supportsWriteConcern() const override {

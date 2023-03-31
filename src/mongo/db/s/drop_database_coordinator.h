@@ -44,7 +44,8 @@ public:
 
     DropDatabaseCoordinator(ShardingDDLCoordinatorService* service, const BSONObj& initialState)
         : RecoverableShardingDDLCoordinator(service, "DropDatabaseCoordinator", initialState),
-          _dbName(nss().db()) {}
+          _dbName(nss().db()),
+          _critSecReason(BSON("dropDatabase" << _dbName)) {}
     ~DropDatabaseCoordinator() = default;
 
     void checkIfOptionsConflict(const BSONObj& doc) const final {}
@@ -54,6 +55,15 @@ private:
         return DropDatabaseCoordinatorPhase_serializer(phase);
     }
 
+    bool _mustAlwaysMakeProgress() override {
+        return !_isPre70Compatible() && _doc.getPhase() > Phase::kUnset;
+    }
+
+    // TODO SERVER-73627: Remove once 7.0 becomes last LTS.
+    bool _isPre70Compatible() const {
+        return operationType() == DDLCoordinatorTypeEnum::kDropDatabasePre70Compatible;
+    }
+
     ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                   const CancellationToken& token) noexcept override;
 
@@ -61,9 +71,13 @@ private:
                                 const CollectionType& coll,
                                 std::shared_ptr<executor::ScopedTaskExecutor> executor);
 
+    void _clearDatabaseInfoOnPrimary(OperationContext* opCtx);
+
     void _clearDatabaseInfoOnSecondaries(OperationContext* opCtx);
 
     StringData _dbName;
+
+    const BSONObj _critSecReason;
 };
 
 }  // namespace mongo

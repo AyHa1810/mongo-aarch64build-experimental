@@ -29,9 +29,9 @@
 
 #pragma once
 
+#include <MurmurHash3.h>
 #include <bitset>
 #include <boost/intrusive_ptr.hpp>
-#include <third_party/murmurhash3/MurmurHash3.h>
 
 #include "mongo/base/static_assert.h"
 #include "mongo/db/exec/document_value/document_metadata_fields.h"
@@ -603,6 +603,29 @@ public:
         return _bson;
     }
 
+    size_t currentApproximateSize() const {
+        size_t size = sizeof(DocumentStorage) + allocatedBytes() + getMetadataApproximateSize() +
+            bsonObjSize();
+
+        for (auto it = iteratorCacheOnly(); !it.atEnd(); it.advance()) {
+            size += it->val.getApproximateSize() - sizeof(Value);
+        }
+
+        return size;
+    }
+
+    size_t snapshottedApproximateSize() const {
+        if (_snapshottedSize == 0) {
+            const_cast<DocumentStorage*>(this)->_snapshottedSize = currentApproximateSize();
+        }
+
+        return _snapshottedSize;
+    }
+
+    void resetSnapshottedApproximateSize() {
+        _snapshottedSize = 0;
+    }
+
 private:
     /// Returns the position of the named field in the cache or Position()
     template <typename T>
@@ -700,6 +723,8 @@ private:
     // This flag is set to true anytime the storage returns a mutable field. It is used to optimize
     // a conversion to BSON; i.e. if there are not any modifications we can directly return _bson.
     bool _modified{false};
+
+    size_t _snapshottedSize{0};
 
     // Defined in document.cpp
     static const DocumentStorage kEmptyDoc;

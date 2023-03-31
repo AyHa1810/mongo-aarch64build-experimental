@@ -32,6 +32,7 @@
 
 #include "mongo/db/query/plan_executor_impl.h"
 
+#include "mongo/util/duration.h"
 #include <memory>
 
 #include "mongo/bson/simple_bsonobj_comparator.h"
@@ -137,13 +138,6 @@ PlanExecutorImpl::PlanExecutorImpl(OperationContext* opCtx,
     invariant(!_expCtx || _expCtx->opCtx == _opCtx);
     invariant(!_cq || !_expCtx || _cq->getExpCtx() == _expCtx);
 
-    // If this PlanExecutor is executing a COLLSCAN, keep a pointer directly to the COLLSCAN
-    // stage. This is used for change streams in order to keep the the latest oplog timestamp
-    // and post batch resume token up to date as the oplog scan progresses.
-    if (auto collectionScan = getStageByType(_root.get(), STAGE_COLLSCAN)) {
-        _collScanStage = static_cast<CollectionScan*>(collectionScan);
-    }
-
     // If we don't yet have a namespace string, then initialize it from either 'collection' or
     // '_cq'.
     if (_nss.isEmpty()) {
@@ -174,6 +168,13 @@ PlanExecutorImpl::PlanExecutorImpl(OperationContext* opCtx,
         auto subplanStage = static_cast<SubplanStage*>(subplan);
         _planExplainer->updateEnumeratorExplainInfo(
             subplanStage->compositeSolution()->_enumeratorExplainInfo);
+    }
+
+    // If this PlanExecutor is executing a COLLSCAN, keep a pointer directly to the COLLSCAN
+    // stage. This is used for change streams in order to keep the the latest oplog timestamp
+    // and post batch resume token up to date as the oplog scan progresses.
+    if (auto collectionScan = getStageByType(_root.get(), STAGE_COLLSCAN)) {
+        _collScanStage = static_cast<CollectionScan*>(collectionScan);
     }
 }
 
@@ -450,8 +451,6 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<Document>* ob
                         "got TemporarilyUnavailable exception on a plan that cannot auto-yield");
                 }
 
-                CurOp::get(_opCtx)->debug().additiveMetrics.incrementTemporarilyUnavailableErrors(
-                    1);
                 tempUnavailErrorsInARow++;
                 handleTemporarilyUnavailableException(
                     _opCtx,
@@ -464,7 +463,8 @@ PlanExecutor::ExecState PlanExecutorImpl::_getNextImpl(Snapshotted<Document>* ob
                 // We're yielding because of a WriteConflictException.
                 if (!_yieldPolicy->canAutoYield() ||
                     MONGO_unlikely(skipWriteConflictRetries.shouldFail())) {
-                    throwWriteConflictException();
+                    throwWriteConflictException(
+                        "Write conflict during plan execution and yielding is disabled.");
                 }
 
                 CurOp::get(_opCtx)->debug().additiveMetrics.incrementWriteConflicts(1);
@@ -611,6 +611,11 @@ long long PlanExecutorImpl::executeDelete() {
             invariant(StageType::STAGE_DELETE == _root->child()->stageType());
             const SpecificStats* stats = _root->child()->getSpecificStats();
             return static_cast<const DeleteStats*>(stats)->docsDeleted;
+        }
+        case StageType::STAGE_TIMESERIES_MODIFY: {
+            const auto* tsWriteStats =
+                static_cast<const TimeseriesModifyStats*>(_root->getSpecificStats());
+            return tsWriteStats->measurementsDeleted;
         }
         default: {
             invariant(StageType::STAGE_DELETE == _root->stageType() ||

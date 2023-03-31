@@ -5,8 +5,7 @@
  *
  * Validate user cache invalidation upon subordinate role removal.
  *
- * @tags: [
- * ]
+ * @tags: [incompatible_with_concurrency_simultaneous]
  */
 load('jstests/concurrency/fsm_workload_helpers/drop_utils.js');  // for dropRoles
 
@@ -201,8 +200,8 @@ var $config = (function() {
     }
 
     return {
-        threadCount: 50,
-        iterations: 10,
+        threadCount: 10,
+        iterations: 50,
         states: states,
         transitions: transitions,
         setup: setup,

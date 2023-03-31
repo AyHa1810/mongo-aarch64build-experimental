@@ -33,10 +33,10 @@
 #include <vector>
 
 #include "mongo/client/read_preference.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/s/client/shard.h"
-#include "mongo/s/shard_id.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/future.h"
 #include "mongo/util/time_support.h"
@@ -90,7 +90,7 @@ public:
 
             auto scheduledWorkHandle = uassertStatusOK(_executor->scheduleWorkAt(
                 when,
-                [ this, task = std::forward<Callable>(task), taskCompletionPromise ](
+                [this, task = std::forward<Callable>(task), taskCompletionPromise](
                     const executor::TaskExecutor::CallbackArgs& args) mutable noexcept {
                     taskCompletionPromise->setWith([&] {
                         {
@@ -188,10 +188,10 @@ private:
     /**
      * Finds the host and port for a shard id, returning it and the shard object used for targeting.
      */
-    Future<HostAndShard> _targetHostAsync(const ShardId& shardId,
-                                          const ReadPreferenceSetting& readPref,
-                                          OperationContextFn operationContextFn =
-                                              [](OperationContext*) {});
+    Future<HostAndShard> _targetHostAsync(
+        const ShardId& shardId,
+        const ReadPreferenceSetting& readPref,
+        OperationContextFn operationContextFn = [](OperationContext*) {});
 
     /**
      * Returns true when all the registered child schedulers, op contexts and handles have joined.

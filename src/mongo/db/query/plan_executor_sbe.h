@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/util/duration.h"
 #include <queue>
 
 #include "mongo/db/exec/sbe/stages/stages.h"
@@ -50,7 +51,8 @@ public:
                     bool returnOwnedBson,
                     NamespaceString nss,
                     bool isOpen,
-                    std::unique_ptr<PlanYieldPolicySBE> yieldPolicy);
+                    std::unique_ptr<PlanYieldPolicySBE> yieldPolicy,
+                    bool generatedByBonsai);
 
     CanonicalQuery* getCanonicalQuery() const override {
         return _cq.get();
@@ -147,6 +149,15 @@ public:
         return _isSaveRecoveryUnitAcrossCommandsEnabled;
     }
 
+    PlanExecutor::QueryFramework getQueryFramework() const override final {
+        return _generatedByBonsai ? PlanExecutor::QueryFramework::kCQF
+                                  : PlanExecutor::QueryFramework::kSBEOnly;
+    }
+
+    void setReturnOwnedData(bool returnOwnedData) override final {
+        _mustReturnOwnedBson = returnOwnedData;
+    }
+
 private:
     template <typename ObjectType>
     ExecState getNextImpl(ObjectType* out, RecordId* dlOut);
@@ -161,7 +172,7 @@ private:
 
     // Vector of secondary namespaces.
     std::vector<NamespaceStringOrUUID> _secondaryNssVector{};
-    const bool _mustReturnOwnedBson;
+    bool _mustReturnOwnedBson;
 
     // CompileCtx owns the instance pointed by _env, so we must keep it around.
     const std::unique_ptr<sbe::PlanStage> _root;
@@ -205,6 +216,9 @@ private:
     bool _isDisposed{false};
 
     bool _isSaveRecoveryUnitAcrossCommandsEnabled = false;
+
+    // Indicates whether this executor was constructed via Bonsai/CQF.
+    bool _generatedByBonsai{false};
 };
 
 /**

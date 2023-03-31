@@ -28,6 +28,7 @@
  */
 
 #include "mongo/db/pipeline/abt/match_expression_visitor.h"
+#include "mongo/db/exec/docval_to_sbeval.h"
 #include "mongo/db/matcher/expression_always_boolean.h"
 #include "mongo/db/matcher/expression_array.h"
 #include "mongo/db/matcher/expression_expr.h"
@@ -62,9 +63,27 @@
 #include "mongo/db/pipeline/abt/agg_expression_visitor.h"
 #include "mongo/db/pipeline/abt/expr_algebrizer_context.h"
 #include "mongo/db/pipeline/abt/utils.h"
-#include "mongo/db/query/optimizer/utils/utils.h"
+#include "mongo/db/query/optimizer/utils/path_utils.h"
 
 namespace mongo::optimizer {
+
+class ABTMatchExpressionPreVisitor : public SelectiveMatchExpressionVisitorBase<true> {
+    using SelectiveMatchExpressionVisitorBase<true>::visit;
+
+public:
+    ABTMatchExpressionPreVisitor(ExpressionAlgebrizerContext& ctx) : _ctx(ctx) {}
+
+    void visit(const ElemMatchObjectMatchExpression* expr) override {
+        _ctx.enterElemMatch(expr->matchType());
+    }
+
+    void visit(const ElemMatchValueMatchExpression* expr) override {
+        _ctx.enterElemMatch(expr->matchType());
+    }
+
+private:
+    ExpressionAlgebrizerContext& _ctx;
+};
 
 class ABTMatchExpressionVisitor : public MatchExpressionConstVisitor {
 public:
@@ -101,10 +120,12 @@ public:
 
     void visit(const ElemMatchObjectMatchExpression* expr) override {
         generateElemMatch<false /*isValueElemMatch*/>(expr);
+        _ctx.exitElemMatch();
     }
 
     void visit(const ElemMatchValueMatchExpression* expr) override {
         generateElemMatch<true /*isValueElemMatch*/>(expr);
+        _ctx.exitElemMatch();
     }
 
     void visit(const EqualityMatchExpression* expr) override {
@@ -115,8 +136,8 @@ public:
         assertSupportedPathExpression(expr);
 
         ABT result = make<PathDefault>(Constant::boolean(false));
-        if (!expr->path().empty()) {
-            result = generateFieldPath(FieldPath(expr->path().toString()), std::move(result));
+        if (shouldGeneratePath(expr)) {
+            result = translateFieldRef(*(expr->fieldRef()), std::move(result));
         }
         _ctx.push(std::move(result));
     }
@@ -125,7 +146,7 @@ public:
         uassert(6624246, "Cannot generate an agg expression in this context", _allowAggExpressions);
 
         ABT result = generateAggExpression(
-            expr->getExpression().get(), _ctx.getRootProjection(), _ctx.getUniqueIdPrefix());
+            expr->getExpression().get(), _ctx.getRootProjection(), _ctx.getPrefixId());
 
         if (auto filterPtr = result.cast<EvalFilter>();
             filterPtr != nullptr && filterPtr->getInput() == _ctx.getRootProjVar()) {
@@ -167,33 +188,69 @@ public:
             return;
         }
 
-        // Additively compose equality comparisons, creating one for each constant in 'equalities'.
         ABT result = make<PathIdentity>();
-        ABT nonTraversedResult = make<PathIdentity>();
+
+        const auto [tagTraverse, valTraverse] = sbe::value::makeNewArray();
+        sbe::value::ValueGuard arrGuard{tagTraverse, valTraverse};
+        auto arrTraversePtr = sbe::value::getArrayView(valTraverse);
+        arrTraversePtr->reserve(equalities.size());
+
+        const auto [tagArraysOnly, valArraysOnly] = sbe::value::makeNewArray();
+        sbe::value::ValueGuard arrOnlyGuard{tagArraysOnly, valArraysOnly};
+        auto arraysOnlyPtr = sbe::value::getArrayView(valArraysOnly);
+        bool addNullPathDefault = false;
+        arraysOnlyPtr->reserve(equalities.size());
+
         for (const auto& pred : equalities) {
-            const auto [tag, val] = convertFrom(Value(pred));
-            ABT comparison = make<PathCompare>(Operations::Eq, make<Constant>(tag, val));
+            const auto [tag, val] = sbe::value::makeValue(Value(pred));
+            arrTraversePtr->push_back(tag, val);
+
             if (tag == sbe::value::TypeTags::Null) {
-                // Handle null and missing.
-                maybeComposePath<PathComposeA>(result, make<PathDefault>(Constant::boolean(true)));
+                addNullPathDefault = true;
             } else if (tag == sbe::value::TypeTags::Array) {
-                maybeComposePath<PathComposeA>(nonTraversedResult, comparison);
+                const auto [tag2, val2] = sbe::value::copyValue(tag, val);
+                arraysOnlyPtr->push_back(tag2, val2);
             }
-            maybeComposePath<PathComposeA>(result, std::move(comparison));
         }
 
-        // The path can be empty if we are within an $elemMatch. In this case elemMatch would insert
-        // a traverse.
-        if (!expr->path().empty()) {
-            // When the path we are comparing is a path to an array, the comparison is considered
-            // true if it evaluates to true for the array itself or for any of the array’s elements.
-            // 'result' evaluates the comparison on the array elements, and 'nonTraversedResult'
-            // evaluates the comparison on the array itself.
+        // If there is only one term in the match expression, we don't need to use EqMember
+        if (arrTraversePtr->size() == 1) {
+            const auto [tagSingle, valSingle] = sbe::value::copyValue(
+                arrTraversePtr->getAt(0).first, arrTraversePtr->getAt(0).second);
+            result = make<PathCompare>(Operations::Eq, make<Constant>(tagSingle, valSingle));
+        } else {
+            result =
+                make<PathCompare>(Operations::EqMember, make<Constant>(tagTraverse, valTraverse));
+            arrGuard.reset();
+        }
 
-            result = make<PathTraverse>(std::move(result), PathTraverse::kSingleLevel);
-            maybeComposePath<PathComposeA>(result, std::move(nonTraversedResult));
+        if (addNullPathDefault) {
+            maybeComposePath<PathComposeA>(result, make<PathDefault>(Constant::boolean(true)));
+        }
 
-            result = generateFieldPath(FieldPath(expr->path().toString()), std::move(result));
+        // Do not insert a traverse if within an $elemMatch; traversal will be handled by the
+        // $elemMatch expression itself.
+        if (shouldGeneratePath(expr)) {
+            // When the path we are comparing is a path to an array, the comparison is
+            // considered true if it evaluates to true for the array itself or for any of the
+            // array’s elements. 'result' evaluates comparison on the array elements, and
+            // 'arraysOnly' evaluates the comparison on the array itself.
+            result = make<PathTraverse>(PathTraverse::kSingleLevel, std::move(result));
+
+            if (arraysOnlyPtr->size() == 1) {
+                const auto [tagSingle, valSingle] = sbe::value::copyValue(
+                    arraysOnlyPtr->getAt(0).first, arraysOnlyPtr->getAt(0).second);
+                maybeComposePath<PathComposeA>(
+                    result,
+                    make<PathCompare>(Operations::Eq, make<Constant>(tagSingle, valSingle)));
+            } else if (arraysOnlyPtr->size() > 0) {
+                maybeComposePath<PathComposeA>(
+                    result,
+                    make<PathCompare>(Operations::EqMember,
+                                      make<Constant>(tagArraysOnly, valArraysOnly)));
+                arrOnlyGuard.reset();
+            }
+            result = translateFieldRef(*(expr->fieldRef()), std::move(result));
         }
         _ctx.push(std::move(result));
     }
@@ -325,6 +382,27 @@ public:
 
     void visit(const NotMatchExpression* expr) override {
         ABT result = _ctx.pop();
+
+        // If this $not expression is a child of an $elemMatch, then we need to use a PathLambda to
+        // ensure that the value stream (variable) corresponding to the inner path element is passed
+        // into the inner EvalFilter.
+        //
+        // Examples:
+        // find({"a.b": {$not: {$eq: 1}}}): The input into the not expression are documents from the
+        // Scan. The EvalFilter expression will encapsulate the "a.b" path traversal.
+        //
+        // find({"a": {$elemMatch: {b: {$not: {$eq: 1}}}}}): The outer EvalFilter expression
+        // encapsulates the "a" path traversal. However, we need the input to the not expression to
+        // be the value of the "b" field, rather than those of "a". We use the PathLambda expression
+        // to achieve this.
+        if (_ctx.inElemMatch()) {
+            auto notProjName = _ctx.getNextId("not");
+            _ctx.push(make<PathLambda>(make<LambdaAbstraction>(
+                notProjName,
+                make<UnaryOp>(Operations::Not,
+                              make<EvalFilter>(std::move(result), make<Variable>(notProjName))))));
+            return;
+        }
         _ctx.push(make<PathConstant>(make<UnaryOp>(
             Operations::Not,
             make<EvalFilter>(std::move(result), make<Variable>(_ctx.getRootProjection())))));
@@ -341,7 +419,7 @@ public:
     void visit(const SizeMatchExpression* expr) override {
         assertSupportedPathExpression(expr);
 
-        const std::string lambdaProjName = _ctx.getNextId("lambda_sizeMatch");
+        const ProjectionName lambdaProjName{_ctx.getNextId("lambda_sizeMatch")};
         ABT result = make<PathLambda>(make<LambdaAbstraction>(
             lambdaProjName,
             make<BinaryOp>(
@@ -349,14 +427,8 @@ public:
                 make<FunctionCall>("getArraySize", makeSeq(make<Variable>(lambdaProjName))),
                 Constant::int64(expr->getData()))));
 
-        if (!expr->path().empty()) {
-            // No traverse.
-            result = translateFieldPath(
-                FieldPath(expr->path().toString()),
-                std::move(result),
-                [](const std::string& fieldName, const bool /*isLastElement*/, ABT input) {
-                    return make<PathGet>(fieldName, std::move(input));
-                });
+        if (shouldGeneratePath(expr)) {
+            result = translateFieldRef(*(expr->fieldRef()), std::move(result));
         }
         _ctx.push(std::move(result));
     }
@@ -376,24 +448,22 @@ public:
     void visit(const TypeMatchExpression* expr) override {
         assertSupportedPathExpression(expr);
 
-        const std::string lambdaProjName = _ctx.getNextId("lambda_typeMatch");
+        const ProjectionName lambdaProjName{_ctx.getNextId("lambda_typeMatch")};
         ABT result = make<PathLambda>(make<LambdaAbstraction>(
             lambdaProjName,
             make<FunctionCall>("typeMatch",
                                makeSeq(make<Variable>(lambdaProjName),
                                        Constant::int32(expr->typeSet().getBSONTypeMask())))));
 
-        // The path can be empty if we are within an $elemMatch. In this case elemMatch would insert
-        // a traverse.
-        if (!expr->path().empty()) {
-            result = make<PathTraverse>(std::move(result), PathTraverse::kSingleLevel);
+        if (shouldGeneratePath(expr)) {
+            result = make<PathTraverse>(PathTraverse::kSingleLevel, std::move(result));
             if (expr->typeSet().hasType(BSONType::Array)) {
                 // If we are testing against array type, insert a comparison against the
                 // non-traversed path (the array itself if we have one).
                 result = make<PathComposeA>(make<PathArr>(), std::move(result));
             }
 
-            result = generateFieldPath(FieldPath(expr->path().toString()), std::move(result));
+            result = translateFieldRef(*(expr->fieldRef()), std::move(result));
         }
         _ctx.push(std::move(result));
     }
@@ -403,10 +473,6 @@ public:
     }
 
     void visit(const WhereNoOpMatchExpression* expr) override {
-        unsupportedExpression(expr);
-    }
-
-    void visit(const EncryptedBetweenMatchExpression* expr) override {
         unsupportedExpression(expr);
     }
 
@@ -422,9 +488,8 @@ private:
         // Returns true if at least one sub-objects matches the condition.
 
         const size_t childCount = expr->numChildren();
-        if (childCount == 0) {
-            _ctx.push(Constant::boolean(true));
-        }
+        tassert(
+            7021700, "ArrayMatchingMatchExpression must have at least one child", childCount > 0);
 
         _ctx.ensureArity(childCount);
         ABT result = _ctx.pop();
@@ -435,153 +500,16 @@ private:
             // Make sure we consider only objects or arrays as elements of the array.
             maybeComposePath(result, make<PathComposeA>(make<PathObj>(), make<PathArr>()));
         }
-        result = make<PathTraverse>(std::move(result), PathTraverse::kSingleLevel);
+        result = make<PathTraverse>(PathTraverse::kSingleLevel, std::move(result));
 
         // Make sure we consider only arrays fields on the path.
         maybeComposePath(result, make<PathArr>());
 
-        if (!expr->path().empty()) {
-            result = translateFieldPath(
-                FieldPath{expr->path().toString()},
-                std::move(result),
-                [&](const std::string& fieldName, const bool isLastElement, ABT input) {
-                    if (!isLastElement) {
-                        input = make<PathTraverse>(std::move(input), PathTraverse::kSingleLevel);
-                    }
-                    return make<PathGet>(fieldName, std::move(input));
-                });
+        if (shouldGeneratePath(expr)) {
+            result = translateFieldRef(*(expr->fieldRef()), std::move(result));
         }
 
         _ctx.push(std::move(result));
-    }
-
-    /**
-     * Return the minimum or maximum value for the "class" of values represented by the input
-     * constant. Used to support type bracketing.
-     * Return format is <min/max value, bool inclusive>
-     */
-    template <bool isMin>
-    std::pair<boost::optional<ABT>, bool> getMinMaxBoundForType(const sbe::value::TypeTags& tag) {
-        switch (tag) {
-            case sbe::value::TypeTags::NumberInt32:
-            case sbe::value::TypeTags::NumberInt64:
-            case sbe::value::TypeTags::NumberDouble:
-            case sbe::value::TypeTags::NumberDecimal:
-                if constexpr (isMin)
-                    return {Constant::fromDouble(std::numeric_limits<double>::quiet_NaN()), true};
-                else
-                    return {Constant::str(""), false};
-            case sbe::value::TypeTags::StringSmall:
-            case sbe::value::TypeTags::StringBig:
-            case sbe::value::TypeTags::bsonString:
-            case sbe::value::TypeTags::bsonSymbol:
-                if constexpr (isMin)
-                    return {Constant::str(""), true};
-                else {
-                    return {Constant::emptyObject(), false};
-                }
-            case sbe::value::TypeTags::Date:
-                if constexpr (isMin)
-                    return {Constant::date(Date_t::min()), true};
-                else
-                    return {Constant::date(Date_t::max()), true};
-            case sbe::value::TypeTags::Timestamp:
-                if constexpr (isMin)
-                    return {Constant::timestamp(Timestamp::min()), true};
-                else
-                    return {Constant::timestamp(Timestamp::max()), true};
-            case sbe::value::TypeTags::Null:
-                return {Constant::null(), true};
-            case sbe::value::TypeTags::bsonUndefined: {
-                auto [tag, val] = convertFrom(mongo::Value(BSONUndefined));
-                return {make<Constant>(sbe::value::TypeTags::bsonUndefined, val), true};
-            }
-            case sbe::value::TypeTags::Object:
-            case sbe::value::TypeTags::bsonObject:
-                if constexpr (isMin)
-                    return {Constant::emptyObject(), true};
-                else
-                    return {Constant::emptyArray(), false};
-            case sbe::value::TypeTags::Array:
-            case sbe::value::TypeTags::ArraySet:
-            case sbe::value::TypeTags::bsonArray:
-                if constexpr (isMin) {
-                    return {Constant::emptyArray(), true};
-                } else {
-                    auto [tag, val] = mongo::optimizer::convertFrom(mongo::Value(BSONBinData()));
-                    return {make<Constant>(sbe::value::TypeTags::bsonBinData, val), false};
-                }
-            case sbe::value::TypeTags::bsonBinData:
-                if constexpr (isMin) {
-                    auto [tag, val] = mongo::optimizer::convertFrom(mongo::Value(BSONBinData()));
-                    return {make<Constant>(sbe::value::TypeTags::bsonBinData, val), true};
-                } else {
-                    auto [tag, val] = mongo::optimizer::convertFrom(mongo::Value(OID()));
-                    return {make<Constant>(sbe::value::TypeTags::ObjectId, val), false};
-                }
-            case sbe::value::TypeTags::Boolean:
-                if constexpr (isMin)
-                    return {Constant::boolean(false), true};
-                else
-                    return {Constant::boolean(true), true};
-            case sbe::value::TypeTags::ObjectId:
-            case sbe::value::TypeTags::bsonObjectId:
-                if constexpr (isMin) {
-                    auto [tag, val] = mongo::optimizer::convertFrom(mongo::Value(OID()));
-                    return {make<Constant>(sbe::value::TypeTags::ObjectId, val), true};
-                } else {
-                    auto [tag, val] = mongo::optimizer::convertFrom(mongo::Value(OID::max()));
-                    return {make<Constant>(sbe::value::TypeTags::ObjectId, val), true};
-                }
-            case sbe::value::TypeTags::bsonRegex:
-                if constexpr (isMin) {
-                    auto [tag, val] = convertFrom(mongo::Value(BSONRegEx("", "")));
-                    return {make<Constant>(sbe::value::TypeTags::bsonRegex, val), true};
-                } else {
-                    auto [tag, val] = convertFrom(mongo::Value(mongo::BSONDBRef()));
-                    return {make<Constant>(sbe::value::TypeTags::bsonDBPointer, val), false};
-                }
-            case sbe::value::TypeTags::bsonDBPointer:
-                if constexpr (isMin) {
-                    auto [tag, val] = convertFrom(mongo::Value(mongo::BSONDBRef()));
-                    return {make<Constant>(sbe::value::TypeTags::bsonDBPointer, val), true};
-                } else {
-                    auto [tag, val] = sbe::value::makeCopyBsonJavascript(StringData(""));
-                    return {make<Constant>(sbe::value::TypeTags::bsonJavascript, val), false};
-                }
-            case sbe::value::TypeTags::bsonJavascript:
-                if constexpr (isMin) {
-                    auto [tag, val] = sbe::value::makeCopyBsonJavascript(StringData(""));
-                    return {make<Constant>(sbe::value::TypeTags::bsonJavascript, val), true};
-                } else {
-                    auto bsonCode = BSONCodeWScope();
-                    auto [tag, val] = convertFrom(mongo::Value(bsonCode));
-                    return {make<Constant>(sbe::value::TypeTags::bsonCodeWScope, val), false};
-                }
-            case sbe::value::TypeTags::bsonCodeWScope:
-                if constexpr (isMin) {
-                    auto bsonCode = BSONCodeWScope();
-                    auto [tag, val] = convertFrom(mongo::Value(bsonCode));
-                    return {make<Constant>(sbe::value::TypeTags::bsonCodeWScope, val), true};
-                } else {
-                    return {Constant::maxKey(), false};
-                }
-            default:
-                return {boost::none, false};
-        }
-        MONGO_UNREACHABLE;
-    }
-
-    ABT generateFieldPath(const FieldPath& fieldPath, ABT initial) {
-        return translateFieldPath(
-            fieldPath,
-            std::move(initial),
-            [&](const std::string& fieldName, const bool isLastElement, ABT input) {
-                if (!isLastElement) {
-                    input = make<PathTraverse>(std::move(input), PathTraverse::kSingleLevel);
-                }
-                return make<PathGet>(fieldName, std::move(input));
-            });
     }
 
     void assertSupportedPathExpression(const PathMatchExpression* expr) {
@@ -593,29 +521,45 @@ private:
     void generateSimpleComparison(const ComparisonMatchExpressionBase* expr, const Operations op) {
         assertSupportedPathExpression(expr);
 
-        auto [tag, val] = convertFrom(Value(expr->getData()));
-        const bool isArray = tag == sbe::value::TypeTags::Array;
+        auto [tag, val] = sbe::value::makeValue(Value(expr->getData()));
         ABT result = make<PathCompare>(op, make<Constant>(tag, val));
+
+        bool tagNullMatchMissingField =
+            tag == sbe::value::TypeTags::Null && (op == Operations::Lte || op == Operations::Gte);
 
         switch (op) {
             case Operations::Lt:
             case Operations::Lte: {
-                auto&& [constant, inclusive] = getMinMaxBoundForType<true /*isMin*/>(tag);
+                auto&& [constant, inclusive] = getMinMaxBoundForType(true /*isMin*/, tag);
                 if (constant) {
                     maybeComposePath(result,
                                      make<PathCompare>(inclusive ? Operations::Gte : Operations::Gt,
                                                        std::move(constant.get())));
+                }
+                // Handle null and missing semantics
+                // find({a: {$lt: MaxKey()}}) matches {a: null} and {b: 1}
+                // find({a: {$lte: null}}) matches {a: null} and {b: 1})
+                if (tag == sbe::value::TypeTags::MaxKey || tagNullMatchMissingField) {
+                    maybeComposePath<PathComposeA>(result,
+                                                   make<PathDefault>(Constant::boolean(true)));
                 }
                 break;
             }
 
             case Operations::Gt:
             case Operations::Gte: {
-                auto&& [constant, inclusive] = getMinMaxBoundForType<false /*isMin*/>(tag);
+                auto&& [constant, inclusive] = getMinMaxBoundForType(false /*isMin*/, tag);
                 if (constant) {
                     maybeComposePath(result,
                                      make<PathCompare>(inclusive ? Operations::Lte : Operations::Lt,
                                                        std::move(constant.get())));
+                }
+                // Handle null and missing semantics
+                // find({a: {$gt: MinKey()}}) matches {a: null} and {b: 1}
+                // find({a: {$gte: null}}) matches {a: null} and {b: 1})
+                if (tag == sbe::value::TypeTags::MinKey || tagNullMatchMissingField) {
+                    maybeComposePath<PathComposeA>(result,
+                                                   make<PathDefault>(Constant::boolean(true)));
                 }
                 break;
             }
@@ -631,25 +575,35 @@ private:
             }
 
             default:
-                break;
+                tasserted(7021701,
+                          str::stream() << "Cannot generate comparison for operation: "
+                                        << OperationsEnum::toString[static_cast<int>(op)]);
         }
 
-        // The path can be empty if we are within an $elemMatch. In this case elemMatch would
-        // insert a traverse.
-        if (!expr->path().empty()) {
-            if (isArray) {
-                // When the path we are comparing is a path to an array, the comparison is
-                // considered true if it evaluates to true for the array itself or for any of
-                // the array’s elements.
-
-                result = make<PathComposeA>(make<PathTraverse>(result, PathTraverse::kSingleLevel),
+        if (shouldGeneratePath(expr)) {
+            if (tag == sbe::value::TypeTags::Array ||
+                (op != Operations::Eq &&
+                 (tag == sbe::value::TypeTags::MinKey || tag == sbe::value::TypeTags::MaxKey))) {
+                // The behavior of PathTraverse when it encounters an array is to apply its subpath
+                // to every element of the array and not the array itself. When we do a comparison
+                // to an array, or an inequality comparison to minKey/maxKey, we need to ensure
+                // that these comparisons happen to every element of the array and the array itself.
+                //
+                // For example:
+                // find({a: [1]})
+                //   matches {a: [1]} and {a: [[1]]}
+                // find({a: {$gt: MinKey()}})
+                //   matches {a: []} and {a: [MinKey()]}
+                //   but not {a: MinKey()}
+                result = make<PathComposeA>(make<PathTraverse>(PathTraverse::kSingleLevel, result),
                                             result);
             } else {
-                result = make<PathTraverse>(std::move(result), PathTraverse::kSingleLevel);
+                result = make<PathTraverse>(PathTraverse::kSingleLevel, std::move(result));
             }
 
-            result = generateFieldPath(FieldPath(expr->path().toString()), std::move(result));
+            result = translateFieldRef(*(expr->fieldRef()), std::move(result));
         }
+
         _ctx.push(std::move(result));
     }
 
@@ -664,16 +618,36 @@ private:
             return;
         }
 
-        ABT node = _ctx.pop();
-        for (size_t i = 0; i < childCount - 1; i++) {
-            node = make<Composition>(_ctx.pop(), std::move(node));
+        ABTVector nodes;
+        for (size_t i = 0; i < childCount; i++) {
+            nodes.push_back(_ctx.pop());
         }
-        _ctx.push(std::move(node));
+
+        // Construct a balanced composition tree.
+        maybeComposePaths<Composition>(nodes);
+        _ctx.push(std::move(nodes.front()));
     }
 
     void unsupportedExpression(const MatchExpression* expr) const {
         uasserted(ErrorCodes::InternalErrorNotSupported,
                   str::stream() << "Match expression is not supported: " << expr->matchType());
+    }
+
+    /**
+     * Returns whether the currently visiting expression should consider the path it's operating on
+     * and build the appropriate ABT. This can return false for expressions within an $elemMatch
+     * that operate against each value in an array (aka "elemMatch value").
+     */
+    bool shouldGeneratePath(const PathMatchExpression* expr) const {
+        // The only case where any expression, including $elemMatch, should ignore it's path is if
+        // it's directly under a value $elemMatch. The 'elemMatchStack' includes 'expr' if it's an
+        // $elemMatch, so we need to look back an extra element.
+        if (expr->matchType() == MatchExpression::MatchType::ELEM_MATCH_OBJECT ||
+            expr->matchType() == MatchExpression::MatchType::ELEM_MATCH_VALUE) {
+            return _ctx.shouldGeneratePathForElemMatch();
+        }
+
+        return _ctx.shouldGeneratePath();
     }
 
     // If we are parsing a partial index filter, we don't allow agg expressions.
@@ -685,12 +659,13 @@ private:
 
 ABT generateMatchExpression(const MatchExpression* expr,
                             const bool allowAggExpressions,
-                            const std::string& rootProjection,
-                            const std::string& uniqueIdPrefix) {
+                            const ProjectionName& rootProjection,
+                            PrefixId& prefixId) {
     ExpressionAlgebrizerContext ctx(
-        false /*assertExprSort*/, true /*assertPathSort*/, rootProjection, uniqueIdPrefix);
-    ABTMatchExpressionVisitor visitor(ctx, allowAggExpressions);
-    MatchExpressionWalker walker(nullptr /*preVisitor*/, nullptr /*inVisitor*/, &visitor);
+        false /*assertExprSort*/, true /*assertPathSort*/, rootProjection, prefixId);
+    ABTMatchExpressionPreVisitor preVisitor(ctx);
+    ABTMatchExpressionVisitor postVisitor(ctx, allowAggExpressions);
+    MatchExpressionWalker walker(&preVisitor, nullptr /*inVisitor*/, &postVisitor);
     tree_walker::walk<true, MatchExpression>(expr, &walker);
     return ctx.pop();
 }

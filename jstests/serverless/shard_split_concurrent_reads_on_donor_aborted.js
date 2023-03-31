@@ -1,6 +1,6 @@
 /**
  * Tests that the donor
- * - does not rejects reads with atClusterTime/afterClusterTime >= blockTimestamp reads and
+ * - does not rejects reads with atClusterTime/afterClusterTime >= blockOpTime reads and
  * linearizable reads after the split aborts.
  *
  * @tags: [
@@ -10,26 +10,26 @@
  *   requires_majority_read_concern,
  *   requires_persistence,
  *   serverless,
- *   requires_fcv_52,
- *   featureFlagShardSplit
+ *   requires_fcv_63
  * ]
  */
 
-(function() {
-'use strict';
+import {
+    assertMigrationState,
+    findSplitOperation,
+    ShardSplitTest
+} from "jstests/serverless/libs/shard_split_test.js";
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/parallelTester.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/serverless/libs/basic_serverless_test.js");
 load("jstests/serverless/shard_split_concurrent_reads_on_donor_util.js");
 
 const kCollName = "testColl";
-const kTenantDefinedDbName = "0";
 
 /**
  * Tests that after the split abort, the donor does not reject linearizable reads or reads with
- * atClusterTime/afterClusterTime >= blockTimestamp.
+ * atClusterTime/afterClusterTime >= blockOpTime.
  */
 function testDoNotRejectReadsAfterMigrationAborted(testCase, dbName, collName) {
     const tenantId = dbName.split('_')[0];
@@ -39,7 +39,7 @@ function testDoNotRejectReadsAfterMigrationAborted(testCase, dbName, collName) {
         const db = node.getDB(dbName);
         if (testCase.requiresReadTimestamp) {
             runCommandForConcurrentReadTest(db,
-                                            testCase.command(collName, donorDoc.blockTimestamp),
+                                            testCase.command(collName, donorDoc.blockOpTime.ts),
                                             null,
                                             testCase.isTransaction);
             runCommandForConcurrentReadTest(
@@ -47,12 +47,12 @@ function testDoNotRejectReadsAfterMigrationAborted(testCase, dbName, collName) {
                 testCase.command(collName, donorDoc.commitOrAbortOpTime.ts),
                 null,
                 testCase.isTransaction);
-            BasicServerlessTest.checkShardSplitAccessBlocker(
+            ShardSplitTest.checkShardSplitAccessBlocker(
                 node, tenantId, {numTenantMigrationAbortedErrors: 0});
         } else {
             runCommandForConcurrentReadTest(
                 db, testCase.command(collName), null, testCase.isTransaction);
-            BasicServerlessTest.checkShardSplitAccessBlocker(
+            ShardSplitTest.checkShardSplitAccessBlocker(
                 node, tenantId, {numTenantMigrationAbortedErrors: 0});
         }
     });
@@ -60,14 +60,15 @@ function testDoNotRejectReadsAfterMigrationAborted(testCase, dbName, collName) {
 
 const testCases = shardSplitConcurrentReadTestCases;
 
-const test = new BasicServerlessTest({
+const test = new ShardSplitTest({
     recipientTagName: "recipientTag",
     recipientSetName: "recipientSet",
     quickGarbageCollection: true
 });
 test.addRecipientNodes();
 
-const tenantId = "tenantId";
+const ktenantId = ObjectId();
+const tenantIds = [ktenantId];
 
 const donorRst = test.donor;
 const donorPrimary = test.getDonorPrimary();
@@ -81,7 +82,7 @@ donorRst.nodes.forEach(node => {
 
 let blockFp = configureFailPoint(donorPrimary, "pauseShardSplitAfterBlocking");
 
-const operation = test.createSplitOperation([tenantId]);
+const operation = test.createSplitOperation(tenantIds);
 const splitThread = operation.commitAsync();
 
 blockFp.wait();
@@ -100,9 +101,8 @@ donorRst.awaitLastOpCommitted();
 
 for (const [testCaseName, testCase] of Object.entries(testCases)) {
     jsTest.log(`Testing inAborted with testCase ${testCaseName}`);
-    const dbName = `${tenantId}_${testCaseName}-inAborted-${kTenantDefinedDbName}`;
+    const dbName = `${ktenantId.str}_${testCaseName}`;
     testDoNotRejectReadsAfterMigrationAborted(testCase, dbName, kCollName);
 }
 
 test.stop();
-})();

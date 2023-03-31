@@ -60,18 +60,23 @@ int tagComparison(const MatchExpression* lhs, const MatchExpression* rhs) {
         return lhsValue < rhsValue ? -1 : 1;
     }
 
-    // Next, order so that if there's a GEO_NEAR it's first.
-    if (MatchExpression::GEO_NEAR == lhs->matchType()) {
-        return -1;
-    } else if (MatchExpression::GEO_NEAR == rhs->matchType()) {
-        return 1;
-    }
+    // Next, order geo and text predicates which MUST use an index before all others. We're not sure
+    // if this is strictly necessary for correctness, but putting these all together and first may
+    // help determine earlier if there is an index that must be used.
+    if (lhs->matchType() != rhs->matchType()) {
+        // Next, order so that if there's a GEO_NEAR it's first.
+        if (MatchExpression::GEO_NEAR == lhs->matchType()) {
+            return -1;
+        } else if (MatchExpression::GEO_NEAR == rhs->matchType()) {
+            return 1;
+        }
 
-    // Ditto text.
-    if (MatchExpression::TEXT == lhs->matchType()) {
-        return -1;
-    } else if (MatchExpression::TEXT == rhs->matchType()) {
-        return 1;
+        // Ditto text.
+        if (MatchExpression::TEXT == lhs->matchType()) {
+            return -1;
+        } else if (MatchExpression::TEXT == rhs->matchType()) {
+            return 1;
+        }
     }
 
     // Next, order so that the first field of a compound index appears first.
@@ -128,9 +133,9 @@ void attachNode(MatchExpression* node,
                 OrMatchExpression* targetParent,
                 size_t targetPosition,
                 std::unique_ptr<MatchExpression::TagData> tagData) {
-    auto clone = node->shallowClone();
+    auto clone = node->clone();
     if (clone->matchType() == MatchExpression::NOT) {
-        IndexTag* indexTag = static_cast<IndexTag*>(tagData.get());
+        IndexTag* indexTag = checked_cast<IndexTag*>(tagData.get());
         clone->setTag(new IndexTag(indexTag->index));
         clone->getChild(0)->setTag(tagData.release());
     } else {
@@ -142,7 +147,7 @@ void attachNode(MatchExpression* node,
         andNode->add(std::move(clone));
     } else {
         auto andNode = std::make_unique<AndMatchExpression>();
-        auto indexTag = static_cast<IndexTag*>(clone->getTag());
+        auto indexTag = checked_cast<IndexTag*>(clone->getTag());
         andNode->setTag(new IndexTag(indexTag->index));
         andNode->add(std::move((*targetParent->getChildVector())[targetPosition]));
         andNode->add(std::move(clone));

@@ -78,7 +78,9 @@ void NetworkInterfaceIntegrationFixture::tearDown() {
     _net->shutdown();
 
     auto lk = stdx::unique_lock(_mutex);
-    auto checkIdle = [&]() { return _workInProgress == 0; };
+    auto checkIdle = [&]() {
+        return _workInProgress == 0;
+    };
     _fixtureIsIdle.wait(lk, checkIdle);
 }
 
@@ -116,8 +118,7 @@ void NetworkInterfaceIntegrationFixture::startCommand(const TaskExecutor::Callba
 }
 
 Future<RemoteCommandResponse> NetworkInterfaceIntegrationFixture::runCommand(
-    const TaskExecutor::CallbackHandle& cbHandle, RemoteCommandRequest request) {
-    RemoteCommandRequestOnAny rcroa{request};
+    const TaskExecutor::CallbackHandle& cbHandle, RemoteCommandRequestOnAny rcroa) {
 
     _onSchedulingCommand();
 

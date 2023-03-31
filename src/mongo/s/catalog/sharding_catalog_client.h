@@ -38,8 +38,12 @@
 #include "mongo/db/repl/optime_with.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/write_concern_options.h"
+#include "mongo/s/catalog/type_index_catalog.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/chunk_version.h"
+#include "mongo/s/client/shard.h"
+#include "mongo/s/index_version.h"
+#include "mongo/s/request_types/get_historical_placement_info_gen.h"
 
 namespace mongo {
 
@@ -84,6 +88,12 @@ public:
     static const WriteConcernOptions kLocalWriteConcern;
 
     virtual ~ShardingCatalogClient() = default;
+
+    virtual std::vector<BSONObj> runCatalogAggregation(
+        OperationContext* opCtx,
+        AggregateCommandRequest& aggRequest,
+        const repl::ReadConcernArgs& readConcern,
+        const Milliseconds& maxTimeout = Shard::kDefaultConfigCommandTimeout) = 0;
 
     /**
      * Retrieves the metadata for a given database, if it exists.
@@ -130,11 +140,14 @@ public:
     /**
      * Retrieves all collections under a specified database (or in the system). If the dbName
      * parameter is empty, returns all collections.
+     *
+     * @param sort Fields to use for sorting the results. If empty, no sorting is performed.
      */
     virtual std::vector<CollectionType> getCollections(
         OperationContext* opCtx,
         StringData db,
-        repl::ReadConcernLevel readConcernLevel = repl::ReadConcernLevel::kMajorityReadConcern) = 0;
+        repl::ReadConcernLevel readConcernLevel = repl::ReadConcernLevel::kMajorityReadConcern,
+        const BSONObj& sort = BSONObj()) = 0;
 
     /**
      * Returns the set of collections for the specified database, which have been marked as sharded.
@@ -144,7 +157,10 @@ public:
      * Throws exception on errors.
      */
     virtual std::vector<NamespaceString> getAllShardedCollectionsForDb(
-        OperationContext* opCtx, StringData dbName, repl::ReadConcernLevel readConcern) = 0;
+        OperationContext* opCtx,
+        StringData dbName,
+        repl::ReadConcernLevel readConcern,
+        const BSONObj& sort = BSONObj()) = 0;
 
     /**
      * Retrieves all databases for a shard.
@@ -193,6 +209,15 @@ public:
         const repl::ReadConcernArgs& readConcern) = 0;
 
     /**
+     * Retrieves the collection metadata and its global index metadata. This function will return
+     * all of the global idexes for a collection.
+     */
+    virtual std::pair<CollectionType, std::vector<IndexCatalogType>>
+    getCollectionAndShardingIndexCatalogEntries(OperationContext* opCtx,
+                                                const NamespaceString& nss,
+                                                const repl::ReadConcernArgs& readConcern) = 0;
+
+    /**
      * Retrieves all zones defined for the specified collection. The returned vector is sorted based
      * on the min key of the zones.
      *
@@ -200,6 +225,12 @@ public:
      */
     virtual StatusWith<std::vector<TagsType>> getTagsForCollection(OperationContext* opCtx,
                                                                    const NamespaceString& nss) = 0;
+
+    /**
+     * Retrieves all namespaces that have zones associated with a database.
+     */
+    virtual std::vector<NamespaceString> getAllNssThatHaveZonesForDatabase(
+        OperationContext* opCtx, const StringData& dbName) = 0;
 
     /**
      * Retrieves all shards in this sharded cluster.
@@ -316,6 +347,42 @@ public:
                                          const BSONObj& query,
                                          const WriteConcernOptions& writeConcern,
                                          boost::optional<BSONObj> hint = boost::none) = 0;
+
+    /**
+     * Returns the list of active shards that still contains data for the specified collection or
+     * that used to contain data for the specified collection at clusterTime >= input clusterTime
+     * based on placementHistory
+     */
+    virtual HistoricalPlacement getShardsThatOwnDataForCollAtClusterTime(
+        OperationContext* opCtx, const NamespaceString& collName, const Timestamp& clusterTime) = 0;
+
+    /**
+     * Returns the list of active shards that still contains data for the specified database or
+     * that used to contain data for the specified database at clusterTime >= input clusterTime
+     * based on placementHistory
+     */
+    virtual HistoricalPlacement getShardsThatOwnDataForDbAtClusterTime(
+        OperationContext* opCtx, const NamespaceString& dbName, const Timestamp& clusterTime) = 0;
+
+    /**
+     * Returns the list of active shards that still contains data or that used to contain data
+     * at clusterTime >= input clusterTime based on placementHistory
+     */
+    virtual HistoricalPlacement getShardsThatOwnDataAtClusterTime(OperationContext* opCtx,
+                                                                  const Timestamp& clusterTime) = 0;
+
+    /**
+     * Queries config.placementHistory to retrieve placement metadata on the requested namespace at
+     * a specific point in time. When no namespace is specified, placement metadata on the whole
+     * cluster will be returned. This function is meant to be exclusively invoked by config server
+     * nodes.
+     *
+     * TODO (SERVER-73029): convert to private method of ShardingCatalogClientImpl
+     */
+    virtual HistoricalPlacement getHistoricalPlacement(
+        OperationContext* opCtx,
+        const Timestamp& atClusterTime,
+        const boost::optional<NamespaceString>& nss) = 0;
 
 protected:
     ShardingCatalogClient() = default;

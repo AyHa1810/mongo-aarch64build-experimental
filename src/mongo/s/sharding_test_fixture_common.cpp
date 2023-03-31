@@ -125,13 +125,13 @@ void ShardingTestFixtureCommon::expectConfigCollectionInsert(const HostAndPort& 
                                                              const BSONObj& detail) {
     onCommand([&](const RemoteCommandRequest& request) {
         ASSERT_EQUALS(configHost, request.target);
-        ASSERT_EQUALS(NamespaceString::kConfigDb, request.dbname);
+        ASSERT_EQUALS(DatabaseName::kConfig.db(), request.dbname);
 
         const auto opMsg = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
         const auto batchRequest(BatchedCommandRequest::parseInsert(opMsg));
         const auto& insertReq(batchRequest.getInsertRequest());
 
-        ASSERT_EQ(NamespaceString::kConfigDb, insertReq.getNamespace().db());
+        ASSERT_EQ(DatabaseName::kConfig.db(), insertReq.getNamespace().db());
         ASSERT_EQ(collName, insertReq.getNamespace().coll());
 
         const auto& inserts = insertReq.getDocuments();
@@ -150,8 +150,8 @@ void ShardingTestFixtureCommon::expectConfigCollectionInsert(const HostAndPort& 
 
         // Handle changeId specially because there's no way to know what OID was generated
         std::string changeId = actualChangeLog.getChangeId();
-        size_t firstDash = changeId.find("-");
-        size_t lastDash = changeId.rfind("-");
+        size_t firstDash = changeId.find('-');
+        size_t lastDash = changeId.rfind('-');
 
         const std::string serverPiece = changeId.substr(0, firstDash);
         const std::string timePiece = changeId.substr(firstDash + 1, lastDash - firstDash - 1);

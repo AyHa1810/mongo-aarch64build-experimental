@@ -62,7 +62,7 @@ public:
 
             uassert(ErrorCodes::IllegalOperation,
                     "_shardsvrAbortReshardCollection can only be run on shard servers",
-                    serverGlobalParams.clusterRole == ClusterRole::ShardServer);
+                    serverGlobalParams.clusterRole.has(ClusterRole::ShardServer));
             CommandHelpers::uassertCommandRunWithMajority(Request::kCommandName,
                                                           opCtx->getWriteConcern());
 
@@ -92,7 +92,7 @@ public:
                 (*machine)->abort(isUserCanceled());
             }
 
-            for (auto doneFuture : futuresToWait) {
+            for (const auto& doneFuture : futuresToWait) {
                 doneFuture.get(opCtx);
             }
 

@@ -111,10 +111,10 @@ protected:
     const BSONObj kDummyResWithWriteConcernError =
         BSON("ok" << 1 << "writeConcernError" << kDummyWriteConcernError);
 
-    const NamespaceString kViewNss = NamespaceString("test.foo");
+    const NamespaceString kViewNss = NamespaceString::createNamespaceString_forTest("test.foo");
 
     const Status kStaleConfigStatus = {
-        StaleConfigInfo(kViewNss, ChunkVersion::UNSHARDED(), boost::none, shard1),
+        StaleConfigInfo(kViewNss, ShardVersion::UNSHARDED(), boost::none, shard1),
         "The metadata for the collection is not loaded"};
 
     void setUp() override {
@@ -159,13 +159,13 @@ protected:
             onCommandForPoolExecutor([&](const RemoteCommandRequest& request) {
                 seenHostAndPorts.insert(request.target);
 
-                ASSERT_EQ(NamespaceString::kAdminDb, request.dbname);
+                ASSERT_EQ(DatabaseName::kAdmin.db(), request.dbname);
 
                 auto cmdName = request.cmdObj.firstElement().fieldNameStringData();
                 ASSERT_EQ(cmdName, "abortTransaction");
 
-                auto osi = OperationSessionInfoFromClient::parse("expectAbortTransaction"_sd,
-                                                                 request.cmdObj);
+                auto osi = OperationSessionInfoFromClient::parse(
+                    IDLParserContext{"expectAbortTransaction"}, request.cmdObj);
 
                 ASSERT(osi.getSessionId());
                 ASSERT_EQ(lsid.getId(), osi.getSessionId()->getId());
@@ -1020,7 +1020,7 @@ void checkSessionDetails(const BSONObj& cmdObj,
                          const LogicalSessionId& lsid,
                          const TxnNumber txnNum,
                          boost::optional<bool> isCoordinator) {
-    auto osi = OperationSessionInfoFromClient::parse("testTxnRouter"_sd, cmdObj);
+    auto osi = OperationSessionInfoFromClient::parse(IDLParserContext{"testTxnRouter"}, cmdObj);
 
     ASSERT(osi.getSessionId());
     ASSERT_EQ(lsid.getId(), osi.getSessionId()->getId());
@@ -2567,7 +2567,7 @@ TEST_F(TransactionRouterTestWithDefaultSession,
 
 TEST_F(TransactionRouterTestWithDefaultSession, NonSnapshotReadConcernHasNoAtClusterTime) {
     TxnNumber txnNum{3};
-    for (auto rcIt : supportedNonSnapshotRCLevels) {
+    for (const auto& rcIt : supportedNonSnapshotRCLevels) {
         repl::ReadConcernArgs::get(operationContext()) = repl::ReadConcernArgs(rcIt.second);
 
         auto txnRouter = TransactionRouter::get(operationContext());
@@ -2589,7 +2589,7 @@ TEST_F(TransactionRouterTestWithDefaultSession, NonSnapshotReadConcernHasNoAtClu
 TEST_F(TransactionRouterTestWithDefaultSession,
        SupportedNonSnapshotReadConcernLevelsArePassedThrough) {
     TxnNumber txnNum{3};
-    for (auto rcIt : supportedNonSnapshotRCLevels) {
+    for (const auto& rcIt : supportedNonSnapshotRCLevels) {
         repl::ReadConcernArgs::get(operationContext()) = repl::ReadConcernArgs(rcIt.second);
 
         auto txnRouter = TransactionRouter::get(operationContext());
@@ -2624,7 +2624,7 @@ TEST_F(TransactionRouterTestWithDefaultSession,
        NonSnapshotReadConcernLevelsPreserveAfterClusterTime) {
     const auto clusterTime = LogicalTime(Timestamp(10, 1));
     TxnNumber txnNum{3};
-    for (auto rcIt : supportedNonSnapshotRCLevels) {
+    for (const auto& rcIt : supportedNonSnapshotRCLevels) {
         repl::ReadConcernArgs::get(operationContext()) =
             repl::ReadConcernArgs(clusterTime, rcIt.second);
 
@@ -2646,7 +2646,7 @@ TEST_F(TransactionRouterTestWithDefaultSession,
 TEST_F(TransactionRouterTestWithDefaultSession, NonSnapshotReadConcernLevelsPreserveAfterOpTime) {
     const auto opTime = repl::OpTime(Timestamp(10, 1), 2);
     TxnNumber txnNum{3};
-    for (auto rcIt : supportedNonSnapshotRCLevels) {
+    for (const auto& rcIt : supportedNonSnapshotRCLevels) {
         repl::ReadConcernArgs::get(operationContext()) = repl::ReadConcernArgs(opTime, rcIt.second);
 
         auto txnRouter = TransactionRouter::get(operationContext());
@@ -3221,7 +3221,7 @@ protected:
         txnRouter().beginOrContinueTxn(
             operationContext(), kTxnNumber, TransactionRouter::TransactionActions::kStart);
         txnRouter().setDefaultAtClusterTime(operationContext());
-        tickSource()->advance(Milliseconds(serverGlobalParams.slowMS + 1));
+        tickSource()->advance(Milliseconds(serverGlobalParams.slowMS.load() + 1));
     }
 
     void beginRecoverCommitWithDefaultTxnNumber() {
@@ -3234,7 +3234,7 @@ protected:
         txnRouter().beginOrContinueTxn(
             operationContext(), kTxnNumber, TransactionRouter::TransactionActions::kCommit);
         txnRouter().setDefaultAtClusterTime(operationContext());
-        tickSource()->advance(Milliseconds(serverGlobalParams.slowMS + 1));
+        tickSource()->advance(Milliseconds(serverGlobalParams.slowMS.load() + 1));
     }
 
     void assertDurationIs(Microseconds micros) {
@@ -3492,16 +3492,16 @@ private:
 //
 
 TEST_F(TransactionRouterMetricsTest, DoesNotLogTransactionsUnderSlowMSThreshold) {
-    const auto originalSlowMS = serverGlobalParams.slowMS;
-    const auto originalSampleRate = serverGlobalParams.sampleRate;
+    const auto originalSlowMS = serverGlobalParams.slowMS.load();
+    const auto originalSampleRate = serverGlobalParams.sampleRate.load();
 
-    serverGlobalParams.slowMS = 100;
-    serverGlobalParams.sampleRate = 1;
+    serverGlobalParams.slowMS.store(100);
+    serverGlobalParams.sampleRate.store(1);
 
     // Reset the global parameters to their original values after this test exits.
     ON_BLOCK_EXIT([originalSlowMS, originalSampleRate] {
-        serverGlobalParams.slowMS = originalSlowMS;
-        serverGlobalParams.sampleRate = originalSampleRate;
+        serverGlobalParams.slowMS.store(originalSlowMS);
+        serverGlobalParams.sampleRate.store(originalSampleRate);
     });
 
     beginTxnWithDefaultTxnNumber();
@@ -3511,16 +3511,16 @@ TEST_F(TransactionRouterMetricsTest, DoesNotLogTransactionsUnderSlowMSThreshold)
 }
 
 TEST_F(TransactionRouterMetricsTest, LogsTransactionsOverSlowMSThreshold) {
-    const auto originalSlowMS = serverGlobalParams.slowMS;
-    const auto originalSampleRate = serverGlobalParams.sampleRate;
+    const auto originalSlowMS = serverGlobalParams.slowMS.load();
+    const auto originalSampleRate = serverGlobalParams.sampleRate.load();
 
-    serverGlobalParams.slowMS = 100;
-    serverGlobalParams.sampleRate = 1;
+    serverGlobalParams.slowMS.store(100);
+    serverGlobalParams.sampleRate.store(1);
 
     // Reset the global parameters to their original values after this test exits.
     ON_BLOCK_EXIT([originalSlowMS, originalSampleRate] {
-        serverGlobalParams.slowMS = originalSlowMS;
-        serverGlobalParams.sampleRate = originalSampleRate;
+        serverGlobalParams.slowMS.store(originalSlowMS);
+        serverGlobalParams.sampleRate.store(originalSampleRate);
     });
 
     beginTxnWithDefaultTxnNumber();
@@ -3530,16 +3530,16 @@ TEST_F(TransactionRouterMetricsTest, LogsTransactionsOverSlowMSThreshold) {
 }
 
 TEST_F(TransactionRouterMetricsTest, LogsTransactionsWithAPIParameters) {
-    const auto originalSlowMS = serverGlobalParams.slowMS;
-    const auto originalSampleRate = serverGlobalParams.sampleRate;
+    const auto originalSlowMS = serverGlobalParams.slowMS.load();
+    const auto originalSampleRate = serverGlobalParams.sampleRate.load();
 
-    serverGlobalParams.slowMS = 100;
-    serverGlobalParams.sampleRate = 1;
+    serverGlobalParams.slowMS.store(100);
+    serverGlobalParams.sampleRate.store(1);
 
     // Reset the global parameters to their original values after this test exits.
     ON_BLOCK_EXIT([originalSlowMS, originalSampleRate] {
-        serverGlobalParams.slowMS = originalSlowMS;
-        serverGlobalParams.sampleRate = originalSampleRate;
+        serverGlobalParams.slowMS.store(originalSlowMS);
+        serverGlobalParams.sampleRate.store(originalSampleRate);
     });
 
     APIParameters::get(operationContext()).setAPIVersion("1");
@@ -3567,16 +3567,16 @@ TEST_F(TransactionRouterMetricsTest, LogsTransactionsWithAPIParameters) {
 }
 
 TEST_F(TransactionRouterMetricsTest, DoesNotLogTransactionsWithSampleRateZero) {
-    const auto originalSlowMS = serverGlobalParams.slowMS;
-    const auto originalSampleRate = serverGlobalParams.sampleRate;
+    const auto originalSlowMS = serverGlobalParams.slowMS.load();
+    const auto originalSampleRate = serverGlobalParams.sampleRate.load();
 
-    serverGlobalParams.slowMS = 100;
-    serverGlobalParams.sampleRate = 0;
+    serverGlobalParams.slowMS.store(100);
+    serverGlobalParams.sampleRate.store(0);
 
     // Reset the global parameters to their original values after this test exits.
     ON_BLOCK_EXIT([originalSlowMS, originalSampleRate] {
-        serverGlobalParams.slowMS = originalSlowMS;
-        serverGlobalParams.sampleRate = originalSampleRate;
+        serverGlobalParams.slowMS.store(originalSlowMS);
+        serverGlobalParams.sampleRate.store(originalSampleRate);
     });
 
     beginTxnWithDefaultTxnNumber();
@@ -4725,12 +4725,12 @@ TEST_F(TransactionRouterTest, RouterMetricsCurrent_ReapForInactiveTxn) {
 
     // Mark the session for reap which will also erase it from the catalog.
     auto catalog = SessionCatalog::get(operationContext()->getServiceContext());
-    catalog->scanSessionsForReap(*operationContext()->getLogicalSessionId(),
-                                 [](ObservableSession& parentSession) {
-                                     parentSession.markForReap(
-                                         ObservableSession::ReapMode::kNonExclusive);
-                                 },
-                                 [](ObservableSession& childSession) {});
+    catalog->scanSessionsForReap(
+        *operationContext()->getLogicalSessionId(),
+        [](ObservableSession& parentSession) {
+            parentSession.markForReap(ObservableSession::ReapMode::kNonExclusive);
+        },
+        [](ObservableSession& childSession) {});
 
     // Verify the session was reaped.
     catalog->scanSession(*operationContext()->getLogicalSessionId(), [](const ObservableSession&) {
@@ -4761,12 +4761,12 @@ TEST_F(TransactionRouterTest, RouterMetricsCurrent_ReapForUnstartedTxn) {
 
     // Mark the session for reap which will also erase it from the catalog.
     auto catalog = SessionCatalog::get(operationContext()->getServiceContext());
-    catalog->scanSessionsForReap(*operationContext()->getLogicalSessionId(),
-                                 [](ObservableSession& parentSession) {
-                                     parentSession.markForReap(
-                                         ObservableSession::ReapMode::kNonExclusive);
-                                 },
-                                 [](ObservableSession& childSession) {});
+    catalog->scanSessionsForReap(
+        *operationContext()->getLogicalSessionId(),
+        [](ObservableSession& parentSession) {
+            parentSession.markForReap(ObservableSession::ReapMode::kNonExclusive);
+        },
+        [](ObservableSession& childSession) {});
 
     // Verify the session was reaped.
     catalog->scanSession(*operationContext()->getLogicalSessionId(), [](const ObservableSession&) {

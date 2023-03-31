@@ -60,7 +60,12 @@ class AuthzManagerExternalState {
     AuthzManagerExternalState& operator=(const AuthzManagerExternalState&) = delete;
 
 public:
-    static std::unique_ptr<AuthzManagerExternalState> create();
+    using UniqueExternalState = std::unique_ptr<AuthzManagerExternalState>;
+    static UniqueExternalState create();
+
+    using ShimFn = std::function<UniqueExternalState(UniqueExternalState)>;
+    static void prependShim(ShimFn&& shim);
+    static void appendShim(ShimFn&& shim);
 
     virtual ~AuthzManagerExternalState();
 
@@ -83,6 +88,13 @@ public:
     /**
      * Retrieves the schema version of the persistent data describing users and roles.
      * Will leave *outVersion unmodified on non-OK status return values.
+     */
+    virtual Status hasValidStoredAuthorizationVersion(OperationContext* opCtx,
+                                                      BSONObj* foundVersionDoc) = 0;
+
+    /**
+     * Retrieves the schema version of the persistent data describing users and roles.
+     * Modifies *outVersion if status is NoMatchingDocument.
      */
     virtual Status getStoredAuthorizationVersion(OperationContext* opCtx, int* outVersion) = 0;
 
@@ -169,7 +181,15 @@ public:
                                             std::vector<BSONObj>* result) = 0;
 
     /**
-     * Returns true if there exists at least one privilege document in the system.
+     * Returns true if there exists at least one user document in the system. If `tenantId` is
+     * set, checks whether a doc associated with this tenantId exists.
+     */
+    virtual Status hasAnyUserDocuments(OperationContext* opCtx,
+                                       const boost::optional<TenantId>& tenantId) = 0;
+
+    /**
+     * Returns true if there exists at least one privilege document in the system. If `tenantId` is
+     * set, checks whether a doc associated with this tenantId exists.
      */
     virtual bool hasAnyPrivilegeDocuments(OperationContext* opCtx) = 0;
 

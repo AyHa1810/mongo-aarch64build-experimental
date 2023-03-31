@@ -128,6 +128,15 @@ IndexEntry indexEntryFromIndexCatalogEntry(OperationContext* opCtx,
                                            const CanonicalQuery* canonicalQuery = nullptr);
 
 /**
+ * Converts the catalog metadata for an index into an ColumnIndexEntry, which is a format that is
+ * meant to be consumed by the query planner. This function can perform index reads and should not
+ * be called unless access to the storage engine is permitted.
+ */
+ColumnIndexEntry columnIndexEntryFromIndexCatalogEntry(OperationContext* opCtx,
+                                                       const CollectionPtr& collection,
+                                                       const IndexCatalogEntry& ice);
+
+/**
  * Determines whether or not to wait for oplog visibility for a query. This is only used for
  * collection scans on the oplog.
  */
@@ -146,7 +155,9 @@ bool shouldWaitForOplogVisibility(OperationContext* opCtx,
  * If the caller provides a 'extractAndAttachPipelineStages' function and the query is eligible for
  * pushdown into the find layer this function will be invoked to extract pipeline stages and
  * attach them to the provided 'CanonicalQuery'. This function should capture the Pipeline that
- * stages should be extracted from.
+ * stages should be extracted from. If the boolean 'attachOnly' argument is true, it will only find
+ * and attach the applicable stages to the query. If it is false, it will remove the extracted
+ * stages from the pipeline.
  *
  * Note that the first overload takes a 'MultipleCollectionAccessor' and can construct a
  * PlanExecutor over multiple collections, while the second overload takes a single 'CollectionPtr'
@@ -156,7 +167,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutor(
     OperationContext* opCtx,
     const MultipleCollectionAccessor& collections,
     std::unique_ptr<CanonicalQuery> canonicalQuery,
-    std::function<void(CanonicalQuery*)> extractAndAttachPipelineStages,
+    std::function<void(CanonicalQuery*, bool)> extractAndAttachPipelineStages,
     PlanYieldPolicy::YieldPolicy yieldPolicy,
     const QueryPlannerParams& plannerOptions);
 
@@ -164,7 +175,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutor(
     OperationContext* opCtx,
     const CollectionPtr* collection,
     std::unique_ptr<CanonicalQuery> canonicalQuery,
-    std::function<void(CanonicalQuery*)> extractAndAttachPipelineStages,
+    std::function<void(CanonicalQuery*, bool)> extractAndAttachPipelineStages,
     PlanYieldPolicy::YieldPolicy yieldPolicy,
     size_t plannerOptions = 0);
 
@@ -181,7 +192,9 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutor(
  * If the caller provides a 'extractAndAttachPipelineStages' function and the query is eligible for
  * pushdown into the find layer this function will be invoked to extract pipeline stages and
  * attach them to the provided 'CanonicalQuery'. This function should capture the Pipeline that
- * stages should be extracted from.
+ * stages should be extracted from. If the boolean 'attachOnly' argument is true, it will only find
+ * and attach the applicable stages to the query. If it is false, it will remove the extracted
+ * stages from the pipeline.
  *
  * Note that the first overload takes a 'MultipleCollectionAccessor' and can construct a
  * PlanExecutor over multiple collections, while the second overload takes a single
@@ -191,7 +204,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorFind
     OperationContext* opCtx,
     const MultipleCollectionAccessor& collections,
     std::unique_ptr<CanonicalQuery> canonicalQuery,
-    std::function<void(CanonicalQuery*)> extractAndAttachPipelineStages,
+    std::function<void(CanonicalQuery*, bool)> extractAndAttachPipelineStages,
     bool permitYield = false,
     QueryPlannerParams plannerOptions = QueryPlannerParams{});
 
@@ -199,7 +212,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorFind
     OperationContext* opCtx,
     const CollectionPtr* collection,
     std::unique_ptr<CanonicalQuery> canonicalQuery,
-    std::function<void(CanonicalQuery*)> extractAndAttachPipelineStages,
+    std::function<void(CanonicalQuery*, bool)> extractAndAttachPipelineStages,
     bool permitYield = false,
     size_t plannerOptions = QueryPlannerParams::DEFAULT);
 
@@ -257,7 +270,10 @@ bool turnIxscanIntoDistinctIxscan(QuerySolution* soln,
  * distinct.
  */
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDistinct(
-    const CollectionPtr* collection, size_t plannerOptions, ParsedDistinct* parsedDistinct);
+    const CollectionPtr* collection,
+    size_t plannerOptions,
+    ParsedDistinct* parsedDistinct,
+    bool flipDistinctScanDirection = false);
 
 /*
  * Get a PlanExecutor for a query executing as part of a count command.
@@ -325,4 +341,20 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpda
     ParsedUpdate* parsedUpdate,
     boost::optional<ExplainOptions::Verbosity> verbosity,
     UpdateStageParams::DocumentCounter&& documentCounter = nullptr);
+
+/**
+ * Direction of collection scan plan executor returned by makeCollectionScanPlanExecutor() below.
+ */
+enum class CollectionScanDirection {
+    kForward = 1,
+    kBackward = -1,
+};
+
+std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> getCollectionScanExecutor(
+    OperationContext* opCtx,
+    const CollectionPtr& collection,
+    PlanYieldPolicy::YieldPolicy yieldPolicy,
+    CollectionScanDirection scanDirection,
+    const boost::optional<RecordId>& resumeAfterRecordId = boost::none);
+
 }  // namespace mongo

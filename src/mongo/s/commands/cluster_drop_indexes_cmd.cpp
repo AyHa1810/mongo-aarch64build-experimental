@@ -27,9 +27,7 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
@@ -38,7 +36,6 @@
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
-
 
 namespace mongo {
 namespace {
@@ -62,12 +59,16 @@ public:
         return false;
     }
 
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const override {
-        ActionSet actions;
-        actions.addAction(ActionType::dropIndex);
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const DatabaseName& dbName,
+                                 const BSONObj& cmdObj) const override {
+        auto* as = AuthorizationSession::get(opCtx->getClient());
+        if (!as->isAuthorizedForActionsOnResource(parseResourcePattern(dbName, cmdObj),
+                                                  ActionType::dropIndex)) {
+            return {ErrorCodes::Unauthorized, "unauthorized"};
+        }
+
+        return Status::OK();
     }
 
     void validateResult(const BSONObj& resultObj) final {
@@ -101,17 +102,17 @@ public:
 
         uassert(ErrorCodes::IllegalOperation,
                 "Cannot drop indexes in 'config' database in sharded cluster",
-                nss.db() != NamespaceString::kConfigDb);
+                nss.dbName() != DatabaseName::kConfig);
 
         uassert(ErrorCodes::IllegalOperation,
                 "Cannot drop indexes in 'admin' database in sharded cluster",
-                nss.db() != NamespaceString::kAdminDb);
+                nss.dbName() != DatabaseName::kAdmin);
 
         LOGV2_DEBUG(22751,
                     1,
                     "dropIndexes: {namespace} cmd: {command}",
                     "CMD: dropIndexes",
-                    "namespace"_attr = nss,
+                    logAttrs(nss),
                     "command"_attr = redact(cmdObj));
 
         ShardsvrDropIndexes shardsvrDropIndexCmd(nss);

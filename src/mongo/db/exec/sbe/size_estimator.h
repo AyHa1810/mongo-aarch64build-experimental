@@ -84,12 +84,21 @@ inline size_t estimate(S) {
     return 0;
 }
 
+inline size_t estimate(const StringData& str) {
+    return 0;
+}
+
 // Calculate the size of a SpecificStats's derived class.
 // We need a template argument here rather than passing const SpecificStats&
 // as we need to know the exact type to properly compute the size of the object.
 template <typename S, std::enable_if_t<std::is_base_of_v<SpecificStats, S>, bool> = true>
 inline size_t estimate(const S& stats) {
     return stats.estimateObjectSizeInBytes() - sizeof(S);
+}
+
+template <typename A, typename B>
+inline size_t estimate(const std::pair<A, B>& pair) {
+    return estimate(pair.first) + estimate(pair.second);
 }
 
 // Calculate the size of the inlined vector's elements.

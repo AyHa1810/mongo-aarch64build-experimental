@@ -3,7 +3,6 @@ test_kind: fsm_workload_test
 selector:
   roots:
   - jstests/concurrency/fsm_workloads/**/*.js
-  - src/mongo/db/modules/*/jstests/concurrency/fsm_workloads/*.js
   exclude_files:
   ##
   # Disabled due to MongoDB restrictions and/or workload restrictions
@@ -89,5 +88,7 @@ executor:
       oplogSize: 1024
       set_parameters:
         enableTestCommands: 1
+        queryAnalysisSamplerConfigurationRefreshSecs: 1
+        queryAnalysisWriterIntervalSecs: 1
         roleGraphInvalidationIsFatal: 1
     num_nodes: 3

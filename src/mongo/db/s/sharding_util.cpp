@@ -37,8 +37,11 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/exception_util.h"
 #include "mongo/db/index_builds_coordinator.h"
+#include "mongo/db/s/shard_authoritative_catalog_gen.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/catalog/type_index_catalog_gen.h"
+#include "mongo/s/catalog/type_collection.h"
+#include "mongo/s/catalog/type_index_catalog.h"
+#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/request_types/flush_routing_table_cache_updates_gen.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
@@ -57,20 +60,16 @@ void tellShardsToRefreshCollection(OperationContext* opCtx,
     cmd.setSyncFromConfig(true);
     cmd.setDbName(nss.db());
     auto cmdObj = CommandHelpers::appendMajorityWriteConcern(cmd.toBSON({}));
-    sendCommandToShards(opCtx, NamespaceString::kAdminDb, cmdObj, shardIds, executor);
+    sendCommandToShards(opCtx, DatabaseName::kAdmin.db(), cmdObj, shardIds, executor);
 }
 
-std::vector<AsyncRequestsSender::Response> sendCommandToShards(
+std::vector<AsyncRequestsSender::Response> processShardResponses(
     OperationContext* opCtx,
     StringData dbName,
     const BSONObj& command,
-    const std::vector<ShardId>& shardIds,
+    const std::vector<AsyncRequestsSender::Request>& requests,
     const std::shared_ptr<executor::TaskExecutor>& executor,
-    const bool throwOnError) {
-    std::vector<AsyncRequestsSender::Request> requests;
-    for (const auto& shardId : shardIds) {
-        requests.emplace_back(shardId, command);
-    }
+    bool throwOnError) {
 
     std::vector<AsyncRequestsSender::Response> responses;
     if (!requests.empty()) {
@@ -96,13 +95,13 @@ std::vector<AsyncRequestsSender::Response> sendCommandToShards(
                     "Failed command {} for database '{}' on shard '{}'"_format(
                         command.toString(), dbName, StringData{response.shardId});
 
-                auto shardResponse =
-                    uassertStatusOKWithContext(std::move(response.swResponse), errorContext);
+                uassertStatusOKWithContext(response.swResponse.getStatus(), errorContext);
+                const auto& respBody = response.swResponse.getValue().data;
 
-                auto status = getStatusFromCommandResult(shardResponse.data);
+                const auto status = getStatusFromCommandResult(respBody);
                 uassertStatusOKWithContext(status, errorContext);
 
-                auto wcStatus = getWriteConcernStatusFromCommandResult(shardResponse.data);
+                const auto wcStatus = getWriteConcernStatusFromCommandResult(respBody);
                 uassertStatusOKWithContext(wcStatus, errorContext);
             }
 
@@ -111,6 +110,37 @@ std::vector<AsyncRequestsSender::Response> sendCommandToShards(
     }
     return responses;
 }
+
+std::vector<AsyncRequestsSender::Response> sendCommandToShards(
+    OperationContext* opCtx,
+    StringData dbName,
+    const BSONObj& command,
+    const std::vector<ShardId>& shardIds,
+    const std::shared_ptr<executor::TaskExecutor>& executor,
+    const bool throwOnError) {
+    std::vector<AsyncRequestsSender::Request> requests;
+    for (const auto& shardId : shardIds) {
+        requests.emplace_back(shardId, command);
+    }
+
+    return processShardResponses(opCtx, dbName, command, requests, executor, throwOnError);
+}
+
+std::vector<AsyncRequestsSender::Response> sendCommandToShardsWithVersion(
+    OperationContext* opCtx,
+    StringData dbName,
+    const BSONObj& command,
+    const std::vector<ShardId>& shardIds,
+    const std::shared_ptr<executor::TaskExecutor>& executor,
+    const CollectionRoutingInfo& cri,
+    const bool throwOnError) {
+    std::vector<AsyncRequestsSender::Request> requests;
+    for (const auto& shardId : shardIds) {
+        requests.emplace_back(shardId, appendShardVersion(command, cri.getShardVersion(shardId)));
+    }
+    return processShardResponses(opCtx, dbName, command, requests, executor, throwOnError);
+}
+
 
 // TODO SERVER-67593: Investigate if DBDirectClient can be used instead.
 Status createIndexOnCollection(OperationContext* opCtx,
@@ -143,7 +173,7 @@ Status createIndexOnCollection(OperationContext* opCtx,
         auto removeIndexBuildsToo = false;
         auto indexSpecs = indexCatalog->removeExistingIndexes(
             opCtx,
-            CollectionPtr(collection, CollectionPtr::NoYieldTag{}),
+            CollectionPtr(collection),
             uassertStatusOK(
                 collection->addCollationDefaultsToIndexSpecsForCreate(opCtx, {index.toBSON()})),
             removeIndexBuildsToo);
@@ -182,33 +212,50 @@ Status createIndexOnCollection(OperationContext* opCtx,
     return Status::OK();
 }
 
-Status createGlobalIndexesIndexes(OperationContext* opCtx) {
+Status createShardingIndexCatalogIndexes(OperationContext* opCtx) {
     bool unique = true;
-    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-        auto result =
-            createIndexOnCollection(opCtx,
-                                    NamespaceString::kConfigsvrIndexCatalogNamespace,
-                                    BSON(IndexCatalogType::kCollectionUUIDFieldName
-                                         << 1 << IndexCatalogType::kLastModFieldName << 1),
-                                    !unique);
-        if (!result.isOK()) {
-            return result.withContext(str::stream()
-                                      << "couldn't create collectionUUID_1_lastmod_1 index on "
-                                      << NamespaceString::kConfigsvrIndexCatalogNamespace);
-        }
+    NamespaceString indexCatalogNamespace;
+    if (serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
+        indexCatalogNamespace = NamespaceString::kConfigsvrIndexCatalogNamespace;
     } else {
-        auto result =
-            createIndexOnCollection(opCtx,
-                                    NamespaceString::kShardsIndexCatalogNamespace,
-                                    BSON(IndexCatalogType::kCollectionUUIDFieldName
-                                         << 1 << IndexCatalogType::kLastModFieldName << 1),
-                                    !unique);
-        if (!result.isOK()) {
-            return result.withContext(str::stream()
-                                      << "couldn't create collectionUUID_1_lastmod_1 index on "
-                                      << NamespaceString::kShardsIndexCatalogNamespace);
-        }
+        indexCatalogNamespace = NamespaceString::kShardIndexCatalogNamespace;
     }
+    auto result = createIndexOnCollection(opCtx,
+                                          indexCatalogNamespace,
+                                          BSON(IndexCatalogType::kCollectionUUIDFieldName
+                                               << 1 << IndexCatalogType::kLastmodFieldName << 1),
+                                          !unique);
+    if (!result.isOK()) {
+        return result.withContext(str::stream()
+                                  << "couldn't create collectionUUID_1_lastmod_1 index on "
+                                  << indexCatalogNamespace);
+    }
+    result = createIndexOnCollection(opCtx,
+                                     indexCatalogNamespace,
+                                     BSON(IndexCatalogType::kCollectionUUIDFieldName
+                                          << 1 << IndexCatalogType::kNameFieldName << 1),
+                                     unique);
+    if (!result.isOK()) {
+        return result.withContext(str::stream()
+                                  << "couldn't create collectionUUID_1_name_1 index on "
+                                  << indexCatalogNamespace);
+    }
+    return Status::OK();
+}
+
+Status createShardCollectionCatalogIndexes(OperationContext* opCtx) {
+    bool unique = true;
+    auto result =
+        createIndexOnCollection(opCtx,
+                                NamespaceString::kShardCollectionCatalogNamespace,
+                                BSON(ShardAuthoritativeCollectionType::kUuidFieldName << 1),
+                                !unique);
+    if (!result.isOK()) {
+        return result.withContext(str::stream()
+                                  << "couldn't create uuid_1 index on "
+                                  << NamespaceString::kShardCollectionCatalogNamespace);
+    }
+
     return Status::OK();
 }
 

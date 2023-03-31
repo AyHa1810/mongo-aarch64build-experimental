@@ -100,8 +100,10 @@ TEST(ChangeStreamEventTransformTest, TestDefaultUpdateTransform) {
 }
 
 TEST(ChangeStreamEventTransformTest, TestCreateViewTransform) {
-    const NamespaceString systemViewNss(boost::none, "viewDB.system.views");
-    const NamespaceString viewNss(boost::none, "viewDB.view.name");
+    const NamespaceString systemViewNss =
+        NamespaceString::makeSystemDotViewsNamespace({boost::none, "viewDB"});
+    const NamespaceString viewNss =
+        NamespaceString::createNamespaceString_forTest(boost::none, "viewDB.view.name");
     const auto viewPipeline =
         Value(fromjson("[{$match: {field: 'value'}}, {$project: {field: 1}}]"));
     const auto opDescription = Document{{"viewOn", "baseColl"_sd}, {"pipeline", viewPipeline}};
@@ -133,8 +135,10 @@ TEST(ChangeStreamEventTransformTest, TestCreateViewTransform) {
 }
 
 TEST(ChangeStreamEventTransformTest, TestCreateViewOnSingleCollection) {
-    const NamespaceString systemViewNss(boost::none, "viewDB.system.views");
-    const NamespaceString viewNss(boost::none, "viewDB.view.name");
+    const NamespaceString systemViewNss =
+        NamespaceString::makeSystemDotViewsNamespace({boost::none, "viewDB"});
+    const NamespaceString viewNss =
+        NamespaceString::createNamespaceString_forTest(boost::none, "viewDB.view.name");
     const auto viewPipeline =
         Value(fromjson("[{$match: {field: 'value'}}, {$project: {field: 1}}]"));
     const auto document = BSON("_id" << viewNss.toString() << "viewOn"
@@ -169,11 +173,12 @@ TEST(ChangeStreamEventTransformTest, TestUpdateTransformWithTenantId) {
     // Turn on multitenancySupport, but not featureFlagRequireTenantId. We expect the tenantId to be
     // part of the 'ns' field in the oplog entry, but it should not be a part of the db name in the
     // change event.
-    gMultitenancySupport = true;
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
 
     const auto documentKey = Document{{"x", 1}, {"y", 1}};
     const auto tenantId = TenantId(OID::gen());
-    NamespaceString nssWithTenant(tenantId, "unittests.serverless_change_stream");
+    NamespaceString nssWithTenant = NamespaceString::createNamespaceString_forTest(
+        tenantId, "unittests.serverless_change_stream");
 
     auto updateField =
         makeOplogEntry(repl::OpTypeEnum::kUpdate,                                 // op type
@@ -204,7 +209,7 @@ TEST(ChangeStreamEventTransformTest, TestUpdateTransformWithTenantId) {
                                      documentKey.toBson()  // o2
     );
 
-    changeStreamDoc = applyTransformation(updateField, nssWithTenant);
+    changeStreamDoc = applyTransformation(oplogEntry, nssWithTenant);
     outputNs = changeStreamDoc[DocumentSourceChangeStream::kNamespaceField].getDocument();
 
     ASSERT_DOCUMENT_EQ(outputNs, expectedNamespace);
@@ -214,11 +219,13 @@ TEST(ChangeStreamEventTransformTest, TestRenameTransformWithTenantId) {
     // Turn on multitenancySupport, but not featureFlagRequireTenantId. We expect the tenantId to be
     // part of the 'ns' field in the oplog entry, but it should not be a part of the db name in the
     // change event.
-    gMultitenancySupport = true;
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
 
     const auto tenantId = TenantId(OID::gen());
-    NamespaceString renameFrom(tenantId, "unittests.serverless_change_stream");
-    NamespaceString renameTo(tenantId, "unittests.rename_coll");
+    NamespaceString renameFrom = NamespaceString::createNamespaceString_forTest(
+        tenantId, "unittests.serverless_change_stream");
+    NamespaceString renameTo =
+        NamespaceString::createNamespaceString_forTest(tenantId, "unittests.rename_coll");
 
     auto renameField = makeOplogEntry(
         repl::OpTypeEnum::kCommand,  // op type
@@ -273,10 +280,11 @@ TEST(ChangeStreamEventTransformTest, TestDropDatabaseTransformWithTenantId) {
     // Turn on multitenancySupport, but not featureFlagRequireTenantId. We expect the tenantId to be
     // part of the 'ns' field in the oplog entry, but it should not be a part of the db name in the
     // change event.
-    gMultitenancySupport = true;
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
 
     const auto tenantId = TenantId(OID::gen());
-    NamespaceString dbToDrop(tenantId, "unittests");
+    NamespaceString dbToDrop =
+        NamespaceString::createNamespaceString_forTest(tenantId, "unittests");
 
     auto dropDbField = makeOplogEntry(repl::OpTypeEnum::kCommand,  // op type
                                       dbToDrop.getCommandNS(),     // namespace
@@ -311,10 +319,11 @@ TEST(ChangeStreamEventTransformTest, TestCreateTransformWithTenantId) {
     // Turn on multitenancySupport, but not featureFlagRequireTenantId. We expect the tenantId to be
     // part of the 'ns' field in the oplog entry, but it should not be a part of the db name in the
     // change event.
-    gMultitenancySupport = true;
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
 
     const auto tenantId = TenantId(OID::gen());
-    NamespaceString nssWithTenant(tenantId, "unittests.serverless_change_stream");
+    NamespaceString nssWithTenant = NamespaceString::createNamespaceString_forTest(
+        tenantId, "unittests.serverless_change_stream");
 
     auto createField = makeOplogEntry(repl::OpTypeEnum::kCommand,              // op type
                                       nssWithTenant.getCommandNS(),            // namespace
@@ -350,12 +359,14 @@ TEST(ChangeStreamEventTransformTest, TestCreateViewTransformWithTenantId) {
     // Turn on multitenancySupport, but not featureFlagRequireTenantId. We expect the tenantId to be
     // part of the 'ns' field in the oplog entry, but it should not be a part of the db name in the
     // change event.
-    gMultitenancySupport = true;
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
 
     const auto tenantId = TenantId(OID::gen());
 
-    const NamespaceString systemViewNss(tenantId, "viewDB.system.views");
-    const NamespaceString viewNss(tenantId, "viewDB.view.name");
+    const NamespaceString systemViewNss =
+        NamespaceString::makeSystemDotViewsNamespace({tenantId, "viewDB"});
+    const NamespaceString viewNss =
+        NamespaceString::createNamespaceString_forTest(tenantId, "viewDB.view.name");
     const auto viewPipeline =
         Value(fromjson("[{$match: {field: 'value'}}, {$project: {field: 1}}]"));
     const auto opDescription = Document{{"viewOn", "baseColl"_sd}, {"pipeline", viewPipeline}};

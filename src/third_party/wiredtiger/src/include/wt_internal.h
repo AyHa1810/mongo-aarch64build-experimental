@@ -147,6 +147,8 @@ struct __wt_connection_stats;
 typedef struct __wt_connection_stats WT_CONNECTION_STATS;
 struct __wt_cursor_backup;
 typedef struct __wt_cursor_backup WT_CURSOR_BACKUP;
+struct __wt_cursor_bounds_state;
+typedef struct __wt_cursor_bounds_state WT_CURSOR_BOUNDS_STATE;
 struct __wt_cursor_btree;
 typedef struct __wt_cursor_btree WT_CURSOR_BTREE;
 struct __wt_cursor_bulk;
@@ -187,6 +189,8 @@ struct __wt_data_handle;
 typedef struct __wt_data_handle WT_DATA_HANDLE;
 struct __wt_data_handle_cache;
 typedef struct __wt_data_handle_cache WT_DATA_HANDLE_CACHE;
+struct __wt_delete_hs_upd;
+typedef struct __wt_delete_hs_upd WT_DELETE_HS_UPD;
 struct __wt_dlh;
 typedef struct __wt_dlh WT_DLH;
 struct __wt_dsrc_stats;
@@ -195,6 +199,8 @@ struct __wt_evict_entry;
 typedef struct __wt_evict_entry WT_EVICT_ENTRY;
 struct __wt_evict_queue;
 typedef struct __wt_evict_queue WT_EVICT_QUEUE;
+struct __wt_evict_timeline;
+typedef struct __wt_evict_timeline WT_EVICT_TIMELINE;
 struct __wt_ext;
 typedef struct __wt_ext WT_EXT;
 struct __wt_extlist;
@@ -303,10 +309,14 @@ struct __wt_rec_kv;
 typedef struct __wt_rec_kv WT_REC_KV;
 struct __wt_reconcile;
 typedef struct __wt_reconcile WT_RECONCILE;
+struct __wt_reconcile_timeline;
+typedef struct __wt_reconcile_timeline WT_RECONCILE_TIMELINE;
 struct __wt_ref;
 typedef struct __wt_ref WT_REF;
 struct __wt_ref_hist;
 typedef struct __wt_ref_hist WT_REF_HIST;
+struct __wt_rollback_to_stable;
+typedef struct __wt_rollback_to_stable WT_ROLLBACK_TO_STABLE;
 struct __wt_row;
 typedef struct __wt_row WT_ROW;
 struct __wt_rwlock;
@@ -367,6 +377,8 @@ struct __wt_update_vector;
 typedef struct __wt_update_vector WT_UPDATE_VECTOR;
 struct __wt_verbose_multi_category;
 typedef struct __wt_verbose_multi_category WT_VERBOSE_MULTI_CATEGORY;
+struct __wt_verify_info;
+typedef struct __wt_verify_info WT_VERIFY_INFO;
 struct __wt_version;
 typedef struct __wt_version WT_VERSION;
 union __wt_lsn;
@@ -437,6 +449,7 @@ typedef uint64_t wt_timestamp_t;
 #include "optrack.h"
 #include "os.h"
 #include "reconcile.h"
+#include "rollback_to_stable.h"
 #include "schema.h"
 #include "thread_group.h"
 #include "tiered.h"
@@ -479,6 +492,7 @@ typedef uint64_t wt_timestamp_t;
 #include "packing_inline.h"
 #include "reconcile_inline.h"
 #include "serial_inline.h"
+#include "str_inline.h"
 #include "time_inline.h"
 
 #if defined(__cplusplus)

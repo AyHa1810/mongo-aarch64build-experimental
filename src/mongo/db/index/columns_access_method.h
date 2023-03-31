@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/db/index/column_cell.h"
+#include "mongo/db/index/column_key_generator.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/storage/column_store.h"
 
@@ -47,6 +48,16 @@ public:
 
     ColumnStoreAccessMethod(IndexCatalogEntry* ice, std::unique_ptr<ColumnStore>);
 
+    const column_keygen::ColumnKeyGenerator& getKeyGen() const {
+        return _keyGen;
+    }
+
+    /**
+     * Returns a pointer to the ColumnstoreProjection owned by the underlying ColumnKeyGenerator.
+     */
+    const ColumnStoreProjection* getColumnstoreProjection() const {
+        return _keyGen.getColumnstoreProjection();
+    }
 
     //
     // Generic IndexAccessMethod APIs
@@ -68,6 +79,7 @@ public:
                 const InsertDeleteOptions& options,
                 int64_t* keysDeletedOut,
                 CheckRecordId checkRecordId) final;
+
     Status update(OperationContext* opCtx,
                   SharedBufferFragmentBuilder& pooledBufferBuilder,
                   const BSONObj& oldDoc,
@@ -78,11 +90,19 @@ public:
                   int64_t* keysInsertedOut,
                   int64_t* keysDeletedOut) final;
 
+    Status applyIndexBuildSideWrite(OperationContext* opCtx,
+                                    const CollectionPtr& coll,
+                                    const BSONObj& operation,
+                                    const InsertDeleteOptions& unusedOptions,
+                                    KeyHandlerFn&& unusedFn,
+                                    int64_t* keysInserted,
+                                    int64_t* keysDeleted) final;
+
     Status initializeAsEmpty(OperationContext* opCtx) final;
 
-    void validate(OperationContext* opCtx,
-                  int64_t* numKeys,
-                  IndexValidateResults* fullResults) const final;
+    IndexValidateResults validate(OperationContext* opCtx, bool full) const final;
+
+    int64_t numKeys(OperationContext* opCtx) const final;
 
     bool appendCustomStats(OperationContext* opCtx,
                            BSONObjBuilder* result,
@@ -99,17 +119,42 @@ public:
         const boost::optional<IndexStateInfo>& stateInfo,
         StringData dbName) final;
 
-    Ident* getIdentPtr() const final;
+    std::shared_ptr<Ident> getSharedIdent() const final;
+
+    void setIdent(std::shared_ptr<Ident> ident) final;
 
     const ColumnStore* storage() const {
         return _store.get();
     }
 
+    ColumnStore* writableStorage() const {
+        return _store.get();
+    }
+
     class BulkBuilder;
 
+    const std::string& indexName() const {
+        return _descriptor->indexName();
+    }
+
+    /**
+     * Returns true iff 'compressor' is a recognized name of a block compression module that is
+     * supported for use with the column store index.
+     *
+     * Actual support for the module depends on the storage engine, however. This method does _not_
+     * guarantee that creating a column store index with 'compressor' will always work.
+     */
+    static bool supportsBlockCompressor(StringData compressor);
+
 private:
+    void _visitCellsForIndexInsert(OperationContext* opCtx,
+                                   PooledFragmentBuilder& pooledFragmentBuilder,
+                                   const std::vector<BsonRecord>& bsonRecords,
+                                   function_ref<void(StringData, const BsonRecord&)> cb) const;
+
     const std::unique_ptr<ColumnStore> _store;
     IndexCatalogEntry* const _indexCatalogEntry;  // owned by IndexCatalog
     const IndexDescriptor* const _descriptor;
+    const column_keygen::ColumnKeyGenerator _keyGen;
 };
 }  // namespace mongo

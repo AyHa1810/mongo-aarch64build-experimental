@@ -322,7 +322,9 @@ struct ValidationErrorContext {
                                   verifySizeAndAppend(details, kDetailsString, builder);
                               },
                               [&](const std::monostate& state) -> void { MONGO_UNREACHABLE },
-                              [&](const std::string& str) -> void { MONGO_UNREACHABLE }},
+                              [&](const std::string& str) -> void {
+                                  MONGO_UNREACHABLE
+                              }},
             latestCompleteError);
     }
     /**
@@ -330,22 +332,23 @@ struct ValidationErrorContext {
      * construct an array as part of their error.
      */
     void appendLatestCompleteError(BSONArrayBuilder* builder) {
-        stdx::visit(
-            OverloadedVisitor{
-                [&](const BSONObj& obj) -> void { verifySizeAndAppend(obj, builder); },
-                [&](const std::string& str) -> void { builder->append(str); },
-                [&](const BSONArray& arr) -> void {
-                    // The '$_internalSchemaAllowedProperties' match expression represents two
-                    // JSONSchema keywords: 'additionalProperties' and 'patternProperties'. As
-                    // such, if both keywords produce an error, their errors will be packaged
-                    // into an array which the parent expression must absorb when constructing
-                    // its array of error details.
-                    for (auto&& elem : arr) {
-                        verifySizeAndAppend(elem, builder);
-                    }
-                },
-                [&](const std::monostate& state) -> void { MONGO_UNREACHABLE }},
-            latestCompleteError);
+        stdx::visit(OverloadedVisitor{
+                        [&](const BSONObj& obj) -> void { verifySizeAndAppend(obj, builder); },
+                        [&](const std::string& str) -> void { builder->append(str); },
+                        [&](const BSONArray& arr) -> void {
+                            // The '$_internalSchemaAllowedProperties' match expression represents
+                            // two JSONSchema keywords: 'additionalProperties' and
+                            // 'patternProperties'. As such, if both keywords produce an error,
+                            // their errors will be packaged into an array which the parent
+                            // expression must absorb when constructing its array of error details.
+                            for (auto&& elem : arr) {
+                                verifySizeAndAppend(elem, builder);
+                            }
+                        },
+                        [&](const std::monostate& state) -> void {
+                            MONGO_UNREACHABLE
+                        }},
+                    latestCompleteError);
     }
 
     /**
@@ -1185,8 +1188,6 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    void visit(const EncryptedBetweenMatchExpression* expr) final {}
-
 private:
     // Set of utilities responsible for appending various fields to build a descriptive error.
     void appendOperatorName(const MatchExpression& expr) {
@@ -1918,7 +1919,6 @@ public:
     void visit(const WhereNoOpMatchExpression* expr) final {
         MONGO_UNREACHABLE;
     }
-    void visit(const EncryptedBetweenMatchExpression* expr) final {}
 
 private:
     /**
@@ -2231,9 +2231,6 @@ public:
     }
     void visit(const WhereNoOpMatchExpression* expr) final {
         MONGO_UNREACHABLE;
-    }
-    void visit(const EncryptedBetweenMatchExpression* expr) final {
-        _context->finishCurrentError(expr);
     }
 
 private:

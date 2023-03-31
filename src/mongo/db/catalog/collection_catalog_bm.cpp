@@ -62,7 +62,8 @@ const ServiceContext::ConstructorActionRegisterer clientObserverRegisterer{
     [](ServiceContext* service) {
         service->registerClientObserver(std::make_unique<LockerImplClientObserver>());
     },
-    [](ServiceContext* serviceContext) {}};
+    [](ServiceContext* serviceContext) {
+    }};
 
 ServiceContext* setupServiceContext() {
     auto serviceContext = ServiceContext::make();
@@ -78,7 +79,10 @@ void createCollections(OperationContext* opCtx, int numCollections) {
     for (auto i = 0; i < numCollections; i++) {
         const NamespaceString nss("collection_catalog_bm", std::to_string(i));
         CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
-            catalog.registerCollection(opCtx, UUID::gen(), std::make_shared<CollectionMock>(nss));
+            catalog.registerCollection(opCtx,
+                                       UUID::gen(),
+                                       std::make_shared<CollectionMock>(nss),
+                                       /*ts=*/boost::none);
         });
     }
 }

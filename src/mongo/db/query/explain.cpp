@@ -59,6 +59,7 @@
 #include "mongo/db/query/query_settings_decoration.h"
 #include "mongo/db/query/stage_builder.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/stats/resource_consumption_metrics.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/overloaded_visitor.h"
@@ -85,7 +86,7 @@ void generatePlannerInfo(PlanExecutor* exec,
                          BSONObjBuilder* out) {
     BSONObjBuilder plannerBob(out->subobjStart("queryPlanner"));
 
-    plannerBob.append("namespace", exec->nss().ns());
+    plannerBob.append("namespace", NamespaceStringUtil::serialize(exec->nss()));
 
     // Find whether there is an index filter set for the query shape. The 'indexFilterSet' field
     // will always be false in the case of EOF or idhack plans.
@@ -97,7 +98,6 @@ void generatePlannerInfo(PlanExecutor* exec,
         const QuerySettings* querySettings =
             QuerySettingsDecoration::get(mainCollection->getSharedDecorations());
         if (exec->getCanonicalQuery()->isSbeCompatible() &&
-            feature_flags::gFeatureFlagSbeFull.isEnabledAndIgnoreFCV() &&
             !exec->getCanonicalQuery()->getForceClassicEngine()) {
             const auto planCacheKeyInfo =
                 plan_cache_key_factory::make(*exec->getCanonicalQuery(), collections);
@@ -123,7 +123,7 @@ void generatePlannerInfo(PlanExecutor* exec,
     auto query = exec->getCanonicalQuery();
     if (nullptr != query) {
         BSONObjBuilder parsedQueryBob(plannerBob.subobjStart("parsedQuery"));
-        query->root()->serialize(&parsedQueryBob);
+        query->root()->serialize(&parsedQueryBob, {});
         parsedQueryBob.doneFast();
 
         if (query->getCollator()) {
@@ -188,7 +188,21 @@ void generateSinglePlanExecutionInfo(const PlanExplainer::PlanStatsDetails& deta
     if (totalTimeMillis) {
         out->appendNumber("executionTimeMillis", *totalTimeMillis);
     } else {
-        out->appendNumber("executionTimeMillisEstimate", summary->executionTimeMillisEstimate);
+        if (summary->executionTime.precision == QueryExecTimerPrecision::kNanos) {
+            out->appendNumber(
+                "executionTimeMillisEstimate",
+                durationCount<Milliseconds>(summary->executionTime.executionTimeEstimate));
+            out->appendNumber(
+                "executionTimeMicros",
+                durationCount<Microseconds>(summary->executionTime.executionTimeEstimate));
+            out->appendNumber(
+                "executionTimeNanos",
+                durationCount<Nanoseconds>(summary->executionTime.executionTimeEstimate));
+        } else if (summary->executionTime.precision == QueryExecTimerPrecision::kMillis) {
+            out->appendNumber(
+                "executionTimeMillisEstimate",
+                durationCount<Milliseconds>(summary->executionTime.executionTimeEstimate));
+        }
     }
 
     out->appendNumber("totalKeysExamined", static_cast<long long>(summary->totalKeysExamined));
@@ -206,6 +220,18 @@ void generateSinglePlanExecutionInfo(const PlanExplainer::PlanStatsDetails& deta
 
     // Add the tree of stages, with individual execution stats for each stage.
     out->append("executionStages", stats);
+}
+
+void generateOperationMetrics(PlanExecutor* exec, BSONObjBuilder* out) {
+    if (ResourceConsumption::isMetricsProfilingEnabled()) {
+        auto& metricsCollector = ResourceConsumption::MetricsCollector::get(exec->getOpCtx());
+        if (metricsCollector.hasCollectedMetrics()) {
+            BSONObjBuilder metricsBuilder(out->subobjStart("operationMetrics"));
+            auto& metrics = metricsCollector.getMetrics();
+            metrics.toBsonNonZeroFields(&metricsBuilder);
+            metricsBuilder.doneFast();
+        }
+    }
 }
 
 /**
@@ -273,7 +299,7 @@ void generateExecutionInfo(PlanExecutor* exec,
         }
         allPlansBob.doneFast();
     }
-
+    generateOperationMetrics(exec, &execBob);
     execBob.doneFast();
 }
 

@@ -8,8 +8,7 @@
 load("jstests/libs/sbe_util.js");      // For 'checkSBEEnabled()'.
 load("jstests/libs/analyze_plan.js");  // For 'getAggPlanStages' and other explain helpers.
 
-const conn =
-    MongoRunner.runMongod({setParameter: {featureFlagSbeFull: true, allowDiskUseByDefault: true}});
+const conn = MongoRunner.runMongod({setParameter: {allowDiskUseByDefault: true}});
 assert.neq(null, conn, "mongod was unable to start up");
 
 const db = conn.getDB(jsTestName());
@@ -56,19 +55,17 @@ function generateExpectedCounters(joinStrategy = lookupStrategy.nonSbe, spillToD
     let counters = db.serverStatus().metrics.query.lookup;
     assert(counters, "counters did not exist");
     let expected = Object.assign(counters);
-    expected.pipelineTotalCount = NumberLong(expected.pipelineTotalCount + 1);
-    let sbeCounters = expected.slotBasedExecutionCounters;
     switch (joinStrategy) {
         case lookupStrategy.nestedLoopJoin:
-            sbeCounters.nestedLoopJoin = NumberLong(sbeCounters.nestedLoopJoin + 1);
+            expected.nestedLoopJoin = NumberLong(expected.nestedLoopJoin + 1);
             break;
         case lookupStrategy.indexedLoopJoin:
-            sbeCounters.indexedLoopJoin = NumberLong(sbeCounters.indexedLoopJoin + 1);
+            expected.indexedLoopJoin = NumberLong(expected.indexedLoopJoin + 1);
             break;
         case lookupStrategy.hashLookup:
-            sbeCounters.hashLookup = NumberLong(sbeCounters.hashLookup + 1);
-            sbeCounters.hashLookupSpillToDisk =
-                NumberLong(sbeCounters.hashLookupSpillToDisk + spillToDisk);
+            expected.hashLookup = NumberLong(expected.hashLookup + 1);
+            expected.hashLookupSpillToDisk =
+                NumberLong(expected.hashLookupSpillToDisk + spillToDisk);
             break;
     }
     return expected;
@@ -77,7 +74,7 @@ function generateExpectedCounters(joinStrategy = lookupStrategy.nonSbe, spillToD
 // Compare the values of the lookup counters to an object that represents the expected values.
 function compareLookupCounters(expectedCounters) {
     let counters = db.serverStatus().metrics.query.lookup;
-    assert.docEq(counters, expectedCounters);
+    assert.docEq(expectedCounters, counters);
 }
 
 // Run a lookup pipeline that does not get pushed down to SBE because it's querying against a view.

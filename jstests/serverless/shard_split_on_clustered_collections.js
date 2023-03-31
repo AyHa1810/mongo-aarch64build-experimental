@@ -3,7 +3,6 @@
  * shard split.
  *
  * @tags: [
- *   requires_fcv_52,
  *   assumes_against_mongod_not_mongos,
  *   assumes_unsharded_collection,
  *   # Basic tags for tenant migration tests.
@@ -13,27 +12,23 @@
  *   requires_majority_read_concern,
  *   requires_persistence,
  *   serverless,
- *   featureFlagShardSplit
+ *   requires_fcv_63
  * ]
  */
 
-(function() {
-"use strict";
+import {ShardSplitTest} from "jstests/serverless/libs/shard_split_test.js";
 
 load("jstests/libs/clustered_collections/clustered_collection_util.js");  // ClusteredCollectionUtil
-load("jstests/libs/parallelTester.js");                                   // Thread()
-load("jstests/libs/uuid_util.js");                                        // extractUUIDFromObject()
-load("jstests/serverless/libs/basic_serverless_test.js");                 // BasicServerlessTest
 
-const test = new BasicServerlessTest({
+const test = new ShardSplitTest({
     recipientSetName: "recipientSet",
     recipientTagName: "recipientTag",
     quickGarbageCollection: true
 });
 test.addRecipientNodes();
 
-const kTenantId = "testTenantId1";
-const kDbName = test.tenantDB(kTenantId, "testDB");
+const kTenantId = ObjectId();
+const kDbName = test.tenantDB(kTenantId.str, "testDB");
 const kEmptyCollName = "testEmptyColl";
 const kNonEmptyCollName = "testNonEmptyColl";
 
@@ -101,4 +96,3 @@ operation.forget();
 validateMigrationResults(recipientRst);
 
 test.stop();
-})();

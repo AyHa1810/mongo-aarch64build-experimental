@@ -43,9 +43,9 @@
 #include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/resharding/resharding_txn_cloner.h"
 #include "mongo/db/s/resharding/resharding_util.h"
-#include "mongo/db/session_txn_record_gen.h"
+#include "mongo/db/session/session_txn_record_gen.h"
+#include "mongo/db/shard_id.h"
 #include "mongo/s/catalog/type_shard.h"
-#include "mongo/s/shard_id.h"
 #include "mongo/unittest/unittest.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
@@ -92,7 +92,7 @@ protected:
     }
 
 private:
-    const NamespaceString _nss{"test.foo"};
+    const NamespaceString _nss = NamespaceString::createNamespaceString_forTest("test.foo");
     const std::string _shardKey = "x";
     const ShardKeyPattern _shardKeyPattern = ShardKeyPattern(BSON("x"
                                                                   << "hashed"));

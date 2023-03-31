@@ -30,8 +30,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <csignal>
 #include <fstream>
-#include <signal.h>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -64,6 +64,7 @@
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/exit_code.h"
+#include "mongo/util/str_escape.h"
 #include "mongo/util/string_map.h"
 #include "mongo/util/uuid.h"
 
@@ -183,6 +184,25 @@ BSONObj toBSON(const TypeWithNonMemberFormatting&) {
     BSONObjBuilder builder;
     builder.append("first"_sd, "TypeWithNonMemberFormatting");
     return builder.obj();
+}
+
+struct TypeWithToStringForLogging {
+    friend std::string toStringForLogging(const TypeWithToStringForLogging& x) {
+        return "toStringForLogging";
+    }
+    std::string toString() const {
+        return "[overridden]";
+    }
+};
+
+enum EnumWithToStringForLogging { e1, e2, e3 };
+
+inline std::string toStringForLogging(EnumWithToStringForLogging x) {
+    return "[log-friendly enum]";
+}
+
+inline std::string toString(EnumWithToStringForLogging x) {
+    return "[not to be used]";
 }
 
 LogManager& mgr() {
@@ -837,6 +857,20 @@ TEST_F(LogV2Test, TextFormat) {
     TypeWithNonMemberFormatting t3;
     LOGV2(20079, "{name}", "name"_attr = t3);
     ASSERT(lines.back().rfind(toString(t3)) != std::string::npos);
+}
+
+TEST_F(LogV2Test, StructToStringForLogging) {
+    auto lines = makeLineCapture(JSONFormatter());
+    TypeWithToStringForLogging x;
+    LOGV2(7496800, "Msg", "x"_attr = x);
+    ASSERT_STRING_CONTAINS(lines.back(), toStringForLogging(x));
+}
+
+TEST_F(LogV2Test, EnumToStringForLogging) {
+    auto lines = makeLineCapture(JSONFormatter());
+    auto e = EnumWithToStringForLogging::e1;
+    LOGV2(7496801, "Msg", "e"_attr = e);
+    ASSERT_STRING_CONTAINS(lines.back(), toStringForLogging(e));
 }
 
 std::string hello() {
@@ -1568,6 +1602,54 @@ TEST_F(LogV2Test, JsonTruncation) {
     validateArrayTruncation(mongo::fromjson(lines.back()));
 }
 
+TEST_F(LogV2Test, StringTruncation) {
+    const AtomicWord<int32_t> maxAttributeSizeKB(1);
+    auto lines = makeLineCapture(JSONFormatter(&maxAttributeSizeKB));
+
+    std::size_t maxLength = maxAttributeSizeKB.load() << 10;
+    std::string prefix(maxLength - 3, 'a');
+
+    struct TestCase {
+        std::string input;
+        std::string suffix;
+        std::string note;
+    };
+
+    TestCase tests[] = {
+        {prefix + "LMNOPQ", "LMN", "unescaped 1-byte octet"},
+        // "\n\"NOPQ" expands to "\\n\\\"NOPQ" after escape, and the limit
+        // is reached at the 2nd '\\' octet, but since it splits the "\\\""
+        // sequence, the actual truncation happens after the 'n' octet.
+        {prefix + "\n\"NOPQ", "\n", "2-byte escape sequence"},
+        // "L\vNOPQ" expands to "L\\u000bNOPQ" after escape, and the limit
+        // is reached at the 'u' octet, so the entire sequence is truncated.
+        {prefix + "L\vNOPQ", "L", "multi-byte escape sequence"},
+        {prefix + "LM\xC3\xB1PQ", "LM", "2-byte UTF-8 sequence"},
+        {prefix + "L\xE1\x9B\x8FPQ", "L", "3-byte UTF-8 sequence"},
+        {prefix + "L\xF0\x90\x8C\xBCQ", "L", "4-byte UTF-8 sequence"},
+        {prefix + "\xE1\x9B\x8E\xE1\x9B\x8F", "\xE1\x9B\x8E", "UTF-8 codepoint boundary"},
+        // The invalid UTF-8 codepoint 0xC3 is replaced with "\\ufffd", and truncated entirely
+        {prefix + "L\xC3NOPQ", "L", "escaped invalid codepoint"},
+        {std::string(maxLength, '\\'), "\\", "escaped backslash"},
+    };
+
+    for (const auto& [input, suffix, note] : tests) {
+        LOGV2(6694001, "name", "name"_attr = input);
+        BSONObj obj = fromjson(lines.back());
+
+        auto str = obj[constants::kAttributesFieldName]["name"].checkAndGetStringData();
+        std::string context = "Failed test: " + note;
+
+        ASSERT_LTE(str.size(), maxLength) << context;
+        ASSERT(str.endsWith(suffix))
+            << context << " - string " << str << " does not end with " << suffix;
+
+        auto trunc = obj[constants::kTruncatedFieldName]["name"];
+        ASSERT_EQUALS(trunc["type"].String(), typeName(BSONType::String)) << context;
+        ASSERT_EQUALS(trunc["size"].numberLong(), str::escapeForJSON(input).size()) << context;
+    }
+}
+
 TEST_F(LogV2Test, Threads) {
     auto linesPlain = makeLineCapture(PlainFormatter());
     auto linesText = makeLineCapture(TextFormatter());
@@ -1919,7 +2001,7 @@ TEST_F(UnstructuredLoggingTest, VectorBSON) {
                                        BSON("str3"
                                             << "str4")};
     logd("{}", vectorBSON);  // NOLINT
-    validate([&vectorBSON](const BSONObj& obj) {
+    validate([](const BSONObj& obj) {
         ASSERT_EQUALS(obj.getField(kMessageFieldName).String(),
                       "({\"str1\":\"str2\"}, {\"str3\":\"str4\"})");
     });
@@ -1933,7 +2015,7 @@ TEST_F(UnstructuredLoggingTest, MapBSON) {
                                                BSON("str3"
                                                     << "str4")}};
     logd("{}", mapBSON);  // NOLINT
-    validate([&mapBSON](const BSONObj& obj) {
+    validate([](const BSONObj& obj) {
         ASSERT_EQUALS(obj.getField(kMessageFieldName).String(),
                       "(key1: {\"str1\":\"str2\"}, key2: {\"str3\":\"str4\"})");
     });

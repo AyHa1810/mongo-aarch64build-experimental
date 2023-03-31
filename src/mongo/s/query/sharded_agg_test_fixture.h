@@ -53,7 +53,8 @@ public:
 
 class ShardedAggTestFixture : public CatalogCacheTestFixture {
 public:
-    const NamespaceString kTestAggregateNss = NamespaceString{"unittests", "sharded_agg_test"};
+    const NamespaceString kTestAggregateNss =
+        NamespaceString::createNamespaceString_forTest("unittests", "sharded_agg_test");
 
     void setUp() {
         CatalogCacheTestFixture::setUp();
@@ -101,9 +102,11 @@ public:
         expectGetDatabase(nss);
         expectCollectionAndChunksAggregation(
             nss, epoch, timestamp, UUID::gen(), shardKey, chunkDistribution);
+        expectCollectionAndIndexesAggregation(
+            nss, epoch, timestamp, UUID::gen(), shardKey, boost::none, {});
 
-        const auto cm = future.default_timed_get();
-        ASSERT(cm->isSharded());
+        const auto cri = future.default_timed_get();
+        ASSERT(cri->cm.isSharded());
     }
 
 protected:

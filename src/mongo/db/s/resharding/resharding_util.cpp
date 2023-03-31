@@ -27,9 +27,6 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/s/resharding/resharding_util.h"
 
 #include <fmt/format.h>
@@ -60,7 +57,6 @@
 #include "mongo/s/shard_key_pattern.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
-
 
 namespace mongo {
 namespace resharding {
@@ -144,7 +140,7 @@ std::set<ShardId> getRecipientShards(OperationContext* opCtx,
                                      const UUID& reshardingUUID) {
     const auto& tempNss = constructTemporaryReshardingNss(sourceNss.db(), reshardingUUID);
     auto* catalogCache = Grid::get(opCtx)->catalogCache();
-    auto cm = uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, tempNss));
+    auto [cm, _] = uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, tempNss));
 
     uassert(ErrorCodes::NamespaceNotSharded,
             str::stream() << "Expected collection " << tempNss << " to be sharded",
@@ -171,11 +167,11 @@ void checkForHolesAndOverlapsInChunks(std::vector<ReshardedChunk>& chunks,
                                                         keyPattern.globalMax()));
 
     boost::optional<BSONObj> prevMax = boost::none;
-    for (auto chunk : chunks) {
+    for (const auto& chunk : chunks) {
         if (prevMax) {
             uassert(ErrorCodes::BadValue,
                     "Chunk ranges must be contiguous",
-                    SimpleBSONObjComparator::kInstance.evaluate(prevMax.get() == chunk.getMin()));
+                    SimpleBSONObjComparator::kInstance.evaluate(prevMax.value() == chunk.getMin()));
         }
         prevMax = boost::optional<BSONObj>(chunk.getMax());
     }
@@ -202,7 +198,7 @@ Timestamp getHighestMinFetchTimestamp(const std::vector<DonorShardEntry>& donorS
         uassert(4957300,
                 "All donors must have a minFetchTimestamp, but donor {} does not."_format(
                     StringData{donor.getId()}),
-                donorFetchTimestamp.is_initialized());
+                donorFetchTimestamp.has_value());
         if (maxMinFetchTimestamp < donorFetchTimestamp.value()) {
             maxMinFetchTimestamp = donorFetchTimestamp.value();
         }
@@ -217,11 +213,11 @@ void checkForOverlappingZones(std::vector<ReshardingZoneType>& zones) {
         });
 
     boost::optional<BSONObj> prevMax = boost::none;
-    for (auto zone : zones) {
+    for (const auto& zone : zones) {
         if (prevMax) {
             uassert(ErrorCodes::BadValue,
                     "Zone ranges must not overlap",
-                    SimpleBSONObjComparator::kInstance.evaluate(prevMax.get() <= zone.getMin()));
+                    SimpleBSONObjComparator::kInstance.evaluate(prevMax.value() <= zone.getMin()));
         }
         prevMax = boost::optional<BSONObj>(zone.getMax());
     }
@@ -352,14 +348,13 @@ bool isFinalOplog(const repl::OplogEntry& oplog, UUID reshardingUUID) {
 }
 
 NamespaceString getLocalOplogBufferNamespace(UUID existingUUID, ShardId donorShardId) {
-    return NamespaceString("config.localReshardingOplogBuffer.{}.{}"_format(
-        existingUUID.toString(), donorShardId.toString()));
+    return NamespaceString::makeReshardingLocalOplogBufferNSS(existingUUID,
+                                                              donorShardId.toString());
 }
 
 NamespaceString getLocalConflictStashNamespace(UUID existingUUID, ShardId donorShardId) {
-    return NamespaceString{NamespaceString::kConfigDb,
-                           "localReshardingConflictStash.{}.{}"_format(existingUUID.toString(),
-                                                                       donorShardId.toString())};
+    return NamespaceString::makeReshardingLocalConflictStashNSS(existingUUID,
+                                                                donorShardId.toString());
 }
 
 void doNoopWrite(OperationContext* opCtx, StringData opStr, const NamespaceString& nss) {

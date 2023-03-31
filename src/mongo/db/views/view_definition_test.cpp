@@ -38,16 +38,20 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/db/views/view.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
 
-const NamespaceString viewNss("testdb.testview");
-const NamespaceString backingNss("testdb.testcoll");
-const NamespaceString bucketsColl("testdb.system.buckets.testcoll");
-const NamespaceString timeseriesColl("testdb.testcoll");
+const NamespaceString viewNss = NamespaceString::createNamespaceString_forTest("testdb.testview");
+const NamespaceString backingNss =
+    NamespaceString::createNamespaceString_forTest("testdb.testcoll");
+const NamespaceString bucketsColl =
+    NamespaceString::createNamespaceString_forTest("testdb.system.buckets.testcoll");
+const NamespaceString timeseriesColl =
+    NamespaceString::createNamespaceString_forTest("testdb.testcoll");
 const BSONObj samplePipeline = BSON_ARRAY(BSON("limit" << 9));
 
 TEST(ViewDefinitionTest, ViewDefinitionCreationCorrectlyBuildsNamespaceStrings) {
@@ -97,7 +101,8 @@ DEATH_TEST_REGEX(ViewDefinitionTest,
                  R"#(Invariant failure.*_viewNss.db\(\) == viewOnNss.db\(\))#") {
     ViewDefinition viewDef(
         viewNss.dbName(), viewNss.coll(), backingNss.coll(), samplePipeline, nullptr);
-    NamespaceString badViewOn("someOtherDb.someOtherCollection");
+    NamespaceString badViewOn =
+        NamespaceString::createNamespaceString_forTest("someOtherDb.someOtherCollection");
     viewDef.setViewOn(badViewOn);
 }
 
@@ -106,7 +111,8 @@ TEST(ViewDefinitionTest, SetViewOnSucceedsIfNewViewOnIsInSameDatabaseAsView) {
         viewNss.dbName(), viewNss.coll(), backingNss.coll(), samplePipeline, nullptr);
     ASSERT_EQ(viewDef.viewOn(), backingNss);
 
-    NamespaceString newViewOn("testdb.othercollection");
+    NamespaceString newViewOn =
+        NamespaceString::createNamespaceString_forTest("testdb.othercollection");
     viewDef.setViewOn(newViewOn);
     ASSERT_EQ(newViewOn, viewDef.viewOn());
 }
@@ -142,9 +148,13 @@ TEST(ViewDefinitionTest, ViewDefinitionCreationCorrectlySetsTimeseries) {
 }
 
 TEST(ViewDefinitionTest, ViewDefinitionCreationCorrectlyBuildsNamespaceStringsWithTenantIds) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+
     TenantId tenantId(OID::gen());
-    NamespaceString viewNss(tenantId, "testdb.testview");
-    NamespaceString backingNss(tenantId, "testdb.testcoll");
+    NamespaceString viewNss =
+        NamespaceString::createNamespaceString_forTest(tenantId, "testdb.testview");
+    NamespaceString backingNss =
+        NamespaceString::createNamespaceString_forTest(tenantId, "testdb.testcoll");
 
     ViewDefinition viewDef(
         viewNss.dbName(), viewNss.coll(), backingNss.coll(), samplePipeline, nullptr);

@@ -10,19 +10,15 @@
  *   requires_majority_read_concern,
  *   requires_persistence,
  *   serverless,
- *   featureFlagShardSplit,
- *   requires_fcv_52
+ *   requires_fcv_63
  * ]
  */
 
-(function() {
-"use strict";
+import {ShardSplitTest} from "jstests/serverless/libs/shard_split_test.js";
 
 load("jstests/libs/fail_point_util.js");
-load("jstests/libs/uuid_util.js");
-load("jstests/serverless/libs/basic_serverless_test.js");
 
-const kTenantIds = ["testTenantId"];
+const kTenantIds = [ObjectId()];
 
 function checkStandardFieldsOK(ops, {migrationId, reachedDecision, tenantIds}) {
     assert.eq(ops.length, 1);
@@ -31,14 +27,19 @@ function checkStandardFieldsOK(ops, {migrationId, reachedDecision, tenantIds}) {
     assert.eq(op.reachedDecision, reachedDecision);
 
     if (tenantIds) {
-        assert.eq(bsonWoCompare(op.tenantIds, tenantIds), 0);
+        // we need to convert tenantIds to an array of string objects.
+        let tenantIdsStrings = [];
+        tenantIds.forEach(tenantId => {
+            tenantIdsStrings.push(tenantId.str);
+        });
+        assert.eq(bsonWoCompare(op.tenantIds, tenantIdsStrings), 0);
     }
 }
 
 (() => {
     jsTestLog("Testing currentOp output for split before blocking state");
-    const test = new BasicServerlessTest(
-        {recipientTagName: "recipientTag", recipientSetName: "recipientSet"});
+    const test =
+        new ShardSplitTest({recipientTagName: "recipientTag", recipientSetName: "recipientSet"});
     test.addRecipientNodes();
 
     const operation = test.createSplitOperation(kTenantIds);
@@ -51,11 +52,12 @@ function checkStandardFieldsOK(ops, {migrationId, reachedDecision, tenantIds}) {
 
     const res = assert.commandWorked(
         donorPrimary.adminCommand({currentOp: true, desc: "shard split operation"}));
+    print(`CURR_OP: ${tojson(res)}`);
 
     checkStandardFieldsOK(
         res.inprog,
         {migrationId: operation.migrationId, reachedDecision: false, tenantIds: kTenantIds});
-    assert(!res.inprog[0].blockTimestamp);
+    assert(!res.inprog[0].blockOpTime);
 
     fp.off();
 
@@ -68,8 +70,8 @@ function checkStandardFieldsOK(ops, {migrationId, reachedDecision, tenantIds}) {
 
 (() => {
     jsTestLog("Testing currentOp output for split in blocking state");
-    const test = new BasicServerlessTest(
-        {recipientTagName: "recipientTag", recipientSetName: "recipientSet"});
+    const test =
+        new ShardSplitTest({recipientTagName: "recipientTag", recipientSetName: "recipientSet"});
     test.addRecipientNodes();
 
     const operation = test.createSplitOperation(kTenantIds);
@@ -88,7 +90,7 @@ function checkStandardFieldsOK(ops, {migrationId, reachedDecision, tenantIds}) {
     checkStandardFieldsOK(
         res.inprog,
         {migrationId: operation.migrationId, reachedDecision: false, tenantIds: kTenantIds});
-    assert(res.inprog[0].blockTimestamp instanceof Timestamp);
+    assert(res.inprog[0].blockOpTime.ts instanceof Timestamp);
 
     fp.off();
 
@@ -101,8 +103,8 @@ function checkStandardFieldsOK(ops, {migrationId, reachedDecision, tenantIds}) {
 
 (() => {
     jsTestLog("Testing currentOp output for aborted split");
-    const test = new BasicServerlessTest(
-        {recipientTagName: "recipientTag", recipientSetName: "recipientSet"});
+    const test =
+        new ShardSplitTest({recipientTagName: "recipientTag", recipientSetName: "recipientSet"});
     test.addRecipientNodes();
 
     const operation = test.createSplitOperation(kTenantIds);
@@ -126,8 +128,8 @@ function checkStandardFieldsOK(ops, {migrationId, reachedDecision, tenantIds}) {
 // Check currentOp while in committed state before and after a split has completed.
 (() => {
     jsTestLog("Testing currentOp output for committed split");
-    const test = new BasicServerlessTest(
-        {recipientTagName: "recipientTag", recipientSetName: "recipientSet"});
+    const test =
+        new ShardSplitTest({recipientTagName: "recipientTag", recipientSetName: "recipientSet"});
     test.addRecipientNodes();
 
     const donorPrimary = test.donor.getPrimary();
@@ -140,7 +142,7 @@ function checkStandardFieldsOK(ops, {migrationId, reachedDecision, tenantIds}) {
     checkStandardFieldsOK(
         res.inprog,
         {migrationId: operation.migrationId, reachedDecision: true, tenantIds: kTenantIds});
-    assert(res.inprog[0].blockTimestamp instanceof Timestamp);
+    assert(res.inprog[0].blockOpTime.ts instanceof Timestamp);
     assert(res.inprog[0].commitOrAbortOpTime.ts instanceof Timestamp);
     assert(res.inprog[0].commitOrAbortOpTime.t instanceof NumberLong);
     assert(!res.inprog[0].expireAt);
@@ -159,11 +161,10 @@ function checkStandardFieldsOK(ops, {migrationId, reachedDecision, tenantIds}) {
     checkStandardFieldsOK(
         res.inprog,
         {migrationId: operation.migrationId, reachedDecision: true, tenantIds: kTenantIds});
-    assert(res.inprog[0].blockTimestamp instanceof Timestamp);
+    assert(res.inprog[0].blockOpTime.ts instanceof Timestamp);
     assert(res.inprog[0].commitOrAbortOpTime.ts instanceof Timestamp);
     assert(res.inprog[0].commitOrAbortOpTime.t instanceof NumberLong);
     assert(res.inprog[0].expireAt instanceof Date);
 
     test.stop();
-})();
 })();

@@ -134,14 +134,16 @@ StatusWith<std::vector<BSONObj>> selectChunkSplitPoints(OperationContext* opCtx,
                                                         const NamespaceString& nss,
                                                         const ShardKeyPattern& shardKeyPattern,
                                                         const ChunkRange& chunkRange,
-                                                        long long chunkSizeBytes) {
+                                                        long long chunkSizeBytes,
+                                                        boost::optional<int> limit) {
     auto shardStatus = Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardId);
     if (!shardStatus.isOK()) {
         return shardStatus.getStatus();
     }
 
-    const AutoSplitVectorRequest req(
+    AutoSplitVectorRequest req(
         nss, shardKeyPattern.toBSON(), chunkRange.getMin(), chunkRange.getMax(), chunkSizeBytes);
+    req.setLimit(limit);
 
     auto cmdStatus = shardStatus.getValue()->runCommandWithFixedRetryAttempts(
         opCtx,
@@ -167,7 +169,6 @@ StatusWith<boost::optional<ChunkRange>> splitChunkAtMultiplePoints(
     const ShardKeyPattern& shardKeyPattern,
     const OID& epoch,
     const Timestamp& timestamp,
-    ChunkVersion shardVersion,
     const ChunkRange& chunkRange,
     const std::vector<BSONObj>& splitPoints) {
     invariant(!splitPoints.empty());
@@ -208,7 +209,6 @@ StatusWith<boost::optional<ChunkRange>> splitChunkAtMultiplePoints(
     cmd.append("keyPattern", shardKeyPattern.toBSON());
     cmd.append("epoch", epoch);
     cmd.append("timestamp", timestamp);
-    shardVersion.serializeToBSON(ChunkVersion::kShardVersionField, &cmd);
 
     chunkRange.append(&cmd);
     cmd.append("splitKeys", splitPointsBeginIt, splitPointsEndIt);

@@ -35,10 +35,8 @@
 #include "mongo/client/remote_command_retry_scheduler.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/commands/txn_two_phase_commit_cmds_gen.h"
-#include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/internal_transactions_feature_flag_gen.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/transaction_coordinator_futures_util.h"
@@ -185,7 +183,7 @@ repl::OpTime persistParticipantListBlocking(
 
     LOGV2_DEBUG(22465,
                 3,
-                "{sessionId}:{txnNumberAndRetryCounter} Wrote participant list",
+                "Wrote participant list",
                 "sessionId"_attr = lsid,
                 "txnNumberAndRetryCounter"_attr = txnNumberAndRetryCounter);
 
@@ -205,7 +203,6 @@ Future<repl::OpTime> persistParticipantsList(
         [&scheduler, lsid, txnNumberAndRetryCounter, participants] {
             return scheduler.scheduleWork(
                 [lsid, txnNumberAndRetryCounter, participants](OperationContext* opCtx) {
-                    FlowControl::Bypass flowControlBypass(opCtx);
                     getTransactionCoordinatorWorkerCurOpRepository()->set(
                         opCtx,
                         lsid,
@@ -251,7 +248,7 @@ Future<PrepareVoteConsensus> sendPrepare(ServiceContext* service,
                                          const APIParameters& apiParams,
                                          const txn::ParticipantsList& participants) {
     PrepareTransaction prepareTransaction;
-    prepareTransaction.setDbName(NamespaceString::kAdminDb);
+    prepareTransaction.setDbName(DatabaseName::kAdmin);
     BSONObjBuilder bob(BSON("lsid" << lsid.toBSON() << "txnNumber"
                                    << txnNumberAndRetryCounter.getTxnNumber() << "autocommit"
                                    << false << WriteConcernOptions::kWriteConcernField
@@ -444,11 +441,11 @@ Future<repl::OpTime> persistDecision(txn::AsyncWorkScheduler& scheduler,
         [&scheduler, lsid, txnNumberAndRetryCounter, participants, decision] {
             return scheduler.scheduleWork(
                 [lsid, txnNumberAndRetryCounter, participants, decision](OperationContext* opCtx) {
-                    FlowControl::Bypass flowControlBypass(opCtx);
                     // Do not acquire a storage ticket in order to avoid unnecessary serialization
                     // with other prepared transactions that are holding a storage ticket
                     // themselves; see SERVER-60682.
-                    SkipTicketAcquisitionForLock skipTicketAcquisition(opCtx);
+                    ScopedAdmissionPriorityForLock setTicketAquisition(
+                        opCtx->lockState(), AdmissionContext::Priority::kImmediate);
                     getTransactionCoordinatorWorkerCurOpRepository()->set(
                         opCtx, lsid, txnNumberAndRetryCounter, CoordinatorAction::kWritingDecision);
                     return persistDecisionBlocking(
@@ -465,7 +462,7 @@ Future<void> sendCommit(ServiceContext* service,
                         const txn::ParticipantsList& participants,
                         Timestamp commitTimestamp) {
     CommitTransaction commitTransaction;
-    commitTransaction.setDbName(NamespaceString::kAdminDb);
+    commitTransaction.setDbName(DatabaseName::kAdmin);
     commitTransaction.setCommitTimestamp(commitTimestamp);
     BSONObjBuilder bob(BSON("lsid" << lsid.toBSON() << "txnNumber"
                                    << txnNumberAndRetryCounter.getTxnNumber() << "autocommit"
@@ -510,7 +507,7 @@ Future<void> sendAbort(ServiceContext* service,
                        const APIParameters& apiParams,
                        const txn::ParticipantsList& participants) {
     AbortTransaction abortTransaction;
-    abortTransaction.setDbName(NamespaceString::kAdminDb);
+    abortTransaction.setDbName(DatabaseName::kAdmin);
     BSONObjBuilder bob(BSON("lsid" << lsid.toBSON() << "txnNumber"
                                    << txnNumberAndRetryCounter.getTxnNumber() << "autocommit"
                                    << false << WriteConcernOptions::kWriteConcernField
@@ -637,21 +634,21 @@ void deleteCoordinatorDocBlocking(OperationContext* opCtx,
 Future<void> deleteCoordinatorDoc(txn::AsyncWorkScheduler& scheduler,
                                   const LogicalSessionId& lsid,
                                   const TxnNumberAndRetryCounter& txnNumberAndRetryCounter) {
-    return txn::doWhile(scheduler,
-                        boost::none /* no need for a backoff */,
-                        [](const Status& s) { return s == ErrorCodes::Interrupted; },
-                        [&scheduler, lsid, txnNumberAndRetryCounter] {
-                            return scheduler.scheduleWork([lsid, txnNumberAndRetryCounter](
-                                                              OperationContext* opCtx) {
-                                FlowControl::Bypass flowControlBypass(opCtx);
-                                getTransactionCoordinatorWorkerCurOpRepository()->set(
-                                    opCtx,
-                                    lsid,
-                                    txnNumberAndRetryCounter,
-                                    CoordinatorAction::kDeletingCoordinatorDoc);
-                                deleteCoordinatorDocBlocking(opCtx, lsid, txnNumberAndRetryCounter);
-                            });
-                        });
+    return txn::doWhile(
+        scheduler,
+        boost::none /* no need for a backoff */,
+        [](const Status& s) { return s == ErrorCodes::Interrupted; },
+        [&scheduler, lsid, txnNumberAndRetryCounter] {
+            return scheduler.scheduleWork(
+                [lsid, txnNumberAndRetryCounter](OperationContext* opCtx) {
+                    getTransactionCoordinatorWorkerCurOpRepository()->set(
+                        opCtx,
+                        lsid,
+                        txnNumberAndRetryCounter,
+                        CoordinatorAction::kDeletingCoordinatorDoc);
+                    deleteCoordinatorDocBlocking(opCtx, lsid, txnNumberAndRetryCounter);
+                });
+        });
 }
 
 std::vector<TransactionCoordinatorDocument> readAllCoordinatorDocs(OperationContext* opCtx) {

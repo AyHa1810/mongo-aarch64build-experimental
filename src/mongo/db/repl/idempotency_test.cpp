@@ -116,9 +116,9 @@ BSONObj RandomizedIdempotencyTest::canonicalizeDocumentForDataHash(const BSONObj
     return canonicalizeBSONObjForDataHash(obj);
 }
 BSONObj RandomizedIdempotencyTest::getDoc() {
-    AutoGetCollectionForReadCommand autoColl(_opCtx.get(), nss);
+    AutoGetCollectionForReadCommand autoColl(_opCtx.get(), _nss);
     BSONObj doc;
-    Helpers::findById(_opCtx.get(), nss.ns(), kDocIdQuery, doc);
+    Helpers::findById(_opCtx.get(), _nss, kDocIdQuery, doc);
     return doc.getOwned();
 }
 
@@ -162,10 +162,18 @@ std::string RandomizedIdempotencyTest::getStatesString(const std::vector<Collect
 }
 
 Status RandomizedIdempotencyTest::resetState() {
-    Status dropStatus = runOpInitialSync(dropCollection());
-    if (!dropStatus.isOK()) {
-        return dropStatus;
-    }
+    // Remove the collection without a drop OpTime. As we are re-applying the initOps the create
+    // OpTime would be less than the previous drop. By removing the collection without an OpTime we
+    // completely clear the history for the namespace.
+    CollectionCatalog::write(_opCtx.get(), [&](CollectionCatalog& catalog) {
+        // Lookup the UUID from the namespace, it will not exist if we're 'resetting' the state
+        // before creating it.
+        auto uuid = catalog.lookupUUIDByNSS(_opCtx.get(), _nss);
+        if (uuid) {
+            catalog.deregisterCollection(
+                _opCtx.get(), *uuid, /*isDropPending=*/false, /*commitTime=*/boost::none);
+        }
+    });
 
     return runOpsInitialSync(initOps);
 }
@@ -204,7 +212,7 @@ void RandomizedIdempotencyTest::runUpdateV2IdempotencyTestCase() {
             // input objects) would break idempotency. So we do a dry run of what the collection
             // state would look like and compute diffs based on that.
             generatedDoc = generateDocWithId(kDocId);
-            auto diffOutput = doc_diff::computeDiff(
+            auto diffOutput = doc_diff::computeOplogDiff(
                 oldDoc, *generatedDoc, update_oplog_entry::kSizeOfDeltaOplogEntryMetadata, nullptr);
             ASSERT(diffOutput);
             oplogDiff = BSON("$v" << 2 << "diff" << diffOutput->diff);

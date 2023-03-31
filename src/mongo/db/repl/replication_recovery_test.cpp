@@ -45,12 +45,13 @@
 #include "mongo/db/repl/replication_recovery.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context_d_test_fixture.h"
-#include "mongo/db/session_catalog_mongod.h"
-#include "mongo/db/session_txn_record_gen.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/session/session_txn_record_gen.h"
 #include "mongo/db/storage/durable_history_pin.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/storage_parameters_gen.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/transaction/session_catalog_mongod_transaction_interface_impl.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/db/update/update_oplog_entry_serialization.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/log_test.h"
@@ -135,6 +136,17 @@ public:
         return {};
     }
 
+    /**
+     * Called when we prepare a multi-doc transaction using the TransactionParticipant.
+     */
+    std::unique_ptr<ApplyOpsOplogSlotAndOperationAssignment> preTransactionPrepare(
+        OperationContext* opCtx,
+        const std::vector<OplogSlot>& reservedSlots,
+        const TransactionOperations& transactionOperations,
+        Date_t wallClockTime) override {
+        return std::make_unique<ApplyOpsOplogSlotAndOperationAssignment>(/*prepare=*/false);
+    }
+
     const repl::OpTime dropOpTime = {Timestamp(Seconds(100), 1U), 1LL};
 };
 
@@ -204,7 +216,13 @@ private:
             ASSERT_OK(_storageInterface->createCollection(
                 getOperationContext(), testNs, generateOptionsWithUuid()));
 
-            MongoDSessionCatalog::onStepUp(_opCtx.get());
+            MongoDSessionCatalog::set(
+                _opCtx->getServiceContext(),
+                std::make_unique<MongoDSessionCatalog>(
+                    std::make_unique<MongoDSessionCatalogTransactionInterfaceImpl>()));
+
+            auto mongoDSessionCatalog = MongoDSessionCatalog::get(_opCtx.get());
+            mongoDSessionCatalog->onStepUp(_opCtx.get());
         }
 
         auto observerRegistry = checked_cast<OpObserverRegistry*>(service->getOpObserver());
@@ -249,7 +267,6 @@ repl::OplogEntry _makeOplogEntry(repl::OpTime opTime,
                                  Date_t wallTime = Date_t()) {
     return {
         repl::DurableOplogEntry(opTime,                           // optime
-                                boost::none,                      // hash
                                 opType,                           // opType
                                 testNs,                           // namespace
                                 boost::none,                      // uuid
@@ -414,7 +431,9 @@ TEST_F(ReplicationRecoveryTest, RecoveryWithNoOplogSucceeds) {
 
     // Create the database.
     ASSERT_OK(getStorageInterface()->createCollection(
-        opCtx, NamespaceString("local.other"), generateOptionsWithUuid()));
+        opCtx,
+        NamespaceString::createNamespaceString_forTest("local.other"),
+        generateOptionsWithUuid()));
 
     recovery.recoverFromOplog(opCtx, boost::none);
 
@@ -428,7 +447,9 @@ TEST_F(ReplicationRecoveryTest, RecoveryWithNoOplogSucceedsWithStableTimestamp) 
 
     // Create the database.
     ASSERT_OK(getStorageInterface()->createCollection(
-        opCtx, NamespaceString("local.other"), generateOptionsWithUuid()));
+        opCtx,
+        NamespaceString::createNamespaceString_forTest("local.other"),
+        generateOptionsWithUuid()));
 
     Timestamp stableTimestamp(3, 3);
     recovery.recoverFromOplog(opCtx, stableTimestamp);
@@ -700,7 +721,32 @@ TEST_F(ReplicationRecoveryTest,
     testRecoveryToStableAppliesDocumentsWithNoAppliedThrough(false);
 }
 
-TEST_F(ReplicationRecoveryTest, RecoveryIgnoresDroppedCollections) {
+TEST_F(ReplicationRecoveryTest, UnstableRecoveryIgnoresDroppedCollections) {
+    ReplicationRecoveryImpl recovery(getStorageInterface(), getConsistencyMarkers());
+    auto opCtx = getOperationContext();
+
+    _setUpOplog(opCtx, getStorageInterface(), {1, 2, 3, 4, 5});
+
+    ASSERT_OK(getStorageInterface()->dropCollection(opCtx, testNs));
+    {
+        AutoGetCollectionForReadCommand autoColl(opCtx, testNs);
+        ASSERT_FALSE(autoColl.getCollection());
+    }
+
+    // Not setting a stable timestamp in order to perform unstable recovery,
+    recovery.recoverFromOplog(opCtx, boost::none);
+
+    _assertDocsInOplog(opCtx, {1, 2, 3, 4, 5});
+    {
+        AutoGetCollectionForReadCommand autoColl(opCtx, testNs);
+        ASSERT_FALSE(autoColl.getCollection());
+    }
+    ASSERT_EQ(getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx), Timestamp());
+}
+
+DEATH_TEST_REGEX_F(ReplicationRecoveryTest,
+                   StableRecoveryCrashOnDroppedCollectionsInTests,
+                   "Fatal assertion.*5415000") {
     ReplicationRecoveryImpl recovery(getStorageInterface(), getConsistencyMarkers());
     auto opCtx = getOperationContext();
 
@@ -714,13 +760,6 @@ TEST_F(ReplicationRecoveryTest, RecoveryIgnoresDroppedCollections) {
 
     getStorageInterfaceRecovery()->setRecoveryTimestamp(Timestamp(2, 2));
     recovery.recoverFromOplog(opCtx, boost::none);
-
-    _assertDocsInOplog(opCtx, {1, 2, 3, 4, 5});
-    {
-        AutoGetCollectionForReadCommand autoColl(opCtx, testNs);
-        ASSERT_FALSE(autoColl.getCollection());
-    }
-    ASSERT_EQ(getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx), Timestamp());
 }
 
 TEST_F(ReplicationRecoveryTest, RecoveryAppliesDocumentsWhenAppliedThroughIsBehindAfterTruncation) {
@@ -1229,7 +1268,7 @@ TEST_F(ReplicationRecoveryTest,
     ASSERT_EQ(getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx), Timestamp());
 }
 
-TEST_F(ReplicationRecoveryTest, RecoverFromOplogUpToBeforeEndOfOplog) {
+TEST_F(ReplicationRecoveryTest, RecoverFromOplogUpTo) {
     ReplicationRecoveryImpl recovery(getStorageInterface(), getConsistencyMarkers());
     auto opCtx = getOperationContext();
 
@@ -1239,8 +1278,16 @@ TEST_F(ReplicationRecoveryTest, RecoverFromOplogUpToBeforeEndOfOplog) {
     // Recovers operations with timestamps: 3, 4, 5.
     recovery.recoverFromOplogUpTo(opCtx, Timestamp(5, 5));
     _assertDocsInTestCollection(opCtx, {3, 4, 5});
+}
 
-    // Recovers operations with timestamps: 6, 7, 8, 9.
+TEST_F(ReplicationRecoveryTest, RecoverFromOplogUpToBeforeEndOfOplog) {
+    ReplicationRecoveryImpl recovery(getStorageInterface(), getConsistencyMarkers());
+    auto opCtx = getOperationContext();
+
+    _setUpOplog(opCtx, getStorageInterface(), {2, 3, 4, 5, 6, 7, 8, 9, 10});
+    getStorageInterfaceRecovery()->setRecoveryTimestamp(Timestamp(2, 2));
+
+    // Recovers operations with timestamps: 3, 4, 5, 6, 7, 8, 9.
     recovery.recoverFromOplogUpTo(opCtx, Timestamp(9, 9));
     _assertDocsInTestCollection(opCtx, {3, 4, 5, 6, 7, 8, 9});
 }
@@ -1306,8 +1353,6 @@ TEST_F(ReplicationRecoveryTest, RecoverFromOplogUpToDoesNotExceedEndPoint) {
     _setUpOplog(opCtx, getStorageInterface(), {2, 5, 10});
     getStorageInterfaceRecovery()->setRecoveryTimestamp(Timestamp(2, 2));
 
-    recovery.recoverFromOplogUpTo(opCtx, Timestamp(9, 9));
-
     recovery.recoverFromOplogUpTo(opCtx, Timestamp(15, 15));
 }
 
@@ -1337,8 +1382,9 @@ TEST_F(ReplicationRecoveryTest, RecoverFromOplogUpToReconstructsPreparedTransact
     const auto sessionId = makeLogicalSessionIdForTest();
     opCtx->setLogicalSessionId(sessionId);
 
+    auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
     {
-        MongoDOperationContextSession ocs(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
 
         OperationSessionInfo sessionInfo;
         sessionInfo.setSessionId(sessionId);
@@ -1361,7 +1407,7 @@ TEST_F(ReplicationRecoveryTest, RecoverFromOplogUpToReconstructsPreparedTransact
     recovery.recoverFromOplogUpTo(opCtx, Timestamp(3, 3));
 
     {
-        MongoDOperationContextSession ocs(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
 
         auto txnParticipant = TransactionParticipant::get(opCtx);
         ASSERT_EQ(txnParticipant.getPrepareOpTime().getTimestamp(), Timestamp(3, 3));
@@ -1381,8 +1427,9 @@ TEST_F(ReplicationRecoveryTest,
     const auto sessionId = makeLogicalSessionIdForTest();
     opCtx->setLogicalSessionId(sessionId);
 
+    auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx);
     {
-        MongoDOperationContextSession ocs(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
 
         OperationSessionInfo sessionInfo;
         sessionInfo.setSessionId(sessionId);
@@ -1419,7 +1466,7 @@ TEST_F(ReplicationRecoveryTest,
         countTextFormatLogLinesContaining("No stored oplog entries to apply for recovery between"));
 
     {
-        MongoDOperationContextSession ocs(opCtx);
+        auto ocs = mongoDSessionCatalog->checkOutSession(opCtx);
 
         auto txnParticipant = TransactionParticipant::get(opCtx);
         ASSERT_EQ(txnParticipant.getPrepareOpTime().getTimestamp(), Timestamp(1, 1));

@@ -37,9 +37,9 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index_builds_coordinator.h"
-#include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/operation_time_tracker.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/session/logical_session_id_helpers.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
@@ -143,7 +143,7 @@ void ReplicaSetNodeProcessInterface::renameIfOptionsAndIndexesHaveNotChanged(
             originalIndexes);
     }
     // internalRenameIfOptionsAndIndexesMatch can only be run against the admin DB.
-    NamespaceString adminNs{NamespaceString::kAdminDb};
+    NamespaceString adminNs{DatabaseName::kAdmin};
     auto cmd = CommonMongodProcessInterface::_convertRenameToInternalRename(
         opCtx, sourceNs, targetNs, originalCollectionOptions, originalIndexes);
     uassertStatusOK(_executeCommandOnPrimary(opCtx, adminNs, cmd));
@@ -152,12 +152,11 @@ void ReplicaSetNodeProcessInterface::renameIfOptionsAndIndexesHaveNotChanged(
 void ReplicaSetNodeProcessInterface::createCollection(OperationContext* opCtx,
                                                       const DatabaseName& dbName,
                                                       const BSONObj& cmdObj) {
-    NamespaceString dbNs = NamespaceString(dbName, StringData(""));
+    NamespaceString dbNs = NamespaceString(dbName);
     if (_canWriteLocally(opCtx, dbNs)) {
         return NonShardServerProcessInterface::createCollection(opCtx, dbName, cmdObj);
     }
-    // TODO SERVER-67519 change CommandHelpers::parseNsCollectionRequired to take in DatabaseName
-    auto ns = CommandHelpers::parseNsCollectionRequired(dbName.toStringWithTenantId(), cmdObj);
+    auto ns = CommandHelpers::parseNsCollectionRequired(dbName, cmdObj);
     uassertStatusOK(_executeCommandOnPrimary(opCtx, ns, cmdObj));
 }
 
@@ -251,7 +250,7 @@ void ReplicaSetNodeProcessInterface::_attachGenericCommandArgs(OperationContext*
 
 bool ReplicaSetNodeProcessInterface::_canWriteLocally(OperationContext* opCtx,
                                                       const NamespaceString& ns) const {
-    Lock::ResourceLock rstl(opCtx->lockState(), resourceIdReplicationStateTransitionLock, MODE_IX);
+    Lock::ResourceLock rstl(opCtx, resourceIdReplicationStateTransitionLock, MODE_IX);
     return repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, ns);
 }
 

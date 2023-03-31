@@ -48,13 +48,15 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/session_update_tracker.h"
+#include "mongo/db/repl/tenant_migration_access_blocker_util.h"
 #include "mongo/db/repl/tenant_migration_decoration.h"
 #include "mongo/db/repl/tenant_migration_recipient_service.h"
 #include "mongo/db/repl/tenant_oplog_batcher.h"
-#include "mongo/db/session_catalog_mongod.h"
-#include "mongo/db/transaction_participant.h"
+#include "mongo/db/session/session_catalog_mongod.h"
+#include "mongo/db/transaction/transaction_participant.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/database_name_util.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTenantMigration
 
@@ -85,6 +87,8 @@ TenantOplogApplier::TenantOplogApplier(const UUID& migrationUuid,
       _resumeBatchingTs(resumeBatchingTs) {
     if (_protocol != MigrationProtocolEnum::kShardMerge) {
         invariant(_tenantId);
+    } else {
+        invariant(!_tenantId);
     }
 }
 
@@ -237,6 +241,21 @@ bool TenantOplogApplier::_shouldStopApplying(Status status) {
     return true;
 }
 
+bool TenantOplogApplier::_shouldIgnore(const OplogEntry& entry) {
+    if (_protocol == MigrationProtocolEnum::kMultitenantMigrations) {
+        return false;
+    }
+
+    // TODO SERVER-62491: Update this code path to handle TenantId::kSystemTenantId for internal
+    // collections.
+    const auto tenantId =
+        tenant_migration_access_blocker::parseTenantIdFromDatabaseName(entry.getNss().dbName());
+    tenant_migration_access_blocker::validateNssIsBeingMigrated(
+        tenantId, entry.getNss(), _migrationUuid);
+
+    return !tenantId;
+}
+
 void TenantOplogApplier::_finishShutdown(WithLock lk, Status status) {
     // shouldStopApplying() might have already set the final status. So, don't mask the original
     // error.
@@ -345,9 +364,8 @@ void TenantOplogApplier::_applyOplogBatch(TenantOplogBatch* batch) {
 
 void TenantOplogApplier::_checkNsAndUuidsBelongToTenant(OperationContext* opCtx,
                                                         const TenantOplogBatch& batch) {
-    // Shard merge protocol migrates all tenants from donor to recipient, whereas multi-tenant
-    // migration protocol migrates only one tenant. So,the below check isn't required for the shard
-    // merge protocol.
+
+    // Shard merge protocol checks the namespace and UUID when ops are assigned to writer pool.
     if (_protocol == MigrationProtocolEnum::kShardMerge)
         return;
 
@@ -539,8 +557,7 @@ void TenantOplogApplier::_writeSessionNoOpsForRange(
     std::vector<TenantNoOpEntry>::const_iterator begin,
     std::vector<TenantNoOpEntry>::const_iterator end) {
     auto opCtx = cc().makeOperationContext();
-    tenantMigrationRecipientInfo(opCtx.get()) =
-        boost::make_optional<TenantMigrationRecipientInfo>(_migrationUuid);
+    tenantMigrationInfo(opCtx.get()) = boost::make_optional<TenantMigrationInfo>(_migrationUuid);
 
     // Since the client object persists across each noop write call and the same writer thread could
     // be reused to write noop entries with older optime, we need to clear the lastOp associated
@@ -553,7 +570,7 @@ void TenantOplogApplier::_writeSessionNoOpsForRange(
     // All the ops will have the same session, so we can retain the scopedSession throughout
     // the loop, except when invalidated by multi-document transactions. This allows us to
     // track the statements in a retryable write.
-    boost::optional<MongoDOperationContextSessionWithoutOplogRead> scopedSession;
+    std::unique_ptr<MongoDSessionCatalog::Session> scopedSession;
 
     // Make sure a partial session doesn't escape.
     ON_BLOCK_EXIT([this, &scopedSession, &opCtx] {
@@ -579,6 +596,7 @@ void TenantOplogApplier::_writeSessionNoOpsForRange(
         noopEntry.setObject2(entry.getEntry().toBSON());
         noopEntry.setOpTime(*iter->second);
         noopEntry.setWallClockTime(opCtx->getServiceContext()->getFastClockSource()->now());
+        noopEntry.setTid(entry.getTid());
 
         boost::optional<SessionTxnRecord> sessionTxnRecord;
         std::vector<StmtId> stmtIds;
@@ -593,9 +611,12 @@ void TenantOplogApplier::_writeSessionNoOpsForRange(
             uassert(ErrorCodes::InvalidOptions,
                     "txnRetryCounter is only supported in sharded clusters",
                     !optTxnRetryCounter.has_value());
-            opCtx->setLogicalSessionId(sessionId);
-            opCtx->setTxnNumber(txnNumber);
-            opCtx->setInMultiDocumentTransaction();
+            {
+                auto lk = stdx::lock_guard(*opCtx->getClient());
+                opCtx->setLogicalSessionId(sessionId);
+                opCtx->setTxnNumber(txnNumber);
+                opCtx->setInMultiDocumentTransaction();
+            }
             LOGV2_DEBUG(5351502,
                         1,
                         "Tenant Oplog Applier committing transaction",
@@ -607,8 +628,11 @@ void TenantOplogApplier::_writeSessionNoOpsForRange(
                         "op"_attr = redact(entry.toBSONForLogging()));
 
             // Check out the session.
-            if (!scopedSession)
-                scopedSession.emplace(opCtx.get());
+            if (!scopedSession) {
+                auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx.get());
+                scopedSession = mongoDSessionCatalog->checkOutSessionWithoutOplogRead(opCtx.get());
+            }
+
             auto txnParticipant = TransactionParticipant::get(opCtx.get());
             uassert(
                 5351500,
@@ -636,9 +660,10 @@ void TenantOplogApplier::_writeSessionNoOpsForRange(
             // Write a fake applyOps with the tenantId as the namespace so that this will be picked
             // up by the committed transaction prefetch pipeline in subsequent migrations.
             //
-            // Unlike MT migration, shard merge protocol fetches all oplog entries, so not setting
-            // the namespace for shard merge, will still ensure that this will be picked up by the
-            // committed transaction prefetch pipeline in subsequent migrations.
+            // Unlike MTM, shard merge copies all tenants from the donor. This means that merge does
+            // not need to filter prefetched committed transactions by tenantId. As a result,
+            // setting a nss containing the tenantId for the fake transaction applyOps entry isn't
+            // necessary.
             if (_protocol != MigrationProtocolEnum::kShardMerge) {
                 noopEntry.setObject(BSON(
                     "applyOps" << BSON_ARRAY(BSON(OplogEntry::kNssFieldName
@@ -749,10 +774,16 @@ void TenantOplogApplier::_writeSessionNoOpsForRange(
                 prePostImageEntry = boost::none;
             }
 
-            opCtx->setLogicalSessionId(sessionId);
-            opCtx->setTxnNumber(txnNumber);
-            if (!scopedSession)
-                scopedSession.emplace(opCtx.get());
+            {
+                auto lk = stdx::lock_guard(*opCtx->getClient());
+                opCtx->setLogicalSessionId(sessionId);
+                opCtx->setTxnNumber(txnNumber);
+            }
+            if (!scopedSession) {
+                auto mongoDSessionCatalog = MongoDSessionCatalog::get(opCtx.get());
+                scopedSession = mongoDSessionCatalog->checkOutSessionWithoutOplogRead(opCtx.get());
+            }
+
             auto txnParticipant = TransactionParticipant::get(opCtx.get());
             uassert(5350900,
                     str::stream() << "Tenant oplog application failed to get retryable write "
@@ -865,7 +896,7 @@ void TenantOplogApplier::_writeSessionNoOpsForRange(
             invariant(txnParticipant);
             txnParticipant.invalidate(opCtx.get());
             opCtx->resetMultiDocumentTransactionState();
-            scopedSession = boost::none;
+            scopedSession = {};
         }
     }
 }
@@ -874,8 +905,7 @@ void TenantOplogApplier::_writeNoOpsForRange(OpObserver* opObserver,
                                              std::vector<TenantNoOpEntry>::const_iterator begin,
                                              std::vector<TenantNoOpEntry>::const_iterator end) {
     auto opCtx = cc().makeOperationContext();
-    tenantMigrationRecipientInfo(opCtx.get()) =
-        boost::make_optional<TenantMigrationRecipientInfo>(_migrationUuid);
+    tenantMigrationInfo(opCtx.get()) = boost::make_optional<TenantMigrationInfo>(_migrationUuid);
 
     // Since the client object persists across each noop write call and the same writer thread could
     // be reused to write noop entries with older optime, we need to clear the lastOp associated
@@ -918,9 +948,9 @@ void TenantOplogApplier::_writeNoOpsForRange(OpObserver* opObserver,
         });
 }
 
-std::vector<std::vector<const OplogEntry*>> TenantOplogApplier::_fillWriterVectors(
+std::vector<std::vector<ApplierOperation>> TenantOplogApplier::_fillWriterVectors(
     OperationContext* opCtx, TenantOplogBatch* batch) {
-    std::vector<std::vector<const OplogEntry*>> writerVectors(
+    std::vector<std::vector<ApplierOperation>> writerVectors(
         _writerPool->getStats().options.maxThreads);
     CachedCollectionProperties collPropertiesCache;
 
@@ -947,7 +977,7 @@ std::vector<std::vector<const OplogEntry*>> TenantOplogApplier::_fillWriterVecto
             auto expansions = &batch->expansions[op.expansionsEntry];
             bool tenantOp = false;
             for (auto&& entry : *expansions) {
-                if (entry.getNss().isOnInternalDb()) {
+                if (_shouldIgnore(entry)) {
                     uassert(6114521,
                             "Can't have a transaction with operations on both tenant and internal "
                             "collections.",
@@ -976,7 +1006,7 @@ std::vector<std::vector<const OplogEntry*>> TenantOplogApplier::_fillWriterVecto
                                              &collPropertiesCache,
                                              isTransactionWithCommand /* serial */);
         } else {
-            if (op.entry.getNss().isOnInternalDb()) {
+            if (_shouldIgnore(op.entry)) {
                 op.ignore = true;
                 continue;
             }
@@ -998,24 +1028,25 @@ Status TenantOplogApplier::_applyOplogEntryOrGroupedInserts(
     invariant(opCtx->writesAreReplicated());
 
     auto op = entryOrGroupedInserts.getOp();
-    if (op.isIndexCommandType() && op.getCommandType() != OplogEntry::CommandType::kCreateIndexes &&
-        op.getCommandType() != OplogEntry::CommandType::kDropIndexes) {
+    if (op->isIndexCommandType() &&
+        op->getCommandType() != OplogEntry::CommandType::kCreateIndexes &&
+        op->getCommandType() != OplogEntry::CommandType::kDropIndexes) {
         LOGV2_ERROR(488610,
                     "Index creation, except createIndex on empty collections, is not supported in "
                     "tenant migration",
                     "protocol"_attr = _protocol,
                     "migrationId"_attr = _migrationUuid,
-                    "op"_attr = redact(op.toBSONForLogging()));
+                    "op"_attr = redact(op->toBSONForLogging()));
 
         uasserted(5434700,
                   "Index creation, except createIndex on empty collections, is not supported in "
                   "tenant migration");
     }
-    if (op.getCommandType() == OplogEntry::CommandType::kCreateIndexes) {
-        auto uuid = op.getUuid();
+    if (op->getCommandType() == OplogEntry::CommandType::kCreateIndexes) {
+        auto uuid = op->getUuid();
         uassert(5652700, "Missing UUID from createIndex oplog entry", uuid);
         try {
-            AutoGetCollectionForRead autoColl(opCtx, {op.getNss().db().toString(), *uuid});
+            AutoGetCollectionForRead autoColl(opCtx, {op->getNss().db().toString(), *uuid});
             uassert(ErrorCodes::NamespaceNotFound, "Collection does not exist", autoColl);
             // During tenant migration oplog application, we only need to apply createIndex on empty
             // collections. Otherwise, the index is guaranteed to be dropped after. This is because
@@ -1024,7 +1055,7 @@ Status TenantOplogApplier::_applyOplogEntryOrGroupedInserts(
                 LOGV2_DEBUG(5652701,
                             2,
                             "Tenant migration ignoring createIndex for non-empty collection",
-                            "op"_attr = redact(op.toBSONForLogging()),
+                            "op"_attr = redact(op->toBSONForLogging()),
                             "protocol"_attr = _protocol,
                             "migrationId"_attr = _migrationUuid);
                 return Status::OK();
@@ -1035,7 +1066,8 @@ Status TenantOplogApplier::_applyOplogEntryOrGroupedInserts(
         }
     }
     // We don't count tenant application in the ops applied stats.
-    auto incrementOpsAppliedStats = [] {};
+    auto incrementOpsAppliedStats = [] {
+    };
     auto status = OplogApplierUtils::applyOplogEntryOrGroupedInsertsCommon(opCtx,
                                                                            entryOrGroupedInserts,
                                                                            oplogApplicationMode,
@@ -1048,15 +1080,14 @@ Status TenantOplogApplier::_applyOplogEntryOrGroupedInserts(
                 "protocol"_attr = _protocol,
                 "migrationId"_attr = _migrationUuid,
                 "error"_attr = status,
-                "op"_attr = redact(op.toBSONForLogging()));
+                "op"_attr = redact(op->toBSONForLogging()));
     return status;
 }
 
-Status TenantOplogApplier::_applyOplogBatchPerWorker(std::vector<const OplogEntry*>* ops) {
+Status TenantOplogApplier::_applyOplogBatchPerWorker(std::vector<ApplierOperation>* ops) {
     auto opCtx = cc().makeOperationContext();
     opCtx->setEnforceConstraints(false);
-    tenantMigrationRecipientInfo(opCtx.get()) =
-        boost::make_optional<TenantMigrationRecipientInfo>(_migrationUuid);
+    tenantMigrationInfo(opCtx.get()) = boost::make_optional<TenantMigrationInfo>(_migrationUuid);
 
     // Set this to satisfy low-level locking invariants.
     opCtx->lockState()->setShouldConflictWithSecondaryBatchApplication(false);
@@ -1073,8 +1104,9 @@ Status TenantOplogApplier::_applyOplogBatchPerWorker(std::vector<const OplogEntr
             mode = OplogApplication::Mode::kInitialSync;
             break;
         case MigrationProtocolEnum::kShardMerge:
-            // Since shard merge protocol uses backup cursor for database cloning, it ensures that
-            // oplog entries are applied on a consistent copy of donor data.
+            // Since shard merge protocol uses backup cursor for database cloning and tenant oplog
+            // catchup phase is not resumable on failovers, the oplog entries will be applied on a
+            // consistent copy of donor data.
             isDataConsistent = true;
             mode = OplogApplication::Mode::kSecondary;
             break;

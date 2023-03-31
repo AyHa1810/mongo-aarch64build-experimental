@@ -3,7 +3,6 @@
  *
  * @tags: [
  *   requires_fcv_51,
- *   __TEMPORARILY_DISABLED__,
  * ]
  */
 
@@ -60,15 +59,9 @@ function checkIndexStats(coll, keys, sharded) {
               keys.length,
               `There should be ${keys.length} indices on the collection.\n${tojson(indices)}`);
     indices.forEach((index, i) => {
-        assert.eq(index.hasOwnProperty('shard'),
-                  sharded,
-                  sharded
-                      ? `Index stats 'shard' field should exist on a sharded collection.\n${
-                            tojson(index)}`
-                      : `Index stats 'shard' field should not exist on a non-sharded collection.\n${
-                            tojson(index)}`);
+        assert(index.hasOwnProperty('shard'), tojson(index));
         assert.docEq(
-            index.key, keys[i], `Index should have key spec ${tojson(keys[i])}.\n${tojson(index)}`);
+            keys[i], index.key, `Index should have key spec ${tojson(keys[i])}.\n${tojson(index)}`);
     });
 }
 

@@ -29,7 +29,7 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/commands/feature_compatibility_version_documentation.h"
+#include "mongo/db/feature_compatibility_version_documentation.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
 #include "mongo/db/pipeline/document_source_add_fields.h"
 #include "mongo/db/pipeline/document_source_project.h"
@@ -47,6 +47,7 @@
 #include "mongo/db/pipeline/window_function/window_function_first_last_n.h"
 #include "mongo/db/pipeline/window_function/window_function_min_max.h"
 #include "mongo/db/pipeline/window_function/window_function_n_traits.h"
+#include "mongo/db/pipeline/window_function/window_function_percentile.h"
 #include "mongo/db/pipeline/window_function/window_function_top_bottom_n.h"
 
 using boost::intrusive_ptr;
@@ -79,6 +80,17 @@ REGISTER_STABLE_WINDOW_FUNCTION(
     (ExpressionN<WindowFunctionBottom,
                  AccumulatorTopBottomN<TopBottomSense::kBottom, true>>::parse));
 
+REGISTER_WINDOW_FUNCTION_WITH_FEATURE_FLAG(
+    percentile,
+    (window_function::ExpressionQuantile<AccumulatorPercentile>::parse),
+    feature_flags::gFeatureFlagApproxPercentiles,
+    AllowedWithApiStrict::kNeverInVersion1);
+
+REGISTER_WINDOW_FUNCTION_WITH_FEATURE_FLAG(
+    median,
+    (window_function::ExpressionQuantile<AccumulatorMedian>::parse),
+    feature_flags::gFeatureFlagApproxPercentiles,
+    AllowedWithApiStrict::kNeverInVersion1);
 StringMap<Expression::ExpressionParserRegistration> Expression::parserMap;
 
 intrusive_ptr<Expression> Expression::parse(BSONObj obj,
@@ -95,15 +107,16 @@ intrusive_ptr<Expression> Expression::parse(BSONObj obj,
                 // be caught as invalid arguments to the Expression parser later.
                 const auto& parserRegistration = parserFCV->second;
                 const auto& parser = parserRegistration.parser;
-                const auto& fcv = parserRegistration.fcv;
+                const auto& featureFlag = parserRegistration.featureFlag;
                 uassert(ErrorCodes::QueryFeatureNotAllowed,
                         str::stream()
                             << exprName
                             << " is not allowed in the current feature compatibility version. See "
                             << feature_compatibility_version_documentation::kCompatibilityLink
                             << " for more information.",
-                        !expCtx->maxFeatureCompatibilityVersion || !fcv ||
-                            (*fcv <= *expCtx->maxFeatureCompatibilityVersion));
+                        !expCtx->maxFeatureCompatibilityVersion || !featureFlag ||
+                            featureFlag->isEnabledOnVersion(
+                                *expCtx->maxFeatureCompatibilityVersion));
 
                 auto allowedWithApi = parserRegistration.allowedWithApi;
 
@@ -147,13 +160,12 @@ intrusive_ptr<Expression> Expression::parse(BSONObj obj,
                        : ", "s + obj.firstElementFieldNameStringData()));
 }
 
-void Expression::registerParser(
-    std::string functionName,
-    Parser parser,
-    boost::optional<multiversion::FeatureCompatibilityVersion> requiredMinVersion,
-    AllowedWithApiStrict allowedWithApi) {
+void Expression::registerParser(std::string functionName,
+                                Parser parser,
+                                boost::optional<FeatureFlag> featureFlag,
+                                AllowedWithApiStrict allowedWithApi) {
     invariant(parserMap.find(functionName) == parserMap.end());
-    ExpressionParserRegistration r{parser, requiredMinVersion, allowedWithApi};
+    ExpressionParserRegistration r{parser, featureFlag, allowedWithApi};
     operatorCountersWindowAccumulatorExpressions.addCounter(functionName);
     parserMap.emplace(std::move(functionName), std::move(r));
 }
@@ -235,13 +247,10 @@ boost::intrusive_ptr<Expression> ExpressionFirstLast::parse(
         auto argName = arg.fieldNameStringData();
         if (argName == kWindowArg) {
             uassert(ErrorCodes::FailedToParse,
-                    "'window' field must be an object",
-                    obj[kWindowArg].type() == BSONType::Object);
-            uassert(ErrorCodes::FailedToParse,
                     str::stream() << "saw multiple 'window' fields in '" << accumulatorName
                                   << "' expression",
                     bounds == boost::none);
-            bounds = WindowBounds::parse(arg.embeddedObject(), sortBy, expCtx);
+            bounds = WindowBounds::parse(arg, sortBy, expCtx);
         } else if (argName == StringData(accumulatorName)) {
             input = ::mongo::Expression::parseOperand(expCtx, arg, expCtx->variablesParseState);
 
@@ -274,13 +283,12 @@ boost::intrusive_ptr<Expression> ExpressionFirstLast::parse(
 }
 
 template <typename WindowFunctionN, typename AccumulatorNType>
-Value ExpressionN<WindowFunctionN, AccumulatorNType>::serialize(
-    boost::optional<ExplainOptions::Verbosity> explain) const {
+Value ExpressionN<WindowFunctionN, AccumulatorNType>::serialize(SerializationOptions opts) const {
     auto acc = buildAccumulatorOnly();
-    MutableDocument result(acc->serialize(nExpr, _input, static_cast<bool>(explain)));
+    MutableDocument result(acc->serialize(nExpr, _input, opts));
 
     MutableDocument windowField;
-    _bounds.serialize(windowField);
+    _bounds.serialize(windowField, opts);
     result[kWindowArg] = windowField.freezeToValue();
     return result.freezeToValue();
 }
@@ -294,14 +302,14 @@ ExpressionN<WindowFunctionN, AccumulatorNType>::buildAccumulatorOnly() const {
     if constexpr (!needsSortBy<WindowFunctionN>::value) {
         tassert(5788606,
                 str::stream() << AccumulatorNType::getName()
-                              << " should not have recieved a 'sortBy' but did!",
+                              << " should not have received a 'sortBy' but did!",
                 !sortPattern);
 
         acc = AccumulatorNType::create(_expCtx);
     } else {
         tassert(5788601,
                 str::stream() << AccumulatorNType::getName()
-                              << " should have recieved a 'sortBy' but did not!",
+                              << " should have received a 'sortBy' but did not!",
                 sortPattern);
         acc = AccumulatorNType::create(_expCtx, *sortPattern);
     }
@@ -320,7 +328,7 @@ ExpressionN<WindowFunctionN, AccumulatorNType>::buildRemovable() const {
     if constexpr (needsSortBy<WindowFunctionN>::value) {
         tassert(5788602,
                 str::stream() << AccumulatorNType::getName()
-                              << " should have recieved a 'sortBy' but did not!",
+                              << " should have received a 'sortBy' but did not!",
                 sortPattern);
         return WindowFunctionN::create(
             _expCtx,
@@ -366,12 +374,9 @@ boost::intrusive_ptr<Expression> ExpressionN<WindowFunctionN, AccumulatorNType>:
             }
         } else if (fieldName == kWindowArg) {
             uassert(ErrorCodes::FailedToParse,
-                    "'window' field must be an object",
-                    obj[kWindowArg].type() == BSONType::Object);
-            uassert(ErrorCodes::FailedToParse,
                     str::stream() << "saw multiple 'window' fields in '" << name << "' expression",
                     bounds == boost::none);
-            bounds = WindowBounds::parse(elem.embeddedObject(), sortBy, expCtx);
+            bounds = WindowBounds::parse(elem, sortBy, expCtx);
         } else {
             uasserted(ErrorCodes::FailedToParse,
                       str::stream() << name << " got unexpected argument: " << fieldName);
@@ -393,6 +398,74 @@ boost::intrusive_ptr<Expression> ExpressionN<WindowFunctionN, AccumulatorNType>:
         std::move(nExpr),
         std::move(innerSortPattern));
 }
+
+template <typename AccumulatorTType>
+boost::intrusive_ptr<Expression> ExpressionQuantile<AccumulatorTType>::parse(
+    BSONObj obj, const boost::optional<SortPattern>& sortBy, ExpressionContext* expCtx) {
+
+    std::vector<double> ps;
+    int32_t algoType = -1;
+    boost::intrusive_ptr<::mongo::Expression> outputExpr;
+    boost::intrusive_ptr<::mongo::Expression> initializeExpr;  // need for serializer.
+    boost::optional<WindowBounds> bounds = WindowBounds::defaultBounds();
+    auto name = AccumulatorTType::kName;
+    for (auto&& elem : obj) {
+        auto fieldName = elem.fieldNameStringData();
+        if (fieldName == name) {
+            uassert(ErrorCodes::FailedToParse,
+                    str::stream() << "saw multiple specifications for '" << name << "expression ",
+                    !(initializeExpr || outputExpr));
+            auto accExpr = AccumulatorTType::parseArgs(expCtx, elem, expCtx->variablesParseState);
+            outputExpr = std::move(accExpr.argument);
+            initializeExpr = std::move(accExpr.initializer);
+
+            // Retrieve the values of 'ps' and 'algoType' from the accumulator's IDL parser.
+            std::tie(ps, algoType) = AccumulatorTType::parsePercentileAndAlgoType(elem);
+        } else if (fieldName == kWindowArg) {
+            bounds = WindowBounds::parse(elem, sortBy, expCtx);
+        } else {
+            uasserted(ErrorCodes::FailedToParse,
+                      str::stream() << name << " got unexpected argument: " << fieldName);
+        }
+    }
+
+    tassert(7455900,
+            str::stream() << "missing accumulator specification for " << name,
+            initializeExpr && outputExpr && !ps.empty() && algoType != -1);
+
+    return make_intrusive<ExpressionQuantile>(
+        expCtx, std::string(name), std::move(outputExpr), initializeExpr, *bounds, ps, algoType);
+}
+
+template <typename AccumulatorTType>
+Value ExpressionQuantile<AccumulatorTType>::serialize(SerializationOptions opts) const {
+    MutableDocument result;
+
+    MutableDocument md;
+    AccumulatorTType::serializeHelper(_input, opts, _ps, _algoType, md);
+    result[AccumulatorTType::kName] = md.freezeToValue();
+
+    MutableDocument windowField;
+    _bounds.serialize(windowField, opts);
+    result[kWindowArg] = windowField.freezeToValue();
+    return result.freezeToValue();
+}
+
+template <typename AccumulatorTType>
+std::unique_ptr<WindowFunctionState> ExpressionQuantile<AccumulatorTType>::buildRemovable() const {
+    if (AccumulatorTType::kName == AccumulatorMedian::kName) {
+        return WindowFunctionMedian::create(_expCtx);
+    } else {
+        return WindowFunctionPercentile::create(_expCtx, _ps);
+    }
+}
+
+template <typename AccumulatorTType>
+boost::intrusive_ptr<AccumulatorState> ExpressionQuantile<AccumulatorTType>::buildAccumulatorOnly()
+    const {
+    return AccumulatorTType::create(_expCtx, _ps, _algoType);
+}
+
 
 MONGO_INITIALIZER_GROUP(BeginWindowFunctionRegistration,
                         ("default"),

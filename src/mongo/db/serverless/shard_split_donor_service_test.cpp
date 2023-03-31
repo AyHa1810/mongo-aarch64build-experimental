@@ -49,6 +49,7 @@
 #include "mongo/db/repl/tenant_migration_access_blocker_util.h"
 #include "mongo/db/repl/tenant_migration_donor_access_blocker.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
+#include "mongo/db/serverless/serverless_operation_lock_registry.h"
 #include "mongo/db/serverless/shard_split_donor_op_observer.h"
 #include "mongo/db/serverless/shard_split_donor_service.h"
 #include "mongo/db/serverless/shard_split_state_machine_gen.h"
@@ -228,11 +229,10 @@ void fastForwardCommittedSnapshotOpTime(
         serviceContext, *foundStateDoc.getCommitOrAbortOpTime());
 }
 
-bool hasActiveSplitForTenants(OperationContext* opCtx,
-                              const std::vector<std::string>& tenantNames) {
-    return std::all_of(tenantNames.begin(), tenantNames.end(), [&](const auto& tenantName) {
+bool hasActiveSplitForTenants(OperationContext* opCtx, const std::vector<TenantId>& tenantIds) {
+    return std::all_of(tenantIds.begin(), tenantIds.end(), [&](const auto& tenantId) {
         return tenant_migration_access_blocker::hasActiveTenantMigration(
-            opCtx, StringData(tenantName + "_db"));
+            opCtx, DatabaseName(tenantId.toString() + "_db"));
     });
 }
 
@@ -316,24 +316,32 @@ bool processReplSetStepUpRequest(executor::NetworkInterfaceMock* net,
     return commandName == cmdObj.firstElementFieldName();
 }
 
-void processHelloRequest(executor::NetworkInterfaceMock* net, MockReplicaSet* replSet) {
+
+using IncomingRequestValidator = std::function<void(executor::RemoteCommandRequest)>;
+void processIncomingRequest(executor::NetworkInterfaceMock* net,
+                            MockReplicaSet* replSet,
+                            const std::string& commandName,
+                            IncomingRequestValidator validator = nullptr) {
     ASSERT(net->hasReadyRequests());
     net->runReadyNetworkOperations();
     auto noi = net->getNextReadyRequest();
     auto request = noi->getRequest();
 
+    assertRemoteCommandNameEquals(commandName, request);
+    if (validator) {
+        validator(request);
+    }
 
-    assertRemoteCommandNameEquals("isMaster", request);
     auto requestHost = request.target.toString();
     const auto node = replSet->getNode(requestHost);
-    if (node->isRunning()) {
-        const auto opmsg = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
-        const auto reply = node->runCommand(request.id, opmsg)->getCommandReply();
-        net->scheduleSuccessfulResponse(noi,
-                                        executor::RemoteCommandResponse(reply, Milliseconds(0)));
-    } else {
+    if (!node->isRunning()) {
         net->scheduleErrorResponse(noi, Status(ErrorCodes::HostUnreachable, ""));
+        return;
     }
+
+    const auto opmsg = OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj);
+    const auto reply = node->runCommand(request.id, opmsg)->getCommandReply();
+    net->scheduleSuccessfulResponse(noi, executor::RemoteCommandResponse(reply, Milliseconds(0)));
 }
 
 void waitForReadyRequest(executor::NetworkInterfaceMock* net) {
@@ -341,9 +349,13 @@ void waitForReadyRequest(executor::NetworkInterfaceMock* net) {
         net->advanceTime(net->now() + Milliseconds{1});
     }
 }
+
 class ShardSplitDonorServiceTest : public repl::PrimaryOnlyServiceMongoDTest {
 public:
     void setUp() override {
+        // Set a 30s timeout to prevent spurious timeouts.
+        repl::shardSplitTimeoutMS.store(30 * 1000);
+
         repl::PrimaryOnlyServiceMongoDTest::setUp();
 
         // The database needs to be open before using shard split donor service.
@@ -392,10 +404,12 @@ protected:
     }
 
     ShardSplitDonorDocument defaultStateDocument() const {
-        return ShardSplitDonorDocument::parse(
-            {"donor.document"},
-            BSON("_id" << _uuid << "tenantIds" << _tenantIds << "recipientTagName"
-                       << _recipientTagName << "recipientSetName" << _recipientSetName));
+        auto shardSplitStateDoc = ShardSplitDonorDocument::parse(
+            IDLParserContext{"donor.document"},
+            BSON("_id" << _uuid << "recipientTagName" << _recipientTagName << "recipientSetName"
+                       << _recipientSetName));
+        shardSplitStateDoc.setTenantIds(_tenantIds);
+        return shardSplitStateDoc;
     }
 
     /**
@@ -410,17 +424,33 @@ protected:
         _net->exitNetwork();
     }
 
+    void waitForRecipientPrimaryMajorityWrite() {
+        _net->enterNetwork();
+        waitForReadyRequest(_net);
+        processIncomingRequest(
+            _net,
+            &_recipientSet,
+            "appendOplogNote",
+            [](const executor::RemoteCommandRequest& request) {
+                ASSERT_TRUE(request.cmdObj.hasField(WriteConcernOptions::kWriteConcernField));
+                ASSERT_BSONOBJ_EQ(request.cmdObj[WriteConcernOptions::kWriteConcernField].Obj(),
+                                  BSON("w" << WriteConcernOptions::kMajority));
+            });
+        _net->runReadyNetworkOperations();
+        _net->exitNetwork();
+    }
+
     /**
      * Wait for monitors to start, and enqueue successfull hello responses
      */
     void waitForMonitorAndProcessHello() {
         _net->enterNetwork();
         waitForReadyRequest(_net);
-        processHelloRequest(_net, &_recipientSet);
+        processIncomingRequest(_net, &_recipientSet, "isMaster");
         waitForReadyRequest(_net);
-        processHelloRequest(_net, &_recipientSet);
+        processIncomingRequest(_net, &_recipientSet, "isMaster");
         waitForReadyRequest(_net);
-        processHelloRequest(_net, &_recipientSet);
+        processIncomingRequest(_net, &_recipientSet, "isMaster");
         _net->runReadyNetworkOperations();
         _net->exitNetwork();
     }
@@ -430,13 +460,17 @@ protected:
         "donorSetForTest", 3, true /* hasPrimary */, false /* dollarPrefixHosts */};
     MockReplicaSet _recipientSet{
         "recipientSetForTest", 3, true /* hasPrimary */, false /* dollarPrefixHosts */};
-    const NamespaceString _nss{"testDB2", "testColl2"};
-    std::vector<std::string> _tenantIds = {"tenant1", "tenantAB"};
+    const NamespaceString _nss =
+        NamespaceString::createNamespaceString_forTest("testDB2", "testColl2");
+    std::vector<TenantId> _tenantIds = {TenantId(OID::gen()), TenantId(OID::gen())};
     std::string _recipientTagName{"$recipientNode"};
     std::string _recipientSetName{_recipientSet.getURI().getSetName()};
 
     std::unique_ptr<FailPointEnableBlock> _skipAcceptanceFP =
         std::make_unique<FailPointEnableBlock>("skipShardSplitWaitForSplitAcceptance");
+
+    std::unique_ptr<FailPointEnableBlock> _skipGarbageTimeoutFP =
+        std::make_unique<FailPointEnableBlock>("skipShardSplitGarbageCollectionTimeout");
 
 
     // for mocking split acceptance
@@ -444,24 +478,19 @@ protected:
     TaskExecutorPtr _executor;
 };
 
-void setUpCommandResult(MockReplicaSet* replSet,
-                        const HostAndPort& target,
-                        const std::string& command,
-                        BSONObj result) {
-    auto node = replSet->getNode(target.toString());
+auto makeHelloReply(const std::string& setName,
+                    const repl::OpTime& lastWriteOpTime = repl::OpTime(Timestamp(100, 1), 1)) {
+    BSONObjBuilder opTimeBuilder;
+    lastWriteOpTime.append(&opTimeBuilder, "opTime");
+    return BSON("setName" << setName << "lastWrite" << opTimeBuilder.obj());
+};
 
-    node->setCommandReply(command, result);
-}
-
-
-void setUpReplSetUpCommandResult(MockReplicaSet* replSet) {
-    // Due to use of std::shuffle to select the recipient to target, any of the node can receive the
-    // command.
-
-    for (auto hostAndPort : replSet->getHosts()) {
+void mockCommandReplies(MockReplicaSet* replSet) {
+    for (const auto& hostAndPort : replSet->getHosts()) {
         auto node = replSet->getNode(hostAndPort.toString());
-
         node->setCommandReply("replSetStepUp", BSON("ok" << 1));
+        node->setCommandReply("appendOplogNote", BSON("ok" << 1));
+        node->setCommandReply("isMaster", makeHelloReply(replSet->getSetName()));
     }
 }
 
@@ -472,9 +501,9 @@ TEST_F(ShardSplitDonorServiceTest, BasicShardSplitDonorServiceInstanceCreation) 
         getServiceContext(), _recipientTagName, _replSet.getHosts(), _recipientSet.getHosts());
 
     // Shard split service will send a stepUp request to the first node in the vector.
-    setUpReplSetUpCommandResult(&_recipientSet);
+    mockCommandReplies(&_recipientSet);
 
-    // We disable this failpoint to test complete functionality. waitForMonitorAndProcessHello()
+    // We reset this failpoint to test complete functionality. waitForMonitorAndProcessHello()
     // returns hello responses that makes split acceptance pass.
     _skipAcceptanceFP.reset();
 
@@ -486,6 +515,12 @@ TEST_F(ShardSplitDonorServiceTest, BasicShardSplitDonorServiceInstanceCreation) 
 
     waitForMonitorAndProcessHello();
     waitForReplSetStepUp(Status(ErrorCodes::OK, ""));
+    waitForRecipientPrimaryMajorityWrite();
+
+    // Verify the serverless lock has been acquired for split.
+    auto& registry = ServerlessOperationLockRegistry::get(opCtx->getServiceContext());
+    ASSERT_EQ(*registry.getActiveOperationType_forTest(),
+              ServerlessOperationLockRegistry::LockType::kShardSplit);
 
     auto result = serviceInstance->decisionFuture().get();
     ASSERT_TRUE(hasActiveSplitForTenants(opCtx.get(), _tenantIds));
@@ -496,77 +531,30 @@ TEST_F(ShardSplitDonorServiceTest, BasicShardSplitDonorServiceInstanceCreation) 
     auto completionFuture = serviceInstance->completionFuture();
     completionFuture.wait();
 
+    // The lock has been released.
+    ASSERT_FALSE(registry.getActiveOperationType_forTest());
+
     ASSERT_OK(serviceInstance->completionFuture().getNoThrow());
     ASSERT_TRUE(serviceInstance->isGarbageCollectable());
 }
 
-TEST_F(ShardSplitDonorServiceTest, ReplSetStepUpTryAgain) {
+TEST_F(ShardSplitDonorServiceTest, ShardSplitFailsWhenLockIsHeld) {
     auto opCtx = makeOperationContext();
-    test::shard_split::ScopedTenantAccessBlocker scopedTenants(_tenantIds, opCtx.get());
     test::shard_split::reconfigToAddRecipientNodes(
         getServiceContext(), _recipientTagName, _replSet.getHosts(), _recipientSet.getHosts());
 
-    // Shard split service will send a stepUp request to the first node in the vector. When it fails
-    // it will send it to the next node.
-    setUpReplSetUpCommandResult(&_recipientSet);
-
-    // We disable this failpoint to test complete functionality. waitForMonitorAndProcessHello()
-    // returns hello responses that makes split acceptance pass.
-    _skipAcceptanceFP.reset();
+    auto& registry = ServerlessOperationLockRegistry::get(opCtx->getServiceContext());
+    registry.acquireLock(ServerlessOperationLockRegistry::LockType::kTenantRecipient, UUID::gen());
 
     // Create and start the instance.
     auto serviceInstance = ShardSplitDonorService::DonorStateMachine::getOrCreate(
         opCtx.get(), _service, defaultStateDocument().toBSON());
     ASSERT(serviceInstance.get());
-    ASSERT_EQ(_uuid, serviceInstance->getId());
 
-    waitForMonitorAndProcessHello();
+    auto decisionFuture = serviceInstance->decisionFuture();
 
-    // We expect to get two replSetStepUp commands. The first will fail and the service will resend
-    // the command to the next node.
-    waitForReplSetStepUp(Status(ErrorCodes::OperationFailed, ""));
-    waitForReplSetStepUp(Status(ErrorCodes::OK, ""));
-
-    auto result = serviceInstance->decisionFuture().get();
-
-    ASSERT(!result.abortReason);
-
-    ASSERT_EQ(result.state, mongo::ShardSplitDonorStateEnum::kCommitted);
-}
-
-TEST_F(ShardSplitDonorServiceTest, ReplSetStepUpFails) {
-    // Test that, even if both replSetStepUp fail, the split will succeed as long as all nodes have
-    // joined the recipient set.
-
-    auto opCtx = makeOperationContext();
-    test::shard_split::ScopedTenantAccessBlocker scopedTenants(_tenantIds, opCtx.get());
-    test::shard_split::reconfigToAddRecipientNodes(
-        getServiceContext(), _recipientTagName, _replSet.getHosts(), _recipientSet.getHosts());
-
-    // Shard split service will send a stepUp request to the first node in the vector. When it fails
-    // it will send it to the next node.
-    setUpReplSetUpCommandResult(&_recipientSet);
-
-    // We disable this failpoint to test complete functionality. waitForMonitorAndProcessHello()
-    // returns hello responses that makes split acceptance pass.
-    _skipAcceptanceFP.reset();
-
-    // Create and start the instance.
-    auto serviceInstance = ShardSplitDonorService::DonorStateMachine::getOrCreate(
-        opCtx.get(), _service, defaultStateDocument().toBSON());
-    ASSERT(serviceInstance.get());
-    ASSERT_EQ(_uuid, serviceInstance->getId());
-
-    waitForMonitorAndProcessHello();
-
-    // Shard split will retry the command once. If both
-    waitForReplSetStepUp(Status(ErrorCodes::OperationFailed, ""));
-    waitForReplSetStepUp(Status(ErrorCodes::OperationFailed, ""));
-
-    auto result = serviceInstance->decisionFuture().get();
-
-    ASSERT(!result.abortReason);
-    ASSERT_EQ(result.state, mongo::ShardSplitDonorStateEnum::kCommitted);
+    auto result = decisionFuture.getNoThrow();
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::ConflictingServerlessOperation);
 }
 
 TEST_F(ShardSplitDonorServiceTest, ReplSetStepUpRetryable) {
@@ -577,7 +565,7 @@ TEST_F(ShardSplitDonorServiceTest, ReplSetStepUpRetryable) {
 
     // Shard split service will send a stepUp request to the first node in the vector. When it fails
     // it will send it to the next node.
-    setUpReplSetUpCommandResult(&_recipientSet);
+    mockCommandReplies(&_recipientSet);
 
     // We disable this failpoint to test complete functionality. waitForMonitorAndProcessHello()
     // returns hello responses that makes split acceptance pass.
@@ -598,6 +586,7 @@ TEST_F(ShardSplitDonorServiceTest, ReplSetStepUpRetryable) {
         Status(ErrorCodes::ConnectionPoolExpired, "test-generated retryable error"));
     waitForReplSetStepUp(Status(ErrorCodes::ExceededTimeLimit, "test-generated retryable error"));
     waitForReplSetStepUp(Status(ErrorCodes::OK, "test-generated retryable error"));
+    waitForRecipientPrimaryMajorityWrite();
 
     auto result = serviceInstance->decisionFuture().get();
 
@@ -644,7 +633,7 @@ TEST_F(ShardSplitDonorServiceTest, ReconfigToRemoveSplitConfig) {
         getServiceContext(), _recipientTagName, _replSet.getHosts(), _recipientSet.getHosts());
 
     // Shard split service will send a stepUp request to the first node in the vector.
-    setUpReplSetUpCommandResult(&_recipientSet);
+    mockCommandReplies(&_recipientSet);
 
     _skipAcceptanceFP.reset();
 
@@ -658,8 +647,8 @@ TEST_F(ShardSplitDonorServiceTest, ReconfigToRemoveSplitConfig) {
     ASSERT_EQ(_uuid, serviceInstance->getId());
 
     waitForMonitorAndProcessHello();
-
     waitForReplSetStepUp(Status::OK());
+    waitForRecipientPrimaryMajorityWrite();
 
     auto result = serviceInstance->decisionFuture().get();
     ASSERT(!result.abortReason);
@@ -675,6 +664,10 @@ TEST_F(ShardSplitDonorServiceTest, ReconfigToRemoveSplitConfig) {
     dynamic_cast<repl::ReplicationCoordinatorMock*>(replCoord)->setGetConfigReturnValue(
         splitConfig);
 
+    // Validate shard split sets a new replicaSetId on the recipientConfig.
+    auto recipientConfig = *splitConfig.getRecipientConfig();
+    ASSERT_NE(splitConfig.getReplicaSetId(), recipientConfig.getReplicaSetId());
+
     // Clear the failpoint and wait for completion.
     fpPtr.reset();
     serviceInstance->tryForget();
@@ -686,6 +679,50 @@ TEST_F(ShardSplitDonorServiceTest, ReconfigToRemoveSplitConfig) {
     ASSERT_TRUE(finalConfigBson.hasField("replSetReconfig"));
     auto finalConfig = repl::ReplSetConfig::parse(finalConfigBson["replSetReconfig"].Obj());
     ASSERT(!finalConfig.isSplitConfig());
+}
+
+TEST_F(ShardSplitDonorServiceTest, SendReplSetStepUpToHighestLastApplied) {
+    // Proves that the node with the highest lastAppliedOpTime is chosen as the recipient primary,
+    // by replacing the default `hello` replies (set by the MockReplicaSet) with ones that report
+    // `lastWrite.opTime` values in a deterministic way.
+    auto opCtx = makeOperationContext();
+    test::shard_split::ScopedTenantAccessBlocker scopedTenants(_tenantIds, opCtx.get());
+    test::shard_split::reconfigToAddRecipientNodes(
+        getServiceContext(), _recipientTagName, _replSet.getHosts(), _recipientSet.getHosts());
+
+    auto newerOpTime = mongo::repl::OpTime(Timestamp(200, 1), 24);
+    auto olderOpTime = mongo::repl::OpTime(Timestamp(100, 1), 24);
+
+    mockCommandReplies(&_recipientSet);
+    auto recipientPrimary = _recipientSet.getNode(_recipientSet.getHosts()[1].toString());
+    recipientPrimary->setCommandReply("isMaster", makeHelloReply(_recipientSetName, newerOpTime));
+
+    for (auto&& recipientNodeHost : _recipientSet.getHosts()) {
+        if (recipientNodeHost == recipientPrimary->getServerHostAndPort()) {
+            continue;
+        }
+
+        auto recipientNode = _recipientSet.getNode(recipientNodeHost.toString());
+        recipientNode->setCommandReply("isMaster", makeHelloReply(_recipientSetName, olderOpTime));
+    }
+
+    _skipAcceptanceFP.reset();
+    auto serviceInstance = ShardSplitDonorService::DonorStateMachine::getOrCreate(
+        opCtx.get(), _service, defaultStateDocument().toBSON());
+    ASSERT(serviceInstance.get());
+    ASSERT_EQ(_uuid, serviceInstance->getId());
+    auto splitAcceptanceFuture = serviceInstance->getSplitAcceptanceFuture_forTest();
+
+    waitForMonitorAndProcessHello();
+    waitForReplSetStepUp(Status::OK());
+    waitForRecipientPrimaryMajorityWrite();
+
+    auto result = serviceInstance->decisionFuture().get();
+    ASSERT(!result.abortReason);
+    ASSERT_EQ(result.state, mongo::ShardSplitDonorStateEnum::kCommitted);
+
+    auto acceptedRecipientPrimary = splitAcceptanceFuture.get(opCtx.get());
+    ASSERT_EQ(acceptedRecipientPrimary, recipientPrimary->getServerHostAndPort());
 }
 
 // Abort scenario : abortSplit called before startSplit.
@@ -775,10 +812,9 @@ TEST_F(ShardSplitDonorServiceTest, StepDownTest) {
 
     auto result = serviceInstance->decisionFuture().getNoThrow();
     ASSERT_FALSE(result.isOK());
-    ASSERT_EQ(ErrorCodes::InterruptedDueToReplStateChange, result.getStatus());
+    ASSERT_EQ(ErrorCodes::CallbackCanceled, result.getStatus());
 
-    ASSERT_EQ(serviceInstance->completionFuture().getNoThrow(),
-              ErrorCodes::InterruptedDueToReplStateChange);
+    ASSERT_EQ(serviceInstance->completionFuture().getNoThrow(), ErrorCodes::CallbackCanceled);
     ASSERT_FALSE(serviceInstance->isGarbageCollectable());
 }
 
@@ -856,11 +892,11 @@ TEST(RecipientAcceptSplitListenerTest, FutureReady) {
         mongo::serverless::RecipientAcceptSplitListener(donor.getURI().connectionString());
 
     for (const auto& host : donor.getHosts()) {
-        ASSERT_FALSE(listener.getFuture().isReady());
-        listener.onServerHeartbeatSucceededEvent(host, BSON("setName" << donor.getSetName()));
+        ASSERT_FALSE(listener.getSplitAcceptedFuture().isReady());
+        listener.onServerHeartbeatSucceededEvent(host, makeHelloReply(donor.getSetName()));
     }
 
-    ASSERT_TRUE(listener.getFuture().isReady());
+    ASSERT_TRUE(listener.getSplitAcceptedFuture().isReady());
 }
 
 TEST(RecipientAcceptSplitListenerTest, FutureReadyNameChange) {
@@ -869,18 +905,16 @@ TEST(RecipientAcceptSplitListenerTest, FutureReadyNameChange) {
         mongo::serverless::RecipientAcceptSplitListener(donor.getURI().connectionString());
 
     for (const auto& host : donor.getHosts()) {
-        listener.onServerHeartbeatSucceededEvent(host,
-                                                 BSON("setName"
-                                                      << "invalidSetName"));
+        listener.onServerHeartbeatSucceededEvent(host, makeHelloReply("invalidSetName"));
     }
 
-    ASSERT_FALSE(listener.getFuture().isReady());
+    ASSERT_FALSE(listener.getSplitAcceptedFuture().isReady());
 
     for (const auto& host : donor.getHosts()) {
-        listener.onServerHeartbeatSucceededEvent(host, BSON("setName" << donor.getSetName()));
+        listener.onServerHeartbeatSucceededEvent(host, makeHelloReply(donor.getSetName()));
     }
 
-    ASSERT_TRUE(listener.getFuture().isReady());
+    ASSERT_TRUE(listener.getSplitAcceptedFuture().isReady());
 }
 
 TEST(RecipientAcceptSplitListenerTest, FutureNotReadyMissingNodes) {
@@ -891,14 +925,14 @@ TEST(RecipientAcceptSplitListenerTest, FutureNotReadyMissingNodes) {
 
     for (size_t i = 0; i < donor.getHosts().size() - 1; ++i) {
         listener.onServerHeartbeatSucceededEvent(donor.getHosts()[i],
-                                                 BSON("setName" << donor.getSetName()));
+                                                 makeHelloReply(donor.getSetName()));
     }
 
-    ASSERT_FALSE(listener.getFuture().isReady());
+    ASSERT_FALSE(listener.getSplitAcceptedFuture().isReady());
     listener.onServerHeartbeatSucceededEvent(donor.getHosts()[donor.getHosts().size() - 1],
-                                             BSON("setName" << donor.getSetName()));
+                                             makeHelloReply(donor.getSetName()));
 
-    ASSERT_TRUE(listener.getFuture().isReady());
+    ASSERT_TRUE(listener.getSplitAcceptedFuture().isReady());
 }
 
 TEST(RecipientAcceptSplitListenerTest, FutureNotReadyNoSetName) {
@@ -910,7 +944,7 @@ TEST(RecipientAcceptSplitListenerTest, FutureNotReadyNoSetName) {
         listener.onServerHeartbeatSucceededEvent(donor.getHosts()[i], BSONObj());
     }
 
-    ASSERT_FALSE(listener.getFuture().isReady());
+    ASSERT_FALSE(listener.getSplitAcceptedFuture().isReady());
 }
 
 TEST(RecipientAcceptSplitListenerTest, FutureNotReadyWrongSet) {
@@ -919,12 +953,10 @@ TEST(RecipientAcceptSplitListenerTest, FutureNotReadyWrongSet) {
         mongo::serverless::RecipientAcceptSplitListener(donor.getURI().connectionString());
 
     for (const auto& host : donor.getHosts()) {
-        listener.onServerHeartbeatSucceededEvent(host,
-                                                 BSON("setName"
-                                                      << "wrongSetName"));
+        listener.onServerHeartbeatSucceededEvent(host, makeHelloReply("wrongSetName"));
     }
 
-    ASSERT_FALSE(listener.getFuture().isReady());
+    ASSERT_FALSE(listener.getSplitAcceptedFuture().isReady());
 }
 
 TEST_F(ShardSplitDonorServiceTest, ResumeAfterStepdownTest) {
@@ -932,8 +964,6 @@ TEST_F(ShardSplitDonorServiceTest, ResumeAfterStepdownTest) {
     test::shard_split::ScopedTenantAccessBlocker scopedTenants(_tenantIds, opCtx.get());
     test::shard_split::reconfigToAddRecipientNodes(
         getServiceContext(), _recipientTagName, _replSet.getHosts(), _recipientSet.getHosts());
-
-    setUpReplSetUpCommandResult(&_recipientSet);
 
     auto firstSplitInstance = [&]() {
         FailPointEnableBlock fp("pauseShardSplitAfterBlocking");
@@ -951,7 +981,7 @@ TEST_F(ShardSplitDonorServiceTest, ResumeAfterStepdownTest) {
     stepDown();
     auto result = firstSplitInstance->completionFuture().getNoThrow();
     ASSERT_FALSE(result.isOK());
-    ASSERT_EQ(ErrorCodes::InterruptedDueToReplStateChange, result.code());
+    ASSERT_EQ(ErrorCodes::CallbackCanceled, result.code());
 
     auto secondSplitInstance = [&]() {
         FailPointEnableBlock fp("pauseShardSplitAfterBlocking");
@@ -965,10 +995,7 @@ TEST_F(ShardSplitDonorServiceTest, ResumeAfterStepdownTest) {
         return *serviceInstance;
     }();
 
-    waitForReplSetStepUp(Status(ErrorCodes::OK, ""));
-
     ASSERT_OK(secondSplitInstance->decisionFuture().getNoThrow().getStatus());
-
     secondSplitInstance->tryForget();
     ASSERT_OK(secondSplitInstance->completionFuture().getNoThrow());
     ASSERT_TRUE(secondSplitInstance->isGarbageCollectable());
@@ -987,6 +1014,10 @@ public:
 
         _recStateDoc = initialStateDocument();
         uassertStatusOK(serverless::insertStateDoc(opCtx, _recStateDoc));
+
+        ServerlessOperationLockRegistry::get(getServiceContext())
+            .acquireLock(ServerlessOperationLockRegistry::LockType::kShardSplit,
+                         _recStateDoc.getId());
 
         _pauseBeforeRecipientCleanupFp =
             std::make_unique<FailPointEnableBlock>("pauseShardSplitBeforeRecipientCleanup");
@@ -1020,7 +1051,7 @@ public:
     ShardSplitDonorDocument initialStateDocument() override {
 
         auto stateDocument = defaultStateDocument();
-        stateDocument.setBlockTimestamp(Timestamp(1, 1));
+        stateDocument.setBlockOpTime(repl::OpTime(Timestamp(1, 1), 1));
         stateDocument.setState(ShardSplitDonorStateEnum::kBlocking);
         stateDocument.setRecipientConnectionString(ConnectionString::forLocal());
 
@@ -1050,7 +1081,7 @@ TEST_F(ShardSplitRecipientCleanupTest, ShardSplitRecipientCleanup) {
         ASSERT_TRUE(hasActiveSplitForTenants(opCtx.get(), _tenantIds));
 
         ASSERT_TRUE(optionalDonor);
-        auto serviceInstance = optionalDonor.get();
+        auto serviceInstance = optionalDonor.value();
         ASSERT(serviceInstance.get());
 
         _pauseBeforeRecipientCleanupFp.reset();
@@ -1087,7 +1118,7 @@ public:
         auto stateDocument = defaultStateDocument();
 
         stateDocument.setState(mongo::ShardSplitDonorStateEnum::kAborted);
-        stateDocument.setBlockTimestamp(Timestamp(1, 1));
+        stateDocument.setBlockOpTime(repl::OpTime(Timestamp(1, 1), 1));
         stateDocument.setCommitOrAbortOpTime(repl::OpTime(Timestamp(1, 1), 1));
 
         Status status(ErrorCodes::InternalError, abortReason);

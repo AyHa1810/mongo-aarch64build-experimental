@@ -39,9 +39,8 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/client/authenticate.h"
-#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_options.h"
-#include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/collection_write_path.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/cloner_gen.h"
@@ -194,9 +193,11 @@ struct Cloner::BatchHandler {
                 WriteUnitOfWork wunit(opCtx);
 
                 BSONObj doc = tmp;
-                OpDebug* const nullOpDebug = nullptr;
-                Status status =
-                    collection->insertDocument(opCtx, InsertStatement(doc), nullOpDebug, true);
+                Status status = collection_internal::insertDocument(opCtx,
+                                                                    CollectionPtr(collection),
+                                                                    InsertStatement(doc),
+                                                                    nullptr /* OpDebug */,
+                                                                    true);
                 if (!status.isOK() && status.code() != ErrorCodes::DuplicateKey) {
                     LOGV2_ERROR(20424,
                                 "error: exception cloning object",
@@ -367,7 +368,7 @@ Status Cloner::_createCollectionsForDb(
             opCtx->checkForInterrupt();
             WriteUnitOfWork wunit(opCtx);
 
-            CollectionPtr collection = catalog->lookupCollectionByNamespace(opCtx, nss);
+            const Collection* collection = catalog->lookupCollectionByNamespace(opCtx, nss);
             if (collection) {
                 if (!params.shardedColl) {
                     // If the collection is unsharded then we want to fail when a collection
@@ -482,8 +483,9 @@ Status Cloner::copyDb(OperationContext* opCtx,
     }
 
     // Gather the list of collections to clone
-    std::list<BSONObj> initialCollections =
-        conn->getCollectionInfos(dBName, ListCollectionsFilter::makeTypeCollectionFilter());
+    // TODO SERVER-63111 Once the cloner takes in a DatabaseName obj, use dBName directly
+    std::list<BSONObj> initialCollections = conn->getCollectionInfos(
+        DatabaseName(boost::none, dBName), ListCollectionsFilter::makeTypeCollectionFilter());
 
     auto statusWithCollections = _filterCollectionsForClone(dBName, initialCollections);
     if (!statusWithCollections.isOK()) {
@@ -540,6 +542,13 @@ Status Cloner::copyDb(OperationContext* opCtx,
 
         // now build the secondary indexes
         for (auto&& params : createCollectionParams) {
+
+            // Indexes of sharded collections are not copied: the primary shard is not required to
+            // have all indexes. The listIndexes cmd is sent to the shard owning the MinKey value.
+            if (params.shardedColl) {
+                continue;
+            }
+
             LOGV2(20422,
                   "copying indexes for: {collectionInfo}",
                   "Copying indexes",

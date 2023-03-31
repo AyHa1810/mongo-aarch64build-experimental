@@ -27,21 +27,20 @@
  *    it in the license file.
  */
 
-
-#include "mongo/platform/basic.h"
-
 #include "mongo/db/s/database_sharding_state.h"
 
+#include <fmt/format.h>
+
+#include "mongo/db/catalog_shard_feature_flag_gen.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/database_version.h"
 #include "mongo/s/stale_exception.h"
+#include "mongo/stdx/unordered_map.h"
 #include "mongo/util/fail_point.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
-
 
 namespace mongo {
 namespace {
@@ -55,24 +54,44 @@ public:
 
     DatabaseShardingStateMap() {}
 
-    std::shared_ptr<DatabaseShardingState> getOrCreate(const StringData dbName) {
+    struct DSSAndLock {
+        DSSAndLock(const DatabaseName& dbName)
+            : dssMutex("DSSMutex::" + dbName.db()),
+              dss(std::make_unique<DatabaseShardingState>(dbName)) {}
+
+        const Lock::ResourceMutex dssMutex;
+        std::unique_ptr<DatabaseShardingState> dss;
+    };
+
+    DSSAndLock* getOrCreate(const DatabaseName& dbName) {
         stdx::lock_guard<Latch> lg(_mutex);
 
         auto it = _databases.find(dbName);
         if (it == _databases.end()) {
-            auto inserted =
-                _databases.try_emplace(dbName, std::make_unique<DatabaseShardingState>(dbName));
+            auto inserted = _databases.try_emplace(dbName, std::make_unique<DSSAndLock>(dbName));
             invariant(inserted.second);
             it = std::move(inserted.first);
         }
 
-        return it->second;
+        return it->second.get();
+    }
+
+    std::vector<DatabaseName> getDatabaseNames() {
+        stdx::lock_guard lg(_mutex);
+        std::vector<DatabaseName> result;
+        result.reserve(_databases.size());
+        for (const auto& [dbName, _] : _databases) {
+            result.emplace_back(dbName);
+        }
+        return result;
     }
 
 private:
-    using DatabasesMap = StringMap<std::shared_ptr<DatabaseShardingState>>;
-
     Mutex _mutex = MONGO_MAKE_LATCH("DatabaseShardingStateMap::_mutex");
+
+    // Entries of the _databases map must never be deleted or replaced. This is to guarantee that a
+    // 'dbName' is always associated to the same 'ResourceMutex'.
+    using DatabasesMap = stdx::unordered_map<DatabaseName, std::unique_ptr<DSSAndLock>>;
     DatabasesMap _databases;
 };
 
@@ -81,62 +100,199 @@ const ServiceContext::Decoration<DatabaseShardingStateMap> DatabaseShardingState
 
 }  // namespace
 
-DatabaseShardingState::DatabaseShardingState(const StringData dbName)
-    : _dbName(dbName.toString()) {}
+DatabaseShardingState::DatabaseShardingState(const DatabaseName& dbName) : _dbName(dbName) {}
 
-DatabaseShardingState* DatabaseShardingState::get(OperationContext* opCtx,
-                                                  const StringData dbName) {
-    // db lock must be held to have a reference to the database sharding state
-    // TODO SERVER-63706 Use dbName directly
-    dassert(opCtx->lockState()->isDbLockedForMode(DatabaseName(boost::none, dbName), MODE_IS));
+DatabaseShardingState::ScopedExclusiveDatabaseShardingState::ScopedExclusiveDatabaseShardingState(
+    Lock::ResourceLock lock, DatabaseShardingState* dss)
+    : _lock(std::move(lock)), _dss(dss) {}
 
-    auto& databasesMap = DatabaseShardingStateMap::get(opCtx->getServiceContext());
-    return databasesMap.getOrCreate(dbName).get();
+DatabaseShardingState::ScopedSharedDatabaseShardingState::ScopedSharedDatabaseShardingState(
+    Lock::ResourceLock lock, DatabaseShardingState* dss)
+    : DatabaseShardingState::ScopedExclusiveDatabaseShardingState(std::move(lock), dss) {}
+
+DatabaseShardingState::ScopedExclusiveDatabaseShardingState DatabaseShardingState::acquireExclusive(
+    OperationContext* opCtx, const DatabaseName& dbName) {
+
+    DatabaseShardingStateMap::DSSAndLock* dssAndLock =
+        DatabaseShardingStateMap::get(opCtx->getServiceContext()).getOrCreate(dbName);
+
+    // First lock the RESOURCE_MUTEX associated to this dbName to guarantee stability of the
+    // DatabaseShardingState pointer. After that, it is safe to get and store the
+    // DatabaseShadingState*, as long as the RESOURCE_MUTEX is kept locked.
+    Lock::ResourceLock lock(opCtx->lockState(), dssAndLock->dssMutex.getRid(), MODE_X);
+
+    return ScopedExclusiveDatabaseShardingState(std::move(lock), dssAndLock->dss.get());
 }
 
-std::shared_ptr<DatabaseShardingState> DatabaseShardingState::getSharedForLockFreeReads(
-    OperationContext* opCtx, const StringData dbName) {
+DatabaseShardingState::ScopedSharedDatabaseShardingState DatabaseShardingState::acquireShared(
+    OperationContext* opCtx, const DatabaseName& dbName) {
+
+    DatabaseShardingStateMap::DSSAndLock* dssAndLock =
+        DatabaseShardingStateMap::get(opCtx->getServiceContext()).getOrCreate(dbName);
+
+    // First lock the RESOURCE_MUTEX associated to this dbName to guarantee stability of the
+    // DatabaseShardingState pointer. After that, it is safe to get and store the
+    // DatabaseShadingState*, as long as the RESOURCE_MUTEX is kept locked.
+    Lock::ResourceLock lock(opCtx->lockState(), dssAndLock->dssMutex.getRid(), MODE_IS);
+
+    return ScopedSharedDatabaseShardingState(std::move(lock), dssAndLock->dss.get());
+}
+
+DatabaseShardingState::ScopedExclusiveDatabaseShardingState
+DatabaseShardingState::assertDbLockedAndAcquireExclusive(OperationContext* opCtx,
+                                                         const DatabaseName& dbName) {
+    dassert(opCtx->lockState()->isDbLockedForMode(dbName, MODE_IS));
+    return acquireExclusive(opCtx, dbName);
+}
+
+DatabaseShardingState::ScopedSharedDatabaseShardingState
+DatabaseShardingState::assertDbLockedAndAcquireShared(OperationContext* opCtx,
+                                                      const DatabaseName& dbName) {
+    dassert(opCtx->lockState()->isDbLockedForMode(dbName, MODE_IS));
+    return acquireShared(opCtx, dbName);
+}
+
+std::vector<DatabaseName> DatabaseShardingState::getDatabaseNames(OperationContext* opCtx) {
     auto& databasesMap = DatabaseShardingStateMap::get(opCtx->getServiceContext());
-    return databasesMap.getOrCreate(dbName);
+    return databasesMap.getDatabaseNames();
+}
+
+void DatabaseShardingState::assertMatchingDbVersion(OperationContext* opCtx,
+                                                    const DatabaseName& dbName) {
+    const auto receivedVersion = OperationShardingState::get(opCtx).getDbVersion(dbName.toString());
+    if (!receivedVersion) {
+        return;
+    }
+
+    assertMatchingDbVersion(opCtx, dbName, *receivedVersion);
+}
+
+void DatabaseShardingState::assertMatchingDbVersion(OperationContext* opCtx,
+                                                    const DatabaseName& dbName,
+                                                    const DatabaseVersion& receivedVersion) {
+    const auto scopedDss = acquireShared(opCtx, dbName);
+
+    {
+        const auto critSecSignal = scopedDss->getCriticalSectionSignal(
+            opCtx->lockState()->isWriteLocked() ? ShardingMigrationCriticalSection::kWrite
+                                                : ShardingMigrationCriticalSection::kRead);
+        uassert(
+            StaleDbRoutingVersion(dbName.toString(), receivedVersion, boost::none, critSecSignal),
+            str::stream() << "The critical section for the database " << dbName
+                          << " is acquired with reason: " << scopedDss->getCriticalSectionReason(),
+            !critSecSignal);
+    }
+
+    const auto wantedVersion = scopedDss->getDbVersion(opCtx);
+    uassert(StaleDbRoutingVersion(dbName.toString(), receivedVersion, boost::none),
+            str::stream() << "No cached info for the database " << dbName,
+            wantedVersion);
+
+    uassert(StaleDbRoutingVersion(dbName.toString(), receivedVersion, *wantedVersion),
+            str::stream() << "Version mismatch for the database " << dbName,
+            receivedVersion == *wantedVersion);
+}
+
+void DatabaseShardingState::assertIsPrimaryShardForDb(OperationContext* opCtx,
+                                                      const DatabaseName& dbName) {
+    if (dbName == DatabaseName::kConfig || dbName == DatabaseName::kAdmin) {
+        uassert(7393700,
+                "The config server is the primary shard for database: {}"_format(dbName.toString()),
+                serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
+        return;
+    }
+
+    uassert(ErrorCodes::IllegalOperation,
+            str::stream() << "Received request without the version for the database " << dbName,
+            OperationShardingState::get(opCtx).hasDbVersion());
+
+    Lock::DBLock dbLock(opCtx, dbName, MODE_IS);
+    assertMatchingDbVersion(opCtx, dbName);
+
+    const auto scopedDss = assertDbLockedAndAcquireShared(opCtx, dbName);
+    const auto primaryShardId = scopedDss->_dbInfo->getPrimary();
+    const auto thisShardId = ShardingState::get(opCtx)->shardId();
+    uassert(ErrorCodes::IllegalOperation,
+            str::stream() << "This is not the primary shard for the database " << dbName
+                          << ". Expected: " << primaryShardId << " Actual: " << thisShardId,
+            primaryShardId == thisShardId);
+}
+
+void DatabaseShardingState::setDbInfo(OperationContext* opCtx, const DatabaseType& dbInfo) {
+    invariant(opCtx->lockState()->isDbLockedForMode(_dbName, MODE_IX));
+
+    LOGV2(7286900,
+          "Setting this node's cached database info",
+          logAttrs(_dbName),
+          "dbVersion"_attr = dbInfo.getVersion());
+    _dbInfo.emplace(dbInfo);
+}
+
+void DatabaseShardingState::clearDbInfo(OperationContext* opCtx, bool cancelOngoingRefresh) {
+    invariant(opCtx->lockState()->isDbLockedForMode(_dbName, MODE_IX));
+
+    if (cancelOngoingRefresh) {
+        _cancelDbMetadataRefresh();
+    }
+
+    LOGV2(7286901, "Clearing this node's cached database info", logAttrs(_dbName));
+    _dbInfo = boost::none;
+}
+
+boost::optional<DatabaseVersion> DatabaseShardingState::getDbVersion(
+    OperationContext* opCtx) const {
+    return _dbInfo ? boost::optional<DatabaseVersion>(_dbInfo->getVersion()) : boost::none;
 }
 
 void DatabaseShardingState::enterCriticalSectionCatchUpPhase(OperationContext* opCtx,
-                                                             DSSLock&,
                                                              const BSONObj& reason) {
-    invariant(opCtx->lockState()->isDbLockedForMode(DatabaseName(boost::none, _dbName), MODE_X));
     _critSec.enterCriticalSectionCatchUpPhase(reason);
+
+    _cancelDbMetadataRefresh();
 }
 
 void DatabaseShardingState::enterCriticalSectionCommitPhase(OperationContext* opCtx,
-                                                            DSSLock&,
                                                             const BSONObj& reason) {
-    invariant(opCtx->lockState()->isDbLockedForMode(DatabaseName(boost::none, _dbName), MODE_X));
     _critSec.enterCriticalSectionCommitPhase(reason);
 }
 
 void DatabaseShardingState::exitCriticalSection(OperationContext* opCtx, const BSONObj& reason) {
-    const auto dssLock = DSSLock::lockExclusive(opCtx, this);
     _critSec.exitCriticalSection(reason);
 }
 
-MovePrimarySourceManager* DatabaseShardingState::getMovePrimarySourceManager(DSSLock&) {
-    return _sourceMgr;
+void DatabaseShardingState::exitCriticalSectionNoChecks(OperationContext* opCtx) {
+    _critSec.exitCriticalSectionNoChecks();
 }
 
-void DatabaseShardingState::setMovePrimarySourceManager(OperationContext* opCtx,
-                                                        MovePrimarySourceManager* sourceMgr,
-                                                        DSSLock&) {
-    invariant(opCtx->lockState()->isDbLockedForMode(DatabaseName(boost::none, _dbName), MODE_X));
-    invariant(sourceMgr);
-    invariant(!_sourceMgr);
-
-    _sourceMgr = sourceMgr;
+void DatabaseShardingState::setMovePrimaryInProgress(OperationContext* opCtx) {
+    invariant(opCtx->lockState()->isDbLockedForMode(_dbName, MODE_X));
+    _movePrimaryInProgress = true;
 }
 
-void DatabaseShardingState::clearMovePrimarySourceManager(OperationContext* opCtx) {
-    invariant(opCtx->lockState()->isDbLockedForMode(DatabaseName(boost::none, _dbName), MODE_IX));
-    const auto dssLock = DSSLock::lockExclusive(opCtx, this);
-    _sourceMgr = nullptr;
+void DatabaseShardingState::unsetMovePrimaryInProgress(OperationContext* opCtx) {
+    invariant(opCtx->lockState()->isDbLockedForMode(_dbName, MODE_IX));
+    _movePrimaryInProgress = false;
+}
+
+void DatabaseShardingState::setDbMetadataRefreshFuture(SharedSemiFuture<void> future,
+                                                       CancellationSource cancellationSource) {
+    invariant(!_dbMetadataRefresh);
+    _dbMetadataRefresh.emplace(std::move(future), std::move(cancellationSource));
+}
+
+boost::optional<SharedSemiFuture<void>> DatabaseShardingState::getDbMetadataRefreshFuture() const {
+    return _dbMetadataRefresh ? boost::optional<SharedSemiFuture<void>>(_dbMetadataRefresh->future)
+                              : boost::none;
+}
+
+void DatabaseShardingState::resetDbMetadataRefreshFuture() {
+    _dbMetadataRefresh = boost::none;
+}
+
+void DatabaseShardingState::_cancelDbMetadataRefresh() {
+    if (_dbMetadataRefresh) {
+        _dbMetadataRefresh->cancellationSource.cancel();
+    }
 }
 
 }  // namespace mongo

@@ -53,7 +53,9 @@ void ActiveIndexBuilds::waitForAllIndexBuildsToStopForShutdown(OperationContext*
         return;
     }
 
-    auto indexBuildToUUID = [](const auto& indexBuild) { return indexBuild.first; };
+    auto indexBuildToUUID = [](const auto& indexBuild) {
+        return indexBuild.first;
+    };
     auto begin = boost::make_transform_iterator(_allIndexBuilds.begin(), indexBuildToUUID);
     auto end = boost::make_transform_iterator(_allIndexBuilds.end(), indexBuildToUUID);
     LOGV2(4725201,
@@ -61,7 +63,9 @@ void ActiveIndexBuilds::waitForAllIndexBuildsToStopForShutdown(OperationContext*
           "indexBuilds"_attr = logv2::seqLog(begin, end));
 
     // Wait for all the index builds to stop.
-    auto pred = [this]() { return _allIndexBuilds.empty(); };
+    auto pred = [this]() {
+        return _allIndexBuilds.empty();
+    };
     _indexBuildsCondVar.wait(lk, pred);
 }
 
@@ -145,7 +149,7 @@ void ActiveIndexBuilds::unregisterIndexBuild(
                 "buildUUID"_attr = replIndexBuildState->buildUUID,
                 "collectionUUID"_attr = replIndexBuildState->collectionUUID);
 
-    indexBuildsManager->unregisterIndexBuild(replIndexBuildState->buildUUID);
+    indexBuildsManager->tearDownAndUnregisterIndexBuild(replIndexBuildState->buildUUID);
     _indexBuildsCompletedGen++;
     _indexBuildsCondVar.notify_all();
 }
@@ -161,7 +165,7 @@ std::vector<std::shared_ptr<ReplIndexBuildState>> ActiveIndexBuilds::_filterInde
     WithLock lk, IndexBuildFilterFn indexBuildFilter) const {
 
     std::vector<std::shared_ptr<ReplIndexBuildState>> indexBuilds;
-    for (auto pair : _allIndexBuilds) {
+    for (const auto& pair : _allIndexBuilds) {
         auto replState = pair.second;
         if (!indexBuildFilter(*replState)) {
             continue;
@@ -171,9 +175,12 @@ std::vector<std::shared_ptr<ReplIndexBuildState>> ActiveIndexBuilds::_filterInde
     return indexBuilds;
 }
 
-void ActiveIndexBuilds::awaitNoBgOpInProgForDb(OperationContext* opCtx, StringData db) {
+void ActiveIndexBuilds::awaitNoBgOpInProgForDb(OperationContext* opCtx,
+                                               const DatabaseName& dbName) {
     stdx::unique_lock<Latch> lk(_mutex);
-    auto indexBuildFilter = [db](const auto& replState) { return db == replState.dbName; };
+    auto indexBuildFilter = [dbName](const auto& replState) {
+        return dbName == replState.dbName;
+    };
     auto pred = [&, this]() {
         auto dbIndexBuilds = _filterIndexBuilds_inlock(lk, indexBuildFilter);
         return dbIndexBuilds.empty();
@@ -191,7 +198,7 @@ Status ActiveIndexBuilds::registerIndexBuild(
         return replIndexBuildState->collectionUUID == replState.collectionUUID;
     };
     auto collIndexBuilds = _filterIndexBuilds_inlock(lk, pred);
-    for (auto existingIndexBuild : collIndexBuilds) {
+    for (const auto& existingIndexBuild : collIndexBuilds) {
         for (const auto& name : replIndexBuildState->indexNames) {
             if (existingIndexBuild->indexNames.end() !=
                 std::find(existingIndexBuild->indexNames.begin(),

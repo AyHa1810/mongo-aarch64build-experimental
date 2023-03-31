@@ -8,15 +8,6 @@ set -o verbose
 
 rm -rf ${install_directory}
 
-# Use hardlinks to reduce the disk space impact of installing
-# all of the binaries and associated debug info.
-
-# The expansion here is a workaround to let us set a different install-action
-# for tasks that don't support the one we set here. A better plan would be
-# to support install-action for Ninja builds directly.
-# TODO: https://jira.mongodb.org/browse/SERVER-48203
-extra_args="--install-action=${task_install_action}"
-
 # By default, limit link jobs to one quarter of our overall -j
 # concurrency unless locally overridden. We do this because in
 # static link environments, the memory consumption of each
@@ -25,6 +16,9 @@ extra_args="--install-action=${task_install_action}"
 # builds, where htis is not a concern, override this value.
 echo "Changing SCons to run with --jlink=${num_scons_link_jobs_available}"
 extra_args="$extra_args --jlink=${num_scons_link_jobs_available} --separate-debug=${separate_debug}"
+
+echo "Changing SCons to run with UNITTESTS_COMPILE_CONCURRENCY=${num_scons_unit_cc_jobs_available}"
+extra_args="$extra_args UNITTESTS_COMPILE_CONCURRENCY=${num_scons_unit_cc_jobs_available}"
 
 if [ "${scons_cache_scope}" = "shared" ]; then
   extra_args="$extra_args --cache-debug=scons_cache.log"
@@ -57,6 +51,8 @@ if [ "${is_patch}" = "true" ] || [ -z "${push_bucket}" ] || [ "${compiling_for_t
 else
   extra_args="$extra_args --release"
 fi
+
+extra_args="$extra_args SPLIT_DWARF=0 GDB_INDEX=0 ENABLE_OOM_RETRY=1"
 
 if [ "${generating_for_ninja}" = "true" ] && [ "Windows_NT" = "$OS" ]; then
   vcvars="$(vswhere -latest -property installationPath | tr '\\' '/' | dos2unix.exe)/VC/Auxiliary/Build/"

@@ -34,7 +34,7 @@
 static inline int
 __cursor_skip_prev(WT_CURSOR_BTREE *cbt)
 {
-    WT_INSERT *current, *ins;
+    WT_INSERT *current, *ins, *next_ins;
     WT_ITEM key;
     WT_SESSION_IMPL *session;
     uint64_t recno;
@@ -82,7 +82,14 @@ restart:
         for (; i >= 0; i--) {
             cbt->ins_stack[i] = NULL;
             cbt->next_stack[i] = NULL;
-            ins = cbt->ins_head->head[i];
+            /*
+             * Compiler may replace the usage of the variable with another read in the following
+             * code. Here we don't need to worry about CPU reordering as we are reading a thread
+             * local value.
+             *
+             * Place a read barrier to avoid this issue.
+             */
+            WT_ORDERED_READ_WEAK_MEMORDER(ins, cbt->ins_head->head[i]);
             if (ins != NULL && ins != current)
                 break;
         }
@@ -98,11 +105,22 @@ restart:
             cbt->next_stack[0] = NULL;
             goto restart;
         }
-        if (ins->next[i] != current) /* Stay at this level */
-            ins = ins->next[i];
+        /*
+         * CPUs with weak memory ordering may reorder the read and return a stale value. This can
+         * lead us to wrongly skip a value in the lower levels of the skip list.
+         *
+         * For example, if we have A -> C initially for both level 0 and level 1 and we concurrently
+         * insert B into both level 0 and level 1. If B is visible on level 1 to this thread, it
+         * must also be visible on level 0. Otherwise, we would record an inconsistent stack.
+         *
+         * Place a read barrier to avoid this issue.
+         */
+        WT_ORDERED_READ_WEAK_MEMORDER(next_ins, ins->next[i]);
+        if (next_ins != current) /* Stay at this level */
+            ins = next_ins;
         else { /* Drop down a level */
+            cbt->next_stack[i] = next_ins;
             cbt->ins_stack[i] = &ins->next[i];
-            cbt->next_stack[i] = ins->next[i];
             --i;
         }
     }
@@ -718,7 +736,11 @@ __wt_btcur_prev(WT_CURSOR_BTREE *cbt, bool truncating)
     size_t total_skipped, skipped;
     uint32_t flags;
     bool key_out_of_bounds, newpage, restart, need_walk;
+#ifdef HAVE_DIAGNOSTIC
+    bool inclusive_set;
 
+    inclusive_set = false;
+#endif
     cursor = &cbt->iface;
     key_out_of_bounds = false;
     need_walk = false;
@@ -869,10 +891,12 @@ __wt_btcur_prev(WT_CURSOR_BTREE *cbt, bool truncating)
 
 done:
 err:
-    if (total_skipped < 100)
-        WT_STAT_CONN_DATA_INCR(session, cursor_prev_skip_lt_100);
-    else
-        WT_STAT_CONN_DATA_INCR(session, cursor_prev_skip_ge_100);
+    if (total_skipped != 0) {
+        if (total_skipped < 100)
+            WT_STAT_CONN_DATA_INCR(session, cursor_prev_skip_lt_100);
+        else
+            WT_STAT_CONN_DATA_INCR(session, cursor_prev_skip_ge_100);
+    }
 
     WT_STAT_CONN_DATA_INCRV(session, cursor_prev_skip_total, total_skipped);
 
@@ -894,6 +918,22 @@ err:
          */
         if (!F_ISSET(cbt, WT_CBT_ITERATE_RETRY_NEXT))
             ret = __wt_cursor_key_order_check(session, cbt, false);
+
+        if (need_walk) {
+            /*
+             * The bounds positioning code relies on the assumption that if we had to walk then we
+             * can't possibly have walked to the upper bound. We check that assumption here by
+             * comparing the upper bound with our current key or recno. Force inclusive to be false
+             * so we don't consider the bound itself.
+             */
+            inclusive_set = F_ISSET(cursor, WT_CURSTD_BOUND_UPPER_INCLUSIVE);
+            F_CLR(cursor, WT_CURSTD_BOUND_UPPER_INCLUSIVE);
+            ret = __wt_compare_bounds(
+              session, cursor, &cbt->iface.key, cbt->recno, true, &key_out_of_bounds);
+            WT_ASSERT(session, ret == 0 && !key_out_of_bounds);
+            if (inclusive_set)
+                F_SET(cursor, WT_CURSTD_BOUND_UPPER_INCLUSIVE);
+        }
 #endif
         break;
     case WT_PREPARE_CONFLICT:

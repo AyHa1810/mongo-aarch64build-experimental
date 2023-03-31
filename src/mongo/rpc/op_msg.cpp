@@ -40,9 +40,11 @@
 #include "mongo/db/auth/security_token_gen.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/multitenancy_gen.h"
+#include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/object_check.h"
 #include "mongo/util/bufreader.h"
+#include "mongo/util/database_name_util.h"
 #include "mongo/util/hex.h"
 
 #ifdef MONGO_CONFIG_WIREDTIGER_ENABLED
@@ -249,6 +251,102 @@ OpMsg OpMsg::parse(const Message& message, Client* client) try {
         "hexdump_message_singleData_view2ptr_message_size"_attr =
             redact(hexdump(message.singleData().view2ptr(), message.size())));
     throw;
+}
+
+OpMsgRequest OpMsgRequest::fromDBAndBody(StringData db, BSONObj body, const BSONObj& extraFields) {
+    return OpMsgRequestBuilder::create({boost::none, db}, std::move(body), extraFields);
+}
+
+boost::optional<TenantId> parseDollarTenant(const BSONObj body) {
+    if (auto tenant = body.getField("$tenant")) {
+        return TenantId::parseFromBSON(tenant);
+    } else {
+        return boost::none;
+    }
+}
+
+bool appendDollarTenant(BSONObjBuilder& builder,
+                        const TenantId& tenant,
+                        boost::optional<TenantId> existingDollarTenant = boost::none) {
+    if (existingDollarTenant) {
+        massert(8423373,
+                str::stream() << "Unable to set TenantId '" << tenant
+                              << "' on OpMsgRequest as it already has "
+                              << existingDollarTenant->toString(),
+                tenant == existingDollarTenant.value());
+        return true;
+    }
+
+    if (gMultitenancySupport) {
+        if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+            gFeatureFlagRequireTenantID.isEnabled(serverGlobalParams.featureCompatibility)) {
+            tenant.serializeToBSON("$tenant", &builder);
+            return true;
+        }
+    }
+    return false;
+}
+
+void appendDollarDbAndTenant(BSONObjBuilder& builder,
+                             const DatabaseName& dbName,
+                             boost::optional<TenantId> existingDollarTenant = boost::none) {
+    if (!dbName.tenantId() ||
+        appendDollarTenant(builder, dbName.tenantId().value(), existingDollarTenant)) {
+        builder.append("$db", dbName.db());
+    } else {
+        builder.append("$db", DatabaseNameUtil::serialize(dbName));
+    }
+}
+
+void OpMsgRequest::setDollarTenant(const TenantId& tenant) {
+    massert(8423372,
+            str::stream() << "Should not set dollar tenant " << tenant
+                          << " on the validated OpMsgRequest.",
+            !validatedTenancyScope);
+
+    auto dollarTenant = parseDollarTenant(body);
+    BSONObjBuilder bodyBuilder(std::move(body));
+    appendDollarTenant(bodyBuilder, tenant, dollarTenant);
+    body = bodyBuilder.obj();
+}
+
+OpMsgRequest OpMsgRequestBuilder::createWithValidatedTenancyScope(
+    const DatabaseName& dbName,
+    boost::optional<auth::ValidatedTenancyScope> validatedTenancyScope,
+    BSONObj body,
+    const BSONObj& extraFields) {
+    auto dollarTenant = parseDollarTenant(body);
+    OpMsgRequest request;
+    request.body = ([&] {
+        BSONObjBuilder bodyBuilder(std::move(body));
+        bodyBuilder.appendElements(extraFields);
+        if (dollarTenant) {
+            appendDollarDbAndTenant(bodyBuilder, dbName, dollarTenant);
+        } else if (validatedTenancyScope && !validatedTenancyScope->hasAuthenticatedUser()) {
+            // Add $tenant into the body if the validated tenant id comes from $tenant.
+            appendDollarDbAndTenant(bodyBuilder, dbName);
+        } else {
+            bodyBuilder.append("$db", DatabaseNameUtil::serialize(dbName));
+        }
+        return bodyBuilder.obj();
+    }());
+
+    request.validatedTenancyScope = validatedTenancyScope;
+    return request;
+}
+
+OpMsgRequest OpMsgRequestBuilder::create(const DatabaseName& dbName,
+                                         BSONObj body,
+                                         const BSONObj& extraFields) {
+    auto dollarTenant = parseDollarTenant(body);
+    BSONObjBuilder bodyBuilder(std::move(body));
+    bodyBuilder.appendElements(extraFields);
+
+    appendDollarDbAndTenant(bodyBuilder, dbName, dollarTenant);
+
+    OpMsgRequest request;
+    request.body = bodyBuilder.obj();
+    return request;
 }
 
 namespace {

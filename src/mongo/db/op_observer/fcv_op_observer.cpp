@@ -31,13 +31,13 @@
 #include "mongo/db/op_observer/fcv_op_observer.h"
 
 #include "mongo/db/commands/feature_compatibility_version.h"
-#include "mongo/db/commands/feature_compatibility_version_parser.h"
-#include "mongo/db/kill_sessions_local.h"
+#include "mongo/db/feature_compatibility_version_parser.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer/op_observer_util.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/session/kill_sessions_local.h"
 #include "mongo/executor/egress_tag_closer_manager.h"
 #include "mongo/logv2/log.h"
 #include "mongo/transport/service_entry_point.h"
@@ -53,6 +53,7 @@ MONGO_FAIL_POINT_DEFINE(finishedDropConnections);
 
 void FcvOpObserver::_setVersion(OperationContext* opCtx,
                                 multiversion::FeatureCompatibilityVersion newVersion,
+                                bool onRollback,
                                 boost::optional<Timestamp> commitTs) {
     // We set the last FCV update timestamp before setting the new FCV, to make sure we never
     // read an FCV that is not stable.  We might still read a stale one.
@@ -104,17 +105,28 @@ void FcvOpObserver::_setVersion(OperationContext* opCtx,
     const bool isReplSet =
         replCoordinator->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
     // We only want to increment the server TopologyVersion when the minWireVersion has changed.
-    // This can only happen in two scenarios:
+    // This can happen in the following cases:
     // 1. Setting featureCompatibilityVersion from downgrading to fullyDowngraded.
     // 2. Setting featureCompatibilityVersion from fullyDowngraded to upgrading.
+    // 3. Rollback from downgrading to fullyUpgraded.
+    // 4. Rollback from fullyDowngraded to downgrading.
+    // Note that the minWireVersion does not change between downgrading -> isCleaningServerMetadata,
+    // as the FCV of the isCleaningServerMetadata is still kDowngrading, so the prevVersion and
+    // newVersion will be equal
     // (Generic FCV reference): This FCV check should exist across LTS binary versions.
-    const auto shouldIncrementTopologyVersion = newVersion == multiversion::GenericFCV::kLastLTS ||
-        (prevVersion &&
-         prevVersion.get() == multiversion::GenericFCV::kDowngradingFromLatestToLastContinuous) ||
-        newVersion == multiversion::GenericFCV::kUpgradingFromLastLTSToLatest ||
-        newVersion == multiversion::GenericFCV::kUpgradingFromLastContinuousToLatest ||
-        newVersion == multiversion::GenericFCV::kUpgradingFromLastLTSToLastContinuous;
-
+    const auto shouldIncrementTopologyVersion =
+        (newVersion == multiversion::GenericFCV::kLastLTS ||
+         (prevVersion &&
+          prevVersion.value() ==
+              multiversion::GenericFCV::kDowngradingFromLatestToLastContinuous) ||
+         newVersion == multiversion::GenericFCV::kUpgradingFromLastLTSToLatest ||
+         newVersion == multiversion::GenericFCV::kUpgradingFromLastContinuousToLatest ||
+         newVersion == multiversion::GenericFCV::kUpgradingFromLastLTSToLastContinuous ||
+         // (Generic FCV reference): This FCV check should exist across LTS binary versions.
+         (onRollback &&
+          (prevVersion == multiversion::GenericFCV::kLastLTS ||
+           newVersion == multiversion::GenericFCV::kLatest))) &&
+        !(prevVersion && prevVersion.value() == newVersion);
     if (isReplSet && shouldIncrementTopologyVersion) {
         replCoordinator->incrementTopologyVersion();
     }
@@ -128,8 +140,8 @@ void FcvOpObserver::_onInsertOrUpdate(OperationContext* opCtx, const BSONObj& do
     }
     auto newVersion = uassertStatusOK(FeatureCompatibilityVersionParser::parse(doc));
 
-    // To avoid extra log messages when the targetVersion is set/unset, only log when the version
-    // changes.
+    // To avoid extra log messages when the targetVersion is set/unset, only log when the
+    // version changes.
     logv2::DynamicAttributes attrs;
     bool isDifferent = true;
     if (serverGlobalParams.featureCompatibility.isVersionInitialized()) {
@@ -144,16 +156,18 @@ void FcvOpObserver::_onInsertOrUpdate(OperationContext* opCtx, const BSONObj& do
     }
 
     opCtx->recoveryUnit()->onCommit(
-        [opCtx, newVersion](boost::optional<Timestamp> ts) { _setVersion(opCtx, newVersion, ts); });
+        [newVersion](OperationContext* opCtx, boost::optional<Timestamp> ts) {
+            _setVersion(opCtx, newVersion, false /*onRollback*/, ts);
+        });
 }
 
 void FcvOpObserver::onInserts(OperationContext* opCtx,
-                              const NamespaceString& nss,
-                              const UUID& uuid,
+                              const CollectionPtr& coll,
                               std::vector<InsertStatement>::const_iterator first,
                               std::vector<InsertStatement>::const_iterator last,
-                              bool fromMigrate) {
-    if (nss.isServerConfigurationCollection()) {
+                              std::vector<bool> fromMigrate,
+                              bool defaultFromMigrate) {
+    if (coll->ns().isServerConfigurationCollection()) {
         for (auto it = first; it != last; it++) {
             _onInsertOrUpdate(opCtx, it->doc);
         }
@@ -164,22 +178,22 @@ void FcvOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs
     if (args.updateArgs->update.isEmpty()) {
         return;
     }
-    if (args.nss.isServerConfigurationCollection()) {
+    if (args.coll->ns().isServerConfigurationCollection()) {
         _onInsertOrUpdate(opCtx, args.updateArgs->updatedDoc);
     }
 }
 
 void FcvOpObserver::onDelete(OperationContext* opCtx,
-                             const NamespaceString& nss,
-                             const UUID& uuid,
+                             const CollectionPtr& coll,
                              StmtId stmtId,
                              const OplogDeleteEntryArgs& args) {
+    const auto& nss = coll->ns();
     // documentKeyDecoration is set in OpObserverImpl::aboutToDelete. So the FcvOpObserver
     // relies on the OpObserverImpl also being in the opObserverRegistry.
     auto optDocKey = repl::documentKeyDecoration(opCtx);
     invariant(optDocKey, nss.ns());
     if (nss.isServerConfigurationCollection()) {
-        auto id = optDocKey.get().getId().firstElement();
+        auto id = optDocKey.value().getId().firstElement();
         if (id.type() == BSONType::String && id.String() == multiversion::kParameterName) {
             uasserted(40670, "removing FeatureCompatibilityVersion document is not allowed");
         }
@@ -202,7 +216,7 @@ void FcvOpObserver::_onReplicationRollback(OperationContext* opCtx,
                   "Setting featureCompatibilityVersion as part of rollback",
                   "newVersion"_attr = multiversion::toString(diskFcv),
                   "oldVersion"_attr = multiversion::toString(memoryFcv));
-            _setVersion(opCtx, diskFcv);
+            _setVersion(opCtx, diskFcv, true /*onRollback*/);
             // The rollback FCV is already in the stable snapshot.
             FeatureCompatibilityVersion::clearLastFCVUpdateTimestamp();
         }

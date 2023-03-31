@@ -2,6 +2,7 @@
 "use strict";
 
 load('jstests/aggregation/extras/utils.js');  // For assertArrayEq
+load('jstests/libs/optimizer_utils.js');      // For checkCascadesOptimizerEnabled
 
 const t = db.type_bracket;
 t.drop();
@@ -43,23 +44,13 @@ const docs = [
 assert.commandWorked(t.insert(docs));
 
 const runTest = (filter, expected) => {
-    try {
-        // Disable pipeline optimization because it is unclear if pipeline optimization is masking
-        // some bugs in ABT translation
-        assert.commandWorked(db.adminCommand(
-            {'configureFailPoint': 'disablePipelineOptimization', 'mode': 'alwaysOn'}));
-
-        const result = t.aggregate({$match: filter}).toArray();
-        assertArrayEq({
-            actual: result,
-            expected: expected,
-        });
-    } finally {
-        assert.commandWorked(
-            db.adminCommand({'configureFailPoint': 'disablePipelineOptimization', 'mode': 'off'}));
-    }
+    const result = t.aggregate({$match: filter}).toArray();
+    assertArrayEq({
+        actual: result,
+        expected: expected,
+    });
 };
-const tests = [
+let tests = [
     // Number
     {filter: {a: {$gt: NumberInt(0)}}, expected: [docs[2], docs[3], docs[4], docs[7], docs[15]]},
     {filter: {a: {$lte: 0}}, expected: [docs[30]]},
@@ -94,9 +85,11 @@ const tests = [
     {filter: {a: {$gte: new Timestamp(10, 1)}}, expected: []},
 
     // Null
-    // TODO SERVER-67853 Uncomment after fixing ABT Translation for comparing GTE and LTE null
-    // {filter: {a: {$gte: null}}, expected: [docs[1], docs[29]]},
-    // {filter: {a: {$lte: null}}, expected: [docs[1], docs[29]]},
+    {filter: {a: {$eq: null}}, expected: [docs[1], docs[29]]},
+    {filter: {a: {$gte: null}}, expected: [docs[1], docs[29]]},
+    {filter: {a: {$lte: null}}, expected: [docs[1], docs[29]]},
+    {filter: {a: {$gt: null}}, expected: []},
+    {filter: {a: {$lt: null}}, expected: []},
 
     {filter: {a: {$gte: false}}, expected: [docs[26], docs[27]]},
     {filter: {a: {$lt: false}}, expected: []},
@@ -114,12 +107,6 @@ const tests = [
         expected: [docs[12], docs[16], docs[20], docs[22]]
     },
 
-    // MaxKey
-    // TODO SERVER-67624 Uncomment after fixing translations for match exprs against MinKey/MaxKey
-    // TODO SERVER-67853 Uncomment after fixing ABT Translation for comparing GTE and LTE min/maxkey
-    // {filter: {a: {$lte: MaxKey()}}, expected: docs},
-    // {filter: {a: {$gte: MaxKey()}}, expected: docs[docs.length - 1]},
-
     // CODEWSCOPE
     {filter: {a: {$gte: new Code('function() {x++;}', {})}}, expected: [docs[24]]},
     {filter: {a: {$lt: new Code('x', {})}}, expected: [docs[25]]},
@@ -129,6 +116,24 @@ const tests = [
     {filter: {a: {$lte: new Code("")}}, expected: []},
 
 ];
+
+// Include Min/MaxKey type bracketing tests conditional on using CQF.
+// TODO SERVER-68274: Always include these testcases once SBE correctly handles the semantics of
+// missing fields and type bracketing (missing field is implicitly null which is greater than
+// MinKey).
+if (checkCascadesOptimizerEnabled(db)) {
+    tests.push(
+        // MinKey
+        {filter: {a: {$gte: MinKey()}}, expected: docs},
+        {filter: {a: {$gt: MinKey()}}, expected: docs.slice(1)},
+        {filter: {a: {$lte: MinKey()}}, expected: [docs[0]]},
+        {filter: {a: {$lt: MinKey()}}, expected: []},
+        // MaxKey
+        {filter: {a: {$lte: MaxKey()}}, expected: docs},
+        {filter: {a: {$lt: MaxKey()}}, expected: docs.slice(0, 31)},
+        {filter: {a: {$gte: MaxKey()}}, expected: [docs[31]]},
+        {filter: {a: {$gt: MaxKey()}}, expected: []});
+}
 
 for (const testData of tests) {
     runTest(testData.filter, testData.expected);

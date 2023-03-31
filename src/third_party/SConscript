@@ -11,24 +11,32 @@ Import([
     'use_system_version_of_library',
     'use_vendored_libunwind',
     'wiredtiger',
+    'releaseBuild',
+    'ssl_provider',
 ])
 
 snappySuffix = '-1.1.7'
 icuSuffix = '-57.1'
-timelibSuffix = '-2021.06'
 tomcryptSuffix = '-1.18.2'
 variantSuffix = '-1.4.0'
 
 thirdPartyEnvironmentModifications = {
-    'abseil-cpp': {'CPPPATH': ['#/src/third_party/abseil-cpp-master/abseil-cpp'], },
+    'abseil-cpp': {'CPPPATH': ['#/src/third_party/abseil-cpp/dist'], },
+    'cares': {
+        'CPPPATH': [
+            '#src/third_party/cares/dist/include',
+            '#src/third_party/cares/platform/${TARGET_OS}_${TARGET_ARCH}/install/include'
+        ],
+    },
     'fmt': {'CPPPATH': ['#src/third_party/fmt/dist/include'], },
+    'immer': {'CPPPATH': ['#src/third_party/immer/dist'], },
     's2': {'CPPPATH': ['#src/third_party/s2'], },
     'safeint': {
         'CPPPATH': ['#src/third_party/SafeInt'],
         # SAFEINT_USE_INTRINSICS=0 for overflow-safe constexpr multiply. See comment in SafeInt.hpp.
         'CPPDEFINES': [('SAFEINT_USE_INTRINSICS', 0)],
     },
-    'timelib': {'CPPPATH': ['#/src/third_party/timelib' + timelibSuffix], },
+    'timelib': {'CPPPATH': ['#/src/third_party/timelib'], },
     'unwind': {},
     'variant': {'CPPPATH': ['#src/third_party/variant' + variantSuffix + '/include'], },
     'mozjs': {
@@ -39,7 +47,14 @@ thirdPartyEnvironmentModifications = {
             "/include",
         ],
         'FORCEINCLUDES': ['js-config.h', ],
-    }
+    },
+    'murmurhash3': {'CPPPATH': ['#src/third_party/murmurhash3', ], },
+    'librdkafka': {
+        'CPPPATH': [
+            '#/src/third_party/librdkafka/dist/src',
+            '#/src/third_party/librdkafka/dist/src-cpp',
+        ],
+    },
 }
 
 
@@ -159,7 +174,7 @@ if not use_system_version_of_library('asio'):
 
 if not use_system_version_of_library('intel_decimal128'):
     thirdPartyEnvironmentModifications['intel_decimal128'] = {
-        'CPPPATH': ['#/src/third_party/IntelRDFPMathLib20U1/LIBRARY'],
+        'CPPPATH': ['#/src/third_party/IntelRDFPMathLib20U1/LIBRARY/src'],
     }
 
 if not use_system_version_of_library('icu'):
@@ -170,10 +185,72 @@ if not use_system_version_of_library('icu'):
         ],
     }
 
-if not use_system_version_of_library('kms-message'):
-    thirdPartyEnvironmentModifications['kms-message'] = {
-        'CPPPATH': ['#/src/third_party/kms-message/src'],
-        'CPPDEFINES': ['KMS_MSG_STATIC'],
+if not use_system_version_of_library('libbson'):
+
+    platform_directory = "build_linux"
+
+    if env['TARGET_ARCH'] == 's390x':
+        platform_directory = "build_linux_s390x"
+
+    if env.TargetOSIs('windows'):
+        platform_directory = "build_windows"
+    elif env.TargetOSIs('darwin'):
+        platform_directory = "build_osx"
+
+    thirdPartyEnvironmentModifications['libbson'] = {
+        'CPPPATH': [
+            '#/src/third_party/libbson/dist/src/libbson/src',
+            '#/src/third_party/libbson/' + platform_directory,
+            '#/src/third_party/libbson/' + platform_directory + '/bson',
+        ],
+        'CPPDEFINES': ['BSON_STATIC'],
+    }
+
+if not use_system_version_of_library('libmongocrypt'):
+
+    platform_directory = "build_linux"
+    crypto_directory = "build_libcrypto"
+
+    if env.TargetOSIs('windows'):
+        platform_directory = "build_windows"
+        crypto_directory = "build_cng"
+    elif env.TargetOSIs('darwin'):
+        platform_directory = "build_osx"
+        crypto_directory = "build_commoncrypto"
+
+    if get_option('ssl') == 'off':
+        crypto_directory = "build_none"
+
+    thirdPartyEnvironmentModifications['libmongocrypt'] = {
+        'CPPPATH': [
+            '#/src/third_party/libmongocrypt/dist/src',
+            '#/src/third_party/libmongocrypt/dist/kms-message/src',
+            '#/src/third_party/libmongocrypt/' + platform_directory,
+            '#/src/third_party/libmongocrypt/' + crypto_directory,
+        ],
+        'CPPDEFINES': [
+            'KMS_MSG_STATIC',
+            'MONGOCRYPT_STATIC_DEFINE',
+        ],
+    }
+
+if not use_system_version_of_library('protobuf'):
+    thirdPartyEnvironmentModifications['protobuf'] = {
+        'CPPPATH': ['#src/third_party/protobuf/dist/src'],
+    }
+
+if not use_system_version_of_library('grpc'):
+    thirdPartyEnvironmentModifications['grpc'] = {
+        'CPPPATH': ['#src/third_party/grpc/dist/include'],
+    }
+    thirdPartyEnvironmentModifications['re2'] = {
+        'CPPPATH': ['#src/third_party/re2/dist'],
+    }
+    thirdPartyEnvironmentModifications['cares'] = {
+        'CPPPATH': [
+            '#src/third_party/cares/dist/include',
+            '#src/third_party/cares/platform/${TARGET_OS}_${TARGET_ARCH}/install/include'
+        ],
     }
 
 if use_system_libunwind:
@@ -202,6 +279,16 @@ def injectThirdParty(thisEnv, libraries=[], parts=[]):
 
 env.AddMethod(injectThirdParty, 'InjectThirdParty')
 
+
+def shouldBuildStreams(thisEnv):
+    # TODO https://jira.mongodb.org/browse/SERVER-74963: Streams release builds.
+    # TODO https://jira.mongodb.org/browse/SERVER-74961: Support other platforms.
+    return not releaseBuild and thisEnv.TargetOSIs(
+        'linux') and thisEnv['TARGET_ARCH'] == 'x86_64' and ssl_provider == 'openssl'
+
+
+env.AddMethod(shouldBuildStreams, 'ShouldBuildStreams')
+
 env = env.Clone()
 
 # Construct an empty object file that we can use to produce the
@@ -215,10 +302,8 @@ empty_source = env.Textfile(
 )
 env.Alias('generated-sources', empty_source)
 
-empty_object = env.LibraryObject(
-    target='third_party_shim',
-    source=empty_source,
-)
+empty_object = env.LibraryObject(target='third_party_shim', source=empty_source,
+                                 NINJA_GENSOURCE_INDEPENDENT=True)
 
 
 def shim_library(env, name, **kwargs):
@@ -287,7 +372,7 @@ if use_libunwind:
             'unwind/unwind',
         ])
 
-    unwindEnv.ShimLibrary(name="unwind", )
+    unwindEnv.ShimLibrary(name="unwind", NINJA_GENSOURCE_INDEPENDENT=True)
 
 fmtEnv = env.Clone()
 if use_system_version_of_library("fmt"):
@@ -348,14 +433,16 @@ else:
 
 boostEnv.ShimLibrary(name="boost")
 
-abseilDirectory = 'abseil-cpp-master'
+abseilDirectory = 'abseil-cpp'
 abseilEnv = env.Clone()
 abseilEnv.InjectThirdParty(libraries=['abseil-cpp'])
 abseilEnv.SConscript(abseilDirectory + '/SConscript', exports={'env': abseilEnv})
 abseilEnv = abseilEnv.Clone(LIBDEPS_INTERFACE=[
-    abseilDirectory + '/absl_container',
+    abseilDirectory + '/absl_city',
     abseilDirectory + '/absl_hash',
-    abseilDirectory + '/absl_numeric',
+    abseilDirectory + '/absl_int128',
+    abseilDirectory + '/absl_low_level_hash',
+    abseilDirectory + '/absl_raw_hash_set',
 ])
 
 abseilEnv.ShimLibrary(name="abseil")
@@ -389,7 +476,7 @@ else:
         'zlib/zlib',
     ])
 
-zlibEnv.ShimLibrary(name="zlib", )
+zlibEnv.ShimLibrary(name="zlib", NINJA_GENSOURCE_INDEPENDENT=True)
 
 zstdEnv = env.Clone()
 if use_system_version_of_library("zstd"):
@@ -476,6 +563,7 @@ gperftoolsEnv.ShimLibrary(
         # allowed to have public dependencies.
         'lint-public-dep-allowed'
     ],
+    NINJA_GENSOURCE_INDEPENDENT=True,
 )
 
 stemmerEnv = env.Clone()
@@ -510,9 +598,9 @@ yamlEnv.ShimLibrary(name="yaml")
 
 timelibEnv = env.Clone()
 timelibEnv.InjectThirdParty(libraries=['timelib'])
-timelibEnv.SConscript('timelib' + timelibSuffix + '/SConscript', exports={'env': timelibEnv})
+timelibEnv.SConscript('timelib' + '/SConscript', exports={'env': timelibEnv})
 timelibEnv = timelibEnv.Clone(LIBDEPS_INTERFACE=[
-    'timelib' + timelibSuffix + '/timelib',
+    'timelib' + '/timelib',
 ])
 
 timelibEnv.ShimLibrary(name='timelib', )
@@ -584,18 +672,77 @@ else:
 
 icuEnv.ShimLibrary(name="icu", )
 
-kmsEnv = env.Clone()
-if get_option('ssl') == 'on':
-    if use_system_version_of_library("kms-message"):
-        kmsEnv = kmsEnv.Clone(SYSLIBDEPS=[
-            env['LIBDEPS_KMS-MESSAGE_SYSLIBDEP'],
+libbsonEnv = env.Clone()
+if use_system_version_of_library("libbson"):
+    libbsonEnv = libbsonEnv.Clone(SYSLIBDEPS=[
+        env['LIBDEPS_LIBBSON_SYSLIBDEP'],
+    ])
+else:
+    libbsonEnv = libbsonEnv.Clone()
+    libbsonEnv.InjectThirdParty(libraries=['libbson'])
+    libbsonEnv.SConscript('libbson/SConscript', exports={'env': libbsonEnv})
+    libbsonEnv = libbsonEnv.Clone(LIBDEPS_INTERFACE=[
+        'libbson/libbson',
+    ])
+
+libbsonEnv.ShimLibrary(name="libbson", )
+
+mcEnv = env.Clone()
+if use_system_version_of_library("libmongocrypt"):
+    mcEnv = mcEnv.Clone(SYSLIBDEPS=[
+        env['LIBDEPS_LIBMONGOCRYPT_SYSLIBDEP'],
+    ])
+else:
+    mcEnv = mcEnv.Clone()
+    mcEnv.InjectThirdParty(libraries=['libmongocrypt'])
+    mcEnv.SConscript('libmongocrypt/SConscript', exports={'env': mcEnv})
+    mcEnv = mcEnv.Clone(LIBDEPS_INTERFACE=[
+        'libmongocrypt/libmongocrypt',
+    ])
+
+mcEnv.ShimLibrary(name="libmongocrypt", )
+
+if env.TargetOSIs('linux') and env['ENABLE_GRPC_BUILD']:
+
+    protobufEnv = env.Clone(NINJA_GENSOURCE_INDEPENDENT=True)
+    if use_system_version_of_library("protobuf"):
+        protobufEnv = protobufEnv.Clone(
+            SYSLIBDEPS=[
+                env['LIBDEPS_PROTOBUF_SYSLIBDEP'],
+                env['LIBDEPS_PROTOC_SYSLIBDEP'],
+            ], )
+    else:
+        protobufEnv.SConscript(dirs=[
+            'protobuf',
+        ], duplicate=False, exports={'env': env})
+        protobufEnv = protobufEnv.Clone(LIBDEPS_INTERFACE=[
+            'protobuf/protoc',
+        ])
+    protobufEnv.ShimLibrary(name="protobuf", )
+
+    grpcEnv = env.Clone()
+    if use_system_version_of_library("grpc"):
+        grpcEnv = grpcEnv.Clone(SYSLIBDEPS=[
+            env['LIBDEPS_GRPC_SYSLIBDEP'],
+            env['LIBDEPS_GRPCXX_SYSLIBDEP'],
+            env['LIBDEPS_GRPCXX_REFLECTION_SYSLIBDEP'],
         ])
     else:
-        kmsEnv = kmsEnv.Clone()
-        kmsEnv.InjectThirdParty(libraries=['kms-message'])
-        kmsEnv.SConscript('kms-message/SConscript', exports={'env': kmsEnv})
-        kmsEnv = kmsEnv.Clone(LIBDEPS_INTERFACE=[
-            'kms-message/kms-message',
+        grpcEnv.SConscript(dirs=[
+            'cares',
+            're2',
+            'grpc',
+        ], duplicate=False, exports={'env': env})
+        grpcEnv = grpcEnv.Clone(LIBDEPS_INTERFACE=[
+            'grpc/grpc++_reflection',
         ])
+    grpcEnv.ShimLibrary(name="grpc", )
 
-    kmsEnv.ShimLibrary(name="kms_message", )
+if env.ShouldBuildStreams():
+    libKafkaEnv = env.Clone()
+    libKafkaEnv.InjectThirdParty(libraries=['librdkafka'])
+    libKafkaEnv.SConscript('librdkafka/SConscript', exports={'env': libKafkaEnv})
+    libKafkaEnv = libKafkaEnv.Clone(LIBDEPS_INTERFACE=[
+        'librdkafka/rdkafka',
+        'librdkafka/rdkafka++',
+    ])

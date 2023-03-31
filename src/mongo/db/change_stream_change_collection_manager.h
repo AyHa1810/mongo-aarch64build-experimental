@@ -30,17 +30,72 @@
 #pragma once
 
 #include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/change_collection_truncate_markers.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/collection_markers.h"
+#include "mongo/util/concurrent_shared_values_map.h"
 
 namespace mongo {
+
+/**
+ * Metadata associated with a particular change collection that is used by the purging job.
+ */
+struct ChangeCollectionPurgingJobMetadata {
+    // The wall time in milliseconds of the first document of the change collection.
+    long long firstDocWallTimeMillis;
+
+    // Current maximum record id present in the change collection.
+    RecordIdBound maxRecordIdBound;
+};
 
 /**
  * Manages the creation, deletion and insertion lifecycle of the change collection.
  */
 class ChangeStreamChangeCollectionManager {
 public:
+    /**
+     * Statistics of the change collection purging job.
+     */
+    struct PurgingJobStats {
+        /**
+         * Total number of deletion passes completed by the purging job.
+         */
+        AtomicWord<long long> totalPass;
+
+        /**
+         * Cumulative number of change collections documents deleted by the purging job.
+         */
+        AtomicWord<long long> docsDeleted;
+
+        /**
+         * Cumulative size in bytes of all deleted documents from all change collections by the
+         * purging job.
+         */
+        AtomicWord<long long> bytesDeleted;
+
+        /**
+         * Cumulative number of change collections scanned by the purging job.
+         */
+        AtomicWord<long long> scannedCollections;
+
+        /**
+         * Cumulative number of milliseconds elapsed since the first pass by the purging job.
+         */
+        AtomicWord<long long> timeElapsedMillis;
+
+        /**
+         * Maximum wall time in milliseconds from the first document of each change collection.
+         */
+        AtomicWord<long long> maxStartWallTimeMillis;
+
+        /**
+         * Serializes the purging job statistics to the BSON object.
+         */
+        BSONObj toBSON() const;
+    };
+
     explicit ChangeStreamChangeCollectionManager(ServiceContext* service) {}
 
     ~ChangeStreamChangeCollectionManager() = default;
@@ -61,30 +116,14 @@ public:
     static ChangeStreamChangeCollectionManager& get(OperationContext* opCtx);
 
     /**
-     * Returns true if change collections are enabled for recording oplog entries, false
-     * otherwise.
+     * Creates a change collection for the specified tenant, if it doesn't exist.
      */
-    static bool isChangeCollectionsModeActive();
-
-    /**
-     * Returns true if the change collection is present for the specified tenant, false otherwise.
-     */
-    bool hasChangeCollection(OperationContext* opCtx, boost::optional<TenantId> tenantId) const;
-
-    /**
-     * Creates a change collection for the specified tenant, if it doesn't exist. Returns Status::OK
-     * if the change collection already exists.
-     *
-     * TODO: SERVER-65950 make tenantId field mandatory.
-     */
-    Status createChangeCollection(OperationContext* opCtx, boost::optional<TenantId> tenantId);
+    void createChangeCollection(OperationContext* opCtx, const TenantId& tenantId);
 
     /**
      * Deletes the change collection for the specified tenant, if it already exist.
-     *
-     * TODO: SERVER-65950 make tenantId field mandatory.
      */
-    Status dropChangeCollection(OperationContext* opCtx, boost::optional<TenantId> tenantId);
+    void dropChangeCollection(OperationContext* opCtx, const TenantId& tenantId);
 
     /**
      * Inserts documents to change collections. The parameter 'oplogRecords' is a vector of oplog
@@ -96,8 +135,6 @@ public:
      *
      * Failure in insertion to any change collection will result in a fatal exception and will bring
      * down the node.
-     *
-     * TODO: SERVER-65950 make tenantId field mandatory.
      */
     void insertDocumentsToChangeCollection(OperationContext* opCtx,
                                            const std::vector<Record>& oplogRecords,
@@ -117,6 +154,47 @@ public:
         std::vector<InsertStatement>::const_iterator endOplogEntries,
         bool isGlobalIXLockAcquired,
         OpDebug* opDebug);
-};
 
+    PurgingJobStats& getPurgingJobStats() {
+        return _purgingJobStats;
+    }
+
+    /**
+     * Scans the provided change collection and returns its metadata that will be used by the
+     * purging job to perform deletion on it. The method returns 'boost::none' if the collection is
+     * empty.
+     */
+    static boost::optional<ChangeCollectionPurgingJobMetadata>
+    getChangeCollectionPurgingJobMetadata(OperationContext* opCtx,
+                                          const CollectionPtr* changeCollection);
+
+    /**
+     * Removes documents from a change collection whose wall time is less than the 'expirationTime'.
+     * Returns the number of documents deleted. The 'maxRecordIdBound' is the maximum record id
+     * bound that will not be included in the collection scan.
+     *
+     * The removal process is performed with a collection scan + batch delete.
+     */
+    static size_t removeExpiredChangeCollectionsDocumentsWithCollScan(
+        OperationContext* opCtx,
+        const CollectionPtr* changeCollection,
+        RecordIdBound maxRecordIdBound,
+        Date_t expirationTime);
+
+    /**
+     * Removes documents from a change collection whose wall time is less than the 'expirationTime'.
+     * Returns the number of documents deleted. The 'maxRecordIdBound' is the maximum record id
+     * bound that will not be included in the collection scan.
+     *
+     * The removal process is performed with a single range truncate call to the record store.
+     */
+    static size_t removeExpiredChangeCollectionsDocumentsWithTruncate(
+        OperationContext* opCtx, const CollectionPtr* changeCollection, Date_t expirationTime);
+
+private:
+    // Change collections purging job stats.
+    PurgingJobStats _purgingJobStats;
+    ConcurrentSharedValuesMap<UUID, ChangeCollectionTruncateMarkers, UUID::Hash>
+        _tenantTruncateMarkersMap;
+};
 }  // namespace mongo

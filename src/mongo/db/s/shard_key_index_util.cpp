@@ -68,6 +68,10 @@ boost::optional<ShardKeyIndex> _findShardKeyPrefixedIndex(
             continue;
         }
 
+        if (indexDescriptor->hidden()) {
+            continue;
+        }
+
         if (isCompatibleWithShardKey(
                 opCtx, collection, indexEntry, shardKey, requireSingleKey, errMsg)) {
             if (!indexEntry->isMultikey(opCtx, collection)) {
@@ -179,24 +183,38 @@ bool isCompatibleWithShardKey(OperationContext* opCtx,
     return false;
 }
 
-bool isLastShardKeyIndex(OperationContext* opCtx,
-                         const CollectionPtr& collection,
-                         const IndexCatalog* indexCatalog,
-                         const std::string& indexName,
-                         const BSONObj& shardKey) {
-    return !_findShardKeyPrefixedIndex(
-                opCtx, collection, indexCatalog, indexName, shardKey, false /* requireSingleKey */)
-                .is_initialized();
+bool isLastNonHiddenShardKeyIndex(OperationContext* opCtx,
+                                  const CollectionPtr& collection,
+                                  const std::string& indexName,
+                                  const BSONObj& shardKey) {
+    const auto index = collection->getIndexCatalog()->findIndexByName(opCtx, indexName);
+    if (!index ||
+        !isCompatibleWithShardKey(
+            opCtx, collection, index->getEntry(), shardKey, false /* requireSingleKey */)) {
+        return false;
+    }
+
+    return !_findShardKeyPrefixedIndex(opCtx,
+                                       collection,
+                                       collection->getIndexCatalog(),
+                                       indexName,
+                                       shardKey,
+                                       true /* requireSingleKey */)
+                .has_value();
 }
 
 boost::optional<ShardKeyIndex> findShardKeyPrefixedIndex(OperationContext* opCtx,
                                                          const CollectionPtr& collection,
-                                                         const IndexCatalog* indexCatalog,
                                                          const BSONObj& shardKey,
                                                          bool requireSingleKey,
                                                          std::string* errMsg) {
-    return _findShardKeyPrefixedIndex(
-        opCtx, collection, indexCatalog, boost::none, shardKey, requireSingleKey, errMsg);
+    return _findShardKeyPrefixedIndex(opCtx,
+                                      collection,
+                                      collection->getIndexCatalog(),
+                                      boost::none,
+                                      shardKey,
+                                      requireSingleKey,
+                                      errMsg);
 }
 
 }  // namespace mongo

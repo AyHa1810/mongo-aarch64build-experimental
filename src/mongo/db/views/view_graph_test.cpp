@@ -40,6 +40,7 @@
 #include "mongo/db/query/query_test_service_context.h"
 #include "mongo/db/views/view.h"
 #include "mongo/db/views/view_graph.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -49,9 +50,9 @@ const auto kTestDb = DatabaseName(boost::none, "test");
 constexpr auto kFooName = "foo"_sd;
 constexpr auto kBarName = "bar"_sd;
 constexpr auto kQuxName = "qux"_sd;
-const auto kFooNamespace = NamespaceString(kTestDb, kFooName);
-const auto kBarNamespace = NamespaceString(kTestDb, kBarName);
-const auto kQuxNamespace = NamespaceString(kTestDb, kQuxName);
+const auto kFooNamespace = NamespaceString::createNamespaceString_forTest(kTestDb, kFooName);
+const auto kBarNamespace = NamespaceString::createNamespaceString_forTest(kTestDb, kBarName);
+const auto kQuxNamespace = NamespaceString::createNamespaceString_forTest(kTestDb, kQuxName);
 const auto kEmptyPipeline = BSONArray();
 const auto kBinaryCollation = BSONObj();
 const auto kFilipinoCollation = BSON("locale"
@@ -246,11 +247,13 @@ TEST_F(ViewGraphFixture, DroppingViewPreservesNodeInGraphIfDependedOnByOtherView
 }
 
 TEST_F(ViewGraphFixture, DifferentTenantsCanCreateViewWithConflictingNamespaces) {
+    RAIIServerParameterControllerForTest multitenancyController("multitenancySupport", true);
+
     DatabaseName db1(TenantId(OID::gen()), "test");
     DatabaseName db2(TenantId(OID::gen()), "test");
 
-    NamespaceString viewOn1(db1, kBarName);
-    NamespaceString viewOn2(db2, kBarName);
+    NamespaceString viewOn1 = NamespaceString::createNamespaceString_forTest(db1, kBarName);
+    NamespaceString viewOn2 = NamespaceString::createNamespaceString_forTest(db2, kBarName);
 
     // Create a view "foo" on tenant1's collection "test.bar".
     const auto fooView1 =
@@ -265,7 +268,7 @@ TEST_F(ViewGraphFixture, DifferentTenantsCanCreateViewWithConflictingNamespaces)
     ASSERT_EQ(viewGraph()->size(), 4UL);
 
     // Remove tenant1's view "foo".
-    NamespaceString viewToRemove(db1, kFooName);
+    NamespaceString viewToRemove = NamespaceString::createNamespaceString_forTest(db1, kFooName);
     viewGraph()->remove(viewToRemove);
     ASSERT_EQ(viewGraph()->size(), 2UL);
 }

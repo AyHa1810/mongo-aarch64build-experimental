@@ -101,7 +101,7 @@ public:
             auto catalogCache = Grid::get(opCtx)->catalogCache();
             auto swDbInfo = Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, fromNss.db());
             if (swDbInfo == ErrorCodes::NamespaceNotFound) {
-                uassert(CollectionUUIDMismatchInfo(fromNss.db().toString(),
+                uassert(CollectionUUIDMismatchInfo(fromNss.dbName(),
                                                    *request().getCollectionUUID(),
                                                    fromNss.coll().toString(),
                                                    boost::none),
@@ -109,7 +109,6 @@ public:
                         !request().getCollectionUUID());
             }
             const auto dbInfo = uassertStatusOK(swDbInfo);
-            auto cri = uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, fromNss));
 
             auto shard = uassertStatusOK(
                 Grid::get(opCtx)->shardRegistry()->getShard(opCtx, dbInfo->getPrimary()));
@@ -131,6 +130,7 @@ public:
                 toNss, renameCollResp.getCollectionVersion(), dbInfo->getPrimary());
 
             catalogCache->invalidateCollectionEntry_LINEARIZABLE(fromNss);
+            catalogCache->invalidateIndexEntry_LINEARIZABLE(fromNss);
         }
 
         NamespaceString ns() const override {

@@ -115,7 +115,10 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    void lockRSTLComplete(OperationContext* opCtx, LockMode mode, Date_t deadline) override {
+    void lockRSTLComplete(OperationContext* opCtx,
+                          LockMode mode,
+                          Date_t deadline,
+                          const LockTimeoutCallback& onTimeout) override {
         MONGO_UNREACHABLE;
     }
 
@@ -170,10 +173,6 @@ public:
     }
 
     void restoreLockState(OperationContext* opCtx, const LockSnapshot& stateToRestore) override {
-        MONGO_UNREACHABLE;
-    }
-
-    void restoreLockState(const LockSnapshot& stateToRestore) override {
         MONGO_UNREACHABLE;
     }
 

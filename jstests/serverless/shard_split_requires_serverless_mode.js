@@ -1,6 +1,6 @@
 /**
  * Prove that shard split commands are not supported outside of serverless mode.
- * @tags: [requires_fcv_52, featureFlagShardSplit]
+ * @tags: [requires_fcv_63, serverless]
  */
 
 (function() {
@@ -8,7 +8,7 @@
 
 const conn = MongoRunner.runMongod();
 const migrationId = UUID();
-const tenantIds = ["tenantA", "tenantB"];
+const tenantIds = [ObjectId(), ObjectId()];
 const recipientSetName = "recipient";
 const recipientTagName = "recipientNode";
 assert.commandFailedWithCode(

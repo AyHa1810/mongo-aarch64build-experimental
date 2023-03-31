@@ -55,7 +55,7 @@ void validate(OperationContext* opCtx,
               boost::optional<ExplainOptions::Verbosity> explainVerbosity);
 
 AggregateCommandRequest parseFromBSON(OperationContext* opCtx,
-                                      const std::string& dbName,
+                                      const DatabaseName& dbName,
                                       const BSONObj& cmdObj,
                                       boost::optional<ExplainOptions::Verbosity> explainVerbosity,
                                       bool apiStrict) {
@@ -75,12 +75,13 @@ StatusWith<AggregateCommandRequest> parseFromBSONForTests(
 }
 
 StatusWith<AggregateCommandRequest> parseFromBSONForTests(
-    const std::string& dbName,
+    const DatabaseName& dbName,
     const BSONObj& cmdObj,
     boost::optional<ExplainOptions::Verbosity> explainVerbosity,
     bool apiStrict) {
     try {
-        return parseFromBSON(/*opCtx=*/nullptr, dbName, cmdObj, explainVerbosity, apiStrict);
+        return parseFromBSON(
+            /*opCtx=*/nullptr, dbName, cmdObj, explainVerbosity, apiStrict);
     } catch (const AssertionException&) {
         return exceptionToStatus();
     }
@@ -103,8 +104,9 @@ AggregateCommandRequest parseFromBSON(OperationContext* opCtx,
     }
 
     AggregateCommandRequest request(nss);
-    request = AggregateCommandRequest::parse(IDLParserContext("aggregate", apiStrict),
-                                             cmdObjChanged ? cmdObjBob.obj() : cmdObj);
+    request =
+        AggregateCommandRequest::parse(IDLParserContext("aggregate", apiStrict, nss.tenantId()),
+                                       cmdObjChanged ? cmdObjBob.obj() : cmdObj);
 
     if (explainVerbosity) {
         uassert(ErrorCodes::FailedToParse,
@@ -118,7 +120,7 @@ AggregateCommandRequest parseFromBSON(OperationContext* opCtx,
     return request;
 }
 
-NamespaceString parseNs(const std::string& dbname, const BSONObj& cmdObj) {
+NamespaceString parseNs(const DatabaseName& dbName, const BSONObj& cmdObj) {
     auto firstElement = cmdObj.firstElement();
 
     if (firstElement.isNumber()) {
@@ -127,14 +129,15 @@ NamespaceString parseNs(const std::string& dbname, const BSONObj& cmdObj) {
                               << firstElement.fieldNameStringData()
                               << "' field must specify a collection name or 1",
                 firstElement.number() == 1);
-        return NamespaceString::makeCollectionlessAggregateNSS(DatabaseName(boost::none, dbname));
+        return NamespaceString::makeCollectionlessAggregateNSS(dbName);
     } else {
         uassert(ErrorCodes::TypeMismatch,
                 str::stream() << "collection name has invalid type: "
                               << typeName(firstElement.type()),
                 firstElement.type() == BSONType::String);
 
-        const NamespaceString nss(dbname, firstElement.valueStringData());
+        const NamespaceString nss(
+            NamespaceStringUtil::parseNamespaceFromRequest(dbName, firstElement.valueStringData()));
 
         uassert(ErrorCodes::InvalidNamespace,
                 str::stream() << "Invalid namespace specified '" << nss.ns() << "'",
@@ -217,6 +220,14 @@ void validateRequestForAPIVersion(const OperationContext* opCtx,
                                  "'apiStrict: true' in API Version "
                               << apiVersion,
                 isInternalClient);
+    }
+}
+
+void validateRequestFromClusterQueryWithoutShardKey(const AggregateCommandRequest& request) {
+    if (request.getIsClusterQueryWithoutShardKeyCmd()) {
+        uassert(ErrorCodes::InvalidOptions,
+                "Only mongos can set the isClusterQueryWithoutShardKeyCmd field",
+                request.getFromMongos());
     }
 }
 

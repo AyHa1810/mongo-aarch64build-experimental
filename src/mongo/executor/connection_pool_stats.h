@@ -56,10 +56,13 @@ public:
 struct ConnectionStatsPer {
     ConnectionStatsPer(size_t nInUse,
                        size_t nAvailable,
+                       size_t nLeased,
                        size_t nCreated,
                        size_t nRefreshing,
                        size_t nRefreshed,
-                       size_t nWasNeverUsed);
+                       size_t nWasNeverUsed,
+                       size_t nWasUsedOnce,
+                       Milliseconds nConnUsageTime);
 
     ConnectionStatsPer();
 
@@ -67,10 +70,13 @@ struct ConnectionStatsPer {
 
     size_t inUse = 0u;
     size_t available = 0u;
+    size_t leased = 0u;
     size_t created = 0u;
     size_t refreshing = 0u;
     size_t refreshed = 0u;
     size_t wasNeverUsed = 0u;
+    size_t wasUsedOnce = 0u;
+    Milliseconds connUsageTime{0};
     ConnectionWaitTimeHistogram acquisitionWaitTimes{};
 };
 
@@ -87,10 +93,13 @@ struct ConnectionPoolStats {
 
     size_t totalInUse = 0u;
     size_t totalAvailable = 0u;
+    size_t totalLeased = 0u;
     size_t totalCreated = 0u;
     size_t totalRefreshing = 0u;
     size_t totalRefreshed = 0u;
     size_t totalWasNeverUsed = 0u;
+    size_t totalWasUsedOnce = 0u;
+    Milliseconds totalConnUsageTime{0};
     boost::optional<ShardingTaskExecutorPoolController::MatchingStrategy> strategy;
 
     ConnectionWaitTimeHistogram acquisitionWaitTimes{};

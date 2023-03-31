@@ -27,16 +27,20 @@
  *    it in the license file.
  */
 
+#pragma once
+
+#include <boost/optional.hpp>
 #include <string>
 
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/virtual_collection_options.h"
+#include "mongo/db/commands/create_gen.h"
 
 namespace mongo {
-class BSONObj;
+
 class OperationContext;
-class BSONElement;
 
 /**
  * Creates a collection as described in "cmdObj" on the database "dbName". Creates the collection's
@@ -44,17 +48,14 @@ class BSONElement;
  * default _id index.
  */
 Status createCollection(OperationContext* opCtx,
-                        const std::string& dbName,
+                        const DatabaseName& dbName,
                         const BSONObj& cmdObj,
                         const BSONObj& idIndex = BSONObj());
 
 /**
  * Creates a collection as parsed in 'cmd'.
  */
-Status createCollection(OperationContext* opCtx,
-                        const NamespaceString& ns,
-                        const CreateCommand& cmd);
-
+Status createCollection(OperationContext* opCtx, const CreateCommand& cmd);
 
 /**
  * Creates the collection or the view as described by 'options'.
@@ -65,6 +66,13 @@ Status createCollection(OperationContext* opCtx,
                         const boost::optional<BSONObj>& idIndex);
 
 /**
+ * Creates a virtual collection as described by 'vopts'.
+ */
+Status createVirtualCollection(OperationContext* opCtx,
+                               const NamespaceString& ns,
+                               const VirtualCollectionOptions& vopts);
+
+/**
  * As above, but only used by replication to apply operations. This allows recreating collections
  * with specific UUIDs (if ui is given). If ui is given and and a collection exists with the same
  * name, the existing collection will be renamed to a temporary name if allowRenameOutOfTheWay is
@@ -73,7 +81,7 @@ Status createCollection(OperationContext* opCtx,
  * error.
  */
 Status createCollectionForApplyOps(OperationContext* opCtx,
-                                   const std::string& dbName,
+                                   const DatabaseName& dbName,
                                    const boost::optional<UUID>& ui,
                                    const BSONObj& cmdObj,
                                    bool allowRenameOutOfTheWay,

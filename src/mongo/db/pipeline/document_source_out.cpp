@@ -78,14 +78,15 @@ DocumentSourceOut::~DocumentSourceOut() {
 NamespaceString DocumentSourceOut::parseNsFromElem(const BSONElement& spec,
                                                    const DatabaseName& defaultDB) {
     if (spec.type() == BSONType::String) {
-        return NamespaceString(defaultDB, spec.valueStringData());
+        return NamespaceStringUtil::parseNamespaceFromRequest(defaultDB, spec.valueStringData());
     } else if (spec.type() == BSONType::Object) {
         auto nsObj = spec.Obj();
         uassert(16994,
                 str::stream() << "If an object is passed to " << kStageName
                               << " it must have exactly 2 fields: 'db' and 'coll'",
                 nsObj.nFields() == 2 && nsObj.hasField("coll") && nsObj.hasField("db"));
-        return NamespaceString(defaultDB.tenantId(), nsObj["db"].String(), nsObj["coll"].String());
+        return NamespaceStringUtil::parseNamespaceFromRequest(
+            defaultDB.tenantId(), nsObj["db"].String(), nsObj["coll"].String());
     } else {
         uassert(16990,
                 "{} only supports a string or object argument, but found {}"_format(
@@ -97,7 +98,6 @@ NamespaceString DocumentSourceOut::parseNsFromElem(const BSONElement& spec,
 
 std::unique_ptr<DocumentSourceOut::LiteParsed> DocumentSourceOut::LiteParsed::parse(
     const NamespaceString& nss, const BSONElement& spec) {
-
     NamespaceString targetNss = parseNsFromElem(spec, nss.dbName());
     uassert(ErrorCodes::InvalidNamespace,
             "Invalid {} target namespace, {}"_format(kStageName, targetNss.ns()),
@@ -113,9 +113,9 @@ void DocumentSourceOut::initialize() {
     // to be the target collection once we are done.
     // Note that this temporary collection name is used by MongoMirror and thus should not be
     // changed without consultation.
-    _tempNs = NamespaceString(outputNs.tenantId(),
-                              str::stream() << outputNs.dbName().toString() << ".tmp.agg_out."
-                                            << UUID::gen());
+    _tempNs = NamespaceStringUtil::parseNamespaceFromRequest(
+        outputNs.tenantId(),
+        str::stream() << outputNs.dbName().toString() << ".tmp.agg_out." << UUID::gen());
 
     // Save the original collection options and index specs so we can check they didn't change
     // during computation.
@@ -211,10 +211,12 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceOut::createFromBson(
     return create(targetNS, expCtx);
 }
 
-Value DocumentSourceOut::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
+Value DocumentSourceOut::serialize(SerializationOptions opts) const {
+    MutableDocument spec;
     // Do not include the tenantId in the serialized 'outputNs'.
-    return Value(
-        DOC(kStageName << DOC("db" << _outputNs.dbName().db() << "coll" << _outputNs.coll())));
+    spec["db"] = Value(opts.serializeFieldName(_outputNs.dbName().db()));
+    spec["coll"] = Value(opts.serializeFieldName(_outputNs.coll()));
+    return Value(Document{{kStageName, spec.freezeToValue()}});
 }
 
 void DocumentSourceOut::waitWhileFailPointEnabled() {

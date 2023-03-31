@@ -54,14 +54,14 @@ public:
     ClusterSetDefaultRWConcernCommand() : BasicCommand("setDefaultRWConcern") {}
 
     bool run(OperationContext* opCtx,
-             const std::string& dbName,
+             const DatabaseName&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
         auto cmdResponse = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
             opCtx,
             ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-            NamespaceString::kAdminDb.toString(),
+            DatabaseName::kAdmin.toString(),
             CommandHelpers::appendMajorityWriteConcern(
                 CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
                 opCtx->getWriteConcern()),
@@ -94,8 +94,8 @@ public:
     }
 
     Status checkAuthForOperation(OperationContext* opCtx,
-                                 const std::string& dbname,
-                                 const BSONObj& cmdObj) const override {
+                                 const DatabaseName&,
+                                 const BSONObj&) const override {
         if (!AuthorizationSession::get(opCtx->getClient())
                  ->isAuthorizedForPrivilege(Privilege{ResourcePattern::forClusterResource(),
                                                       ActionType::setDefaultRWConcern})) {
@@ -148,7 +148,7 @@ public:
             auto cmdResponse = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
                 opCtx,
                 ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                NamespaceString::kAdminDb.toString(),
+                DatabaseName::kAdmin.toString(),
                 applyReadWriteConcern(opCtx, this, configsvrRequest.toBSON({})),
                 Shard::RetryPolicy::kIdempotent));
 
@@ -172,7 +172,7 @@ public:
         }
 
         NamespaceString ns() const override {
-            return NamespaceString(request().getDbName(), "");
+            return NamespaceString(request().getDbName());
         }
     };
 

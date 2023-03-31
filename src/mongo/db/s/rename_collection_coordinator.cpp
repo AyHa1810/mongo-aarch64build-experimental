@@ -32,7 +32,6 @@
 
 #include "mongo/db/s/rename_collection_coordinator.h"
 
-#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_uuid_mismatch.h"
 #include "mongo/db/catalog/database_holder.h"
@@ -40,20 +39,22 @@
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/persistent_task_store.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
-#include "mongo/db/s/recoverable_critical_section_service.h"
+#include "mongo/db/s/sharded_index_catalog_commands_gen.h"
 #include "mongo/db/s/sharding_ddl_util.h"
+#include "mongo/db/s/sharding_index_catalog_ddl_util.h"
 #include "mongo/db/s/sharding_logging.h"
+#include "mongo/db/s/sharding_recovery_service.h"
 #include "mongo/db/s/sharding_state.h"
-#include "mongo/db/s/sharding_util.h"
+#include "mongo/db/vector_clock.h"
 #include "mongo/idl/idl_parser.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/index_version.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
-
 
 namespace mongo {
 namespace {
@@ -88,6 +89,43 @@ boost::optional<UUID> getCollectionUUID(OperationContext* opCtx,
 
     return collPtr->uuid();
 }
+
+void renameIndexMetadataInShards(OperationContext* opCtx,
+                                 const NamespaceString& nss,
+                                 const RenameCollectionRequest& request,
+                                 const OperationSessionInfo& osi,
+                                 const std::shared_ptr<executor::TaskExecutor>& executor,
+                                 RenameCollectionCoordinatorDocument* doc) {
+    const auto [configTime, newIndexVersion] = [opCtx]() -> std::pair<LogicalTime, Timestamp> {
+        VectorClock::VectorTime vt = VectorClock::get(opCtx)->getTime();
+        return {vt.configTime(), vt.clusterTime().asTimestamp()};
+    }();
+
+    // Bump the index version only if there are indexes in the source
+    // collection.
+    auto optShardedCollInfo = doc->getOptShardedCollInfo();
+    if (optShardedCollInfo && optShardedCollInfo->getIndexVersion()) {
+        // Bump sharding catalog's index version on the config server if the source
+        // collection is sharded. It will be updated later on.
+        optShardedCollInfo->setIndexVersion({optShardedCollInfo->getUuid(), newIndexVersion});
+        doc->setOptShardedCollInfo(optShardedCollInfo);
+    }
+
+    // Update global index metadata in shards.
+    auto& toNss = request.getTo();
+
+    auto participants = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
+    ShardsvrRenameIndexMetadata renameIndexCatalogReq(
+        nss, toNss, {doc->getSourceUUID().value(), newIndexVersion});
+    const auto renameIndexCatalogCmdObj =
+        CommandHelpers::appendMajorityWriteConcern(renameIndexCatalogReq.toBSON({}));
+    sharding_ddl_util::sendAuthenticatedCommandToShards(
+        opCtx,
+        toNss.db(),
+        renameIndexCatalogCmdObj.addFields(osi.toBSON()),
+        participants,
+        executor);
+}
 }  // namespace
 
 RenameCollectionCoordinator::RenameCollectionCoordinator(ShardingDDLCoordinatorService* service,
@@ -121,9 +159,9 @@ ExecutorFuture<void> RenameCollectionCoordinator::_runImpl(
     std::shared_ptr<executor::ScopedTaskExecutor> executor,
     const CancellationToken& token) noexcept {
     return ExecutorFuture<void>(**executor)
-        .then(_executePhase(
+        .then(_buildPhaseHandler(
             Phase::kCheckPreconditions,
-            [this, anchor = shared_from_this()] {
+            [this, executor = executor, anchor = shared_from_this()] {
                 auto opCtxHolder = cc().makeOperationContext();
                 auto* opCtx = opCtxHolder.get();
                 getForwardableOpMetadata().setOn(opCtx);
@@ -149,11 +187,34 @@ ExecutorFuture<void> RenameCollectionCoordinator::_runImpl(
                             fromNss.db() == toNss.db() ||
                                 (!_doc.getExpectedSourceUUID() && !_doc.getExpectedTargetUUID()));
 
+                    uassert(ErrorCodes::IllegalOperation,
+                            "Can't rename a collection in the config database",
+                            !fromNss.isConfigDB());
+
+                    uassert(ErrorCodes::IllegalOperation,
+                            "Can't rename a collection in the admin database",
+                            !fromNss.isAdminDB());
+
                     {
                         AutoGetCollection coll{
-                            opCtx, fromNss, MODE_IS, AutoGetCollectionViewMode::kViewsPermitted};
+                            opCtx,
+                            fromNss,
+                            MODE_IS,
+                            AutoGetCollection::Options{}
+                                .viewMode(auto_get_collection::ViewMode::kViewsPermitted)
+                                .expectedUUID(_doc.getExpectedSourceUUID())};
+
+                        uassert(ErrorCodes::CommandNotSupportedOnView,
+                                str::stream() << "Can't rename source collection `" << fromNss
+                                              << "` because it is a view.",
+                                !CollectionCatalog::get(opCtx)->lookupView(opCtx, fromNss));
+
                         checkCollectionUUIDMismatch(
                             opCtx, fromNss, *coll, _doc.getExpectedSourceUUID());
+
+                        uassert(ErrorCodes::NamespaceNotFound,
+                                str::stream() << "Collection " << fromNss << " doesn't exist.",
+                                coll.getCollection());
 
                         uassert(ErrorCodes::IllegalOperation,
                                 "Cannot rename an encrypted collection",
@@ -183,10 +244,13 @@ ExecutorFuture<void> RenameCollectionCoordinator::_runImpl(
                     _doc.setTargetUUID(getCollectionUUID(
                         opCtx, toNss, optTargetCollType, /*throwNotFound*/ false));
 
-                    auto criticalSection = RecoverableCriticalSectionService::get(opCtx);
                     if (!targetIsSharded) {
                         // (SERVER-67325) Acquire critical section on the target collection in order
-                        // to disallow concurrent `createCollection`
+                        // to disallow concurrent `createCollection`. In case the collection does
+                        // not exist, it will be later released by the rename participant. In case
+                        // the collection exists and is unsharded, the critical section can be
+                        // released right away as the participant will re-acquire it when needed.
+                        auto criticalSection = ShardingRecoveryService::get(opCtx);
                         criticalSection->acquireRecoverableCriticalSectionBlockWrites(
                             opCtx,
                             toNss,
@@ -197,40 +261,36 @@ ExecutorFuture<void> RenameCollectionCoordinator::_runImpl(
                             toNss,
                             criticalSectionReason,
                             ShardingCatalogClient::kLocalWriteConcern);
-                    }
 
-                    // Make sure the target namespace is not a view
-                    {
-                        uassert(ErrorCodes::CommandNotSupportedOnView,
-                                str::stream() << "Can't rename to target collection `" << toNss
-                                              << "` because it is a view.",
+                        // Make sure the target namespace is not a view
+                        uassert(ErrorCodes::NamespaceExists,
+                                str::stream() << "a view already exists with that name: " << toNss,
                                 !CollectionCatalog::get(opCtx)->lookupView(opCtx, toNss));
-                    }
 
-                    const bool targetExists = [&]() {
-                        if (targetIsSharded) {
-                            return true;
+                        if (CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx,
+                                                                                       toNss)) {
+                            // Release the critical section because the unsharded target collection
+                            // already exists, hence no risk of concurrent `createCollection`
+                            criticalSection->releaseRecoverableCriticalSection(
+                                opCtx,
+                                toNss,
+                                criticalSectionReason,
+                                WriteConcerns::kLocalWriteConcern);
                         }
-                        auto collectionCatalog = CollectionCatalog::get(opCtx);
-                        auto targetColl =
-                            collectionCatalog->lookupCollectionByNamespace(opCtx, toNss);
-                        return (bool)targetColl;  // true if exists and is unsharded
-                    }();
-
-                    if (targetExists) {
-                        // Release the critical section because the target collection
-                        // already exists, hence no risk of concurrent `createCollection`
-                        criticalSection->releaseRecoverableCriticalSection(
-                            opCtx, toNss, criticalSectionReason, WriteConcerns::kLocalWriteConcern);
                     }
 
                     sharding_ddl_util::checkRenamePreconditions(
                         opCtx, sourceIsSharded, toNss, _doc.getDropTarget());
 
+                    sharding_ddl_util::checkCatalogConsistencyAcrossShardsForRename(
+                        opCtx, fromNss, toNss, _doc.getDropTarget(), executor);
+
                     {
-                        AutoGetCollection coll{opCtx, toNss, MODE_IS};
-                        checkCollectionUUIDMismatch(
-                            opCtx, toNss, *coll, _doc.getExpectedTargetUUID());
+                        AutoGetCollection coll{opCtx,
+                                               toNss,
+                                               MODE_IS,
+                                               AutoGetCollection::Options{}.expectedUUID(
+                                                   _doc.getExpectedTargetUUID())};
                         uassert(ErrorCodes::IllegalOperation,
                                 "Cannot rename to an existing encrypted collection",
                                 !coll || !coll->getCollectionOptions().encryptedFieldConfig ||
@@ -238,14 +298,18 @@ ExecutorFuture<void> RenameCollectionCoordinator::_runImpl(
                     }
 
                 } catch (const DBException&) {
-                    auto criticalSection = RecoverableCriticalSectionService::get(opCtx);
+                    auto criticalSection = ShardingRecoveryService::get(opCtx);
                     criticalSection->releaseRecoverableCriticalSection(
-                        opCtx, toNss, criticalSectionReason, WriteConcerns::kLocalWriteConcern);
+                        opCtx,
+                        toNss,
+                        criticalSectionReason,
+                        WriteConcerns::kLocalWriteConcern,
+                        false /* throwIfReasonDiffers */);
                     _completeOnError = true;
                     throw;
                 }
             }))
-        .then(_executePhase(
+        .then(_buildPhaseHandler(
             Phase::kFreezeMigrations,
             [this, executor = executor, anchor = shared_from_this()] {
                 auto opCtxHolder = cc().makeOperationContext();
@@ -271,7 +335,7 @@ ExecutorFuture<void> RenameCollectionCoordinator::_runImpl(
                     sharding_ddl_util::stopMigrations(opCtx, toNss, _doc.getTargetUUID());
                 }
             }))
-        .then(_executePhase(
+        .then(_buildPhaseHandler(
             Phase::kBlockCrudAndRename,
             [this, executor = executor, anchor = shared_from_this()] {
                 auto opCtxHolder = cc().makeOperationContext();
@@ -295,22 +359,35 @@ ExecutorFuture<void> RenameCollectionCoordinator::_runImpl(
                 // - Locally drop the target collection
                 // - Locally rename source to target
                 ShardsvrRenameCollectionParticipant renameCollParticipantRequest(
-                    fromNss, _doc.getSourceUUID().get());
+                    fromNss, _doc.getSourceUUID().value());
                 renameCollParticipantRequest.setDbName(fromNss.db());
                 renameCollParticipantRequest.setTargetUUID(_doc.getTargetUUID());
                 renameCollParticipantRequest.setRenameCollectionRequest(_request);
+                const auto cmdObj = CommandHelpers::appendMajorityWriteConcern(
+                                        renameCollParticipantRequest.toBSON({}))
+                                        .addFields(osi.toBSON());
 
-                auto participants = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
                 // We need to send the command to all the shards because both
                 // movePrimary and moveChunk leave garbage behind for sharded
                 // collections.
-                const auto cmdObj = CommandHelpers::appendMajorityWriteConcern(
-                    renameCollParticipantRequest.toBSON({}));
+                // At the same time, the primary shard needs to be last participant to perfom its
+                // local rename operation: this will ensure that the op entries generated by the
+                // collections being renamed/dropped will be generated at points in time where all
+                // shards have a consistent view of the metadata and no concurrent writes are being
+                // performed.
+                const auto primaryShardId = ShardingState::get(opCtx)->shardId();
+                auto participants = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
+                participants.erase(
+                    std::remove(participants.begin(), participants.end(), primaryShardId),
+                    participants.end());
 
                 sharding_ddl_util::sendAuthenticatedCommandToShards(
-                    opCtx, fromNss.db(), cmdObj.addFields(osi.toBSON()), participants, **executor);
+                    opCtx, fromNss.db(), cmdObj, participants, **executor);
+
+                sharding_ddl_util::sendAuthenticatedCommandToShards(
+                    opCtx, fromNss.db(), cmdObj, {primaryShardId}, **executor);
             }))
-        .then(_executePhase(
+        .then(_buildPhaseHandler(
             Phase::kRenameMetadata,
             [this, executor = executor, anchor = shared_from_this()] {
                 auto opCtxHolder = cc().makeOperationContext();
@@ -324,6 +401,12 @@ ExecutorFuture<void> RenameCollectionCoordinator::_runImpl(
                 if (!_firstExecution) {
                     _performNoopRetryableWriteOnAllShardsAndConfigsvr(
                         opCtx, getCurrentSession(), **executor);
+                }
+
+                if (!_isPre63Compatible() &&
+                    (_doc.getTargetIsSharded() || _doc.getOptShardedCollInfo())) {
+                    renameIndexMetadataInShards(
+                        opCtx, nss(), _request, getCurrentSession(), **executor, &_doc);
                 }
 
                 ConfigsvrRenameCollectionMetadata req(nss(), _request.getTo());
@@ -350,7 +433,7 @@ ExecutorFuture<void> RenameCollectionCoordinator::_runImpl(
                         ShardingCatalogClient::kMajorityWriteConcern));
                 }
             }))
-        .then(_executePhase(
+        .then(_buildPhaseHandler(
             Phase::kUnblockCRUD,
             [this, executor = executor, anchor = shared_from_this()] {
                 auto opCtxHolder = cc().makeOperationContext();
@@ -367,7 +450,7 @@ ExecutorFuture<void> RenameCollectionCoordinator::_runImpl(
                 // On participant shards:
                 // - Unblock CRUD on participants for both source and destination collections
                 ShardsvrRenameCollectionUnblockParticipant unblockParticipantRequest(
-                    fromNss, _doc.getSourceUUID().get());
+                    fromNss, _doc.getSourceUUID().value());
                 unblockParticipantRequest.setDbName(fromNss.db());
                 unblockParticipantRequest.setRenameCollectionRequest(_request);
                 auto const cmdObj = CommandHelpers::appendMajorityWriteConcern(
@@ -380,35 +463,35 @@ ExecutorFuture<void> RenameCollectionCoordinator::_runImpl(
                 sharding_ddl_util::sendAuthenticatedCommandToShards(
                     opCtx, fromNss.db(), cmdObj.addFields(osi.toBSON()), participants, **executor);
             }))
-        .then(_executePhase(Phase::kSetResponse,
-                            [this, anchor = shared_from_this()] {
-                                auto opCtxHolder = cc().makeOperationContext();
-                                auto* opCtx = opCtxHolder.get();
-                                getForwardableOpMetadata().setOn(opCtx);
+        .then(_buildPhaseHandler(
+            Phase::kSetResponse,
+            [this, anchor = shared_from_this()] {
+                auto opCtxHolder = cc().makeOperationContext();
+                auto* opCtx = opCtxHolder.get();
+                getForwardableOpMetadata().setOn(opCtx);
 
-                                // Retrieve the new collection version
-                                const auto catalog = Grid::get(opCtx)->catalogCache();
-                                const auto cm =
-                                    uassertStatusOK(catalog->getCollectionRoutingInfoWithRefresh(
-                                        opCtx, _request.getTo()));
-                                _response = RenameCollectionResponse(
-                                    cm.isSharded() ? cm.getVersion() : ChunkVersion::UNSHARDED());
+                // Retrieve the new collection version
+                const auto catalog = Grid::get(opCtx)->catalogCache();
+                const auto cri = uassertStatusOK(
+                    catalog->getCollectionRoutingInfoWithRefresh(opCtx, _request.getTo()));
+                _response = RenameCollectionResponse(
+                    cri.cm.isSharded() ? cri.getCollectionVersion() : ShardVersion::UNSHARDED());
 
-                                ShardingLogging::get(opCtx)->logChange(
-                                    opCtx,
-                                    "renameCollection.end",
-                                    nss().ns(),
-                                    BSON("source" << nss().toString() << "destination"
-                                                  << _request.getTo().toString()),
-                                    ShardingCatalogClient::kMajorityWriteConcern);
-                                LOGV2(5460504, "Collection renamed", "namespace"_attr = nss());
-                            }))
+                ShardingLogging::get(opCtx)->logChange(
+                    opCtx,
+                    "renameCollection.end",
+                    nss().ns(),
+                    BSON("source" << nss().toString() << "destination"
+                                  << _request.getTo().toString()),
+                    ShardingCatalogClient::kMajorityWriteConcern);
+                LOGV2(5460504, "Collection renamed", logAttrs(nss()));
+            }))
         .onError([this, anchor = shared_from_this()](const Status& status) {
             if (!status.isA<ErrorCategory::NotPrimaryError>() &&
                 !status.isA<ErrorCategory::ShutdownError>()) {
                 LOGV2_ERROR(5460505,
                             "Error running rename collection",
-                            "namespace"_attr = nss(),
+                            logAttrs(nss()),
                             "error"_attr = redact(status));
             }
 

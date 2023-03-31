@@ -1,9 +1,10 @@
 /**
  * Test that mongos times out when the config server replica set only contains nodes that
  * are behind the majority opTime.
+ *
+ * @tags: [temporary_catalog_shard_incompatible]
  */
 
-load("jstests/libs/logv2_helpers.js");
 load("jstests/libs/write_concern_util.js");
 
 // Checking UUID and index consistency involves mongos being able to do a read from the config
@@ -12,6 +13,7 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 TestData.skipCheckOrphans = true;
 TestData.skipCheckRoutingTableConsistency = true;
+TestData.skipCheckShardFilteringMetadata = true;
 
 (function() {
 
@@ -22,6 +24,7 @@ TestData.skipCheckRoutingTableConsistency = true;
  * To prevent this, disable the pinger threads to prevent them reaching out to the config server.
  */
 const failpointParams = {
+    // TODO SERVER-68551: Remove once 7.0 becomes last-lts
     setParameter: {"failpoint.disableReplSetDistLockManager": "{mode: 'alwaysOn'}"}
 };
 
@@ -70,10 +73,7 @@ assert(ErrorCodes.isExceededTimeLimitError(exception.code));
 
 let msgAA = 'command config.$cmd command: find { find: "databases"';
 let msgAB = 'errCode:' + ErrorCodes.ClientDisconnect;
-let msgB = 'Command on database config timed out waiting for read concern to be satisfied';
-if (isJsonLogNoConn()) {
-    msgB = /Command timed out waiting for read concern to be satisfied.*"db":"config"/;
-}
+let msgB = /Command timed out waiting for read concern to be satisfied.*"db":"config"/;
 
 assert.soon(
     function() {

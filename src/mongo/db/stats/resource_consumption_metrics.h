@@ -219,6 +219,7 @@ public:
          * Reports all metrics on a BSONObjBuilder.
          */
         void toBson(BSONObjBuilder* builder) const;
+        BSONObj toBson() const;
 
         /**
          * Reports metrics on a BSONObjBuilder. Only non-zero fields are reported.
@@ -230,7 +231,7 @@ public:
         WriteMetrics writeMetrics;
 
         // Records CPU time consumed by this operation.
-        OperationCPUTimer* cpuTimer = nullptr;
+        std::unique_ptr<OperationCPUTimer> cpuTimer;
     };
 
     /**
@@ -280,7 +281,8 @@ public:
         static MetricsCollector& get(OperationContext* opCtx);
 
         /**
-         * When called, resource consumption metrics should be recorded for this operation.
+         * When called, resource consumption metrics should be recorded for this operation. Clears
+         * any metrics from previous collection periods.
          */
         void beginScopedCollecting(OperationContext* opCtx, const std::string& dbName);
 
@@ -333,11 +335,6 @@ public:
         const OperationMetrics& getMetrics() const {
             invariant(!_dbName.empty(), "observing Metrics before a dbName has been set");
             return _metrics;
-        }
-
-        void reset() {
-            invariant(!isInScope());
-            *this = {};
         }
 
         /**
@@ -499,8 +496,8 @@ public:
      * Returns whether the database's metrics should be collected.
      */
     static bool shouldCollectMetricsForDatabase(StringData dbName) {
-        if (dbName == NamespaceString::kAdminDb || dbName == NamespaceString::kConfigDb ||
-            dbName == NamespaceString::kLocalDb) {
+        if (dbName == DatabaseName::kAdmin.db() || dbName == DatabaseName::kConfig.db() ||
+            dbName == DatabaseName::kLocal.db()) {
             return false;
         }
         return true;

@@ -62,7 +62,9 @@ ReplSettings createReplSettingsForSingleNodeReplSet() {
 
 ReplicationCoordinatorMock::ReplicationCoordinatorMock(ServiceContext* service,
                                                        const ReplSettings& settings)
-    : _service(service), _settings(settings) {}
+    : _service(service),
+      _settings(settings),
+      _splitSessionManager(InternalSessionPool::get(service)) {}
 
 ReplicationCoordinatorMock::ReplicationCoordinatorMock(ServiceContext* service,
                                                        StorageInterface* storage)
@@ -171,7 +173,9 @@ void ReplicationCoordinatorMock::setAwaitReplicationReturnValueFunction(
 
 SharedSemiFuture<void> ReplicationCoordinatorMock::awaitReplicationAsyncNoWTimeout(
     const OpTime& opTime, const WriteConcernOptions& writeConcern) {
-    MONGO_UNREACHABLE;
+    auto opCtx = cc().makeOperationContext();
+    auto result = _awaitReplicationReturnValueFunction(opCtx.get(), opTime);
+    return Future<ReplicationCoordinator::StatusAndDuration>::makeReady(result).ignoreValue();
 }
 
 void ReplicationCoordinatorMock::stepDown(OperationContext* opCtx,
@@ -228,7 +232,7 @@ Status ReplicationCoordinatorMock::checkCanServeReadsFor_UNSAFE(OperationContext
 
 bool ReplicationCoordinatorMock::shouldRelaxIndexConstraints(OperationContext* opCtx,
                                                              const NamespaceString& ns) {
-    return (!canAcceptWritesFor(opCtx, ns) || tenantMigrationRecipientInfo(opCtx));
+    return (!canAcceptWritesFor(opCtx, ns) || tenantMigrationInfo(opCtx));
 }
 
 void ReplicationCoordinatorMock::setMyHeartbeatMessage(const std::string& msg) {
@@ -240,11 +244,13 @@ void ReplicationCoordinatorMock::_setMyLastAppliedOpTimeAndWallTime(
     _myLastAppliedOpTime = opTimeAndWallTime.opTime;
     _myLastAppliedWallTime = opTimeAndWallTime.wallTime;
 
-    _setCurrentCommittedSnapshotOpTime(lk, opTimeAndWallTime.opTime);
+    if (_updateCommittedSnapshot) {
+        _setCurrentCommittedSnapshotOpTime(lk, opTimeAndWallTime.opTime);
 
-    if (auto storageEngine = _service->getStorageEngine()) {
-        if (auto snapshotManager = storageEngine->getSnapshotManager()) {
-            snapshotManager->setCommittedSnapshot(opTimeAndWallTime.opTime.getTimestamp());
+        if (auto storageEngine = _service->getStorageEngine()) {
+            if (auto snapshotManager = storageEngine->getSnapshotManager()) {
+                snapshotManager->setCommittedSnapshot(opTimeAndWallTime.opTime.getTimestamp());
+            }
         }
     }
 }
@@ -533,7 +539,8 @@ Status ReplicationCoordinatorMock::doOptimizedReconfig(OperationContext* opCtx,
 }
 
 Status ReplicationCoordinatorMock::awaitConfigCommitment(OperationContext* opCtx,
-                                                         bool waitForOplogCommitment) {
+                                                         bool waitForOplogCommitment,
+                                                         long long term) {
     return Status::OK();
 }
 
@@ -775,8 +782,8 @@ std::shared_ptr<const HelloResponse> ReplicationCoordinatorMock::awaitHelloRespo
     return response;
 }
 
-StatusWith<OpTime> ReplicationCoordinatorMock::getLatestWriteOpTime(OperationContext* opCtx) const
-    noexcept {
+StatusWith<OpTime> ReplicationCoordinatorMock::getLatestWriteOpTime(
+    OperationContext* opCtx) const noexcept {
     return getMyLastAppliedOpTime();
 }
 
@@ -808,7 +815,10 @@ void ReplicationCoordinatorMock::recordIfCWWCIsSetOnConfigServerOnStartup(Operat
 ReplicationCoordinatorMock::WriteConcernTagChanges*
 ReplicationCoordinatorMock::getWriteConcernTagChanges() {
     MONGO_UNREACHABLE;
-    return nullptr;
+}
+
+SplitPrepareSessionManager* ReplicationCoordinatorMock::getSplitPrepareSessionManager() {
+    return &_splitSessionManager;
 }
 
 }  // namespace repl

@@ -16,20 +16,25 @@ def _is_replica_set_fixture(fixture):
     return hasattr(fixture, 'replset_name')
 
 
-def _teardown_and_clean_node(node):
-    """Teardown the provided node and remove its data directory."""
-    node.teardown(finished=True)
+def _teardown_and_clean_fixture(fixture):
+    """Teardown the provided fixture, and remove its data directory."""
+    # ReplicaSetFixtures in the shard split fixture share the same logger as the parent
+    # ShardSplitFixture instance. We only want to explicitly close the loggers if we are tearing
+    # down single recipient nodes (before they become a replica set).
+    should_close_logger = not _is_replica_set_fixture(fixture)
+    fixture.teardown(finished=should_close_logger)
+
     # Remove the data directory for the node to prevent unbounded disk space utilization.
-    shutil.rmtree(node.get_dbpath_prefix(), ignore_errors=False)
+    shutil.rmtree(fixture.get_dbpath_prefix(), ignore_errors=False)
 
 
-class ShardSplitFixture(interface.MultiClusterFixture):  # pylint: disable=too-many-instance-attributes
+class ShardSplitFixture(interface.MultiClusterFixture):
     """Fixture which provides JSTests with a replica set and recipient nodes to run splits against."""
 
     AWAIT_REPL_TIMEOUT_MINS = 5
     AWAIT_REPL_TIMEOUT_FOREVER_MINS = 24 * 60
 
-    def __init__(  # pylint: disable=too-many-arguments,too-many-locals
+    def __init__(
             self,
             logger,
             job_num,
@@ -58,6 +63,12 @@ class ShardSplitFixture(interface.MultiClusterFixture):  # pylint: disable=too-m
                                                                   self.config.MIXED_BIN_VERSIONS)
         self.num_nodes_per_replica_set = num_nodes_per_replica_set if num_nodes_per_replica_set \
             else self.config.NUM_REPLSET_NODES
+        # The default shard split timeout (10 seconds) is not long enough for some test cases
+        # which have slow system performances may cause the shard split operation to be long.
+        if "set_parameters" not in self.common_mongod_options:
+            self.common_mongod_options["set_parameters"] = {}
+        if "shardSplitTimeoutMS" not in self.common_mongod_options["set_parameters"]:
+            self.common_mongod_options["set_parameters"]["shardSplitTimeoutMS"] = 60000
 
         self.fixtures = []
         self._can_teardown_retired_donor_rs = threading.Event()
@@ -358,7 +369,7 @@ class ShardSplitFixture(interface.MultiClusterFixture):  # pylint: disable=too-m
 
         self.logger.info("Tearing down recipient nodes and removing data directories.")
         for recipient_node in reversed(recipient_nodes):
-            _teardown_and_clean_node(recipient_node)
+            _teardown_and_clean_fixture(recipient_node)
 
     def replace_donor_with_recipient(self, recipient_set_name):
         """Replace the current donor with the newly initiated recipient."""
@@ -384,7 +395,7 @@ class ShardSplitFixture(interface.MultiClusterFixture):  # pylint: disable=too-m
 
         self._can_teardown_retired_donor_rs.wait()
         self.logger.info(f"Retiring old donor replica set '{retired_donor_rs.replset_name}'.")
-        _teardown_and_clean_node(retired_donor_rs)
+        _teardown_and_clean_fixture(retired_donor_rs)
 
     def enter_step_down(self):
         """Called by the ContinuousStepDown hook to indicate that we are stepping down."""

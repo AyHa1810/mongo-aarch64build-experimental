@@ -33,7 +33,7 @@
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsontypes.h"
-#include "mongo/crypto/encryption_fields_gen.h"
+#include "mongo/crypto/fle_field_schema_gen.h"
 #include "mongo/db/field_ref.h"
 #include "mongo/util/assert_util.h"
 
@@ -145,6 +145,23 @@ inline bool isFLE2UnindexedSupportedType(BSONType type) {
         case MinKey:
         case Undefined:
             return false;
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
+
+// Wrapper of the three helper functions above. Should be used on FLE type 6, 7, and 9, 14, and 15.
+inline bool isFLE2SupportedType(EncryptedBinDataType fleType, BSONType bsonType) {
+    switch (fleType) {
+        case EncryptedBinDataType::kFLE2UnindexedEncryptedValue:
+        case EncryptedBinDataType::kFLE2UnindexedEncryptedValueV2:
+            return isFLE2UnindexedSupportedType(bsonType);
+        case EncryptedBinDataType::kFLE2EqualityIndexedValue:
+        case EncryptedBinDataType::kFLE2EqualityIndexedValueV2:
+            return isFLE2EqualityIndexedSupportedType(bsonType);
+        case EncryptedBinDataType::kFLE2RangeIndexedValue:
+        case EncryptedBinDataType::kFLE2RangeIndexedValueV2:
+            return isFLE2RangeIndexedSupportedType(bsonType);
         default:
             MONGO_UNREACHABLE;
     }

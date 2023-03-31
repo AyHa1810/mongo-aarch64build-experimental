@@ -36,6 +36,7 @@
 #include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/commands/set_cluster_parameter_invocation.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/server_feature_flags_gen.h"
 #include "mongo/idl/cluster_server_parameter_gen.h"
 #include "mongo/logv2/log.h"
 
@@ -66,6 +67,10 @@ public:
         return "Set cluster parameter on replica set or node";
     }
 
+    bool allowedWithSecurityToken() const final {
+        return true;
+    }
+
     class Invocation final : public InvocationBase {
     public:
         using InvocationBase::InvocationBase;
@@ -73,14 +78,15 @@ public:
         void typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::ErrorCodes::NotImplemented,
                     "setClusterParameter can only run on mongos in sharded clusters",
-                    (serverGlobalParams.clusterRole == ClusterRole::None));
+                    (serverGlobalParams.clusterRole.has(ClusterRole::None)));
 
-            // TODO SERVER-65249: This will eventually be made specific to the parameter being set
-            // so that some parameters will be able to use setClusterParameter even on standalones.
-            uassert(ErrorCodes::IllegalOperation,
-                    str::stream() << Request::kCommandName << " cannot be run on standalones",
-                    repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() !=
-                        repl::ReplicationCoordinator::modeNone);
+            if (!feature_flags::gFeatureFlagAuditConfigClusterParameter.isEnabled(
+                    serverGlobalParams.featureCompatibility)) {
+                uassert(ErrorCodes::IllegalOperation,
+                        str::stream() << Request::kCommandName << " cannot be run on standalones",
+                        repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() !=
+                            repl::ReplicationCoordinator::modeNone);
+            }
 
             std::unique_ptr<ServerParameterService> parameterService =
                 std::make_unique<ClusterParameterService>();

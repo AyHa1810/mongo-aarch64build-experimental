@@ -84,10 +84,13 @@ std::shared_ptr<CappedInsertNotifier> getCappedInsertNotifier(OperationContext* 
 
     // We can only wait if we have a collection; otherwise we should retry immediately when
     // we hit EOF.
-    auto collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespaceForRead(opCtx, nss);
+    //
+    // Hold reference to the catalog for collection lookup without locks to be safe.
+    auto catalog = CollectionCatalog::get(opCtx);
+    auto collection = catalog->lookupCollectionByNamespace(opCtx, nss);
     invariant(collection);
 
-    return collection->getCappedInsertNotifier();
+    return collection->getRecordStore()->getCappedInsertNotifier();
 }
 
 void waitForInserts(OperationContext* opCtx,

@@ -88,7 +88,7 @@ struct Helpers {
      * Returns true if a matching document was found.
      */
     static bool findById(OperationContext* opCtx,
-                         StringData ns,
+                         const NamespaceString& nss,
                          BSONObj query,
                          BSONObj& result,
                          bool* nsFound = nullptr,

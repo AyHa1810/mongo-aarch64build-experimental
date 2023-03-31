@@ -42,25 +42,7 @@ namespace {
 
 using unittest::assertGet;
 
-class ConfigIndexTest : public ConfigServerTestFixture {
-protected:
-    /*
-     * Initializes the sharding state and locks both the config db and rstl.
-     */
-    void setUp() override {
-        // Prevent DistLockManager from writing to lockpings collection before we create the
-        // indexes.
-        // TODO (SERVER-64987): Remove lock acquisition.
-        _autoDb = setUpAndLockConfigDb();
-    }
-
-    void tearDown() override {
-        _autoDb = {};
-        ConfigServerTestFixture::tearDown();
-    }
-
-    std::unique_ptr<AutoGetDb> _autoDb;
-};
+using ConfigIndexTest = ConfigServerTestFixture;
 
 TEST_F(ConfigIndexTest, CompatibleIndexAlreadyExists) {
     createIndexOnConfigCollection(operationContext(),
@@ -99,7 +81,7 @@ TEST_F(ConfigIndexTest, IncompatibleIndexAlreadyExists) {
 }
 
 TEST_F(ConfigIndexTest, CreateIndex) {
-    NamespaceString nss("config.foo");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("config.foo");
 
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, getIndexes(operationContext(), nss).getStatus());
 
@@ -129,13 +111,13 @@ TEST_F(ConfigIndexTest, CreateIndex) {
 }
 
 TEST_F(ConfigIndexTest, CreateIndexNonEmptyCollection) {
-    NamespaceString nss("config.foo");
+    NamespaceString nss = NamespaceString::createNamespaceString_forTest("config.foo");
 
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, getIndexes(operationContext(), nss).getStatus());
 
     // Inserting the document should implicitly create the collection
     DBDirectClient dbDirectClient(operationContext());
-    dbDirectClient.insert(nss.toString(), BSON("_id" << 1 << "a" << 1));
+    dbDirectClient.insert(nss, BSON("_id" << 1 << "a" << 1));
 
     auto status = createIndexOnConfigCollection(operationContext(), nss, BSON("a" << 1), false);
     ASSERT_OK(status);

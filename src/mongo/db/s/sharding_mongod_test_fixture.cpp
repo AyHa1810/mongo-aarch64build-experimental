@@ -52,12 +52,14 @@
 #include "mongo/db/repl/replication_consistency_markers_mock.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/replication_recovery_mock.h"
-#include "mongo/db/repl/storage_interface_mock.h"
+#include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/s/config_server_op_observer.h"
 #include "mongo/db/s/op_observer_sharding_impl.h"
 #include "mongo/db/s/shard_local.h"
 #include "mongo/db/s/shard_server_op_observer.h"
+#include "mongo/db/session/session_catalog_mongod.h"
 #include "mongo/db/storage/snapshot_manager.h"
+#include "mongo/db/transaction/session_catalog_mongod_transaction_interface_impl.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
@@ -150,7 +152,7 @@ std::unique_ptr<ShardRegistry> ShardingMongodTestFixture::makeShardRegistry(
         {ConnectionString::ConnectionType::kStandalone, std::move(standaloneBuilder)}};
 
     // Only config servers use ShardLocal for now.
-    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+    if (serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
         ShardFactory::BuilderCallable localBuilder = [](const ShardId& shardId,
                                                         const ConnectionString& connStr) {
             return std::make_unique<ShardLocal>(shardId);
@@ -165,32 +167,6 @@ std::unique_ptr<ShardRegistry> ShardingMongodTestFixture::makeShardRegistry(
 
     return std::make_unique<ShardRegistry>(
         getServiceContext(), std::move(shardFactory), configConnStr);
-}
-
-std::unique_ptr<DistLockManager> ShardingMongodTestFixture::makeDistLockManager() {
-    class DistLockManagerNoop : public DistLockManager {
-    public:
-        DistLockManagerNoop() : DistLockManager(OID::gen()) {}
-        void startUp() override {}
-        void shutDown(OperationContext* opCtx) {}
-        std::string getProcessID() override {
-            return "DistLockManagerNoop";
-        }
-        Status lockDirect(OperationContext* opCtx,
-                          StringData name,
-                          StringData whyMessage,
-                          Milliseconds waitFor) override {
-            return Status::OK();
-        }
-        Status tryLockDirectWithLocalWriteConcern(OperationContext* opCtx,
-                                                  StringData name,
-                                                  StringData whyMessage) override {
-            return Status::OK();
-        }
-        void unlock(Interruptible* intr, StringData name) override {}
-        void unlockAll(OperationContext* opCtx) override {}
-    };
-    return std::make_unique<DistLockManagerNoop>();
 }
 
 std::unique_ptr<ClusterCursorManager> ShardingMongodTestFixture::makeClusterCursorManager() {
@@ -208,8 +184,8 @@ std::unique_ptr<CatalogCache> ShardingMongodTestFixture::makeCatalogCache() {
 
 Status ShardingMongodTestFixture::initializeGlobalShardingStateForMongodForTest(
     const ConnectionString& configConnStr) {
-    invariant(serverGlobalParams.clusterRole == ClusterRole::ShardServer ||
-              serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
+    invariant(serverGlobalParams.clusterRole.has(ClusterRole::ShardServer) ||
+              serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer));
 
     // Create and initialize each sharding component individually before moving them to the Grid
     // in order to control the order of initialization, since some components depend on others.
@@ -227,11 +203,6 @@ Status ShardingMongodTestFixture::initializeGlobalShardingStateForMongodForTest(
                makeBalancerConfiguration(),
                std::move(executorPoolPtr),
                _mockNetwork);
-
-    DistLockManager::create(getServiceContext(), makeDistLockManager());
-    if (DistLockManager::get(operationContext())) {
-        DistLockManager::get(operationContext())->startUp();
-    }
 
     return Status::OK();
 }
@@ -262,7 +233,7 @@ void ShardingMongodTestFixture::setUp() {
 
     repl::ReplicationCoordinator::set(service, std::move(replCoordPtr));
 
-    auto storagePtr = std::make_unique<repl::StorageInterfaceMock>();
+    auto storagePtr = std::make_unique<repl::StorageInterfaceImpl>();
 
     repl::DropPendingCollectionReaper::set(
         service, std::make_unique<repl::DropPendingCollectionReaper>(storagePtr.get()));
@@ -282,6 +253,11 @@ void ShardingMongodTestFixture::setUp() {
 
     repl::createOplog(operationContext());
 
+    MongoDSessionCatalog::set(
+        service,
+        std::make_unique<MongoDSessionCatalog>(
+            std::make_unique<MongoDSessionCatalogTransactionInterfaceImpl>()));
+
     // Set the highest FCV because otherwise it defaults to the lower FCV. This way we default to
     // testing this release's code, not backwards compatibility code.
     // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
@@ -297,10 +273,6 @@ void ShardingMongodTestFixture::setUp() {
 
 void ShardingMongodTestFixture::tearDown() {
     ReplicaSetMonitor::cleanup();
-
-    if (DistLockManager::get(operationContext())) {
-        DistLockManager::get(operationContext())->shutDown(operationContext());
-    }
 
     if (Grid::get(operationContext())->getExecutorPool() && !_executorPoolShutDown) {
         Grid::get(operationContext())->getExecutorPool()->shutdownAndJoin();

@@ -1,11 +1,17 @@
-// @tags: [does_not_support_stepdowns, requires_profiling, assumes_read_preference_unchanged]
-//
-//  Confirms that profiled find queries and corresponding logs have matching queryHashes.
+/**
+ * Confirms that profiled find queries and corresponding logs have matching queryHashes.
+ * @tags: [
+ *  does_not_support_stepdowns,
+ *  requires_profiling,
+ *  assumes_read_preference_unchanged,
+ *  # TODO SERVER-67607: support query hash in slow query log lines.
+ *  cqf_incompatible,
+ * ]
+ */
 (function() {
 "use strict";
 
 // For getLatestProfilerEntry().
-load("jstests/libs/logv2_helpers.js");
 load("jstests/libs/profiler.js");
 load("jstests/libs/sbe_util.js");
 
@@ -31,12 +37,8 @@ assert.commandWorked(testDB.setLogLevel(0, "query"));
 // Returns true if the logLine command components correspond to the profile entry. This is
 // sufficient for the purpose of testing query hashes.
 function logMatchesEntry(logLine, profileEntry) {
-    if ((!isJsonLogNoConn() ? logLine.indexOf("command: find { find: \"test\"") >= 0
-                            : logLine.indexOf('command":{"find":"test"') >= 0) &&
-        logLine.indexOf(profileEntry["command"]["comment"]) >= 0) {
-        return true;
-    }
-    return false;
+    return logLine.indexOf('command":{"find":"test"') >= 0 &&
+        logLine.indexOf(profileEntry["command"]["comment"]) >= 0;
 }
 
 // Fetch the log line that corresponds to the profile entry. If there is no such line, return
@@ -108,7 +110,7 @@ const testList = [
         test: function(db, comment) {
             assert.eq(200, db.test.find().comment(comment).itcount());
         },
-        hasPlanCacheKey: checkSBEEnabled(testDB, ["featureFlagSbeFull"])
+        hasPlanCacheKey: checkSBEEnabled(testDB)
     },
     {
         comment: "Test1 find query",
